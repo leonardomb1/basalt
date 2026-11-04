@@ -1442,7 +1442,7 @@ test "INSERT literals of every kind, in every dialect" {
     const dates = "('1970-01-01') ('2024-01-01') ('0000-01-01') ('-5877641-06-24') (NULL)";
     const times = "('00:00:00') ('01:02:03.000001') ('23:59:59.999999') (NULL)";
     const stamps = "('1970-01-01 00:00:00') ('2024-01-01 00:00:00.123456') ('1969-12-31 23:59:59.999999') ('0001-01-01 00:00:00') (NULL)";
-    const nested = "(NULL) (NULL)";
+    const nested = "('[1,\"a b\",null]') (NULL)";
     const rows = "(1,'a b',2.50) (NULL,NULL,NULL) (-2,'',-0.1)";
     const n_strings = "(N'') (N'plain') (N'tab\there') (N'line\nbreak') (N'cr\rlf\r\n') (N'say \"hi\"') (N'O''Brien') (N'back\\slash\\') (N'a\\Nb') (N'\\N ') (N'NULL') (N'a\x01b\x02c') (N'a,b;c:d.e-1 0') (N'\xc3\xb3 \xf0\x9f\x98\x80') (N'\x00nul') (N'sixteen bytes and more\x01') (NULL)";
     const wire_strings = "('') ('plain') ('tab\there') ('line\nbreak') ('cr\rlf\r\n') ('say \"hi\"') ('O''Brien') ('back\\\\slash\\\\') ('a\\\\Nb') ('\\\\N ') ('NULL') ('a\x01b\x02c') ('a,b;c:d.e-1 0') ('\xc3\xb3 \xf0\x9f\x98\x80') ('\x00nul') ('sixteen bytes and more\x01') (NULL)";
@@ -1473,7 +1473,7 @@ test "INSERT literals of every kind, in every dialect" {
             nested,
             rows,
         } },
-        .{ .sqlserver, .{ "(1) (0) (NULL)", ints, floats, decimals, n_strings, hex, dates, times, stamps, nested, "(1,N'a b',2.50) (NULL,NULL,NULL) (-2,N'',-0.1)" } },
+        .{ .sqlserver, .{ "(1) (0) (NULL)", ints, floats, decimals, n_strings, hex, dates, times, stamps, "(N'[1,\"a b\",null]') (NULL)", "(1,N'a b',2.50) (NULL,NULL,NULL) (-2,N'',-0.1)" } },
         .{ .starrocks, .{ words, ints, floats, decimals, wire_strings, hex, dates, times, stamps, nested, rows } },
         .{ .doris, .{ words, ints, floats, decimals, wire_strings, hex, dates, times, stamps, nested, rows } },
     };
@@ -1506,7 +1506,7 @@ test "COPY and LOAD DATA text of every kind" {
         "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\\N\n",
         "00:00:00\n01:02:03.000001\n23:59:59.999999\n\\N\n",
         "1970-01-01 00:00:00\n2024-01-01 00:00:00.123456\n1969-12-31 23:59:59.999999\n0001-01-01 00:00:00\n\\N\n",
-        "\\N\n\\N\n",
+        "[1,\"a b\",null]\n\\N\n",
         "1\ta b\t2.50\n\\N\t\\N\t\\N\n-2\t\t-0.1\n",
     };
     try celltext.expectGolden(&want, try goldenBulkText(a, .{}));

@@ -72,7 +72,7 @@ pub fn expr(w: W, e: *const ast.Expr) Error!void {
             try w.writeAll(if (c.safe) "TRY_CAST(" else "CAST(");
             try expr(w, c.e);
             try w.writeAll(" AS ");
-            if (c.ty.kind == .decimal) try w.print("DECIMAL({d}, {d})", .{ c.ty.precision, c.ty.scale }) else try upper(w, @tagName(c.ty.kind));
+            try c.ty.writeName(w, .upper);
             try w.writeByte(')');
         },
         .is_null => |n| {
@@ -127,10 +127,6 @@ fn list(w: W, es: []const *ast.Expr) Error!void {
         if (i > 0) try w.writeAll(", ");
         try expr(w, a);
     }
-}
-
-fn upper(w: W, s: []const u8) Error!void {
-    for (s) |c| try w.writeByte(std.ascii.toUpper(c));
 }
 
 fn bareIdent(s: []const u8) bool {

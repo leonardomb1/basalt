@@ -13,6 +13,15 @@
 //! Statistics values are copied there because an incoming `Value` borrows from
 //! the batch arena, which is recycled long before the group flushes.
 //!
+//! The writer's columns are leaves. A flat field is one, at definition level 1 if
+//! nullable, else 0. A nested field (a list, map or struct, held as JSON text) is
+//! its `shape.zig` groups and leaves, each leaf mapped as a flat column of its type
+//! would be and encoded the same way, plus repetition levels. Each row of the field
+//! is shredded into its leaves (`shred.zig`). A leaf's page is sealed only before
+//! a row starts, so no row spans two pages. `Lay` places each field's leaves among
+//! the columns. The footer writes the groups' elements and each leaf's full path.
+//! A nested field has no summary statistics (`summarize`). Its leaf chunks keep theirs.
+//!
 //! Pages of one chunk must land contiguously, so they are held until the flush.
 //! A dictionary is per chunk and emitted whole, for every type but BOOLEAN: a byte
 //! array keyed by its bytes, a fixed-width value by its PLAIN encoding. A chunk gives
@@ -69,9 +78,77 @@ const Decimal = @import("../../exec/value.zig").Decimal;
 const Value = @import("../../exec/value.zig").Value;
 
 const List = std.array_list.Managed;
+const shape = @import("shape.zig");
+const shred = @import("shred.zig");
+const json = @import("../../exec/json.zig");
+const nested = @import("../../exec/nested.zig");
+
+const Lay = struct { first: u32, n: u32, shape: ?*const shape.Shape = null };
+
+const Columns = struct {
+    maps: []Mapping,
+    lays: []const Lay,
+    paths: []const []const []const u8,
+};
+
+/// Each schema field's leaves among the writer's columns, their mappings and their
+/// paths: one leaf for a flat field, its shape's leaves for a nested one, each leaf
+/// mapped as a flat column of its type would be.
+fn planColumns(arena: std.mem.Allocator, schema: types.Schema, phys: []const Physical) Error!Columns {
+    var maps = List(Mapping).init(arena);
+    var paths = List([]const []const u8).init(arena);
+    const lays = try arena.alloc(Lay, schema.fields.len);
+    for (schema.fields, lays, 0..) |f, *lay, i| {
+        const ty = f.ty.sinkType();
+        switch (ty.kind) {
+            .array, .@"struct", .map => {
+                const sh = try arena.create(shape.Shape);
+                sh.* = shape.of(arena, f.name, ty) catch |e| return switch (e) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.UnsupportedNestedType => Error.UnsupportedParquetNestedType,
+                };
+                lay.* = .{ .first = @intCast(maps.items.len), .n = @intCast(sh.leaves.len), .shape = sh };
+                for (sh.leaves, sh.paths) |l, path| {
+                    var m = mapType(l.ty) catch return Error.UnsupportedParquetNestedType;
+                    m.optional = l.nullable;
+                    try maps.append(m);
+                    try paths.append(path);
+                }
+            },
+            else => {
+                var m = try mapPhysical(ty, if (i < phys.len) phys[i] else .{});
+                m.optional = ty.nullable;
+                lay.* = .{ .first = @intCast(maps.items.len), .n = 1 };
+                try maps.append(m);
+                try paths.append(try arena.dupe([]const u8, &.{f.name}));
+            },
+        }
+    }
+    return .{ .maps = maps.items, .lays = lays, .paths = paths.items };
+}
+
+/// A column buffer per leaf in `alloc`: a flat leaf's levels are a nullable
+/// column's 0 or 1, a nested leaf's its shape's.
+fn newCols(arena: std.mem.Allocator, alloc: std.mem.Allocator, c: Columns) Error![]ColBuf {
+    const cols = try arena.alloc(ColBuf, c.maps.len);
+    for (cols, c.maps) |*cb, m| {
+        cb.* = ColBuf.init(alloc);
+        cb.dict_eligible = m.phys != .boolean;
+        cb.dict_ok = cb.dict_eligible;
+        cb.def_width = @intFromBool(m.optional);
+    }
+    for (c.lays) |lay| if (lay.shape) |sh| for (sh.leaves, cols[lay.first..][0..lay.n]) |l, *cb| {
+        cb.present_def = @intCast(l.def);
+        cb.def_width = levelWidth(l.def);
+        cb.rep_width = levelWidth(l.rep);
+    };
+    return cols;
+}
 
 pub const Error = error{
     UnsupportedParquetWrite,
+    UnsupportedParquetNestedType,
+    ParquetNestedValueMismatch,
     AppendNotSupported,
     UnsupportedParquetDecimal,
     ParquetValueOutOfRange,
@@ -166,6 +243,7 @@ const FixedKey = struct {
 pub const dict_max_bytes = 1 << 20;
 
 const PendingPage = struct {
+    reps: []const u8,
     defs: []const u8,
     values: []const u8,
     rows: usize,
@@ -175,6 +253,10 @@ const ColBuf = struct {
     values: List(u8),
     pages: List(PendingPage),
     defs: List(u8),
+    reps: List(u8),
+    present_def: u8 = 1,
+    def_width: u8 = 1,
+    rep_width: u8 = 0,
     bit_buf: u8 = 0,
     bit_n: u3 = 0,
     nulls: i64 = 0,
@@ -202,6 +284,7 @@ const ColBuf = struct {
             .values = List(u8).init(a),
             .pages = List(PendingPage).init(a),
             .defs = List(u8).init(a),
+            .reps = List(u8).init(a),
             .dict = std.StringHashMap(u32).init(a),
             .dict_order = List([]const u8).init(a),
             .fixed = std.HashMap(u128, u32, FixedKey, 80).init(a),
@@ -210,26 +293,25 @@ const ColBuf = struct {
         };
     }
 
-    fn sealPage(self: *ColBuf, arena: std.mem.Allocator, optional: bool) !void {
+    fn sealPage(self: *ColBuf, arena: std.mem.Allocator) !void {
         if (self.defs.items.len == 0) return;
         try self.flushBits();
-        const defs: []const u8 = if (optional)
-            try packLevels(arena, self.defs.items)
-        else
-            &.{};
         try self.pages.append(.{
-            .defs = defs,
+            .reps = try packLevels(arena, self.reps.items, self.rep_width),
+            .defs = try packLevels(arena, self.defs.items, self.def_width),
             .values = try arena.dupe(u8, self.values.items),
             .rows = self.defs.items.len,
         });
         self.values.clearRetainingCapacity();
         self.defs.clearRetainingCapacity();
+        self.reps.clearRetainingCapacity();
     }
 
     fn reset(self: *ColBuf) void {
         self.values.clearRetainingCapacity();
         self.pages.clearRetainingCapacity();
         self.defs.clearRetainingCapacity();
+        self.reps.clearRetainingCapacity();
         self.bit_buf = 0;
         self.bit_n = 0;
         self.nulls = 0;
@@ -304,21 +386,21 @@ const ColBuf = struct {
     }
 
     /// A non-null fixed-width value, as its PLAIN bytes, after its definition level.
-    fn putFixed(self: *ColBuf, arena: std.mem.Allocator, optional: bool, v: []const u8) !void {
+    fn putFixed(self: *ColBuf, arena: std.mem.Allocator, v: []const u8) !void {
         self.plain += v.len;
         if (self.dict_ok) {
             if (try self.dictPutFixed(v)) return;
-            try self.spill(arena, optional);
+            try self.spill(arena);
         }
         try self.values.appendSlice(v);
     }
 
     /// A non-null byte-array value after its definition level.
-    fn putBytes(self: *ColBuf, arena: std.mem.Allocator, optional: bool, v: []const u8) !void {
+    fn putBytes(self: *ColBuf, arena: std.mem.Allocator, v: []const u8) !void {
         self.plain += 4 + v.len;
         if (self.dict_ok) {
             if (try self.dictPut(arena, v)) return;
-            try self.spill(arena, optional);
+            try self.spill(arena);
         }
         var len4: [4]u8 = undefined;
         std.mem.writeInt(u32, &len4, @intCast(v.len), .little);
@@ -329,26 +411,32 @@ const ColBuf = struct {
 
     /// Gives the dictionary up mid-chunk, for a value whose definition level is
     /// already appended but which the dictionary refused.
-    fn spill(self: *ColBuf, arena: std.mem.Allocator, optional: bool) !void {
+    fn spill(self: *ColBuf, arena: std.mem.Allocator) !void {
         const last = self.defs.pop().?;
-        try self.rebuildPlain(arena, optional);
+        const last_rep = if (self.rep_width > 0) self.reps.pop() else null;
+        try self.rebuildPlain(arena);
         self.defs.appendAssumeCapacity(last);
+        if (last_rep) |r| self.reps.appendAssumeCapacity(r);
     }
 
     /// The values the dictionary holds, written out PLAIN in row order from
     /// `dict_idx` and sealed into pages as they pass `page_target_bytes`; the
     /// dictionary is then dropped for the rest of the chunk. The byte cap on a row
     /// group counts PLAIN bytes, so this never builds more than a group's worth.
-    fn rebuildPlain(self: *ColBuf, arena: std.mem.Allocator, optional: bool) !void {
+    fn rebuildPlain(self: *ColBuf, arena: std.mem.Allocator) !void {
         self.dict_ok = false;
         const defs = try arena.dupe(u8, self.defs.items);
+        const reps = try arena.dupe(u8, self.reps.items);
         self.defs.clearRetainingCapacity();
+        self.reps.clearRetainingCapacity();
         const fixed_n = self.fixed.count();
         const w = if (fixed_n == 0) 0 else self.fixed_raw.items.len / fixed_n;
         var k: usize = 0;
-        for (defs) |d| {
+        for (defs, 0..) |d, i| {
+            if (reps.len > 0 and reps[i] == 0 and self.values.items.len >= page_target_bytes) try self.sealPage(arena);
             self.defs.appendAssumeCapacity(d);
-            if (d == 0) continue;
+            if (reps.len > 0) self.reps.appendAssumeCapacity(reps[i]);
+            if (d != self.present_def) continue;
             const ix = self.dict_idx.items[k];
             k += 1;
             if (fixed_n == 0) {
@@ -359,7 +447,7 @@ const ColBuf = struct {
                 self.values.appendSliceAssumeCapacity(&len4);
                 self.values.appendSliceAssumeCapacity(v);
             } else try self.values.appendSlice(self.fixed_raw.items[ix * w ..][0..w]);
-            if (self.values.items.len >= page_target_bytes) try self.sealPage(arena, optional);
+            if (reps.len == 0 and self.values.items.len >= page_target_bytes) try self.sealPage(arena);
         }
         self.dict.clearRetainingCapacity();
         self.dict_order.clearRetainingCapacity();
@@ -452,6 +540,8 @@ pub const Writer = struct {
     fw: std.fs.File.Writer = undefined,
     schema: types.Schema,
     maps: []Mapping,
+    lays: []const Lay,
+    paths: []const []const []const u8,
     compression: codec.Codec,
     cols: []ColBuf,
     rows: usize = 0,
@@ -507,18 +597,8 @@ pub const Writer = struct {
         mem.* = std.heap.ArenaAllocator.init(pagecache.process);
         errdefer mem.deinit();
         const arena = mem.allocator();
-        const maps = try arena.alloc(Mapping, schema.fields.len);
-        for (schema.fields, maps, 0..) |f, *m, i| {
-            m.* = try mapPhysical(f.ty.sinkType(), if (i < phys.len) phys[i] else .{});
-            m.optional = f.ty.nullable;
-        }
-
-        const cols = try arena.alloc(ColBuf, schema.fields.len);
-        for (cols, maps) |*c, m| {
-            c.* = ColBuf.init(arena);
-            c.dict_eligible = m.phys != .boolean;
-            c.dict_ok = c.dict_eligible;
-        }
+        const plan = try planColumns(arena, schema, phys);
+        const cols = try newCols(arena, arena, plan);
 
         const self = try plan_arena.create(Writer);
         self.* = .{
@@ -526,7 +606,9 @@ pub const Writer = struct {
             .scratch = std.heap.ArenaAllocator.init(pagecache.process),
             .backend = undefined,
             .schema = schema,
-            .maps = maps,
+            .maps = plan.maps,
+            .lays = plan.lays,
+            .paths = plan.paths,
             .compression = compression,
             .cols = cols,
             .groups = List(RowGroupMeta).init(arena),
@@ -571,12 +653,18 @@ pub const Writer = struct {
         while (start < batch.len) {
             const room = self.group_bytes -| self.bufferedBytes();
             const end = start + @max(1, @min(room / row_bytes, self.group_rows - self.rows, batch.len - start));
-            for (batch.columns, self.cols, self.maps) |col, *cb, m| {
+            for (batch.columns, self.lays) |col, lay| {
+                if (lay.shape) |sh| {
+                    try self.shredRows(sa, sh, lay, col, start, end);
+                    continue;
+                }
+                const cb = &self.cols[lay.first];
+                const m = self.maps[lay.first];
                 var lo = start;
                 while (lo < end) {
                     const hi = @min(end, lo + slice_rows);
                     try encodeSlice(cb, sa, m, col, lo, hi);
-                    if (!cb.dict_ok and cb.values.items.len >= page_target_bytes) try cb.sealPage(sa, m.optional);
+                    if (!cb.dict_ok and cb.values.items.len >= page_target_bytes) try cb.sealPage(sa);
                     lo = hi;
                 }
             }
@@ -584,6 +672,23 @@ pub const Writer = struct {
             self.total_rows += @intCast(end - start);
             start = end;
             if (self.rows >= self.group_rows or self.bufferedBytes() >= self.group_bytes) try self.flushRowGroup();
+        }
+    }
+
+    /// Rows `lo..hi` of nested column `col` shredded into its leaves, a leaf past
+    /// `page_target_bytes` sealing its page before a row starts, so no row spans
+    /// two pages.
+    fn shredRows(self: *Writer, sa: std.mem.Allocator, sh: *const shape.Shape, lay: Lay, col: column.Column, lo: usize, hi: usize) !void {
+        const cols = self.cols[lay.first..][0..lay.n];
+        var s = try shred.Shredder(LeafSink).init(sa, sh, .{ .cols = cols, .maps = self.maps[lay.first..][0..lay.n], .sh = sh, .sa = sa });
+        for (lo..hi) |r| {
+            for (cols) |*cb| if (!cb.dict_ok and cb.values.items.len >= page_target_bytes) try cb.sealPage(sa);
+            const text: ?[]const u8 = if (!col.validity.get(r)) null else if (col.codes_only) col.dict.?.values[col.dict.?.codes[r]] else col.data.bytes.at(r);
+            s.row(sa, text) catch |e| return switch (e) {
+                error.InvalidJson, error.NotNested, error.CastFailed => Error.ParquetNestedValueMismatch,
+                error.NullInRequired => Error.ParquetNullInRequired,
+                else => e,
+            };
         }
     }
 
@@ -607,8 +712,8 @@ pub const Writer = struct {
                 cb.reset();
                 continue;
             }
-            if (cb.dict_ok) try cb.rebuildPlain(sa, m.optional);
-            try cb.sealPage(sa, m.optional);
+            if (cb.dict_ok) try cb.rebuildPlain(sa);
+            try cb.sealPage(sa);
 
             const start = self.offset;
             var values: i64 = 0;
@@ -617,12 +722,8 @@ pub const Writer = struct {
 
             for (cb.pages.items) |pgm| {
                 var body = List(u8).init(sa);
-                if (m.optional) {
-                    var len4: [4]u8 = undefined;
-                    std.mem.writeInt(u32, &len4, @intCast(pgm.defs.len), .little);
-                    try body.appendSlice(&len4);
-                    try body.appendSlice(pgm.defs);
-                }
+                try appendLevels(&body, pgm.reps, cb.rep_width);
+                try appendLevels(&body, pgm.defs, cb.def_width);
                 try body.appendSlice(pgm.values);
 
                 const raw = body.items;
@@ -685,13 +786,8 @@ pub const Writer = struct {
         const data_start = self.offset;
 
         var body = List(u8).init(sa);
-        if (m.optional) {
-            const levels = try packLevels(sa, cb.defs.items);
-            var len4: [4]u8 = undefined;
-            std.mem.writeInt(u32, &len4, @intCast(levels.len), .little);
-            try body.appendSlice(&len4);
-            try body.appendSlice(levels);
-        }
+        try appendLevels(&body, try packLevels(sa, cb.reps.items, cb.rep_width), cb.rep_width);
+        try appendLevels(&body, try packLevels(sa, cb.defs.items, cb.def_width), cb.def_width);
         const width = indexWidth(cb.entries());
         try body.append(width);
         try packRleIndices(&body, cb.dict_idx.items, width);
@@ -734,9 +830,14 @@ pub const Writer = struct {
     }
 
     fn summarize(self: *Writer, out: std.mem.Allocator) !Summary {
-        const cols = try out.alloc(ColumnStats, self.cols.len);
-        for (cols, 0..) |*c, k| {
+        const cols = try out.alloc(ColumnStats, self.lays.len);
+        for (cols, self.lays) |*c, lay| {
             c.* = .{};
+            if (lay.shape != null) {
+                c.bounded = false;
+                continue;
+            }
+            const k = lay.first;
             for (self.groups.items) |g| {
                 const ch = g.chunks[k];
                 c.nulls += ch.nulls;
@@ -832,9 +933,25 @@ pub const Writer = struct {
         var w = thrift.Writer.init(out);
         try w.structBegin();
         try w.writeI32(1, 1);
-        try w.listBegin(2, .@"struct", self.schema.fields.len + 1);
+        var elements: usize = 1;
+        for (self.lays) |lay| elements += if (lay.shape) |sh| sh.elements.len else 1;
+        try w.listBegin(2, .@"struct", elements);
         try writeSchemaRoot(&w, self.schema.fields.len);
-        for (self.schema.fields, self.maps) |f, m| try writeSchemaLeaf(&w, f.name, m);
+        for (self.schema.fields, self.lays) |f, lay| {
+            const sh = lay.shape orelse {
+                try writeSchemaLeaf(&w, f.name, self.maps[lay.first]);
+                continue;
+            };
+            var leaf = lay.first;
+            for (sh.elements) |e| {
+                if (e.num_children > 0) {
+                    try writeSchemaGroup(&w, e);
+                    continue;
+                }
+                try writeSchemaLeaf(&w, e.name, self.maps[leaf]);
+                leaf += 1;
+            }
+        }
 
         try w.writeI64(3, self.total_rows);
         try w.listBegin(4, .@"struct", self.groups.items.len);
@@ -846,7 +963,7 @@ pub const Writer = struct {
     fn writeRowGroup(self: *Writer, w: *thrift.Writer, g: RowGroupMeta) !void {
         try w.structBegin();
         try w.listBegin(1, .@"struct", g.chunks.len);
-        for (g.chunks, self.schema.fields, self.maps) |c, f, m| {
+        for (g.chunks, self.paths, self.maps) |c, path, m| {
             try w.structBegin();
             try w.writeI64(2, c.offset);
             try w.fieldBegin(.@"struct", 3);
@@ -854,9 +971,11 @@ pub const Writer = struct {
             try w.writeI32(1, @intFromEnum(m.phys));
             try w.listBegin(2, .i32, 1);
             try w.writeZigZag(@intFromEnum(if (c.dict) parquet.Encoding.rle_dictionary else parquet.Encoding.plain));
-            try w.listBegin(3, .binary, 1);
-            try w.writeVarint(f.name.len);
-            try w.out.appendSlice(f.name);
+            try w.listBegin(3, .binary, path.len);
+            for (path) |part| {
+                try w.writeVarint(part.len);
+                try w.out.appendSlice(part);
+            }
             try w.writeI32(4, @intFromEnum(self.compression));
             try w.writeI64(5, c.num_values);
             try w.writeI64(6, c.uncompressed);
@@ -885,12 +1004,7 @@ pub const Writer = struct {
     fn openEncoder(self: *Writer, arena: std.mem.Allocator) !*Writer {
         const col_mem = try self.takeColMem();
         errdefer self.giveColMem(col_mem);
-        const cols = try arena.alloc(ColBuf, self.cols.len);
-        for (cols, self.maps) |*c, m| {
-            c.* = ColBuf.init(col_mem.allocator());
-            c.dict_eligible = m.phys != .boolean;
-            c.dict_ok = c.dict_eligible;
-        }
+        const cols = try newCols(arena, col_mem.allocator(), .{ .maps = self.maps, .lays = self.lays, .paths = self.paths });
         const mem = try arena.create(std.Io.Writer.Allocating);
         mem.* = std.Io.Writer.Allocating.init(arena);
         const e = try arena.create(Writer);
@@ -900,6 +1014,8 @@ pub const Writer = struct {
             .backend = .{ .memory = mem },
             .schema = self.schema,
             .maps = self.maps,
+            .lays = self.lays,
+            .paths = self.paths,
             .compression = self.compression,
             .cols = cols,
             .groups = List(RowGroupMeta).init(arena),
@@ -1057,6 +1173,23 @@ fn writeSchemaRoot(w: *thrift.Writer, children: usize) !void {
     try w.structEnd();
 }
 
+/// A nested column's group element: its repetition, children, and for a list or a
+/// map the converted and logical type that name it so.
+fn writeSchemaGroup(w: *thrift.Writer, e: parquet.SchemaElement) !void {
+    try w.structBegin();
+    try w.writeI32(3, @intFromEnum(e.repetition orelse .required));
+    try w.writeBinary(4, e.name);
+    try w.writeI32(5, e.num_children);
+    if (e.converted_type) |c| {
+        try w.writeI32(6, c);
+        try w.fieldBegin(.@"struct", 10);
+        try w.structBegin();
+        try emptyVariant(w, if (c == logical.conv_list) 3 else 2);
+        try w.structEnd();
+    }
+    try w.structEnd();
+}
+
 fn writeSchemaLeaf(w: *thrift.Writer, name: []const u8, m: Mapping) !void {
     try w.structBegin();
     try w.writeI32(1, @intFromEnum(m.phys));
@@ -1141,14 +1274,30 @@ fn writePageHeader(
     try w.structEnd();
 }
 
-/// Definition levels as an RLE/bit-packed hybrid, always bit-packed groups of
-/// eight at width 1.
-/// Definition levels (0 or 1) as an RLE/bit-packed hybrid of width 1, with no width
-/// byte: a column without nulls is a single run.
-fn packLevels(arena: std.mem.Allocator, defs: []const u8) ![]u8 {
+/// Repetition or definition levels as an RLE/bit-packed hybrid of `width` bits,
+/// with no width byte, as a data page holds them; nothing at width 0, a column
+/// whose levels are all zero, which a page leaves out. A column without nulls is a
+/// single run.
+fn packLevels(arena: std.mem.Allocator, levels: []const u8, width: u8) ![]u8 {
+    if (width == 0) return &.{};
     var out = List(u8).init(arena);
-    try encodeHybrid(u8, &out, defs, 1);
+    try encodeHybrid(u8, &out, levels, width);
     return out.toOwnedSlice();
+}
+
+/// Packed levels as a V1 data page holds them, their byte length first; nothing
+/// for a column whose levels a page leaves out (`width` 0).
+fn appendLevels(body: *List(u8), levels: []const u8, width: u8) !void {
+    if (width == 0) return;
+    var len4: [4]u8 = undefined;
+    std.mem.writeInt(u32, &len4, @intCast(levels.len), .little);
+    try body.appendSlice(&len4);
+    try body.appendSlice(levels);
+}
+
+/// The bits a level up to `max` takes.
+fn levelWidth(max: u32) u8 {
+    return if (max == 0) 0 else @intCast(32 - @clz(max));
 }
 
 /// The RLE/bit-packed hybrid: a run of at least eight equal values is one RLE run,
@@ -1238,24 +1387,63 @@ fn encodeSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: column.Colum
 }
 
 fn encodeValue(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, v: Value) !void {
-    try cb.defs.append(if (v == .null) 0 else 1);
     if (v == .null) {
+        try cb.defs.append(0);
         if (!m.optional) return Error.ParquetNullInRequired;
         cb.nulls += 1;
         return;
     }
+    try encodeAt(cb, sa, m, 1, v);
+}
+
+/// Non-null value `v` at definition level `def`, its column's full depth.
+fn encodeAt(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, def: u8, v: Value) !void {
+    try cb.defs.append(def);
     try cb.observe(sa, v);
     switch (m.phys) {
         .boolean => try cb.pushBit(v == .bool and v.bool),
-        .byte_array => try cb.putBytes(sa, m.optional, switch (v) {
+        .byte_array => try cb.putBytes(sa, switch (v) {
             .string, .bytes => |x| x,
             else => "",
         }),
         else => {
             var buf: [16]u8 = undefined;
-            try cb.putFixed(sa, m.optional, try plainFixed(&buf, m, v));
+            try cb.putFixed(sa, try plainFixed(&buf, m, v));
         },
     }
+}
+
+/// The shredder's sink for one nested column: each leaf's levels and values into
+/// its column buffer, a leaf's JSON scalar read as its type by `nested.scalarOf`.
+const LeafSink = struct {
+    pub const Error = anyerror;
+    cols: []ColBuf,
+    maps: []const Mapping,
+    sh: *const shape.Shape,
+    sa: std.mem.Allocator,
+
+    pub fn level(self: LeafSink, leaf: u32, rep: u32, def: u32, v: ?shred.Leaf) anyerror!void {
+        const cb = &self.cols[leaf];
+        if (cb.rep_width > 0) try cb.reps.append(@intCast(rep));
+        const x = v orelse {
+            try cb.defs.append(@intCast(def));
+            cb.nulls += 1;
+            return;
+        };
+        const val = try leafValue(self.sa, self.sh.leaves[leaf].ty, x);
+        try encodeAt(cb, self.sa, self.maps[leaf], @intCast(def), val);
+    }
+};
+
+fn leafValue(sa: std.mem.Allocator, ty: types.Type, v: shred.Leaf) !Value {
+    const text = switch (v) {
+        .json => |t| switch (try json.cell(sa, t)) {
+            .null => unreachable,
+            .text => |x| x,
+        },
+        .key => |k| try json.decodeString(sa, k),
+    };
+    return nested.scalarOf(sa, ty, text);
 }
 
 fn typedValue(kind: types.TypeKind, x: anytype) Value {
@@ -1289,7 +1477,7 @@ fn encodeFixedSlice(comptime T: type, cb: *ColBuf, sa: std.mem.Allocator, option
         const x = data[r];
         var le: [@sizeOf(T)]u8 = undefined;
         std.mem.writeInt(U, &le, @bitCast(x), .little);
-        try cb.putFixed(sa, optional, &le);
+        try cb.putFixed(sa, &le);
         if (T == f64 and std.math.isNan(x)) {
             nan = true;
             continue;
@@ -1352,7 +1540,7 @@ fn encodeDecimalSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: colum
                 break :blk v;
             },
         };
-        try cb.putFixed(sa, m.optional, out);
+        try cb.putFixed(sa, out);
         if (!any) {
             mn = x;
             mx = x;
@@ -1382,7 +1570,7 @@ fn encodeBytesSlice(cb: *ColBuf, sa: std.mem.Allocator, optional: bool, col: col
         }
         cb.defs.appendAssumeCapacity(1);
         const s = b.at(r);
-        try cb.putBytes(sa, optional, s);
+        try cb.putBytes(sa, s);
         if (mn == null or std.mem.order(u8, s, mn.?) == .lt) mn = s;
         if (mx == null or std.mem.order(u8, s, mx.?) == .gt) mx = s;
     }
@@ -1503,7 +1691,7 @@ test "definition levels pack LSB-first into bit-packed groups of eight" {
     defer ar.deinit();
     const a = ar.allocator();
 
-    const packed_levels = try packLevels(a, &[_]u8{ 1, 0, 1, 1, 1, 1, 0, 1 });
+    const packed_levels = try packLevels(a, &[_]u8{ 1, 0, 1, 1, 1, 1, 0, 1 }, 1);
     try testing.expectEqual(@as(usize, 2), packed_levels.len);
     try testing.expectEqual(@as(u8, 0x03), packed_levels[0]);
     try testing.expectEqual(@as(u8, 0b10111101), packed_levels[1]);
@@ -1639,6 +1827,165 @@ fn writeReadBack(cc: codec.Codec) !void {
     try testing.expectEqual(true, b.columns[3].getValue(0).bool);
     try testing.expectEqual(false, b.columns[3].getValue(1).bool);
     try testing.expect((try r.next(a)) == null);
+}
+
+test "nested columns write the spec's groups and levels, and read back as the JSON they were written from" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "nested.parquet" });
+
+    const str = types.Type.init(.string).asNullable();
+    const tags = types.Type{ .kind = .array, .nullable = true, .elem = &str };
+    const doc = types.Type{ .kind = .@"struct", .nullable = true, .fields = &.{ .{ .name = "id", .ty = types.Type.init(.int) }, .{ .name = "tags", .ty = tags } } };
+    const attrs = types.Type{ .kind = .map, .nullable = true, .fields = &.{ .{ .name = "key", .ty = types.Type.init(.string) }, .{ .name = "value", .ty = types.Type.init(.int).asNullable() } } };
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "n", .ty = types.Type.init(.int) },
+        .{ .name = "doc", .ty = doc },
+        .{ .name = "attrs", .ty = attrs },
+    } };
+
+    const docs = [_]?[]const u8{ "{\"id\":1,\"tags\":[\"a\",null]}", "{\"id\":2,\"tags\":[]}", "{\"id\":3}", null };
+    const maps = [_]?[]const u8{ "{\"x\":1,\"y\":null}", "{}", null, "{\"z\":7}" };
+    var ns = try column.Builder.initCapacity(a, schema.fields[0].ty, 4);
+    var ds = try column.Builder.initCapacity(a, doc, 4);
+    var ms = try column.Builder.initCapacity(a, attrs, 4);
+    for (docs, maps, 0..) |d, m, i| {
+        try ns.append(.{ .int = @intCast(i) });
+        try ds.append(if (d) |x| .{ .string = x } else .null);
+        try ms.append(if (m) |x| .{ .string = x } else .null);
+    }
+    var cols = [_]column.Column{ try ns.finish(), try ds.finish(), try ms.finish() };
+    var w = try Writer.open(a, path, schema, .snappy, .truncate);
+    try w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 4 });
+    try w.close();
+
+    const r = try pqdecode.Reader.open(a, path);
+    const b = (try r.next(a)).?;
+    try testing.expectEqual(@as(usize, 4), b.len);
+    const tags_back = [_]?[]const u8{ "[\"a\",null]", "[]", null, null };
+    const maps_back = [_]?[]const u8{ "{\"x\":1,\"y\":null}", "{}", null, "{\"z\":7}" };
+    for (0..4) |i| {
+        try testing.expectEqual(@as(i64, @intCast(i)), b.columns[0].getValue(i).int);
+        try expectText(tags_back[i], b.columns[2].getValue(i));
+        try expectText(maps_back[i], b.columns[3].getValue(i));
+    }
+    try testing.expect(b.columns[1].getValue(3).isNull());
+
+    const bytes = try tmp.dir.readFileAlloc(a, "nested.parquet", 1 << 20);
+    const md = try parquet.parseFile(a, bytes);
+    const names = [_][]const u8{ "basalt_schema", "n", "doc", "id", "tags", "list", "element", "attrs", "key_value", "key", "value" };
+    try testing.expectEqual(names.len, md.schema.len);
+    for (names, md.schema) |want, e| try testing.expectEqualStrings(want, e.name);
+    try testing.expectEqual(@as(usize, 5), md.row_groups[0].columns.len);
+}
+
+fn expectText(want: ?[]const u8, got: Value) !void {
+    if (want) |x| try testing.expectEqualStrings(x, got.string) else try testing.expect(got.isNull());
+}
+
+test "a nested struct's typed leaves are read from their JSON text: bools, floats, dates, decimals, base64 bytes and plain strings" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "typed.parquet" });
+
+    const rec = types.Type{ .kind = .@"struct", .nullable = true, .fields = &.{
+        .{ .name = "ok", .ty = types.Type.init(.bool).asNullable() },
+        .{ .name = "f", .ty = types.Type.init(.float).asNullable() },
+        .{ .name = "d", .ty = types.Type.init(.date).asNullable() },
+        .{ .name = "amt", .ty = types.Type.decimal(10, 2).asNullable() },
+        .{ .name = "raw", .ty = types.Type.init(.bytes).asNullable() },
+        .{ .name = "s", .ty = types.Type.init(.string).asNullable() },
+    } };
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "rec", .ty = rec },
+        .{ .name = "flat", .ty = types.Type.init(.string).asNullable() },
+    } };
+    var rs = try column.Builder.initCapacity(a, rec, 2);
+    var fs = try column.Builder.initCapacity(a, schema.fields[1].ty, 2);
+    try rs.append(.{ .string = "{\"ok\":true,\"f\":-1.5,\"d\":\"2024-02-29\",\"amt\":12.34,\"raw\":\"AAH/\",\"s\":\"x\\ny\"}" });
+    try rs.append(.{ .string = "{\"ok\":false,\"f\":2,\"d\":null,\"amt\":-0.05,\"raw\":\"\",\"s\":\"z\"}" });
+    try fs.append(.{ .string = "x" });
+    try fs.append(.{ .string = "z" });
+    var cols = [_]column.Column{ try rs.finish(), try fs.finish() };
+    var w = try Writer.open(a, path, schema, .snappy, .truncate);
+    try w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 2 });
+    try w.close();
+
+    const r = try pqdecode.Reader.open(a, path);
+    const b = (try r.next(a)).?;
+    try testing.expectEqual(true, b.columns[0].getValue(0).bool);
+    try testing.expectEqual(false, b.columns[0].getValue(1).bool);
+    try testing.expectEqual(@as(f64, -1.5), b.columns[1].getValue(0).float);
+    try testing.expectEqual(@as(f64, 2), b.columns[1].getValue(1).float);
+    try testing.expect(b.columns[2].getValue(1).isNull());
+    try testing.expectEqual(@as(i32, 19782), b.columns[2].getValue(0).date);
+    try testing.expectEqual(@as(i128, 1234), b.columns[3].getValue(0).decimal.unscaled);
+    try testing.expectEqual(@as(i128, -5), b.columns[3].getValue(1).decimal.unscaled);
+    try testing.expectEqualSlices(u8, &.{ 0, 1, 0xff }, b.columns[4].getValue(0).bytes);
+    try testing.expectEqual(@as(usize, 0), b.columns[4].getValue(1).bytes.len);
+    try testing.expectEqualStrings("x\ny", b.columns[5].getValue(0).string);
+
+    var bad = try column.Builder.initCapacity(a, rec, 1);
+    try bad.append(.{ .string = "{\"d\":\"not a date\"}" });
+    var bad_cols = [_]column.Column{ try bad.finish(), try fs.finish() };
+    var w2 = try Writer.open(a, try std.fs.path.join(a, &.{ dir, "bad.parquet" }), schema, .snappy, .truncate);
+    try testing.expectError(Error.ParquetNestedValueMismatch, w2.writeBatch(a, .{ .schema = &schema, .columns = &bad_cols, .len = 1 }));
+}
+
+test "a nested column over many pages, dictionary and PLAIN leaves alike, reads back row for row, written directly or through a unit encoder" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+
+    const str = types.Type.init(.string).asNullable();
+    const tags = types.Type{ .kind = .array, .nullable = true, .elem = &str };
+    const schema = types.Schema{ .fields = &.{.{ .name = "tags", .ty = tags }} };
+    const n = 60_000;
+    var want = try a.alloc(?[]const u8, n);
+    var bs = try column.Builder.initCapacity(a, tags, n);
+    for (0..n) |i| {
+        var t: std.ArrayList(u8) = .empty;
+        try t.append(a, '[');
+        for (0..i % 5) |k| {
+            if (k > 0) try t.append(a, ',');
+            if ((i + k) % 7 == 0) try t.appendSlice(a, "null") else if (i % 2 == 0) try t.print(a, "\"{c}\"", .{@as(u8, 'a') + @as(u8, @intCast(k))}) else try t.print(a, "\"tag-{d:0>48}-{d}\"", .{ i, k });
+        }
+        try t.append(a, ']');
+        want[i] = if (i % 11 == 0) null else t.items;
+        try bs.append(if (want[i]) |x| .{ .string = x } else .null);
+    }
+    var cols = [_]column.Column{try bs.finish()};
+    const bt = Batch{ .schema = &schema, .columns = &cols, .len = n };
+    for ([_]bool{ false, true }) |unit| {
+        const path = try std.fs.path.join(a, &.{ dir, if (unit) "unit.parquet" else "direct.parquet" });
+        var w = try Writer.open(a, path, schema, .snappy, .truncate);
+        if (unit) {
+            const u = try w.openUnit(a);
+            try u.vtable.write(u.ptr, a, bt);
+            try u.vtable.seal(u.ptr);
+            try u.vtable.commit(u.ptr);
+        } else try w.writeBatch(a, bt);
+        try w.close();
+        const r = try pqdecode.Reader.open(a, path);
+        var row: usize = 0;
+        while (try r.next(a)) |b| {
+            for (0..b.len) |i| try expectText(want[row + i], b.columns[0].getValue(i));
+            row += b.len;
+        }
+        try testing.expectEqual(@as(usize, n), row);
+    }
 }
 
 test "a codec without an encoder is refused at open, before any bytes are written" {
@@ -1924,7 +2271,7 @@ test "the RLE/bit-packed hybrid round-trips runs, short stretches and runs that 
     }
 
     const all_set = [_]u8{1} ** 100_000;
-    const levels = try packLevels(a, &all_set);
+    const levels = try packLevels(a, &all_set, 1);
     try testing.expect(levels.len <= 4);
     try testing.expectEqualSlices(u32, &([_]u32{1} ** 100_000), try pqdecode.decodeRleHybrid(a, levels, 1, all_set.len));
 }

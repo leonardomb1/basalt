@@ -9,10 +9,9 @@
 //! - optionally `bytes(w, s)` (else as a string), `float(w, x)` (else `{d}`),
 //!   `quote_decimal` and `quote_temporal` (text around a decimal, or a date, time
 //!   or timestamp), `bc_years` (a year before 1 spelled PostgreSQL's way,
-//!   `0044-03-15 BC`), and `escape_scalars`, which passes every other cell's text
-//!   through `string` too, a nested cell's as the empty text.
-//!
-//! A nested cell is otherwise null, as `Column.getValue` has it.
+//!   `0044-03-15 BC`), `escape_scalars`, which passes every other cell's text
+//!   through `string` too, and `nested(w, s)`, how a nested cell's JSON text goes
+//!   in (else as a string), which JSON targets write as the JSON it is.
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
@@ -68,7 +67,7 @@ pub const Utf8Runs = struct {
 };
 
 pub fn isNull(c: *const Column, r: usize) bool {
-    return !c.validity.get(r) or c.ty.kind == .array or c.ty.kind == .@"struct" or c.ty.kind == .map;
+    return !c.validity.get(r);
 }
 
 pub inline fn write(w: anytype, c: *const Column, r: usize, p: anytype) !void {
@@ -77,7 +76,7 @@ pub inline fn write(w: anytype, c: *const Column, r: usize, p: anytype) !void {
     switch (c.ty.kind) {
         .string => return p.string(w, c.data.bytes.at(r)),
         .bytes => return if (@hasDecl(P, "bytes")) p.bytes(w, c.data.bytes.at(r)) else p.string(w, c.data.bytes.at(r)),
-        .array, .@"struct", .map => return if (escapes(P)) p.string(w, "") else w.writeAll(P.null_text),
+        .array, .@"struct", .map => return if (@hasDecl(P, "nested")) p.nested(w, c.data.bytes.at(r)) else p.string(w, c.data.bytes.at(r)),
         else => {},
     }
     if (escapes(P)) {
@@ -93,8 +92,7 @@ pub inline fn write(w: anytype, c: *const Column, r: usize, p: anytype) !void {
 /// into `buf`.
 pub fn text(c: *const Column, r: usize, buf: *[scalar_bound]u8, p: anytype) []const u8 {
     switch (c.ty.kind) {
-        .string, .bytes => return c.data.bytes.at(r),
-        .array, .@"struct", .map => return "",
+        .string, .bytes, .array, .@"struct", .map => return c.data.bytes.at(r),
         else => {},
     }
     var fw = std.Io.Writer.fixed(buf);
@@ -218,7 +216,7 @@ pub fn goldenColumn(arena: std.mem.Allocator, kind: types.TypeKind) !Batch {
         .date => for ([_]i32{ 0, 19723, -719528, std.math.minInt(i32) + 1 }) |x| try b.append(.{ .date = x }),
         .time => for ([_]i64{ 0, 3_723_000_001, 86_399_999_999 }) |x| try b.append(.{ .time = x }),
         .timestamp => for ([_]i64{ 0, 1_704_067_200_123_456, -1, -62_135_596_800_000_000 }) |x| try b.append(.{ .timestamp = x }),
-        .array, .@"struct", .map => try b.append(.{ .string = "x" }),
+        .array, .@"struct", .map => try b.append(.{ .string = "[1,\"a b\",null]" }),
     }
     try b.append(.null);
     const cols = try arena.alloc(Column, 1);

@@ -860,7 +860,7 @@ pub const Column = struct {
             return if (self.ty.kind == .bytes) .{ .bytes = v } else .{ .string = v };
         }
         return switch (self.ty.kind) {
-            .array, .@"struct", .map => .null,
+            .array, .@"struct", .map => .{ .string = self.data.bytes.at(i) },
             .decimal => .{ .decimal = decimals(self).at(i) },
             inline else => |k| blk: {
                 const t = comptime storageOf(k);

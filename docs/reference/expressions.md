@@ -94,6 +94,23 @@ columns it has not seen.
   joins, `MIN`/`MAX` and sorting tell `1234567890.12345678` from
   `1234567890.12345679` — and against an int exactly too; against a float
   they compare as floats.
+- **Nested types**: `CAST(x AS STRUCT(city STRING, zip INT NOT NULL))`,
+  `CAST(x AS LIST(INT))`, `CAST(x AS MAP(STRING, DECIMAL(10,2)))`, and any
+  nesting of them. `x` is JSON text — a string column, what `json_object` or
+  `json_get` returns — or a nested value. A part is nullable unless `NOT NULL`
+  follows it; a map's key never is, and is a scalar type. The cast reads the
+  JSON against the type: a struct's fields come out in the type's order, a field
+  the JSON lacks is null and one it has beyond the type is dropped; a list's
+  elements and a map's entries keep the order written; every scalar is read as
+  its type, as a CAST of its text would read it (`BYTES` from base64, as JSON
+  writes them). `'{"zip":"01310","city":"SP"}'` as the struct above is
+  `{"city":"SP","zip":1310}`. A value that does not read as its type, a null or
+  missing `NOT NULL` part, or an object where a list belongs fails the cast;
+  `TRY_CAST` gives null. JSON `null` is SQL `NULL`. A nested value is shown and
+  written as its JSON: in a JSON file as the object or array itself, in CSV and
+  database columns as its text, and in a Parquet file as Parquet's own
+  `LIST`, `MAP` and nested groups, laid out as the format's spec has them.
+  Arrow, Avro and Excel outputs refuse a nested column.
 - **DECIMAL arithmetic is exact.** `+`, `-` and `%` over two decimals (or a
   decimal and an int) answer a decimal at the wider operand's scale, `*` one at
   the summed scale — `1.1 + 0.3` is `1.4`, not `1.4000000000000001`, so a `SUM`

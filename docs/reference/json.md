@@ -5,6 +5,11 @@ a REST response's nested object. These functions build and take them apart;
 `CROSS JOIN UNNEST(JSON_EACH(col))` turns an array into rows (see
 [Queries](../language/queries.md#operators)).
 
+To give a document a type, cast it: `CAST(doc AS STRUCT(id INT, tags
+LIST(STRING)))` checks and normalizes it, and a Parquet file written from it
+holds real nested columns (see
+[Expressions](expressions.md), nested types).
+
 ## Building a document
 
 `JSON_OBJECT(k1, v1, …)`, `JSON_ARRAY(v1, …)` — build a JSON document, for an

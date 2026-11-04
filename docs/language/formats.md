@@ -172,8 +172,8 @@ it still creates a table, and a `REPLACE` of no rows empties one.
 A created table is version 0 with protocol 1/2 and the rows' schema: `INT` as
 `long`, `FLOAT` as `double`, `DECIMAL(p,s)` as `decimal(p,s)`, `TIMESTAMP` as
 `timestamp` (UTC-adjusted in its files), `BOOL`, `STRING`, `BYTES` and `DATE` as
-`boolean`, `string`, `binary` and `date`, every column nullable. A `TIME`, an
-array, a struct or an untyped NULL column is refused, to be cast first.
+`boolean`, `string`, `binary` and `date`, every column nullable. A `TIME`, a
+list, map or struct, or an untyped NULL column is refused, to be cast first.
 `WITH (partition_by = 'c1, c2')` partitions it; a later write takes the table's
 own partition columns, and naming different ones is refused. A write to an
 existing table must give exactly its columns — by name, in any order; one
@@ -427,7 +427,7 @@ rounded, and a NaN or infinite float is an empty cell. `DATE`, `TIMESTAMP` and
 the millisecond (finer digits are cut); a date before 1 March 1900 — where
 Excel's calendar holds a day that never was — or after 9999 is written as ISO
 text. Text is written as is, line breaks and control characters included
-(invalid UTF-8 becomes U+FFFD); `BYTES` is base64 text. An array or struct column
+(invalid UTF-8 becomes U+FFFD); `BYTES` is base64 text. A list, map or struct column
 is refused.
 
 Excel's limits are errors, never truncation: 1,048,575 data rows under the
@@ -525,7 +525,7 @@ unless `compression` names `snappy` or `none`; zstandard is read but not written
 Each batch is one block, encoded and compressed on its lane, so `-j` spreads the
 work and only finished blocks are written in turn. A column name Avro does not
 allow (letters, digits and `_`, not starting with a digit, so not a flattened
-`addr.city`) and an array or struct column are refused naming the column; rename
+`addr.city`) and a list, map or struct column are refused naming the column; rename
 one with `AS`. A decimal is written at its column's scale, rounded as Parquet's
 writer rounds it, and one with more digits than its column's precision fails the
 write naming the column. The file goes to a local path, an object store, SFTP or
@@ -564,7 +564,11 @@ of a binary leaf that holds text.
 `CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag` gives a row per element and
 `json_get` reaches into one. No column of the file is left out, so
 `LOAD INTO 'copy.parquet' AS SELECT * FROM 'x.parquet'` carries every one — the
-nested ones as JSON text, since that is how basalt holds them. A filter on a
+nested ones as JSON text, since that is how basalt holds them. Cast one to its
+type to write it nested again: `CAST(tags AS LIST(STRING))`, a `STRUCT(...)` or
+a `MAP(K, V)` (see [Expressions](../reference/expressions.md)) is written as the
+spec's three-level `LIST`, its `MAP` and nested groups, each leaf encoded as a
+flat column of its type is, with repetition and definition levels. A filter on a
 nested column is never used to skip row groups: the file's statistics describe
 its leaves, not the JSON.
 

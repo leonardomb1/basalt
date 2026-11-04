@@ -355,7 +355,50 @@ pub fn parseTypeName(self: *Parser) Error!types.Type {
         }
         return types.Type.decimal(p, s);
     }
+    if (eqlNoCase(name, "list")) {
+        _ = try self.expect(.lparen);
+        const elem = try self.arena.create(types.Type);
+        elem.* = try parseInnerType(self);
+        _ = try self.expect(.rparen);
+        return .{ .kind = .array, .elem = elem };
+    }
+    if (eqlNoCase(name, "map")) {
+        _ = try self.expect(.lparen);
+        const kpos = self.curPos();
+        const k = try self.parseTypeName();
+        if (k.isNested()) return self.fail(kpos, "a MAP key must be a scalar type, got {s}", .{try k.name(self.arena)});
+        _ = try self.expect(.comma);
+        const v = try parseInnerType(self);
+        _ = try self.expect(.rparen);
+        const kv = try self.arena.dupe(types.Type.Field, &.{ .{ .name = "key", .ty = k }, .{ .name = "value", .ty = v } });
+        return .{ .kind = .map, .fields = kv };
+    }
+    if (eqlNoCase(name, "struct")) {
+        _ = try self.expect(.lparen);
+        var fields = std.array_list.Managed(types.Type.Field).init(self.arena);
+        while (true) {
+            const fpos = self.curPos();
+            const fname = try self.expectIdent();
+            for (fields.items) |f| if (std.mem.eql(u8, f.name, fname)) return self.fail(fpos, "STRUCT field `{s}` is named twice", .{fname});
+            try fields.append(.{ .name = fname, .ty = try parseInnerType(self) });
+            if (!self.eat(.comma)) break;
+        }
+        _ = try self.expect(.rparen);
+        return .{ .kind = .@"struct", .fields = fields.items };
+    }
     return self.fail(pos, "unknown type `{s}`", .{name});
+}
+
+/// A nested type's element, value or field type: nullable unless `NOT NULL`
+/// follows it, as SQL columns are.
+fn parseInnerType(self: *Parser) Error!types.Type {
+    const t = try self.parseTypeName();
+    if (self.isKw("not") and self.peekKw("null")) {
+        _ = self.advance();
+        _ = self.advance();
+        return t;
+    }
+    return t.asNullable();
 }
 
 pub fn expectU8(self: *Parser) Error!u8 {

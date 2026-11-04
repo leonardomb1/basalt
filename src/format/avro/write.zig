@@ -7,7 +7,7 @@
 //! `decimal` logical type (precision 38 when the column's is unknown), DATE as `date`,
 //! TIME as `time-micros` and TIMESTAMP as `local-timestamp-micros`, since basalt's
 //! timestamps carry no timezone (as its Parquet files say with `isAdjustedToUTC`
-//! false). An array or struct column, and a column name Avro does not allow
+//! false). A list, map or struct column, and a column name Avro does not allow
 //! (`[A-Za-z_][A-Za-z0-9_]*`, so not a flattened `addr.city`), are refused up front
 //! naming the column, rather than written under another name.
 //!
@@ -48,8 +48,8 @@ pub const Error = error{ AvroUnsupportedType, AvroBadName, AvroCodecUnsupported,
 /// Why a column cannot be written, null when every one can.
 pub fn schemaProblem(schema: types.Schema) ?anyerror {
     for (schema.fields) |f| {
-        if (f.ty.kind == .array or f.ty.kind == .@"struct" or f.ty.kind == .map)
-            return stream.explainf(error.AvroUnsupportedType, "column `{s}` is an array or struct, which basalt does not write to Avro", .{f.name});
+        if (f.ty.isNested())
+            return stream.explainf(error.AvroUnsupportedType, "column `{s}` is a list, map or struct, which basalt does not write to Avro", .{f.name});
         if (!schema_mod.validName(f.name))
             return stream.explainf(error.AvroBadName, "column `{s}` is not a name Avro allows (letters, digits and `_`, not starting with a digit); rename it with AS", .{f.name});
     }

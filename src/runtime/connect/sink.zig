@@ -214,7 +214,7 @@ fn openStdoutSink(env: *Env, schema: types.Schema, info: arrow.ResultInfo) !driv
         },
         .arrow => {
             const writer = ArrowWriter.open(env.gpa, schema, info) catch |e| switch (e) {
-                error.ArrowUnsupportedType => return planErr(env.diag, "arrow output cannot carry an array or struct column"),
+                error.ArrowUnsupportedType => return planErr(env.diag, "arrow output cannot carry a list, map or struct column"),
                 else => return planErr(env.diag, "could not open stdout arrow writer"),
             };
             return writer.sink();
@@ -257,7 +257,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
             .arrow => {
                 const aw = ArrowFileSink.open(env.gpa, w.target, schema) catch |e| switch (e) {
                     error.ArrowRemoteSink => return planErr(env.diag, try msgfmt.allocPrint(env.arena, "cannot write `{s}`: Arrow IPC is written to a local file", .{w.target})),
-                    error.ArrowUnsupportedType => return planErr(env.diag, "Arrow IPC cannot carry an array or struct column"),
+                    error.ArrowUnsupportedType => return planErr(env.diag, "Arrow IPC cannot carry a list, map or struct column"),
                     else => return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not open output Arrow IPC `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
                 };
                 return aw.sink();

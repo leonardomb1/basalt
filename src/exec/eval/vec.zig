@@ -650,7 +650,7 @@ const vec_casts = blk: {
 };
 
 fn castColVec(arena: std.mem.Allocator, col: Column, ty: Type, n: usize) VecError!Vec {
-    if (col.ty.kind == ty.kind and ty.kind != .decimal) return .{ .col = col };
+    if (col.ty.kind == ty.kind and ty.kind != .decimal and !ty.isNested()) return .{ .col = col };
     inline for (vec_casts) |p| if (col.ty.kind == p[0] and ty.kind == p[1]) return switch (p[0]) {
         .string => castColWith(p[0], p[1], arena, col.data.bytes, col, ty, n),
         .decimal => switch (column.decimals(col)) {

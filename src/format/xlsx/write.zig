@@ -74,8 +74,8 @@ pub const Writer = struct {
     pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema, sheet_name: []const u8) !*Writer {
         if (schema.fields.len > max_cols)
             return explainf(error.XlsxTooManyColumns, "an Excel sheet holds at most {d} columns; this result has {d}", .{ max_cols, schema.fields.len });
-        for (schema.fields) |f| if (f.ty.kind == .array or f.ty.kind == .@"struct" or f.ty.kind == .map)
-            return explainf(error.XlsxNestedColumn, "an Excel sheet cannot hold the array or struct column `{s}`", .{f.name});
+        for (schema.fields) |f| if (f.ty.isNested())
+            return explainf(error.XlsxNestedColumn, "an Excel sheet cannot hold the list, map or struct column `{s}`", .{f.name});
         if (sheetNameProblem(sheet_name)) |why| return explainf(error.XlsxBadSheetName, "sheet `{s}`: {s}", .{ sheet_name, why });
 
         const self = try arena.create(Writer);

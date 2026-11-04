@@ -129,6 +129,15 @@ pub fn base64(w: *Writer, s: []const u8) Writer.Error!void {
     try w.writeByte('"');
 }
 
+/// BYTES back from the base64 text `base64` writes them as; `CastFailed` for text
+/// that is not base64.
+pub fn unbase64(arena: std.mem.Allocator, s: []const u8) error{ CastFailed, OutOfMemory }![]u8 {
+    const dec = std.base64.standard.Decoder;
+    const out = try arena.alloc(u8, dec.calcSizeForSlice(s) catch return error.CastFailed);
+    dec.decode(out, s) catch return error.CastFailed;
+    return out;
+}
+
 /// The text a map key of value `v` takes as an object key: bytes as base64, as a
 /// value would be, so distinct binary keys stay distinct; `null` as "null"; any
 /// other kind as its SQL text.
@@ -160,6 +169,10 @@ pub const Text = struct {
 
     pub fn bytes(_: Text, out: *Writer, s: []const u8) !void {
         try base64(out, s);
+    }
+
+    pub fn nested(_: Text, out: *Writer, s: []const u8) !void {
+        try out.writeAll(s);
     }
 
     pub fn float(_: Text, out: *Writer, x: f64) !void {

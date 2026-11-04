@@ -9,6 +9,8 @@ const civil = @import("../../exec/civil.zig");
 const eval = @import("../../exec/eval.zig");
 
 pub const conv_utf8 = 0;
+pub const conv_map = 1;
+pub const conv_list = 3;
 pub const conv_decimal = 5;
 pub const conv_date = 6;
 const conv_time_millis = 7;

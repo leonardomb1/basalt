@@ -440,6 +440,21 @@ pub const Members = struct {
     }
 };
 
+/// Object `t`'s values for the names `items` hold (each item's `.name`), into `out`
+/// in their order, null where the object has none: one pass over its members,
+/// a key's escapes resolved before it is matched, a key written twice its last.
+pub fn pick(arena: std.mem.Allocator, t: []const u8, items: anytype, out: []?[]const u8) Error!void {
+    @memset(out, null);
+    var it = Members.root(t);
+    while (it.next()) |m| {
+        const k = try decodeString(arena, m.key);
+        for (items, 0..) |x, i| if (std.mem.eql(u8, x.name, k)) {
+            out[i] = m.value;
+            break;
+        };
+    }
+}
+
 pub const Cell = union(enum) { null, text: []const u8 };
 
 pub fn cell(arena: std.mem.Allocator, raw: []const u8) Error!Cell {

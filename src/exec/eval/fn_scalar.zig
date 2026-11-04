@@ -680,11 +680,10 @@ pub const FromBase64 = struct {
     pub const result = .bytes;
     pub fn apply(cx: Cx, s: []const u8) EvalError![]const u8 {
         const text = std.mem.trim(u8, s, " \t\r\n");
-        const dec = std.base64.standard.Decoder;
-        const bad = "from_base64: '{s}' is not base64";
-        const out = try cx.extend(dec.calcSizeForSlice(text) catch return failWith(error.CastFailed, bad, .{clip(text)}));
-        dec.decode(out, text) catch return failWith(error.CastFailed, bad, .{clip(text)});
-        return cx.written();
+        return jsontext.unbase64(cx.arena, text) catch |e| switch (e) {
+            error.CastFailed => failWith(error.CastFailed, "from_base64: '{s}' is not base64", .{clip(text)}),
+            error.OutOfMemory => error.OutOfMemory,
+        };
     }
 };
 

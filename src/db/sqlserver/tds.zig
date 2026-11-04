@@ -1225,7 +1225,7 @@ test "INSERT BULK rows of every kind" {
         "\xd1\x14\x00" ++ wide("1970-01-01") ++ "\xd1\x14\x00" ++ wide("2024-01-01") ++ "\xd1\x14\x00" ++ wide("0000-01-01") ++ "\xd1\x1c\x00" ++ wide("-5877641-06-24") ++ "\xd1\xff\xff",
         "\xd1\x10\x00" ++ wide("00:00:00") ++ "\xd1\x1e\x00" ++ wide("01:02:03.000001") ++ "\xd1\x1e\x00" ++ wide("23:59:59.999999") ++ "\xd1\xff\xff",
         "\xd1\x26\x00" ++ wide("1970-01-01 00:00:00") ++ "\xd1\x34\x00" ++ wide("2024-01-01 00:00:00.123456") ++ "\xd1\x34\x00" ++ wide("1969-12-31 23:59:59.999999") ++ "\xd1\x26\x00" ++ wide("0001-01-01 00:00:00") ++ "\xd1\xff\xff",
-        "\xd1\xff\xff\xd1\xff\xff",
+        "\xd1\x1c\x00" ++ wide("[1,\"a b\",null]") ++ "\xd1\xff\xff",
         "\xd1\x02\x00" ++ wide("1") ++ "\x06\x00" ++ wide("a b") ++ "\x08\x00" ++ wide("2.50") ++ "\xd1\xff\xff\xff\xff\xff\xff\xd1\x04\x00" ++ wide("-2") ++ "\x00\x00\x08\x00" ++ wide("-0.1"),
     }, got);
 }

@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const msgfmt = @import("../format/msgfmt.zig");
+const quote = @import("quote.zig");
 
 pub const TypeKind = enum {
     bool,
@@ -85,11 +86,64 @@ pub const Type = struct {
         return self;
     }
 
-    /// The type as `DESCRIBE` and Tab name it: the kind, and a decimal's
-    /// precision and scale. Nullability is not part of the name.
+    /// The type as `DESCRIBE` and Tab name it: the kind, a decimal's precision and
+    /// scale, and a nested type's parts (`struct(city string, zip int)`,
+    /// `list(int)`, `map(string, int)`). Nullability is not part of the name.
     pub fn name(self: Type, arena: std.mem.Allocator) ![]const u8 {
         if (self.kind == .decimal) return msgfmt.allocPrint(arena, "decimal({d},{d})", .{ self.precision, self.scale });
-        return @tagName(self.kind);
+        if (!self.isNested()) return @tagName(self.kind);
+        var out = std.Io.Writer.Allocating.init(arena);
+        self.writeName(&out.writer, .lower) catch return error.OutOfMemory;
+        return out.written();
+    }
+
+    /// The type as SQL spells it (`.upper`, which CAST parses back, a nested part
+    /// `NOT NULL` where it is not nullable) or as `name` gives it (`.lower`).
+    pub fn writeName(self: Type, w: *std.Io.Writer, case: enum { lower, upper }) std.Io.Writer.Error!void {
+        const up = case == .upper;
+        switch (self.kind) {
+            .decimal => try w.print("{s}({d}, {d})", .{ if (up) "DECIMAL" else "decimal", self.precision, self.scale }),
+            .array => {
+                try w.writeAll(if (up) "LIST(" else "list(");
+                if (self.elem) |e| try e.writeInner(w, up);
+                try w.writeByte(')');
+            },
+            .map => {
+                try w.writeAll(if (up) "MAP(" else "map(");
+                if (self.fields) |kv| if (kv.len == 2) {
+                    try kv[0].ty.writeName(w, case);
+                    try w.writeAll(", ");
+                    try kv[1].ty.writeInner(w, up);
+                };
+                try w.writeByte(')');
+            },
+            .@"struct" => {
+                try w.writeAll(if (up) "STRUCT(" else "struct(");
+                for (self.fields orelse &.{}, 0..) |f, i| {
+                    if (i > 0) try w.writeAll(", ");
+                    if (plainName(f.name)) try w.writeAll(f.name) else try quote.ident(w, f.name);
+                    try w.writeByte(' ');
+                    try f.ty.writeInner(w, up);
+                }
+                try w.writeByte(')');
+            },
+            else => for (@tagName(self.kind)) |c| try w.writeByte(if (up) std.ascii.toUpper(c) else c),
+        }
+    }
+
+    fn plainName(s: []const u8) bool {
+        if (s.len == 0 or std.ascii.isDigit(s[0])) return false;
+        for (s) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+        return true;
+    }
+
+    fn writeInner(self: Type, w: *std.Io.Writer, up: bool) std.Io.Writer.Error!void {
+        try self.writeName(w, if (up) .upper else .lower);
+        if (up and !self.nullable) try w.writeAll(" NOT NULL");
+    }
+
+    pub fn isNested(self: Type) bool {
+        return self.kind == .array or self.kind == .@"struct" or self.kind == .map;
     }
 
     pub fn withNull(self: Type, n: bool) Type {
@@ -98,9 +152,22 @@ pub const Type = struct {
         return t;
     }
 
+    /// The same type, a nested one part for part: each element, field (by name, in
+    /// order) and their nullability.
     pub fn eql(a: Type, b: Type) bool {
         if (a.kind != b.kind) return false;
         if (a.kind == .decimal and (a.precision != b.precision or a.scale != b.scale)) return false;
+        if (a.elem != null or b.elem != null) {
+            const x = a.elem orelse return false;
+            const y = b.elem orelse return false;
+            if (x.nullable != y.nullable or !eql(x.*, y.*)) return false;
+        }
+        if (a.fields != null or b.fields != null) {
+            const xs = a.fields orelse return false;
+            const ys = b.fields orelse return false;
+            if (xs.len != ys.len) return false;
+            for (xs, ys) |x, y| if (!std.mem.eql(u8, x.name, y.name) or x.ty.nullable != y.ty.nullable or !eql(x.ty, y.ty)) return false;
+        }
         return true;
     }
 
@@ -116,6 +183,7 @@ pub const Type = struct {
         if (b.unknown) return a.asNullable();
         const nn = a.nullable or b.nullable;
         if (a.kind == b.kind) {
+            if (a.isNested() and !eql(a, b)) return null;
             var t = a;
             t.nullable = nn;
             if (a.kind == .decimal) {

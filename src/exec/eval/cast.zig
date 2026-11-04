@@ -20,11 +20,17 @@ const decimalOverflow = decimal.decimalOverflow;
 const failWith = @import("support.zig").failWith;
 const trim = @import("support.zig").trim;
 const types = @import("../../lang/types.zig");
+const nested = @import("../nested.zig");
 const valueToString = @import("format.zig").valueToString;
 
 /// Cast honouring the target's scale; `castValue` only sees a `TypeKind`, which
 /// for `DECIMAL(p, s)` left the conversion undefined.
 pub fn castValueTyped(arena: std.mem.Allocator, v: Value, ty: types.Type) EvalError!Value {
+    if (ty.isNested()) {
+        if (v == .null) return .null;
+        if (v != .string) return error.CastFailed;
+        return if (try nested.conform(arena, v.string, ty)) |t| .{ .string = t } else .null;
+    }
     if (ty.kind != .decimal) return castValue(arena, v, ty.kind);
     return .{ .decimal = try toDecimal(asDecimalValue(v), ty) };
 }

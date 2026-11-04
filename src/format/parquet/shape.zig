@@ -21,6 +21,7 @@ const std = @import("std");
 const types = @import("../../lang/types.zig");
 const footer = @import("footer.zig");
 const schema = @import("schema.zig");
+const logical = @import("logical.zig");
 
 pub const Kind = enum { leaf, group, list, map };
 
@@ -30,6 +31,7 @@ pub const Node = struct {
     ty: types.Type,
     nullable: bool,
     def: u32,
+    rep: u32,
     entry_def: u32 = 0,
     entry_rep: u32 = 0,
     children: []Node = &.{},
@@ -42,13 +44,11 @@ pub const Shape = struct {
     root: *const Node,
     elements: []const footer.SchemaElement,
     leaves: []const *const Node,
+    paths: []const []const []const u8,
     slots: u32,
 };
 
 pub const Error = error{ OutOfMemory, UnsupportedNestedType };
-
-const list_converted: i32 = 3;
-const map_converted: i32 = 1;
 
 /// Top-level column `name` of type `ty` as Parquet groups and leaves.
 pub fn of(arena: std.mem.Allocator, name: []const u8, ty: types.Type) Error!Shape {
@@ -56,13 +56,15 @@ pub fn of(arena: std.mem.Allocator, name: []const u8, ty: types.Type) Error!Shap
     const root = try arena.create(Node);
     root.* = try b.node(name, ty, ty.nullable, 0, 0);
     try b.number(root);
-    return .{ .root = root, .elements = b.elements.items, .leaves = b.leaves.items, .slots = b.slots };
+    return .{ .root = root, .elements = b.elements.items, .leaves = b.leaves.items, .paths = b.paths.items, .slots = b.slots };
 }
 
 const Builder = struct {
     arena: std.mem.Allocator,
     elements: std.ArrayList(footer.SchemaElement),
     leaves: std.ArrayList(*const Node),
+    paths: std.ArrayList([]const []const u8) = .empty,
+    path: std.ArrayList([]const u8) = .empty,
     slots: u32 = 0,
 
     fn add(b: *Builder, e: footer.SchemaElement) Error!void {
@@ -80,42 +82,51 @@ const Builder = struct {
                 try b.add(.{ .name = name, .repetition = r, .num_children = @intCast(fields.len) });
                 const kids = try b.arena.alloc(Node, fields.len);
                 for (fields, kids) |f, *k| k.* = try b.node(f.name, f.ty, f.ty.nullable, d, rep);
-                return .{ .name = name, .kind = .group, .ty = ty, .nullable = nullable, .def = d, .children = kids };
+                return .{ .name = name, .kind = .group, .ty = ty, .nullable = nullable, .def = d, .rep = rep, .children = kids };
             },
             .array => {
                 const elem = ty.elem orelse return Error.UnsupportedNestedType;
-                try b.add(.{ .name = name, .repetition = r, .num_children = 1, .converted_type = list_converted });
+                try b.add(.{ .name = name, .repetition = r, .num_children = 1, .converted_type = logical.conv_list });
                 try b.add(.{ .name = "list", .repetition = .repeated, .num_children = 1 });
                 const ed, const er = schema.step(d, rep, .repeated);
                 const kids = try b.arena.alloc(Node, 1);
                 kids[0] = try b.node("element", elem.*, elem.nullable, ed, er);
-                return .{ .name = name, .kind = .list, .ty = ty, .nullable = nullable, .def = d, .entry_def = ed, .entry_rep = er, .children = kids };
+                return .{ .name = name, .kind = .list, .ty = ty, .nullable = nullable, .def = d, .rep = rep, .entry_def = ed, .entry_rep = er, .children = kids };
             },
             .map => {
                 const kv = ty.fields orelse return Error.UnsupportedNestedType;
                 if (kv.len != 2) return Error.UnsupportedNestedType;
-                try b.add(.{ .name = name, .repetition = r, .num_children = 1, .converted_type = map_converted });
+                try b.add(.{ .name = name, .repetition = r, .num_children = 1, .converted_type = logical.conv_map });
                 try b.add(.{ .name = "key_value", .repetition = .repeated, .num_children = 2 });
                 const ed, const er = schema.step(d, rep, .repeated);
                 const kids = try b.arena.alloc(Node, 2);
                 kids[0] = try b.node("key", kv[0].ty, false, ed, er);
                 kids[1] = try b.node("value", kv[1].ty, kv[1].ty.nullable, ed, er);
                 if (kids[0].kind != .leaf) return Error.UnsupportedNestedType;
-                return .{ .name = name, .kind = .map, .ty = ty, .nullable = nullable, .def = d, .entry_def = ed, .entry_rep = er, .children = kids };
+                return .{ .name = name, .kind = .map, .ty = ty, .nullable = nullable, .def = d, .rep = rep, .entry_def = ed, .entry_rep = er, .children = kids };
             },
             else => {
                 try b.add(.{ .name = name, .repetition = r });
-                return .{ .name = name, .kind = .leaf, .ty = ty, .nullable = nullable, .def = d };
+                return .{ .name = name, .kind = .leaf, .ty = ty, .nullable = nullable, .def = d, .rep = rep };
             },
         }
     }
 
-    /// Each node's first leaf and leaf count, leaves listed in schema order, and
-    /// each struct's scratch slots.
+    /// Each node's first leaf and leaf count, leaves listed in schema order with
+    /// their paths from the column down, and each struct's scratch slots. A list's
+    /// and a map's repeated group is named on the path as the elements name it.
     fn number(b: *Builder, n: *Node) Error!void {
+        try b.path.append(b.arena, n.name);
+        defer _ = b.path.pop();
+        if (n.kind == .list) try b.path.append(b.arena, "list");
+        if (n.kind == .map) try b.path.append(b.arena, "key_value");
+        defer if (n.kind == .list or n.kind == .map) {
+            _ = b.path.pop();
+        };
         n.first_leaf = @intCast(b.leaves.items.len);
         if (n.kind == .leaf) {
             try b.leaves.append(b.arena, n);
+            try b.paths.append(b.arena, try b.arena.dupe([]const u8, b.path.items));
             n.leaves = 1;
             return;
         }
@@ -154,9 +165,9 @@ test "shape: structs, three-level lists and maps take the spec's layout, and the
     const names = [_][]const u8{ "doc", "id", "langs", "list", "element", "code", "country", "attrs", "key_value", "key", "value" };
     try testing.expectEqual(names.len, s.elements.len);
     for (names, s.elements) |n, e| try testing.expectEqualStrings(n, e.name);
-    try testing.expectEqual(@as(?i32, list_converted), s.elements[2].converted_type);
+    try testing.expectEqual(@as(?i32, logical.conv_list), s.elements[2].converted_type);
     try testing.expectEqual(footer.Repetition.repeated, s.elements[3].repetition.?);
-    try testing.expectEqual(@as(?i32, map_converted), s.elements[7].converted_type);
+    try testing.expectEqual(@as(?i32, logical.conv_map), s.elements[7].converted_type);
     try testing.expectEqual(footer.Repetition.required, s.elements[9].repetition.?);
 
     var with_root: std.ArrayList(footer.SchemaElement) = .empty;
@@ -168,12 +179,14 @@ test "shape: structs, three-level lists and maps take the spec's layout, and the
     }
     const read = try schema.collectLeaves(a, with_root.items);
     try testing.expectEqual(s.leaves.len, read.len);
-    for (s.leaves, read) |mine, theirs| {
+    for (s.leaves, read, s.paths) |mine, theirs, path| {
         try testing.expectEqual(theirs.max_def, mine.def);
-        var reps: u32 = 0;
-        if (theirs.list) |l| reps = @intCast(l.rep_def.len);
-        try testing.expectEqual(theirs.max_rep, reps);
+        try testing.expectEqual(theirs.max_rep, mine.rep);
+        try testing.expect(path.len > 0);
     }
+    const want_path = [_][]const u8{ "doc", "langs", "list", "element", "country" };
+    try testing.expectEqual(want_path.len, s.paths[2].len);
+    for (want_path, s.paths[2]) |w, g| try testing.expectEqualStrings(w, g);
     const defs = [_]u32{ 1, 4, 5, 3, 4 };
     for (defs, s.leaves) |d, l| try testing.expectEqual(d, l.def);
     try testing.expectEqual(@as(u32, 3), s.root.children[1].entry_def);

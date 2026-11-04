@@ -4,7 +4,7 @@
 //! deep the path is present: below the leaf's own `def`, an ancestor is null,
 //! absent or empty) and, at its full depth, the value. A row is basalt's JSON text
 //! for the column, walked where it lies (`json.Members`, `json.Elements`): no tree
-//! is built and nothing is copied, a struct's fields picked into the scratch slots
+//! is built and nothing is copied, a struct's fields picked (`json.pick`) into the scratch slots
 //! its plan node owns (`shape.Node.slot`) as its object is read once.
 //!
 //! What a sink receives: `level(leaf, rep, def, value)`, the value the leaf's JSON
@@ -31,9 +31,10 @@ pub fn Shredder(comptime S: type) type {
         sh: *const shape.Shape,
         slots: []?[]const u8,
         sink: S,
+        arena: std.mem.Allocator,
 
         pub fn init(arena: std.mem.Allocator, sh: *const shape.Shape, sink: S) error{OutOfMemory}!Self {
-            return .{ .sh = sh, .slots = try arena.alloc(?[]const u8, sh.slots), .sink = sink };
+            return .{ .sh = sh, .slots = try arena.alloc(?[]const u8, sh.slots), .sink = sink, .arena = arena };
         }
 
         /// One row: `text` the column's JSON, null for a NULL value. The text is
@@ -51,14 +52,7 @@ pub fn Shredder(comptime S: type) type {
                 .group => {
                     if (t[0] != '{') return Error.NotNested;
                     const got = self.slots[n.slot..][0..n.children.len];
-                    @memset(got, null);
-                    var it = json.Members.root(t);
-                    while (it.next()) |m| {
-                        for (n.children, 0..) |k, i| if (std.mem.eql(u8, k.name, m.key)) {
-                            got[i] = m.value;
-                            break;
-                        };
-                    }
+                    try json.pick(self.arena, t, n.children, got);
                     for (n.children, 0..) |*k, i| try self.value(k, got[i], rep);
                 },
                 .list => {

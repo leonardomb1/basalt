@@ -90,6 +90,11 @@ pub fn failWith(e: EvalError, comptime fmt: []const u8, args: anytype) EvalError
 /// read in, since that is what a file in another convention trips over.
 pub fn castFailure(arena: std.mem.Allocator, v: Value, ty: Type) EvalError {
     const text = clip(valueToString(arena, v) catch "?");
+    if (ty.isNested()) {
+        var name = std.Io.Writer.Allocating.init(arena);
+        ty.writeName(&name.writer, .upper) catch return error.OutOfMemory;
+        return failWith(error.CastFailed, "CAST: '{s}' does not fit {s}", .{ text, name.written() });
+    }
     const want: []const u8 = switch (ty.kind) {
         .int => "an INT",
         .float => "a FLOAT",

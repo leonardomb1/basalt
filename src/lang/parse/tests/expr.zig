@@ -265,3 +265,29 @@ test "parseTypeStr: params, aliases, junk" {
     try testing.expect(parseTypeStr(a, "nope") == null);
     try testing.expect(parseTypeStr(a, "int int") == null);
 }
+
+test "parseTypeStr: nested types read their parts, nullable unless NOT NULL, and print back as SQL and as DESCRIBE names them" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const src = "STRUCT(city STRING, zip INT NOT NULL, tags LIST(STRING NOT NULL), attrs MAP(STRING, DECIMAL(10, 2)), \"order\" STRUCT(n INT), \"zip code\" INT)";
+    const t = parseTypeStr(a, src).?;
+    try testing.expectEqual(.@"struct", t.kind);
+    try testing.expectEqual(@as(usize, 6), t.fields.?.len);
+    try testing.expect(t.fields.?[0].ty.nullable);
+    try testing.expect(!t.fields.?[1].ty.nullable);
+    try testing.expect(!t.fields.?[2].ty.elem.?.nullable);
+    try testing.expect(!t.fields.?[3].ty.fields.?[0].ty.nullable);
+    try testing.expectEqualStrings("order", t.fields.?[4].name);
+
+    var out = std.Io.Writer.Allocating.init(a);
+    try t.writeName(&out.writer, .upper);
+    try testing.expectEqualStrings("STRUCT(city STRING, zip INT NOT NULL, tags LIST(STRING NOT NULL), attrs MAP(STRING, DECIMAL(10, 2)), order STRUCT(n INT), \"zip code\" INT)", out.written());
+    try testing.expectEqualStrings("list(map(int, bool))", try parseTypeStr(a, "list(map(int, bool))").?.name(a));
+    try testing.expect(t.eql(parseTypeStr(a, out.written()).?));
+    try testing.expect(!t.eql(parseTypeStr(a, "STRUCT(city STRING, zip INT)").?));
+    try testing.expect(parseTypeStr(a, "struct(a int, a int)") == null);
+    try testing.expect(parseTypeStr(a, "struct()") == null);
+    try testing.expect(parseTypeStr(a, "map(list(int), int)") == null);
+    try testing.expect(parseTypeStr(a, "list(int") == null);
+}

@@ -156,6 +156,8 @@ pub const TypeCtx = struct {
             .match => |m| return self.typeOfMatch(m),
             .cast => |c| {
                 const s = try self.typeOf(c.e);
+                if (c.ty.isNested() and !s.unknown and s.kind != .string and !s.isNested())
+                    return self.err("CAST to {s} takes JSON text or a nested value, got {s}", .{ try c.ty.name(self.arena), try s.name(self.arena) });
                 return c.ty.withNull(s.nullable or c.safe);
             },
             .is_null => |n| {
@@ -297,7 +299,7 @@ pub const TypeCtx = struct {
     /// since `concat(id, '-', name)` is too common to refuse. Only nested values fail.
     pub fn wantText(self: *TypeCtx, c: ast.Expr.Call, i: usize) TypeError!Type {
         const t = try self.argType(c, i);
-        if (t.kind == .array or t.kind == .@"struct" or t.kind == .map)
+        if (t.isNested())
             return self.err("`{s}` argument {d} must be text, got {s}", .{ c.name, i + 1, @tagName(t.kind) });
         return t;
     }
