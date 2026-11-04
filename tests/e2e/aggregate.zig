@@ -297,6 +297,50 @@ test "DECIMAL MIN/MAX/AVG and INT MIN/MAX: exact order across scales, nulls skip
     }
 }
 
+test "global COUNT(DISTINCT) over INT and DATE agrees serial and over many lanes, one lane's values past its bits included" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    for ([_]bool{ false, true }) |far| {
+        var csv: std.ArrayList(u8) = .empty;
+        defer csv.deinit(alloc);
+        try csv.appendSlice(alloc, "v,d\n");
+        var seen = std.AutoHashMap(i64, void).init(alloc);
+        defer seen.deinit();
+        var rows: usize = 0;
+        var lo: i64 = std.math.maxInt(i64);
+        var hi: i64 = std.math.minInt(i64);
+        for (0..3000) |i| {
+            const day = 1 + i % 28;
+            if (i % 50 == 7) {
+                try csv.print(alloc, ",2020-02-{d:0>2}\n", .{day});
+                continue;
+            }
+            const v: i64 = if (far and i == 1500) 1_000_000_000_000 else @as(i64, @intCast(i * 7919 % 1500)) - 200;
+            try csv.print(alloc, "{d},2020-02-{d:0>2}\n", .{ v, day });
+            try seen.put(v, {});
+            rows += 1;
+            lo = @min(lo, v);
+            hi = @max(hi, v);
+        }
+        try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = csv.items });
+        const want = try std.fmt.allocPrint(alloc, "c,cd,n,mn,mx\n{d},28,{d},{d},{d}\n", .{ seen.count(), rows, lo, hi });
+        defer alloc.free(want);
+        const script = try std.fmt.allocPrint(alloc,
+            \\LOAD INTO '{s}/out.csv' AS SELECT count(DISTINCT v) AS c, count(DISTINCT d) AS cd, count(v) AS n,
+            \\  min(v) AS mn, max(v) AS mx FROM '{s}/in.csv';
+        , .{ base, base });
+        defer alloc.free(script);
+        for ([_]basalt.env.RunOptions{ .{ .threads = 1 }, .{ .threads = 4, .morsel_bytes = 256 } }) |o| {
+            const got = try runScriptOpts(alloc, &tmp, script, o);
+            defer alloc.free(got);
+            try std.testing.expectEqualStrings(want, got);
+        }
+    }
+}
+
 test "MEDIAN: odd count takes the middle, even count the mean of the two, nulls ignored, empty is null" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -10,6 +10,13 @@
 //! global aggregate's pairs are partitioned by the value's hash instead, a string's
 //! by its text, so each partition unions on its own and the partitions' states fold
 //! in partition order.
+//!
+//! A global aggregate over an INT-like argument whose result the order of its
+//! values cannot change (`orderFree`) keeps its values as bits instead
+//! (`bits.zig`): one bit set a row, the lanes' sets unioned by OR. Its partitions
+//! are value ranges, not hashes, so a set that outgrows its bits is turned into
+//! pairs (`toPairs`), and once any lane's set is pairs the merge turns them all
+//! before it unions (`GroupMerge.settleGlobal`).
 
 const GroupStore = keytable.GroupStore(keytable.NoPayload);
 const FixedStore = keytable.FixedStore(keytable.NoPayload);
@@ -21,6 +28,8 @@ const column = @import("../../column.zig");
 const eval = @import("../../eval.zig");
 const keyhash = @import("../../keyhash.zig");
 const keytable = @import("../../keytable.zig");
+const ast = @import("../../../lang/ast.zig");
+const Bits = @import("bits.zig").Bits;
 const std = @import("std");
 const types = @import("../../../lang/types.zig");
 
@@ -36,6 +45,8 @@ pub const Pairs = struct {
     alloc: std.mem.Allocator,
     seen: Seen = .{},
     enc: ?keytable.Encoder = null,
+    bits: ?Bits = null,
+    gpa: std.mem.Allocator,
 
     const Seen = struct { id: u64 = 0, bits: []u64 = &.{} };
 
@@ -62,8 +73,10 @@ pub const Pairs = struct {
     /// Aggregate `j`'s pairs over `nparts` partitions, partition `p`'s records in
     /// `allocs[p]` (or `allocs[0]` for all) and its index in `table_alloc`: a lane's
     /// bounded (`GroupTable.initBounded`), as the merge dedups what it repeats, or
-    /// sized for `expect` pairs.
-    pub fn init(a: std.mem.Allocator, j: usize, arg_ty: ?types.Type, grouped: bool, nparts: usize, allocs: []const std.mem.Allocator, table_alloc: std.mem.Allocator, bounded: bool, expect: usize) !Pairs {
+    /// sized for `expect` pairs. `order_free`: the aggregate's result does not
+    /// depend on its values' order, so a global one over an INT-like argument
+    /// keeps bits.
+    pub fn init(a: std.mem.Allocator, j: usize, arg_ty: ?types.Type, grouped: bool, nparts: usize, allocs: []const std.mem.Allocator, table_alloc: std.mem.Allocator, bounded: bool, expect: usize, order_free: bool) !Pairs {
         var ty = arg_ty orelse types.Type.init(.string);
         if (arg_ty == null) ty.unknown = true;
         const kind = if (ty.unknown) null else keyhash.keyKindOf(ty.kind);
@@ -81,17 +94,25 @@ pub const Pairs = struct {
             const kinds = try a.dupe(keyhash.KeyKind, &.{k});
             enc = try keytable.Encoder.init(a, &.{0}, kinds);
         }
-        return .{ .j = j, .ty = ty, .kind = kind, .grouped = grouped, .parts = parts, .alloc = a, .enc = enc };
+        const bits: ?Bits = if (!grouped and order_free and (kind == .i64k or kind == .i32k)) .{} else null;
+        return .{ .j = j, .ty = ty, .kind = kind, .grouped = grouped, .parts = parts, .alloc = a, .enc = enc, .bits = bits, .gpa = table_alloc };
     }
 
     /// An empty one-partition set like `like`, sized for `expect` pairs, for a merge
-    /// to absorb into.
+    /// to absorb into; bits when `like` holds bits.
     pub fn initLike(a: std.mem.Allocator, like: *const Pairs, table_alloc: std.mem.Allocator, expect: usize) !Pairs {
-        return init(a, like.j, like.ty, like.grouped, 1, &.{a}, table_alloc, false, expect);
+        return init(a, like.j, like.ty, like.grouped, 1, &.{a}, table_alloc, false, expect, like.bits != null);
     }
 
-    /// How many pairs partition `p` holds.
+    /// Whether aggregate `func` over `arg` gives one result for its distinct values
+    /// in any order. Only COUNT takes DISTINCT today, and a count is a count.
+    pub fn orderFree(func: ast.AggFunc, arg: ?types.Type) bool {
+        return arg != null and func == .count;
+    }
+
+    /// How many values partition `p` holds.
     pub fn count(self: *const Pairs, p: usize) usize {
+        if (self.bits) |*b| return b.count(p);
         return switch (self.parts[p].store) {
             inline else => |st| st.len,
         };
@@ -115,12 +136,15 @@ pub const Pairs = struct {
 
     pub fn deinit(self: *Pairs) void {
         for (self.parts) |*p| p.table.deinit();
+        if (self.bits) |*b| b.deinit(self.gpa);
+        self.bits = null;
     }
 
     /// The bytes the partitions' indexes hold, for a spilling fold's budget.
     pub fn tableBytes(self: *const Pairs) usize {
         var n: usize = 0;
         for (self.parts) |p| n += p.table.entries.len * @sizeOf(u32);
+        if (self.bits) |*b| n += b.bytes();
         return n;
     }
 
@@ -151,6 +175,15 @@ pub const Pairs = struct {
                     m += 1;
                 }
             } else {
+                if (self.bits) |*b| {
+                    for (0..n) |r| if (e.mask(r) == 0) {
+                        keys[m] = e.keys[r];
+                        m += 1;
+                    };
+                    if (try b.addAll(self.gpa, keys[0..m])) return;
+                    try self.toPairs();
+                    m = 0;
+                }
                 const d = if (kind == .strk) col.dict else null;
                 var none = [_]u64{};
                 const seen: []u64 = if (d) |dd| try self.seenOf(dd) else &none;
@@ -186,11 +219,7 @@ pub const Pairs = struct {
             }
         }
         if (self.kind != null) {
-            const runs = try keytable.Runs(i64).init(scratch, self.parts.len, nk, pof[0..m], &.{}, hashes, keys, &.{});
-            for (self.parts, 0..) |*part, p| {
-                var v = Record(FixedStore){ .tb = &part.table, .st = part.store.fixed };
-                try keytable.probe(FixedStore, .dupe, &runs, runs.starts[p], runs.starts[p + 1], &v);
-            }
+            try self.insertFixed(scratch, nk, pof[0..m], hashes, keys);
         } else {
             const runs = try keytable.Runs(Value).init(scratch, self.parts.len, nk, pof[0..m], &.{}, hashes, probes, &.{});
             for (self.parts, 0..) |*part, p| {
@@ -198,6 +227,43 @@ pub const Pairs = struct {
                 try keytable.probe(GroupStore, .dupe, &runs, runs.starts[p], runs.starts[p + 1], &v);
             }
         }
+    }
+
+    /// Fixed-width keys filed into the partitions `pof` names and recorded where new.
+    fn insertFixed(self: *Pairs, scratch: std.mem.Allocator, nk: usize, pof: []const u8, hashes: []const u64, keys: []const i64) !void {
+        const runs = try keytable.Runs(i64).init(scratch, self.parts.len, nk, pof, &.{}, hashes, keys, &.{});
+        for (self.parts, 0..) |*part, p| {
+            var v = Record(FixedStore){ .tb = &part.table, .st = part.store.fixed };
+            try keytable.probe(FixedStore, .dupe, &runs, runs.starts[p], runs.starts[p + 1], &v);
+        }
+    }
+
+    /// The bits as pairs, each value hashed and filed as `add` files it: for a set
+    /// whose values outgrew its bits, or a merge whose other sets hold pairs.
+    pub fn toPairs(self: *Pairs) !void {
+        var b = self.bits orelse return;
+        self.bits = null;
+        defer b.deinit(self.gpa);
+        var arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var vals: std.ArrayListUnmanaged(i64) = .empty;
+        const Collect = struct {
+            l: *std.ArrayListUnmanaged(i64),
+            a: std.mem.Allocator,
+            fn put(c: *const @This(), v: i64) !void {
+                try c.l.append(c.a, v);
+            }
+        };
+        const ctx = Collect{ .l = &vals, .a = a };
+        for (0..keytable.parts) |p| try b.each(p, &ctx, Collect.put);
+        const hashes = try a.alloc(u64, vals.items.len);
+        const pof = try a.alloc(u8, vals.items.len);
+        for (vals.items, hashes, pof) |k, *h, *pp| {
+            h.* = keytable.fixedHash(&[1]i64{k}, 0);
+            pp.* = if (self.parts.len == 1) 0 else @intCast(keytable.partOf(h.*));
+        }
+        try self.insertFixed(a, 1, pof, hashes, vals.items);
     }
 
     /// `add`'s side of `keytable.probe`: a pair only recorded.
@@ -240,6 +306,21 @@ pub const Pairs = struct {
     /// ordinal through `remap`.
     pub fn absorb(self: *Pairs, dp: usize, src: *const Pairs, sp: usize, remap: ?[]const u32) !void {
         const part = &self.parts[dp];
+        if (src.bits) |*sb| {
+            if (self.bits) |*db| {
+                if (try db.unionPart(self.gpa, sb, sp)) return;
+                try self.toPairs();
+            }
+            const Put = struct {
+                part: *Part,
+                fn one(c: *const @This(), v: i64) !void {
+                    const key = [1]i64{v};
+                    try put(c.part, keytable.fixedHash(&key, 0), &key);
+                }
+            };
+            return sb.each(sp, &Put{ .part = part }, Put.one);
+        }
+        try self.toPairs();
         switch (src.parts[sp].store) {
             .fixed => |st| for (0..st.len) |i| {
                 const r = st.at(i);
@@ -263,6 +344,22 @@ pub const Pairs = struct {
         const k: *const Kernel = layout.kernels[self.j];
         const off = layout.offs[self.j];
         const cx = layout.ctx(self.j, alloc);
+        if (self.bits) |*b| {
+            const Add = struct {
+                k: *const Kernel,
+                at: [*]u8,
+                cx: @TypeOf(cx),
+                kind: types.TypeKind,
+                fn one(c: *const @This(), v: i64) !void {
+                    try c.k.add(c.at, keytable.wordValue(c.kind, v, null), c.cx);
+                }
+            };
+            const add_one = Add{ .k = k, .at = into.tail(0) + off, .cx = cx, .kind = self.ty.kind };
+            if (self.parts.len == 1) {
+                for (0..keytable.parts) |q| try b.each(q, &add_one, Add.one);
+            } else try b.each(p, &add_one, Add.one);
+            return;
+        }
         switch (self.parts[p].store) {
             .fixed => |st| for (0..st.len) |i| {
                 const r = st.at(i);
@@ -300,7 +397,7 @@ test "pairs: a dictionary seen again is not re-interned into the state" {
     const d = column.Column.Dict{ .values = vals, .codes = codes, .id = 5 };
     col.dict = &d;
 
-    var pairs = try Pairs.init(sa, 0, types.Type.init(.string), false, 1, &.{sa}, std.testing.allocator, false, 0);
+    var pairs = try Pairs.init(sa, 0, types.Type.init(.string), false, 1, &.{sa}, std.testing.allocator, false, 0, false);
     defer pairs.deinit();
     try pairs.add(scratch.allocator(), col, n, null, in);
     const after_one = state.queryCapacity();

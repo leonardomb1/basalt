@@ -268,7 +268,9 @@ pub const GroupMerge = struct {
 
     /// A global aggregate's pairs, each value-hash partition unioned across the sets
     /// into a partial state of its own, the partials then folded in partition order
-    /// and what they hold rebuilt in this merge's allocator.
+    /// and what they hold rebuilt in this merge's allocator. A DISTINCT aggregate
+    /// whose sets are bits in some lanes and pairs in others has them all turned to
+    /// pairs first, since bits partition by value range and pairs by hash.
     fn settleGlobal(self: *GroupMerge, layout: *const Layout, dst: [*]u8) !void {
         const keep = try self.alloc.alloc(std.heap.ArenaAllocator, keytable.parts);
         for (keep) |*k| k.* = std.heap.ArenaAllocator.init(pagecache.process);
@@ -277,6 +279,14 @@ pub const GroupMerge = struct {
         for (partials) |*pt| {
             pt.* = (try self.alloc.alignedAlloc(u8, .of(Value), @max(layout.size, 1))).ptr;
             layout.clear(pt.*);
+        }
+        for (self.globals.items[0].pairs) |*like| {
+            var bits = false;
+            var pairs = false;
+            for (self.globals.items) |src| for (src.pairs) |*s| if (s.j == like.j) {
+                if (s.bits != null) bits = true else pairs = true;
+            };
+            if (bits and pairs) for (self.globals.items) |src| for (src.pairs) |*s| if (s.j == like.j) try s.toPairs();
         }
         const errs = try self.alloc.alloc(?anyerror, keytable.parts);
         @memset(errs, null);

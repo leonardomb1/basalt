@@ -132,6 +132,7 @@ test {
     _ = @import("aggregate/funcs.zig");
     _ = @import("aggregate/kernel.zig");
     _ = @import("aggregate/pairs.zig");
+    _ = @import("aggregate/bits.zig");
     _ = @import("spill_parts.zig");
 }
 

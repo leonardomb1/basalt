@@ -129,7 +129,7 @@ fn initPairs(self: *Aggregate, grouped: bool) !void {
     var i: usize = 0;
     for (self.aggs, 0..) |a, j| {
         if (!a.distinct) continue;
-        pairs[i] = try Pairs.init(self.state, j, a.arg_ty, grouped, fold_parts, allocs, self.table_gpa orelse self.gpa, self.part_state != null, 0);
+        pairs[i] = try Pairs.init(self.state, j, a.arg_ty, grouped, fold_parts, allocs, self.table_gpa orelse self.gpa, self.part_state != null, 0, Pairs.orderFree(a.func, a.arg_ty));
         i += 1;
     }
     self.pairs = pairs;
