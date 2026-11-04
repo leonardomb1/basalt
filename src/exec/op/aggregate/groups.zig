@@ -16,6 +16,7 @@ const keyhash = @import("../../keyhash.zig");
 const keytable = @import("../../keytable.zig");
 const par = @import("../../par.zig");
 const std = @import("std");
+const pagecache = @import("../../pagecache.zig");
 const types = @import("../../../lang/types.zig");
 
 pub const GroupSet = struct {
@@ -96,9 +97,9 @@ pub const GroupMerge = struct {
     pub fn deinit(self: *GroupMerge) void {
         self.table.deinit();
         for (self.pairs) |*pp| pp.deinit();
-        self.globals.deinit(std.heap.page_allocator);
+        self.globals.deinit(pagecache.process);
         self.globals = .empty;
-        self.remap.deinit(std.heap.page_allocator);
+        self.remap.deinit(pagecache.process);
         self.remap = .empty;
     }
 
@@ -147,14 +148,14 @@ pub const GroupMerge = struct {
     pub fn addSet(self: *GroupMerge, src: *const GroupSet) !void {
         if (self.set.store == .single) {
             for (0..src.len) |i| _ = try self.add(src, i);
-            if (src.pairs.len > 0) try self.globals.append(std.heap.page_allocator, src);
+            if (src.pairs.len > 0) try self.globals.append(pagecache.process, src);
             return;
         }
         if (src.pairs.len == 0) {
             for (0..src.len) |i| _ = try self.add(src, i);
             return;
         }
-        try self.remap.resize(std.heap.page_allocator, src.len);
+        try self.remap.resize(pagecache.process, src.len);
         for (self.remap.items, 0..) |*r, i| r.* = try self.add(src, i);
         for (self.pairs, src.pairs) |*d, *s| try d.absorb(0, s, src.part, self.remap.items);
     }
@@ -245,7 +246,7 @@ pub const GroupMerge = struct {
         }
 
         fn part(c: *const GlobalCtx, p: usize) !void {
-            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            var arena = std.heap.ArenaAllocator.init(pagecache.process);
             defer arena.deinit();
             const a = arena.allocator();
             for (c.m.globals.items[0].pairs) |*like| {
@@ -255,7 +256,7 @@ pub const GroupMerge = struct {
                         expect += s.count(p);
                     };
                 }
-                var u = try Pairs.initLike(a, like, std.heap.page_allocator, expect);
+                var u = try Pairs.initLike(a, like, pagecache.process, expect);
                 defer u.deinit();
                 for (c.m.globals.items) |src| {
                     for (src.pairs) |*s| if (s.j == like.j) try u.absorb(0, s, p, null);
@@ -270,7 +271,7 @@ pub const GroupMerge = struct {
     /// and what they hold rebuilt in this merge's allocator.
     fn settleGlobal(self: *GroupMerge, layout: *const Layout, dst: [*]u8) !void {
         const keep = try self.alloc.alloc(std.heap.ArenaAllocator, keytable.parts);
-        for (keep) |*k| k.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        for (keep) |*k| k.* = std.heap.ArenaAllocator.init(pagecache.process);
         defer for (keep) |*k| k.deinit();
         const partials = try self.alloc.alloc([*]u8, keytable.parts);
         for (partials) |*pt| {

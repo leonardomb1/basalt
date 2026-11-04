@@ -48,6 +48,7 @@
 //! a lane), and the next unit reuses those pages already faulted in.
 
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const msgfmt = @import("../msgfmt.zig");
 const parquet = @import("footer.zig");
 const logical = @import("logical.zig");
@@ -503,7 +504,7 @@ pub const Writer = struct {
         if (mode == .append) return Error.AppendNotSupported;
         if (!codec.canCompress(compression)) return codec.Error.UnsupportedCodec;
         const mem = try plan_arena.create(std.heap.ArenaAllocator);
-        mem.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        mem.* = std.heap.ArenaAllocator.init(pagecache.process);
         errdefer mem.deinit();
         const arena = mem.allocator();
         const maps = try arena.alloc(Mapping, schema.fields.len);
@@ -522,7 +523,7 @@ pub const Writer = struct {
         const self = try plan_arena.create(Writer);
         self.* = .{
             .arena = arena,
-            .scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .scratch = std.heap.ArenaAllocator.init(pagecache.process),
             .backend = undefined,
             .schema = schema,
             .maps = maps,
@@ -895,7 +896,7 @@ pub const Writer = struct {
         const e = try arena.create(Writer);
         e.* = .{
             .arena = arena,
-            .scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .scratch = std.heap.ArenaAllocator.init(pagecache.process),
             .backend = .{ .memory = mem },
             .schema = self.schema,
             .maps = self.maps,
@@ -917,7 +918,7 @@ pub const Writer = struct {
         defer self.pool_mu.unlock();
         if (self.pool.pop()) |cm| return cm;
         const cm = try std.heap.smp_allocator.create(std.heap.ArenaAllocator);
-        cm.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        cm.* = std.heap.ArenaAllocator.init(pagecache.process);
         return cm;
     }
 

@@ -20,6 +20,7 @@
 //! basalt does not know.
 
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const msgfmt = @import("../msgfmt.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Layout = @import("../parquet/fit.zig").Layout;
@@ -325,9 +326,9 @@ pub const State = struct {
     /// Each row group is decoded into memory freed once its rows are kept, and the
     /// file map is sized for the rows up front, as an arena keeps every outgrown table.
     fn checkpoint(self: *State, url: []const u8) !void {
-        var reader_mem = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var reader_mem = std.heap.ArenaAllocator.init(pagecache.process);
         defer reader_mem.deinit();
-        var batch_mem = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var batch_mem = std.heap.ArenaAllocator.init(pagecache.process);
         defer batch_mem.deinit();
         const scratch = batch_mem.allocator();
         const r = try Reader.openProjected(reader_mem.allocator(), url, &checkpoint_columns);
@@ -671,9 +672,9 @@ pub fn snapshot(arena: std.mem.Allocator, root: []const u8, at: table.At, listed
         while (k <= c.parts) : (k += 1) try st.checkpoint(files.get(k).?);
         if (st.v2) |f| return refuse("{s} uses V2 checkpoints (reader feature `v2Checkpoint`, checkpoint `{s}`), which basalt does not read", .{ name, folder.below(f, log_path) });
     }
-    var text_mem = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var text_mem = std.heap.ArenaAllocator.init(pagecache.process);
     defer text_mem.deinit();
-    var line_mem = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var line_mem = std.heap.ArenaAllocator.init(pagecache.process);
     defer line_mem.deinit();
     var v: u64 = if (from) |f| f.version + 1 else 0;
     while (v <= target) : (v += 1) {

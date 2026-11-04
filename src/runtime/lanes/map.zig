@@ -39,6 +39,7 @@ const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const sqlDescForStage = @import("../connect.zig").sqlDescForStage;
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const msgfmt = @import("../../format/msgfmt.zig");
 const trace = @import("../../exec/trace.zig");
 const types = @import("../../lang/types.zig");
@@ -128,15 +129,15 @@ pub const OrderedOut = struct {
     }
 
     fn newUnit() !*Unit {
-        const u = try std.heap.page_allocator.create(Unit);
-        u.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator), .parts = undefined };
+        const u = try pagecache.process.create(Unit);
+        u.* = .{ .arena = std.heap.ArenaAllocator.init(pagecache.process), .parts = undefined };
         u.parts = std.array_list.Managed(Part).init(u.arena.allocator());
         return u;
     }
 
     pub fn freeUnit(u: *Unit) void {
         u.arena.deinit();
-        std.heap.page_allocator.destroy(u);
+        pagecache.process.destroy(u);
     }
 
     pub fn freeRest(self: *OrderedOut) void {

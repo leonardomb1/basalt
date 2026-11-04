@@ -9,6 +9,7 @@
 //! multipart parts stay invisible.
 
 const std = @import("std");
+const pagecache = @import("../exec/pagecache.zig");
 const deflate = @import("compress/deflate.zig");
 const driver = @import("../connect/driver.zig");
 const objstore = @import("../store/objstore.zig");
@@ -62,7 +63,7 @@ pub const Output = struct {
     pub fn compress(self: *Output, path: []const u8) !void {
         switch (stream.splitCodec(path).codec) {
             .none => {},
-            .gzip => self.gz = try deflate.Deflate.init(std.heap.page_allocator, self.raw(), .{}),
+            .gzip => self.gz = try deflate.Deflate.init(pagecache.process, self.raw(), .{}),
             .zstd => return error.ZstdWriteUnsupported,
         }
     }
@@ -123,7 +124,7 @@ pub const Output = struct {
     pub fn finish(self: *Output) !void {
         if (self.gz) |g| {
             defer {
-                g.deinit(std.heap.page_allocator);
+                g.deinit(pagecache.process);
                 self.gz = null;
             }
             g.finish() catch |e| {
@@ -146,7 +147,7 @@ pub const Output = struct {
 
     pub fn abort(self: *Output) void {
         if (self.gz) |g| {
-            g.deinit(std.heap.page_allocator);
+            g.deinit(pagecache.process);
             self.gz = null;
         }
         switch (self.backend) {

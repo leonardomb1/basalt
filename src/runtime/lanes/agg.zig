@@ -60,6 +60,7 @@ const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const schemaPtr = @import("../env.zig").schemaPtr;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const msgfmt = @import("../../format/msgfmt.zig");
 const trace = @import("../../exec/trace.zig");
 const topNTail = @import("topn.zig").topNTail;
@@ -134,7 +135,7 @@ fn partSets(a: std.mem.Allocator, parts: []PqPart) ![]const op.Aggregate.GroupSe
 /// Free when unused: an arena allocates nothing until used.
 fn allocMergeParts(gpa: std.mem.Allocator) ![]PqPart {
     const parts = try gpa.alloc(PqPart, pq_parts);
-    for (parts) |*pp| pp.* = .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+    for (parts) |*pp| pp.* = .{ .arena = std.heap.ArenaAllocator.init(pagecache.process) };
     return parts;
 }
 
@@ -661,7 +662,7 @@ pub fn runParallelAgg(env: *Env, m_in: ?*const Morsels, head: ?ast.Stage, shape:
         joins = try std.mem.concat(env.arena, LaneJoin, &.{ joins, chain.joins });
         agg_in = chain.out_schema;
     }
-    var strs = op.Aggregate.StrTable.init(std.heap.page_allocator);
+    var strs = op.Aggregate.StrTable.init(pagecache.process);
     defer strs.deinit();
     const la = LaneAgg.of(env, try resolveAt(env, agg_in, shape.agg), &strs);
     if (m.* != .sql) env.src_name = m.label();

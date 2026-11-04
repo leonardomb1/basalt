@@ -42,6 +42,7 @@ const fld = @import("../../testing/ast_util.zig").fld;
 const nullColumn = @import("join.zig").nullColumn;
 const op_mod = @import("../op.zig");
 const std = @import("std");
+const pagecache = @import("../pagecache.zig");
 const testing = std.testing;
 const types = @import("../../lang/types.zig");
 
@@ -272,7 +273,7 @@ pub const NLJoin = struct {
     fn ensureSorted(self: *NLJoin, ix: *JoinIndex) !Sorted {
         if (self.sorted) |s| return s;
         const r = self.range.?;
-        var tmp = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var tmp = std.heap.ArenaAllocator.init(pagecache.process);
         defer tmp.deinit();
         const pair = try self.halfPair(tmp.allocator(), ix.build_batch, self.left_schema, true);
         const by_lower = r.lower != null;

@@ -21,6 +21,7 @@
 //! asked for another codec fails up front instead of emitting an unreadable file.
 
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const deflate = @import("deflate.zig");
 const varint = @import("../varint.zig");
 
@@ -460,8 +461,8 @@ pub fn compress(arena: std.mem.Allocator, codec: Codec, src: []const u8) Error![
 /// return rather than left in the page arena.
 fn gzipCompress(arena: std.mem.Allocator, src: []const u8) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(arena);
-    const z = try deflate.Deflate.init(std.heap.page_allocator, &out.writer, .{ .level = .fast });
-    defer z.deinit(std.heap.page_allocator);
+    const z = try deflate.Deflate.init(pagecache.process, &out.writer, .{ .level = .fast });
+    defer z.deinit(pagecache.process);
     try z.interface.writeAll(src);
     try z.finish();
     return out.toOwnedSlice();

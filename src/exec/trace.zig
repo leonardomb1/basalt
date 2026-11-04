@@ -5,6 +5,7 @@
 //! and a branch; on, its end takes a lock, so spans mark units of work, not rows.
 
 const std = @import("std");
+const pagecache = @import("pagecache.zig");
 const jsontext = @import("jsontext.zig");
 
 const Event = struct { name: []const u8, tid: u64, ts: u64, dur: u64, arg: u64 };
@@ -33,7 +34,7 @@ pub const Span = struct {
         const now = std.time.Instant.now() catch return;
         mtx.lock();
         defer mtx.unlock();
-        events.append(std.heap.page_allocator, .{
+        events.append(pagecache.process, .{
             .name = self.name,
             .tid = std.Thread.getCurrentId(),
             .ts = s.since(t0),
@@ -60,7 +61,7 @@ pub fn short(comptime T: type) []const u8 {
 pub fn write(path: []const u8) !void {
     mtx.lock();
     defer mtx.unlock();
-    defer events.clearAndFree(std.heap.page_allocator);
+    defer events.clearAndFree(pagecache.process);
     var file = try std.fs.cwd().createFile(path, .{});
     defer file.close();
     var buf: [1 << 16]u8 = undefined;

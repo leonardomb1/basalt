@@ -64,6 +64,7 @@
 //! the tests of its own code; `testing_util.zig` holds the helpers they share.
 
 const std = @import("std");
+const pagecache = @import("pagecache.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const msgfmt = @import("../format/msgfmt.zig");
@@ -846,7 +847,7 @@ test "now() and today() read their own statement's clock on every row and batch,
         }
 
         fn loop(s: *@This(), batch: Batch) void {
-            var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            var ar = std.heap.ArenaAllocator.init(pagecache.process);
             defer ar.deinit();
             for (0..500) |_| {
                 s.check(ar.allocator(), batch) catch return;

@@ -12,6 +12,7 @@ const eval = @import("../../exec/eval.zig");
 const jsontext = @import("../../exec/jsontext.zig");
 const parquet = @import("footer.zig");
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const types = @import("../../lang/types.zig");
 const entriesOf = @import("testing_util.zig").entriesOf;
 const testing = std.testing;
@@ -302,7 +303,7 @@ pub fn assembleNested(arena: std.mem.Allocator, root: *const NNode, entries: []c
         st.* = list.items;
     }
     var out = try column.Builder.initCapacity(arena, types.Type.init(.string).asNullable(), @min(rows, capacity_hint));
-    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var scratch = std.heap.ArenaAllocator.init(pagecache.process);
     defer scratch.deinit();
     const spans = try arena.alloc(Span, entries.len);
     for (0..rows) |row| {

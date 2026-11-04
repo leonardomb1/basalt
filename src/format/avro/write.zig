@@ -19,6 +19,7 @@
 //! compressor.
 
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const msgfmt = @import("../msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
@@ -216,8 +217,8 @@ pub fn compress(arena: std.mem.Allocator, codec: Codec, body: []const u8) ![]con
         .null => return body,
         .deflate => {
             var aw: std.Io.Writer.Allocating = .init(arena);
-            const z = try deflate.Deflate.init(std.heap.page_allocator, &aw.writer, .{ .level = .fast, .container = .raw });
-            defer z.deinit(std.heap.page_allocator);
+            const z = try deflate.Deflate.init(pagecache.process, &aw.writer, .{ .level = .fast, .container = .raw });
+            defer z.deinit(pagecache.process);
             try z.interface.writeAll(body);
             try z.finish();
             return aw.written();

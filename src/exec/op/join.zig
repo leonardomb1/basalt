@@ -50,6 +50,7 @@ const spill_parts = @import("spill_parts.zig");
 const Space = @import("../space.zig").Space;
 const eval = @import("../eval.zig");
 const std = @import("std");
+const pagecache = @import("../pagecache.zig");
 const op_mod = @import("../op.zig");
 const types = @import("../../lang/types.zig");
 const JoinRows = @import("testing_util.zig").JoinRows;
@@ -195,7 +196,7 @@ const Split = struct {
     ws: [grace_parts + 1]?spill.Writer = @splat(null),
 
     fn init(space: Space, schema: *const types.Schema, keys: []const usize, mixed: []const bool, depth: u8, nulls: u8, tag: []const u8) Split {
-        return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator), .space = space, .schema = schema, .keys = keys, .mixed = mixed, .depth = depth, .nulls = nulls, .tag = tag };
+        return .{ .arena = std.heap.ArenaAllocator.init(pagecache.process), .space = space, .schema = schema, .keys = keys, .mixed = mixed, .depth = depth, .nulls = nulls, .tag = tag };
     }
 
     /// `b`'s rows written to the files of their partitions, gathered in `scratch`.
@@ -234,7 +235,7 @@ const Split = struct {
     fn addRun(self: *Split, run: spill.Run) !void {
         var r = try spill.Reader.open(run);
         defer r.close();
-        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var scratch = std.heap.ArenaAllocator.init(pagecache.process);
         defer scratch.deinit();
         while (try r.next(scratch.allocator())) |b| {
             try self.add(scratch.allocator(), b);
@@ -418,7 +419,7 @@ pub const JoinIndex = struct {
         cap: usize,
         threads: usize,
     ) anyerror!*JoinIndex {
-        var pull = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var pull = std.heap.ArenaAllocator.init(pagecache.process);
         defer pull.deinit();
         var bytes: usize = 0;
         const chunks = try drainBuild(pull.allocator(), build, &bytes, cap);
@@ -995,7 +996,7 @@ pub const Join = struct {
         const build = self.build orelse return error.JoinHasNoBuildSide;
         const cap = self.build_cap orelse op_mod.join_build_byte_cap;
         if (!self.mayGrace()) return try JoinIndex.createMeeting(self.state, build, self.right_schema, self.right_keys, try self.probeKinds(), cap, self.threads);
-        var pull = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var pull = std.heap.ArenaAllocator.init(pagecache.process);
         defer pull.deinit();
         var held = std.array_list.Managed(Batch).init(pull.allocator());
         var bytes: usize = 0;
@@ -1029,14 +1030,14 @@ pub const Join = struct {
     /// kept apart in a file streamed out last.
     fn startGrace(self: *Join, pull: *std.heap.ArenaAllocator, held: []const Batch, build: Op) anyerror!void {
         const g = try self.state.create(Grace);
-        g.* = .{ .files = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
+        g.* = .{ .files = std.heap.ArenaAllocator.init(pagecache.process) };
         errdefer g.files.deinit();
         const fa = g.files.allocator();
         g.build_mixed = try mixedKeys(fa, self.right_schema, self.right_keys, self.left_schema, self.left_keys);
         g.probe_mixed = try mixedKeys(fa, self.left_schema, self.left_keys, self.right_schema, self.right_keys);
         var sp = Split.init(self.space.?, self.right_schema, self.right_keys, g.build_mixed, 0, if (self.emitsBuild()) grace_parts else drop_row, "join-build");
         defer sp.deinit();
-        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var scratch = std.heap.ArenaAllocator.init(pagecache.process);
         defer scratch.deinit();
         for (held) |b| {
             try sp.add(scratch.allocator(), b);
@@ -1099,7 +1100,7 @@ pub const Join = struct {
     fn splitProbe(self: *Join, g: *Grace) anyerror!void {
         var sp = Split.init(self.space.?, self.left_schema, self.left_keys, g.probe_mixed, 0, if (self.emitsProbe()) 0 else drop_row, "join-probe");
         defer sp.deinit();
-        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var scratch = std.heap.ArenaAllocator.init(pagecache.process);
         defer scratch.deinit();
         while (try self.nextProbe(scratch.allocator())) |b| {
             try sp.add(scratch.allocator(), b);
@@ -1147,7 +1148,7 @@ pub const Join = struct {
     fn oneKey(self: *Join, g: *Grace, run: spill.Run) anyerror!bool {
         var r = try spill.Reader.open(run);
         defer r.close();
-        var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var scratch = std.heap.ArenaAllocator.init(pagecache.process);
         defer scratch.deinit();
         var first: ?u64 = null;
         while (try r.next(scratch.allocator())) |b| {
@@ -1197,7 +1198,7 @@ pub const Join = struct {
     /// The current partition's index, read from its build file (deleted once read;
     /// none is an empty index), and its probe file opened.
     fn openPart(self: *Join, g: *Grace, fit: Fit) anyerror!void {
-        g.part_mem = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        g.part_mem = std.heap.ArenaAllocator.init(pagecache.process);
         const pa = g.part_mem.?.allocator();
         const ix = try self.indexPart(pa, g.cur.build, fit);
         if (g.cur.build) |run| spill.discard(run);

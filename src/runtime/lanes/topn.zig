@@ -23,6 +23,7 @@ const resolveAt = @import("../plan.zig").resolveAt;
 const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const msgfmt = @import("../../format/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 
@@ -192,7 +193,7 @@ pub fn runParallelTopN(
     env.src_name = m.label();
     env.sink_name = sinkLabel(env, w);
 
-    var kept_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var kept_arena = std.heap.ArenaAllocator.init(pagecache.process);
     defer kept_arena.deinit();
     var g = TopNSink{
         .env = env,

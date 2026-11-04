@@ -17,6 +17,7 @@
 //! between records differ, or a `split` on a longer terminator, stays on one lane.
 
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const types = @import("../../lang/types.zig");
 const column = @import("../../exec/column.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
@@ -309,8 +310,8 @@ pub const Mapped = struct {
         self.mu.lock();
         defer self.mu.unlock();
         if (self.cuts.len == n) return self.cuts;
-        if (self.cuts.len > 0) std.heap.page_allocator.free(self.cuts);
-        self.cuts = try std.heap.page_allocator.alloc(Cut, n);
+        if (self.cuts.len > 0) pagecache.process.free(self.cuts);
+        self.cuts = try pagecache.process.alloc(Cut, n);
         const size = self.data.len;
         if (self.stride > 0) {
             const total = (size + self.eol) / self.stride;
@@ -356,7 +357,7 @@ pub const Mapped = struct {
     }
 
     pub fn deinit(self: *Mapped) void {
-        if (self.cuts.len > 0) std.heap.page_allocator.free(self.cuts);
+        if (self.cuts.len > 0) pagecache.process.free(self.cuts);
     }
 };
 

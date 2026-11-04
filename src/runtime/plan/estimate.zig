@@ -33,6 +33,7 @@ const split = @import("../../connect/split.zig");
 const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const msgfmt = @import("../../format/msgfmt.zig");
 
 pub const Estimate = struct {
@@ -111,7 +112,7 @@ fn lineFormat(path: []const u8) bool {
 }
 
 fn parquetRows(path: []const u8) ?u64 {
-    var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var ar = std.heap.ArenaAllocator.init(pagecache.process);
     defer ar.deinit();
     const src = pqread.Bytes.open(ar.allocator(), path) catch return null;
     defer src.close();
@@ -125,8 +126,8 @@ fn parquetRows(path: []const u8) ?u64 {
 fn sampledRows(path: []const u8, size: u64) ?u64 {
     const f = std.fs.cwd().openFile(path, .{}) catch return null;
     defer f.close();
-    const buf = std.heap.page_allocator.alloc(u8, sample_len) catch return null;
-    defer std.heap.page_allocator.free(buf);
+    const buf = pagecache.process.alloc(u8, sample_len) catch return null;
+    defer pagecache.process.free(buf);
     const n = f.readAll(buf) catch return null;
     if (n == 0) return 0;
     const lines: u64 = std.mem.count(u8, buf[0..n], "\n");

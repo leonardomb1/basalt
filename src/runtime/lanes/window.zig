@@ -36,6 +36,7 @@ const parallel = @import("../parallel.zig");
 const resolveAt = @import("../plan.zig").resolveAt;
 const sortIdx = @import("../../exec/op/sort.zig").sortIdx;
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const types = @import("../../lang/types.zig");
 
 /// Rows one lane sent to one bucket, with their positions.
@@ -82,7 +83,7 @@ const TopKSink = struct {
         defer self.mtx.unlock();
         try self.lanes.ensureUnusedCapacity(gpa, 1);
         const l = try gpa.create(Lane);
-        l.* = .{ .keep = .init(std.heap.page_allocator), .sent = &.{}, .mem = mem };
+        l.* = .{ .keep = .init(pagecache.process), .sent = &.{}, .mem = mem };
         self.lanes.appendAssumeCapacity(l);
         l.sent = try l.keep.allocator().alloc(std.ArrayListUnmanaged(Part), self.nb);
         for (l.sent) |*x| x.* = .empty;

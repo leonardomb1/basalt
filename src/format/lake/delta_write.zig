@@ -38,6 +38,7 @@
 //! checkpoint's actions are nested structs and maps.
 
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const msgfmt = @import("../msgfmt.zig");
 const textconv = @import("../../exec/textconv.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
@@ -682,7 +683,7 @@ pub const Sink = struct {
             try self.finishFile(self.files.keys()[oldest]);
         }
         const mem = try self.gpa.create(std.heap.ArenaAllocator);
-        mem.* = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        mem.* = std.heap.ArenaAllocator.init(pagecache.process);
         errdefer {
             mem.deinit();
             self.gpa.destroy(mem);

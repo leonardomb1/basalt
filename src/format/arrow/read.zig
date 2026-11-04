@@ -44,6 +44,7 @@
 //! several, and which one a query meant is not something to guess.
 
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const msgfmt = @import("../msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const column = @import("../../exec/column.zig");
@@ -462,7 +463,7 @@ pub const Reader = struct {
     why: []const u8 = "",
     path: []const u8 = "",
     done: bool = false,
-    rb_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+    rb_arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(pagecache.process),
     cursors: []*Cursor = &.{},
     rb_rows: usize = 0,
     rb_off: usize = 0,

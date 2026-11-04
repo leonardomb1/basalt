@@ -11,6 +11,7 @@
 //! is reached (`error.ZipTooLarge`). Times are the DOS epoch, 1980-01-01.
 
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const zip = std.zip;
 const deflate = @import("deflate.zig");
 
@@ -69,7 +70,7 @@ pub const Writer = struct {
     }
 
     pub fn deinit(self: *Writer) void {
-        if (self.def) |d| d.deinit(std.heap.page_allocator);
+        if (self.def) |d| d.deinit(pagecache.process);
         self.def = null;
     }
 
@@ -126,7 +127,7 @@ pub const Writer = struct {
         self.open_name = try self.arena.dupe(u8, name);
         _ = try self.offset32();
         try self.localHeader(.{ .name = self.open_name, .method = .deflate, .flags = bit3, .crc = 0, .csize = 0, .usize = 0, .offset = 0 });
-        if (self.def) |d| try d.reset() else self.def = try deflate.Deflate.init(std.heap.page_allocator, &self.counter.writer, .{ .container = .raw, .level = .fast });
+        if (self.def) |d| try d.reset() else self.def = try deflate.Deflate.init(pagecache.process, &self.counter.writer, .{ .container = .raw, .level = .fast });
         self.member = .initHasher(&self.def.?.interface, .{}, self.member_buf);
         self.open_at = at;
         return &self.member.writer;

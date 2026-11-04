@@ -21,6 +21,7 @@ const joinBindingStages = @import("../plan.zig").joinBindingStages;
 const profile = @import("../../exec/profile.zig");
 const schemaPtr = @import("../env.zig").schemaPtr;
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const msgfmt = @import("../../format/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
@@ -607,7 +608,7 @@ const TestLane = struct {
     }
 
     fn probeAll(self: *TestLane) !void {
-        var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var ar = std.heap.ArenaAllocator.init(pagecache.process);
         defer ar.deinit();
         const a = ar.allocator();
         var ts = op_testing.TestSource{ .schema_ = op_testing.join_left_schema, .batches = self.probe };

@@ -1,5 +1,6 @@
 //! The basalt executable's entry point. Debug builds run on a leak-checking
-//! DebugAllocator, release builds on the SMP allocator; everything else is
+//! DebugAllocator, release builds on `pagecache.process` (the SMP allocator for
+//! small requests, recycled blocks for large ones); everything else is
 //! `cli.run`. The test block pulls every declaration under root.zig into the
 //! test build.
 
@@ -12,7 +13,7 @@ pub fn main() !void {
     defer if (builtin.mode == .Debug) {
         _ = debug_gpa.deinit();
     };
-    const gpa = if (builtin.mode == .Debug) debug_gpa.allocator() else std.heap.smp_allocator;
+    const gpa = if (builtin.mode == .Debug) debug_gpa.allocator() else root.pagecache.process;
     try root.cli.run(gpa);
 }
 

@@ -10,7 +10,7 @@ const types = @import("../lang/types.zig");
 const Column = @import("column.zig").Column;
 const column_mod = @import("column.zig");
 const intColumn = @import("column.zig").intColumn;
-const hugepages = @import("hugepages.zig");
+const pagecache = @import("pagecache.zig");
 
 pub const Batch = struct {
     /// The most rows a sliced source hands on at once; a multiple of 8, so each
@@ -64,7 +64,7 @@ pub const Batch = struct {
 /// across pulls). `rows` sits on `back`, never on a lane's arena, so a reset that
 /// outgrows one buffer and `deinit` give the decoded rows back.
 pub const Slicer = struct {
-    back: std.mem.Allocator = hugepages.pages,
+    back: std.mem.Allocator = pagecache.huge,
     rows: ?std.heap.ArenaAllocator = null,
     pend: ?Batch = null,
     at: usize = 0,

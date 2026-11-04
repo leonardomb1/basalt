@@ -10,6 +10,7 @@
 const DirSpace = @import("../exec/space.zig").DirSpace;
 const Space = @import("../exec/space.zig").Space;
 const std = @import("std");
+const pagecache = @import("../exec/pagecache.zig");
 const msgfmt = @import("../format/msgfmt.zig");
 
 pub const Scratch = struct {
@@ -189,7 +190,7 @@ test "Scratch makes a missing spill directory and creates from parallel threads"
     defer s.deinit();
     const Worker = struct {
         fn go(sc: *Scratch, ok: *bool) void {
-            var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            var ar = std.heap.ArenaAllocator.init(pagecache.process);
             defer ar.deinit();
             for (0..8) |_| {
                 const f = sc.space().create(ar.allocator(), "lane") catch return;

@@ -28,6 +28,7 @@ const parallel = @import("../parallel.zig");
 const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const msgfmt = @import("../../format/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const writeTail = @import("agg.zig").writeTail;
@@ -307,7 +308,7 @@ pub fn runParallelDistinct(
     const items = try arena.alloc(Item, nitems);
     for (items) |*it| it.* = .{ .arena = .init(env.gpa) };
     defer for (items) |*it| it.arena.deinit();
-    var strs_table = keytable.StrTable.init(std.heap.page_allocator);
+    var strs_table = keytable.StrTable.init(pagecache.process);
     defer strs_table.deinit();
     var strs: ?*keytable.StrTable = &strs_table;
     var g = DistinctSink{

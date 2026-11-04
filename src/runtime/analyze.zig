@@ -41,6 +41,7 @@
 //! EXPLAIN. Whole-program tests are in `analyze/tests.zig`.
 
 const std = @import("std");
+const pagecache = @import("../exec/pagecache.zig");
 const ast = @import("../lang/ast.zig");
 const expand = @import("../lang/expand.zig");
 const formats = @import("../format/formats.zig");
@@ -1971,7 +1972,7 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
         diag.pos = h.pos;
         return e;
     }
-    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var scratch = std.heap.ArenaAllocator.init(pagecache.process);
     defer scratch.deinit();
     _ = try writeOptions(scratch.allocator(), w, hints, diag);
     _ = try cutoverProblem(w, hints, diag);

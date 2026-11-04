@@ -62,6 +62,7 @@ const read = @import("aggregate/read.zig");
 const Ctx = aggFuncs.Ctx;
 const Moments = aggFuncs.Moments;
 const std = @import("std");
+const pagecache = @import("../pagecache.zig");
 const types = @import("../../lang/types.zig");
 
 pub const Window = struct {
@@ -885,7 +886,7 @@ pub const Window = struct {
     }
 
     fn alloc(self: *const Window) std.mem.Allocator {
-        return self.gpa orelse std.heap.page_allocator;
+        return self.gpa orelse pagecache.process;
     }
 
     /// Drains the child through a sort by partition and order keys that writes runs

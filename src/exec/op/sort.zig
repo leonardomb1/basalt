@@ -32,6 +32,7 @@ const eval = @import("../eval.zig");
 const floatord = @import("../floatord.zig");
 const decimal = @import("../decimal.zig");
 const std = @import("std");
+const pagecache = @import("../pagecache.zig");
 const types = @import("../../lang/types.zig");
 const Filter = @import("../op.zig").Filter;
 const Project = @import("../op.zig").Project;
@@ -56,7 +57,7 @@ pub const Sort = struct {
     spill_at: usize = std.math.maxInt(usize),
     fan_in: usize = 64,
     batch_rows: usize = 1 << 16,
-    gpa: std.mem.Allocator = std.heap.page_allocator,
+    gpa: std.mem.Allocator = pagecache.process,
     merge: ?*Merge = null,
     held: ?*Held = null,
     /// The child's batches are a materialized binding's, held uncopied (`Held.adopt`).
@@ -1002,7 +1003,7 @@ pub fn sortIdxMarked(out_arena: std.mem.Allocator, idx: []usize, arrs: []const K
     _ = out_arena;
     const n = idx.len;
     if (n == 0 or arrs.len == 0) return;
-    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var scratch = std.heap.ArenaAllocator.init(pagecache.process);
     defer scratch.deinit();
     const arena = scratch.allocator();
     const plans = try arena.alloc(KeyPlan, arrs.len);
@@ -1223,7 +1224,7 @@ const Deal = struct {
     fn sortRange(d: *Deal, g: usize) void {
         const part = d.idx[d.start[g]..d.start[g + 1]];
         if (part.len < 2) return;
-        var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        var ar = std.heap.ArenaAllocator.init(pagecache.process);
         defer ar.deinit();
         sortRows(ar.allocator(), part, d.arrs, d.plans, d.exact, d.marks, d.start[g]) catch |e| {
             d.errs[g] = e;
