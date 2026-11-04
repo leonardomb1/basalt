@@ -72,6 +72,7 @@
 //! or not the rest of that script succeeds.
 
 const std = @import("std");
+const pagecache = @import("../exec/pagecache.zig");
 const msgfmt = @import("../format/msgfmt.zig");
 const Flags = @import("args.zig").Flags;
 const sharedFlag = @import("args.zig").sharedFlag;
@@ -230,6 +231,7 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     defer catalog.deinit();
 
     while (queue.pop()) |raw| {
+        defer pagecache.trim();
         defer alloc.free(raw);
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();

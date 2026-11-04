@@ -23,6 +23,7 @@ const nextWord = @import("../entry.zig").nextWord;
 const prepareEntry = @import("../prepare.zig").prepareEntry;
 const runtime = @import("../../runtime/run.zig");
 const std = @import("std");
+const pagecache = @import("../../exec/pagecache.zig");
 const msgfmt = @import("../../format/msgfmt.zig");
 const suggest = @import("catalog.zig").suggest;
 const table = @import("../../connect/table.zig");
@@ -235,6 +236,7 @@ pub fn cmdRepl(alloc: std.mem.Allocator) !u8 {
     var quit = false;
     while (!quit) {
         runtime.resetAbort();
+        pagecache.trim();
         block.clearRetainingCapacity();
         while (true) {
             var line: []const u8 = undefined;

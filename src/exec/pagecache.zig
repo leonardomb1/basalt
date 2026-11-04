@@ -9,7 +9,9 @@
 //! class takes it back, or halves a block of a class or few above it, since a
 //! run's arenas grow to other sizes than the ones that freed their blocks; past
 //! `cache_cap` bytes held, a freed block is unmapped, and unmapping is costly in
-//! itself (each `munmap` shoots down every thread's TLB).
+//! itself (each `munmap` shoots down every thread's TLB). A process that outlives
+//! its statements (the kernel, the REPL) empties the cache between them (`trim`),
+//! so an idle session holds none of it.
 //! A reused block holds whatever its last owner wrote, as the `Allocator`
 //! contract allows; safety-checked builds fill it with 0xaa so that code reading
 //! memory it never wrote fails in tests rather than by luck.
@@ -100,6 +102,11 @@ fn pop(class: usize, alignment: usize) ?*Free {
     return null;
 }
 
+/// Files a freed block on its class's list, its pages kept as they are; false,
+/// nothing filed, past `cache_cap`. Advising them `MADV_FREE` so a container's
+/// memory limit could reclaim them was measured 5-10% slower on TPC-H SF1 for
+/// 1-10% less peak memory: clearing their dirty bits shoots down every thread's TLB,
+/// as `munmap` does.
 fn keep(ptr: [*]u8, class: usize) bool {
     const n = @as(usize, 1) << @intCast(class);
     cache.mtx.lock();
@@ -110,6 +117,23 @@ fn keep(ptr: [*]u8, class: usize) bool {
     cache.lists[class] = f;
     cache.held += n;
     return true;
+}
+
+/// Every cached block unmapped, for a process that outlives its statements (the
+/// kernel, the REPL): between them nothing wants the blocks, so what a statement
+/// freed goes back to the system and the next one maps afresh.
+pub fn trim() void {
+    if (!linux) return;
+    cache.mtx.lock();
+    defer cache.mtx.unlock();
+    for (&cache.lists, 0..) |*list, c| {
+        while (list.*) |f| {
+            list.* = f.next;
+            const p: [*]align(std.heap.page_size_min) u8 = @ptrCast(@alignCast(f));
+            std.posix.munmap(p[0 .. @as(usize, 1) << @intCast(c)]);
+        }
+    }
+    cache.held = 0;
 }
 
 /// A fresh mapping of `len` bytes on an `alignment` boundary, advised to the
@@ -222,6 +246,13 @@ test "pages: a freed block is reused with its pages, filled in safe builds; huge
     try std.testing.expectEqual(@as(u8, 1), half[0]);
     a.free(quarter);
     a.free(half);
+
+    const kept = try a.alloc(u8, 200 << 10);
+    a.free(kept);
+    if (linux) try std.testing.expect(cache.held > 0);
+    trim();
+    try std.testing.expectEqual(@as(usize, 0), cache.held);
+    for (cache.lists) |l| try std.testing.expect(l == null);
 
     const p = process;
     const s = try p.alloc(u8, 100);
