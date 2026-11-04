@@ -250,7 +250,7 @@ pub const palette = struct {
             .int, .float, .decimal => if (cell.len > 0 and cell[0] == '-') "\x1b[31m" else "\x1b[36m",
             .date, .time, .timestamp => "\x1b[35m",
             .bool => if (textconv.boolText(.printed, cell).?) "\x1b[32m" else "\x1b[31m",
-            .array, .@"struct" => "\x1b[33m",
+            .array, .@"struct", .map => "\x1b[33m",
             .bytes => "\x1b[2m",
             .string => "",
         };

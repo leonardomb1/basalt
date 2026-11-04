@@ -312,7 +312,7 @@ fn typeTable(fb: *flatbuf.Builder, ty: types.Type) !struct { tag: TypeTag, off: 
             try fb.addInt(i16, 0, 2);
             return .{ .tag = .timestamp, .off = try fb.endTable() };
         },
-        .array, .@"struct" => return error.ArrowUnsupportedType,
+        .array, .@"struct", .map => return error.ArrowUnsupportedType,
     }
 }
 
@@ -370,7 +370,7 @@ fn pushData(arena: std.mem.Allocator, body: *Body, col: *const Column, n: usize)
             }
             try body.push(b.values[base..end]);
         },
-        .array, .@"struct" => return error.ArrowUnsupportedType,
+        .array, .@"struct", .map => return error.ArrowUnsupportedType,
     }
 }
 

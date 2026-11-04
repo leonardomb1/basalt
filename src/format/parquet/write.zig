@@ -131,7 +131,7 @@ fn mapPhysical(t: types.Type, ph: Physical) Error!Mapping {
             if (p <= 18) break :blk .{ .phys = .int64, .converted = logical.conv_decimal, .precision = p, .scale = s };
             break :blk .{ .phys = .fixed_len_byte_array, .converted = logical.conv_decimal, .precision = p, .scale = s, .type_length = flbaLen(p) };
         },
-        .array, .@"struct" => Error.UnsupportedParquetWrite,
+        .array, .@"struct", .map => Error.UnsupportedParquetWrite,
     };
 }
 

@@ -68,8 +68,7 @@ fn walkNode(
     pos.* += 1;
 
     const r = e.repetition orelse .required;
-    const d2 = def + @as(u32, if (r == .required) 0 else 1);
-    const r2 = rep + @as(u32, if (r == .repeated) 1 else 0);
+    const d2, const r2 = step(def, rep, r);
     try path.append(.{ .name = e.name, .idx = idx, .def = d2, .repeated = r == .repeated, .list_group = !e.isLeaf() and isListGroup(e) });
     defer _ = path.pop();
 
@@ -109,6 +108,14 @@ fn walkNode(
     }
     const n: usize = @intCast(@max(0, e.num_children));
     for (0..n) |_| try walkNode(arena, schema, pos, chunk, out, path, d2, r2);
+}
+
+/// The definition and repetition levels below a node of repetition `r` under levels
+/// `def` and `rep`: a node that may be absent adds a definition level, a repeated
+/// one a repetition level too. The one rule the reader's walk and the writer's
+/// shape (`shape.zig`) both take their levels from.
+pub fn step(def: u32, rep: u32, r: parquet.Repetition) struct { u32, u32 } {
+    return .{ def + @intFromBool(r != .required), rep + @intFromBool(r == .repeated) };
 }
 
 fn joinPath(arena: std.mem.Allocator, nodes: []const PathNode) ![]const u8 {

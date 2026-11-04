@@ -97,6 +97,7 @@ const pg_rows = [_]Row{
     .{ .kind = .timestamp, .ddl = n("TIMESTAMP"), .cast = n("TIMESTAMP"), .echo = .{ .code = 1114 }, .wire = codes(&.{ 1114, 1184 }) },
     .{ .kind = .array, .ddl = n("TEXT"), .cast = null, .echo = .{ .code = 25 } },
     .{ .kind = .@"struct", .ddl = n("TEXT"), .cast = null, .echo = .{ .code = 25 } },
+    .{ .kind = .map, .ddl = n("TEXT"), .cast = null, .echo = .{ .code = 25 } },
 };
 
 const my_int = codes(&.{ 0x08, 0x01, 0x02, 0x03, 0x09, 0x0d, 0x10 });
@@ -121,6 +122,7 @@ const mysql_rows = [_]Row{
     .{ .kind = .timestamp, .ddl = n("DATETIME"), .cast = n("DATETIME"), .echo = .{ .code = 0x0c }, .wire = my_timestamp },
     .{ .kind = .array, .ddl = n("TEXT"), .cast = null, .echo = .{ .code = 0xfc } },
     .{ .kind = .@"struct", .ddl = n("TEXT"), .cast = null, .echo = .{ .code = 0xfc } },
+    .{ .kind = .map, .ddl = n("TEXT"), .cast = null, .echo = .{ .code = 0xfc } },
 };
 
 const sqlserver_rows = [_]Row{
@@ -135,6 +137,7 @@ const sqlserver_rows = [_]Row{
     .{ .kind = .timestamp, .ddl = n("DATETIME2"), .cast = n("DATETIME2"), .echo = .{ .code = 0x2A }, .wire = codes(&.{ 0x3D, 0x3A, 0x6F, 0x2A, 0x2B }) },
     .{ .kind = .array, .ddl = n("TEXT"), .cast = null, .echo = .{ .code = 0x23 } },
     .{ .kind = .@"struct", .ddl = n("TEXT"), .cast = null, .echo = .{ .code = 0x23 } },
+    .{ .kind = .map, .ddl = n("TEXT"), .cast = null, .echo = .{ .code = 0x23 } },
 };
 
 const starrocks_rows = [_]Row{
@@ -149,6 +152,7 @@ const starrocks_rows = [_]Row{
     .{ .kind = .timestamp, .ddl = n("DATETIME"), .cast = n("DATETIME"), .echo = .{ .code = 0x0c }, .wire = my_timestamp },
     .{ .kind = .array, .ddl = n("STRING"), .cast = null, .echo = .{ .code = 0xfd } },
     .{ .kind = .@"struct", .ddl = n("JSON"), .cast = null, .echo = .{ .code = 0xf5 } },
+    .{ .kind = .map, .ddl = n("JSON"), .cast = null, .echo = .{ .code = 0xf5 } },
 };
 
 const doris_rows = [_]Row{
@@ -163,6 +167,7 @@ const doris_rows = [_]Row{
     .{ .kind = .timestamp, .ddl = n("DATETIME(6)"), .cast = n("DATETIME"), .echo = .{ .code = 0x0c }, .wire = my_timestamp },
     .{ .kind = .array, .ddl = n("STRING"), .cast = null, .echo = .{ .code = 0xfd } },
     .{ .kind = .@"struct", .ddl = n("JSON"), .cast = null, .echo = .{ .code = 0xf5 } },
+    .{ .kind = .map, .ddl = n("JSON"), .cast = null, .echo = .{ .code = 0xf5 } },
 };
 
 pub const rows = std.EnumArray(Dialect, []const Row).init(.{
@@ -175,11 +180,11 @@ pub const rows = std.EnumArray(Dialect, []const Row).init(.{
 
 /// The kinds each dialect's declared column reads back as something else.
 pub const lossy = std.EnumArray(Dialect, []const TypeKind).init(.{
-    .postgres = &.{ .array, .@"struct" },
-    .mysql = &.{ .bool, .time, .array, .@"struct" },
-    .sqlserver = &.{ .bytes, .array, .@"struct" },
-    .starrocks = &.{ .bool, .bytes, .time, .array, .@"struct" },
-    .doris = &.{ .bool, .bytes, .time, .array, .@"struct" },
+    .postgres = &.{ .array, .@"struct", .map },
+    .mysql = &.{ .bool, .time, .array, .@"struct", .map },
+    .sqlserver = &.{ .bytes, .array, .@"struct", .map },
+    .starrocks = &.{ .bool, .bytes, .time, .array, .@"struct", .map },
+    .doris = &.{ .bool, .bytes, .time, .array, .@"struct", .map },
 });
 
 /// The kind a wire code reads as when no row lists it: text on PostgreSQL and the
@@ -288,7 +293,7 @@ fn pinnedDdl(self: Dialect, arena: std.mem.Allocator, ty: types.Type, is_key: bo
             .postgres, .mysql, .sqlserver => "TEXT",
             .starrocks, .doris => "STRING",
         },
-        .@"struct" => switch (self) {
+        .@"struct", .map => switch (self) {
             .postgres, .mysql, .sqlserver => "TEXT",
             .starrocks, .doris => "JSON",
         },
@@ -320,7 +325,7 @@ fn pinnedCast(self: Dialect, arena: std.mem.Allocator, ty: types.Type) !?[]const
             .mysql, .starrocks, .doris => "DATETIME",
             .sqlserver => "DATETIME2",
         },
-        .bool, .bytes, .array, .@"struct" => null,
+        .bool, .bytes, .array, .@"struct", .map => null,
     };
 }
 
@@ -371,8 +376,8 @@ fn pinnedTds(t: u8) ?TypeKind {
     };
 }
 
-fn sampleTypes() [15]types.Type {
-    var out: [15]types.Type = undefined;
+fn sampleTypes() [std.enums.values(TypeKind).len + 4]types.Type {
+    var out: [std.enums.values(TypeKind).len + 4]types.Type = undefined;
     var i: usize = 0;
     for (std.enums.values(TypeKind)) |k| {
         out[i] = types.Type.init(k);

@@ -732,7 +732,7 @@ pub fn storageOf(kind: types.TypeKind) Tag {
         .int, .time, .timestamp => .i64,
         .float => .f64,
         .decimal => .dec,
-        .string, .bytes, .array, .@"struct" => .bytes,
+        .string, .bytes, .array, .@"struct", .map => .bytes,
     };
 }
 
@@ -860,7 +860,7 @@ pub const Column = struct {
             return if (self.ty.kind == .bytes) .{ .bytes = v } else .{ .string = v };
         }
         return switch (self.ty.kind) {
-            .array, .@"struct" => .null,
+            .array, .@"struct", .map => .null,
             .decimal => .{ .decimal = decimals(self).at(i) },
             inline else => |k| blk: {
                 const t = comptime storageOf(k);

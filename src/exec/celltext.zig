@@ -68,7 +68,7 @@ pub const Utf8Runs = struct {
 };
 
 pub fn isNull(c: *const Column, r: usize) bool {
-    return !c.validity.get(r) or c.ty.kind == .array or c.ty.kind == .@"struct";
+    return !c.validity.get(r) or c.ty.kind == .array or c.ty.kind == .@"struct" or c.ty.kind == .map;
 }
 
 pub inline fn write(w: anytype, c: *const Column, r: usize, p: anytype) !void {
@@ -77,7 +77,7 @@ pub inline fn write(w: anytype, c: *const Column, r: usize, p: anytype) !void {
     switch (c.ty.kind) {
         .string => return p.string(w, c.data.bytes.at(r)),
         .bytes => return if (@hasDecl(P, "bytes")) p.bytes(w, c.data.bytes.at(r)) else p.string(w, c.data.bytes.at(r)),
-        .array, .@"struct" => return if (escapes(P)) p.string(w, "") else w.writeAll(P.null_text),
+        .array, .@"struct", .map => return if (escapes(P)) p.string(w, "") else w.writeAll(P.null_text),
         else => {},
     }
     if (escapes(P)) {
@@ -94,7 +94,7 @@ pub inline fn write(w: anytype, c: *const Column, r: usize, p: anytype) !void {
 pub fn text(c: *const Column, r: usize, buf: *[scalar_bound]u8, p: anytype) []const u8 {
     switch (c.ty.kind) {
         .string, .bytes => return c.data.bytes.at(r),
-        .array, .@"struct" => return "",
+        .array, .@"struct", .map => return "",
         else => {},
     }
     var fw = std.Io.Writer.fixed(buf);
@@ -186,7 +186,7 @@ inline fn scalar(w: anytype, c: *const Column, r: usize, p: anytype) !void {
             try writeTemporal(w, c.ty.kind, if (c.ty.kind == .date) c.data.i32[r] else c.data.i64[r], P);
             try w.writeAll(q);
         },
-        .string, .bytes, .array, .@"struct" => unreachable,
+        .string, .bytes, .array, .@"struct", .map => unreachable,
     }
 }
 
@@ -205,7 +205,7 @@ pub fn writeTemporal(w: anytype, kind: types.TypeKind, x: i64, comptime P: type)
 /// Tests' fixture: a one-column batch of `kind` over the values sinks spell
 /// differently, its last row null; decimals carry scales other than the column's.
 pub fn goldenColumn(arena: std.mem.Allocator, kind: types.TypeKind) !Batch {
-    const nested = kind == .array or kind == .@"struct";
+    const nested = kind == .array or kind == .@"struct" or kind == .map;
     const ty = if (kind == .decimal) types.Type.decimal(14, 2).asNullable() else types.Type.init(kind).asNullable();
     var b = column.Builder.init(arena, if (nested) types.Type.init(.string).asNullable() else ty);
     switch (kind) {
@@ -218,7 +218,7 @@ pub fn goldenColumn(arena: std.mem.Allocator, kind: types.TypeKind) !Batch {
         .date => for ([_]i32{ 0, 19723, -719528, std.math.minInt(i32) + 1 }) |x| try b.append(.{ .date = x }),
         .time => for ([_]i64{ 0, 3_723_000_001, 86_399_999_999 }) |x| try b.append(.{ .time = x }),
         .timestamp => for ([_]i64{ 0, 1_704_067_200_123_456, -1, -62_135_596_800_000_000 }) |x| try b.append(.{ .timestamp = x }),
-        .array, .@"struct" => try b.append(.{ .string = "x" }),
+        .array, .@"struct", .map => try b.append(.{ .string = "x" }),
     }
     try b.append(.null);
     const cols = try arena.alloc(Column, 1);

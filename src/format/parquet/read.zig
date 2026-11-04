@@ -699,6 +699,8 @@ test {
     _ = @import("nested.zig");
     _ = @import("../bytes.zig");
     _ = @import("schema.zig");
+    _ = @import("shape.zig");
+    _ = @import("shred.zig");
     _ = @import("stats.zig");
     _ = @import("testing_util.zig");
 }

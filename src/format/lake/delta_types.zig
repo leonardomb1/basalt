@@ -102,7 +102,7 @@ pub fn deltaName(k: types.TypeKind) ?[]const u8 {
         .bytes => "binary",
         .date => "date",
         .timestamp => "timestamp",
-        .decimal, .time, .array, .@"struct" => null,
+        .decimal, .time, .array, .@"struct", .map => null,
     };
 }
 
@@ -375,7 +375,7 @@ test "delta_types: a new table's column names and decimals" {
     try testing.expectEqualStrings("binary", deltaName(.bytes).?);
     try testing.expectEqualStrings("date", deltaName(.date).?);
     try testing.expectEqualStrings("timestamp", deltaName(.timestamp).?);
-    for ([_]types.TypeKind{ .decimal, .time, .array, .@"struct" }) |k| try testing.expect(deltaName(k) == null);
+    for ([_]types.TypeKind{ .decimal, .time, .array, .@"struct", .map }) |k| try testing.expect(deltaName(k) == null);
     inline for (std.meta.fields(types.TypeKind)) |f| {
         const k: types.TypeKind = @enumFromInt(f.value);
         if (deltaName(k)) |n| try testing.expectEqual(k, scalarType(n, .write).?.kind);

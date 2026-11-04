@@ -48,7 +48,7 @@ pub const Error = error{ AvroUnsupportedType, AvroBadName, AvroCodecUnsupported,
 /// Why a column cannot be written, null when every one can.
 pub fn schemaProblem(schema: types.Schema) ?anyerror {
     for (schema.fields) |f| {
-        if (f.ty.kind == .array or f.ty.kind == .@"struct")
+        if (f.ty.kind == .array or f.ty.kind == .@"struct" or f.ty.kind == .map)
             return stream.explainf(error.AvroUnsupportedType, "column `{s}` is an array or struct, which basalt does not write to Avro", .{f.name});
         if (!schema_mod.validName(f.name))
             return stream.explainf(error.AvroBadName, "column `{s}` is not a name Avro allows (letters, digits and `_`, not starting with a digit); rename it with AS", .{f.name});
@@ -76,7 +76,7 @@ pub fn schemaJson(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
             .date => try w.writeAll("{\"type\":\"int\",\"logicalType\":\"date\"}"),
             .time => try w.writeAll("{\"type\":\"long\",\"logicalType\":\"time-micros\"}"),
             .timestamp => try w.writeAll("{\"type\":\"long\",\"logicalType\":\"local-timestamp-micros\"}"),
-            .array, .@"struct" => unreachable,
+            .array, .@"struct", .map => unreachable,
         }
         try w.writeAll("],\"default\":null}");
     }
@@ -372,7 +372,7 @@ fn randomValue(r: std.Random, a: std.mem.Allocator, ty: types.Type) !Value {
         .date => .{ .date = if (edge) std.math.minInt(i32) + 1 else r.int(i32) },
         .time => .{ .time = r.intRangeLessThan(i64, 0, civil.us_per_day) },
         .timestamp => .{ .timestamp = if (edge) (if (r.boolean()) std.math.minInt(i64) else std.math.maxInt(i64)) else r.int(i64) },
-        .array, .@"struct" => unreachable,
+        .array, .@"struct", .map => unreachable,
     };
 }
 

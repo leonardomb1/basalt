@@ -297,7 +297,7 @@ pub const TypeCtx = struct {
     /// since `concat(id, '-', name)` is too common to refuse. Only nested values fail.
     pub fn wantText(self: *TypeCtx, c: ast.Expr.Call, i: usize) TypeError!Type {
         const t = try self.argType(c, i);
-        if (t.kind == .array or t.kind == .@"struct")
+        if (t.kind == .array or t.kind == .@"struct" or t.kind == .map)
             return self.err("`{s}` argument {d} must be text, got {s}", .{ c.name, i + 1, @tagName(t.kind) });
         return t;
     }

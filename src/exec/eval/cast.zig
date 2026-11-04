@@ -393,7 +393,7 @@ test "castValue on castElem gives what the per-kind switch gave, for every kind 
         .{ .time = 86_399_999_999 },            .{ .timestamp = 0 },                    .{ .timestamp = -1 },
         .{ .timestamp = std.math.maxInt(i64) }, .{ .timestamp = std.math.minInt(i64) },
     };
-    const kinds = [_]types.TypeKind{ .bool, .int, .float, .decimal, .string, .bytes, .date, .time, .timestamp, .array, .@"struct" };
+    const kinds = [_]types.TypeKind{ .bool, .int, .float, .decimal, .string, .bytes, .date, .time, .timestamp, .array, .@"struct", .map };
     for (values) |v| for (kinds) |k| Orig.expectSameCast(a, v, k) catch |e| {
         std.debug.print("CAST({any} AS {s})\n", .{ v, @tagName(k) });
         return e;

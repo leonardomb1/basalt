@@ -273,7 +273,7 @@ pub fn appendBatchTsv(out: *std.array_list.Managed(u8), batch: Batch) !void {
 /// own bytes; a float in plain notation is the widest, at 5e-324.
 fn cellBound(kind: types.TypeKind) usize {
     return switch (kind) {
-        .string, .bytes, .array, .@"struct" => NULL_MARKER.len,
+        .string, .bytes, .array, .@"struct", .map => NULL_MARKER.len,
         .bool => 5,
         .int => 20,
         .float => 340,

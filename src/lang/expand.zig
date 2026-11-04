@@ -538,6 +538,7 @@ pub fn typeWord(k: types.TypeKind) []const u8 {
         .timestamp => "TIMESTAMP",
         .array => "ARRAY",
         .@"struct" => "STRUCT",
+        .map => "MAP",
     };
 }
 

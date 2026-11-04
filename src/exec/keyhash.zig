@@ -133,7 +133,7 @@ pub inline fn hashCell(h: *std.hash.Wyhash, col: *const Column, row: usize) void
         .time => hashTagged(h, .time, std.mem.asBytes(&col.data.i64[row])),
         .timestamp => hashTagged(h, .timestamp, std.mem.asBytes(&col.data.i64[row])),
         .string => hashTagged(h, .string, col.data.bytes.at(row)),
-        .bytes, .array, .@"struct" => hashTagged(h, .bytes, col.data.bytes.at(row)),
+        .bytes, .array, .@"struct", .map => hashTagged(h, .bytes, col.data.bytes.at(row)),
         .bool, .date, .decimal => hashValue(h, col.getValue(row)),
     }
 }

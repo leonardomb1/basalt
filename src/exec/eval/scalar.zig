@@ -384,7 +384,7 @@ noinline fn checkArgs(comptime args: anytype, comptime null_first: bool, self: *
     inline for (args, 0..) |a, i| if (i < c.args.len) {
         const t = try self.argType(c, i);
         const ok = switch (a) {
-            .str, .opt_str => t.kind != .array and t.kind != .@"struct",
+            .str, .opt_str => t.kind != .array and t.kind != .@"struct" and t.kind != .map,
             .int, .exact_int, .opt_int => intish(t),
             .num => numericish(t),
             .dec => t.kind == .decimal or intish(t),

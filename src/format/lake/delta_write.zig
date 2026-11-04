@@ -314,7 +314,11 @@ fn createCol(arena: std.mem.Allocator, name: []const u8, f: types.Schema.Field, 
             return .{ .name = f.name, .delta_type = try msgfmt.allocPrint(arena, "decimal({d},{d})", .{ d.precision, d.scale }), .ty = d, .src = src };
         },
         .time => return refuse("column `{s}` is a time of day, which Delta has no type for; cast it to a string or store microseconds as a number", .{f.name}),
-        .array, .@"struct" => return refuse("column `{s}` is {s}; basalt writes Delta tables of scalar columns", .{ f.name, if (t.kind == .array) "an array" else "a struct" }),
+        .array, .@"struct", .map => return refuse("column `{s}` is {s}; basalt writes Delta tables of scalar columns", .{ f.name, switch (t.kind) {
+            .array => "an array",
+            .map => "a map",
+            else => "a struct",
+        } }),
         else => {},
     }
     const dt = dtypes.deltaName(t.kind).?;
