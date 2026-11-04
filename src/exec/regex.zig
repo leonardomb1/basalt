@@ -482,8 +482,10 @@ fn isUnit(a: Atom) bool {
     };
 }
 
-/// Where a single-unit atom ends when it matches at `pos`.
-fn unitMatch(a: Atom, s: []const u8, pos: usize) ?usize {
+/// Where a single-unit atom ends when it matches at `pos`. Inline: it runs once a
+/// character of every repeat, and left a call (as it was once `find` grew its
+/// start prefilters) it made class patterns such as `[A-Z]+` about 40% slower.
+inline fn unitMatch(a: Atom, s: []const u8, pos: usize) ?usize {
     if (pos >= s.len) return null;
     const u = unitAt(s, pos);
     const ok = switch (a) {
