@@ -42,6 +42,7 @@
 //! `env.space` with `env.op_memory`, and removed when the run ends.
 
 const std = @import("std");
+const pagecache = @import("../exec/pagecache.zig");
 const msgfmt = @import("../format/msgfmt.zig");
 const ast = @import("../lang/ast.zig");
 const expand = @import("../lang/expand.zig");
@@ -115,6 +116,7 @@ const Scratch = @import("scratch.zig").Scratch;
 /// allocate from it alongside the reading thread, so an `ArenaAllocator` will not do.
 pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions, diag: *Diag) !Stats {
     const opts = opts_in;
+    pagecache.setCap(opts.op_memory);
     ftp.beginRun();
     defer {
         if (diag.msg.len > 0) {

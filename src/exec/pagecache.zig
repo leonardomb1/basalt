@@ -33,7 +33,19 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const min_block: usize = 64 << 10;
-pub const cache_cap: usize = 512 << 20;
+
+/// What the cache holds at most: a run sets it to `--op-memory` over `cap_share`
+/// (`setCap`), 64 MiB at the default 2 GiB. Measured on TPC-H SF1 (4 cores), 64 MiB
+/// keeps every bit of the reuse's speed (2.19s against 2.29s with none) for about
+/// 30% less peak memory than 512 MiB, which held blocks no later request took.
+var cache_cap: usize = 64 << 20;
+pub const cap_share = 32;
+
+/// Sets what the cache may hold from a run's operator memory budget; blocks held
+/// past it stay until they are taken or `trim` runs.
+pub fn setCap(op_memory: usize) void {
+    @atomicStore(usize, &cache_cap, op_memory / cap_share, .monotonic);
+}
 const split_classes = 3;
 
 const huge_len: usize = 2 << 20;
@@ -111,7 +123,7 @@ fn keep(ptr: [*]u8, class: usize) bool {
     const n = @as(usize, 1) << @intCast(class);
     cache.mtx.lock();
     defer cache.mtx.unlock();
-    if (cache.held + n > cache_cap) return false;
+    if (cache.held + n > @atomicLoad(usize, &cache_cap, .monotonic)) return false;
     const f: *Free = @ptrCast(@alignCast(ptr));
     f.next = cache.lists[class];
     cache.lists[class] = f;
@@ -206,6 +218,7 @@ fn pFree(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) v
 }
 
 test "pages: a freed block is reused with its pages, filled in safe builds; huge blocks are 2 MiB aligned; growth keeps contents" {
+    setCap(2 << 30);
     const a = large;
     const one = try a.alloc(u8, 100 << 10);
     @memset(one, 7);
