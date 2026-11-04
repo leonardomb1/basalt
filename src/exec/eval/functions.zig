@@ -121,7 +121,7 @@ const base = [_]Builtin{
     .{ .name = "ends_with", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.ends_with)).eval, .vec_fn = S(f.Match(.ends_with)).vec },
     .{ .name = "contains", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.contains)).eval, .vec_fn = S(f.Match(.contains)).vec },
     .{ .name = "search", .type_fn = fn_search.typeSearch, .eval_fn = fn_search.rowSearch, .vec_fn = fn_search.vecSearch },
-    .{ .name = "like", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.like)).eval, .vec_fn = S(f.Match(.like)).vec },
+    .{ .name = "like", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.like)).eval, .vec_fn = vectorized.like },
     .{ .name = "trim", .type_fn = typing.unaryString, .eval_fn = S(f.Trim).eval, .vec_fn = S(f.Trim).vec },
     .{ .name = "substr", .type_fn = typing.substr, .eval_fn = S(f.Substr).eval, .vec_fn = S(f.Substr).vec },
     .{ .name = "replace", .type_fn = typing.replace, .eval_fn = S(f.Replace).eval, .vec_fn = S(f.Replace).vec },

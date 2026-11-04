@@ -988,6 +988,31 @@ test "join: computed keys of bare columns take their side from where the columns
     }
 }
 
+test "LIKE over a column: a piece across two rows is no match, NULL stays NULL, anchored, multi-piece, _ and NOT LIKE" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const input = "id,s\n1,abc\n2,ab\n3,cde\n4,NULL\n5,xbcx\n6,special requests here\n7,requests special\n8,_bc_\n";
+    const out = try runToString(alloc, &tmp, input,
+        \\SELECT id, t LIKE '%bc%' AS a, t LIKE '%special%requests%' AS b, t NOT LIKE '%bc%' AS c,
+        \\       t LIKE 'ab%' AS d, t LIKE '%de' AS e, t LIKE 'abc' AS f, t LIKE '_bc_' AS g
+        \\FROM (SELECT id, nullif(s, 'NULL') AS t FROM '$IN') x ORDER BY id
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        \\id,a,b,c,d,e,f,g
+        \\1,true,false,false,true,false,true,false
+        \\2,false,false,true,true,false,false,false
+        \\3,false,false,true,false,true,false,false
+        \\4,,,,,,,
+        \\5,true,false,false,false,false,false,true
+        \\6,false,true,true,false,false,false,false
+        \\7,false,false,true,false,false,false,false
+        \\8,true,false,false,false,false,false,true
+        \\
+    , out);
+}
+
 test "aggregate: SUM over text is exact, typed by the sampled scale; AVG stays FLOAT" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

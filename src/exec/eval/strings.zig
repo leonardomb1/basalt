@@ -5,6 +5,7 @@ const EvalError = @import("../eval.zig").EvalError;
 const failWith = @import("support.zig").failWith;
 const max_str_bytes = @import("functions.zig").max_str_bytes;
 const pow10f = @import("../decimal.zig").pow10f;
+const simd = @import("../simd.zig");
 const std = @import("std");
 
 pub inline fn charWidth(s: []const u8, i: usize) usize {
@@ -233,6 +234,111 @@ pub fn likeMatch(s: []const u8, pat: []const u8) bool {
     }
     while (pi < pat.len and pat[pi] == '%') pi += 1;
     return pi == pat.len;
+}
+
+/// A LIKE pattern read once. With no `_`, a pattern is literal pieces between
+/// `%`s: the first held to the start unless the pattern opens with `%`, the last
+/// to the end unless it closes with one, each between them found leftmost after
+/// the one before, which is all a `%` can do. A piece is matched byte for byte,
+/// as `likeMatch` matches it: a piece of a UTF-8 pattern starts on a character,
+/// so it is found only where a character starts. A `_` (it counts characters),
+/// a pattern that is not UTF-8, or one of more than `max_pieces` pieces is left to
+/// `likeMatch`.
+pub const Like = struct {
+    pat: []const u8,
+    pieces: [max_pieces][]const u8 = undefined,
+    n: usize = 0,
+    lead: bool = false,
+    trail: bool = false,
+    general: bool = false,
+
+    const max_pieces = 8;
+
+    pub fn init(pat: []const u8) Like {
+        var l = Like{ .pat = pat };
+        if (std.mem.indexOfScalar(u8, pat, '_') != null or !std.unicode.utf8ValidateSlice(pat)) {
+            l.general = true;
+            return l;
+        }
+        l.lead = pat.len > 0 and pat[0] == '%';
+        l.trail = pat.len > 0 and pat[pat.len - 1] == '%';
+        var it = std.mem.tokenizeScalar(u8, pat, '%');
+        while (it.next()) |p| {
+            if (l.n == max_pieces) {
+                l.general = true;
+                return l;
+            }
+            l.pieces[l.n] = p;
+            l.n += 1;
+        }
+        return l;
+    }
+
+    pub fn match(self: *const Like, s: []const u8) bool {
+        if (self.general) return likeMatch(s, self.pat);
+        if (self.n == 0) return self.lead or s.len == 0;
+        var lo: usize = 0;
+        var hi: usize = s.len;
+        var first: usize = 0;
+        var stop: usize = self.n;
+        if (!self.lead) {
+            const p = self.pieces[0];
+            if (!std.mem.startsWith(u8, s, p)) return false;
+            if (self.n == 1 and !self.trail) return s.len == p.len;
+            lo = p.len;
+            first = 1;
+        }
+        if (!self.trail) {
+            const p = self.pieces[self.n - 1];
+            if (hi - lo < p.len or !std.mem.endsWith(u8, s, p)) return false;
+            hi -= p.len;
+            stop = self.n - 1;
+        }
+        for (self.pieces[first..stop]) |p| {
+            const at = simd.find(s[0..hi], p, lo) orelse return false;
+            lo = at + p.len;
+        }
+        return true;
+    }
+
+    /// A piece every match holds somewhere, the longest, for finding candidate
+    /// rows in many values at once; null when the pattern names none.
+    pub fn needle(self: *const Like) ?[]const u8 {
+        if (self.general or self.n == 0) return null;
+        var best = self.pieces[0];
+        for (self.pieces[1..self.n]) |p| if (p.len > best.len) {
+            best = p;
+        };
+        return best;
+    }
+};
+
+test "Like matches as likeMatch does, on generated strings and patterns, UTF-8 and stray bytes included" {
+    var prng = std.Random.DefaultPrng.init(0x11ce);
+    const r = prng.random();
+    const text_parts = [_][]const u8{ "a", "b", "ab", "%", "_", "é", "\xff", "\xc3" };
+    const pat_parts = [_][]const u8{ "a", "b", "ab", "ba", "%", "%", "é", "_" };
+    var sbuf: [32]u8 = undefined;
+    var pbuf: [32]u8 = undefined;
+    for (0..20000) |_| {
+        var sl: usize = 0;
+        for (0..r.uintLessThan(usize, 7)) |_| {
+            const t = text_parts[r.uintLessThan(usize, text_parts.len)];
+            @memcpy(sbuf[sl..][0..t.len], t);
+            sl += t.len;
+        }
+        var pl: usize = 0;
+        for (0..r.uintLessThan(usize, 6)) |_| {
+            const t = pat_parts[r.uintLessThan(usize, pat_parts.len)];
+            @memcpy(pbuf[pl..][0..t.len], t);
+            pl += t.len;
+        }
+        const s = sbuf[0..sl];
+        const p = pbuf[0..pl];
+        const l = Like.init(p);
+        try std.testing.expectEqual(likeMatch(s, p), l.match(s));
+        if (l.needle()) |nd| if (l.match(s)) try std.testing.expect(std.mem.indexOf(u8, s, nd) != null);
+    }
 }
 
 test "UTF-8 string helpers: substr, like, reverse, pad, case-map" {

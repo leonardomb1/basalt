@@ -33,7 +33,8 @@ const endSlice = @import("strings.zig").endSlice;
 const failWith = @import("support.zig").failWith;
 const isAscii = @import("strings.zig").isAscii;
 const isWordChar = @import("strings.zig").isWordChar;
-const likeMatch = @import("strings.zig").likeMatch;
+const Like = @import("strings.zig").Like;
+const simd = @import("../simd.zig");
 const max_str_bytes = @import("functions.zig").max_str_bytes;
 const padChars = @import("strings.zig").padChars;
 const parseHexI64 = @import("support.zig").parseHexI64;
@@ -84,8 +85,8 @@ pub fn Match(comptime how: Affix) type {
             return switch (how) {
                 .starts_with => std.mem.startsWith(u8, s, p),
                 .ends_with => std.mem.endsWith(u8, s, p),
-                .contains => std.mem.indexOf(u8, s, p) != null,
-                .like => likeMatch(s, p),
+                .contains => simd.find(s, p, 0) != null,
+                .like => Like.init(p).match(s),
             };
         }
     };

@@ -36,6 +36,7 @@
 //! nothing ends the loop, so `(a*)*` cannot spin.
 
 const std = @import("std");
+const simd = @import("simd.zig");
 
 pub const Error = error{ BadPattern, OutOfMemory, PatternTooComplex };
 
@@ -156,7 +157,7 @@ pub const Regex = struct {
                 if (s.len < from + n or !std.mem.endsWith(u8, s, self.text)) return null;
                 return .{ s.len - n, s.len };
             }
-            const at = std.mem.indexOfPos(u8, s, from, self.text) orelse return null;
+            const at = simd.find(s, self.text, from) orelse return null;
             return .{ at, at + n };
         }
     };
@@ -295,11 +296,11 @@ pub const Regex = struct {
         var sfa = std.heap.stackFallback(8 * 1024, std.heap.smp_allocator);
         var m = Machine{ .s = s, .caps = caps, .gpa = sfa.get(), .steps = 10_000_000 + 4 * @as(u64, s.len) };
         defer m.deinit();
-        if (self.need.len > 0 and std.mem.indexOfPos(u8, s, from, self.need) == null) return null;
+        if (self.need.len > 0 and simd.find(s, self.need, from) == null) return null;
         var start = from;
         while (start <= s.len) : (start += if (start < s.len) unitAt(s, start).len else 1) {
             if (self.prefix.len > 0) {
-                start = std.mem.indexOfPos(u8, s, start, self.prefix) orelse return null;
+                start = simd.find(s, self.prefix, start) orelse return null;
             } else if (self.first) |set| {
                 while (start < s.len and !set[s[start]]) start += 1;
                 if (start == s.len) return null;

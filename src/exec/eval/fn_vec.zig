@@ -13,6 +13,12 @@ const std = @import("std");
 const civil = @import("../civil.zig");
 const clockOf = @import("support.zig").clockOf;
 const strArg = @import("vec.zig").strArg;
+const asStr = @import("vec.zig").asStr;
+const Filled = @import("vec.zig").Filled;
+const Scalar = @import("scalar.zig").Scalar;
+const Match = @import("fn_scalar.zig").Match;
+const Like = @import("strings.zig").Like;
+const simd = @import("../simd.zig");
 const strAt = @import("vec.zig").strAt;
 const compareVecs = @import("vec.zig").compareVecs;
 const evalVec = @import("vec.zig").evalVec;
@@ -54,6 +60,48 @@ pub const vectorized = struct {
             any = true;
         }
         return mkCol(Type.init(.string).withNull(any), n, bm, .{ .bytes = try out.finish() });
+    }
+
+    /// `s LIKE p` over a string column and one pattern, read once (`Like`): its
+    /// longest piece is searched for across the batch's bytes at once, and only a
+    /// row the piece lies wholly inside is matched, so a row without it is never
+    /// visited. Any other shape runs row by row, as `Match(.like)`.
+    pub fn like(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+        if (c.args.len != 2) return error.Unsupported;
+        const sv = try evalVec(arena, c.args[0], batch);
+        const pv = try evalVec(arena, c.args[1], batch);
+        const str = asStr(sv);
+        if (pv != .scalar or pv.scalar != .string or str == null or str.? != .col) {
+            return Scalar(Match(.like)).vecWith(arena, c, batch, &.{ sv, pv }, 0);
+        }
+        const d = str.?.col.d;
+        const valid = str.?.col.v;
+        const l = Like.init(pv.scalar.string);
+        const n = batch.len;
+        var out = try Filled(bool).init(arena, n);
+        @memset(out.d, false);
+        for (0..n) |i| if (!valid.get(i)) out.setNull(i);
+        if (l.needle()) |nd| {
+            const end: usize = @intCast(d.offsets[n]);
+            var at: usize = @intCast(d.offsets[0]);
+            var r: usize = 0;
+            while (r < n) {
+                const hit = simd.find(d.values[0..end], nd, at) orelse break;
+                while (@as(usize, @intCast(d.offsets[r + 1])) <= hit) r += 1;
+                if (hit + nd.len > @as(usize, @intCast(d.offsets[r + 1]))) {
+                    at = hit + 1;
+                    continue;
+                }
+                if (valid.get(r)) out.d[r] = l.match(d.at(r));
+                r += 1;
+                if (r < n) at = @intCast(d.offsets[r]);
+            }
+        } else for (0..n) |i| {
+            if (valid.get(i)) out.d[i] = l.match(d.at(i));
+        }
+        var res = out.finish(Type.init(.bool));
+        res.col.ty = Type.init(.bool).withNull(sv.col.ty.nullable or out.any);
+        return res;
     }
 
     /// NULL where `a = b`, else `a`, for operands of one kind (others run row by row).
