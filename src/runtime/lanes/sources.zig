@@ -26,6 +26,11 @@ const table_builtins = @import("../../connect/table_builtins.zig");
 const builtinArgs = @import("../connect/source.zig").builtinArgs;
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
+const obs = @import("../obs.zig");
+const op = @import("../../exec/op.zig");
+const Reader = @import("morsels.zig").Reader;
+const chainAt = @import("../plan.zig").chainAt;
+const chainOps = @import("../plan.zig").chainOps;
 const types = @import("../../lang/types.zig");
 
 /// One open Parquet reader as a lane source, its row groups handed on in
@@ -255,4 +260,43 @@ fn recordSplitFile(env: *Env, call: ast.BuiltinRead, w: ast.Write) anyerror!?*cs
         error.OutOfMemory => return e,
         else => null,
     };
+}
+
+/// The rows the filtered read `pre` (a read, then map stages) is estimated to leave
+/// of its `total`: its first morsel, or its first `limit` rows of it, run through it
+/// on this thread, the pass rate scaled up. A read the lanes cannot split counts as
+/// passing every row.
+pub fn passingRows(env: *Env, pre: []const ast.Stage, w: ast.Write, opts: RunOptions, total: u64, limit: u64) !u64 {
+    const src_base = env.sources.items.len;
+    defer {
+        for (env.sources.items[src_base..]) |sc| sc.close();
+        env.sources.shrinkRetainingCapacity(src_base);
+    }
+    const rd = pre[0].node.read;
+    var mapped: ?*csv.MappedCsv = null;
+    defer if (mapped) |mc| mc.close();
+    const m: Morsels = if (try parquetSplit(env, rd, pre[0].hints, pre[1..], w, opts)) |pm| pm else blk: {
+        mapped = (try csvSplitFile(env, rd, pre[0].hints, w)) orelse return total;
+        break :blk Morsels.ofCsv(mapped.?, &mapped.?.schema, opts.morsel_bytes);
+    };
+    if (m.count() == 0) return 0;
+    const recs = (try chainAt(env, m.schema().*, pre[1..])).recs;
+    var ar = std.heap.ArenaAllocator.init(env.gpa);
+    defer ar.deinit();
+    var rdr = Reader.init(env.gpa);
+    defer rdr.deinit();
+    const src = (try m.open(0, &rdr, ar.allocator())) orelse return total;
+    defer src.close();
+    var seen = obs.RowCounter{};
+    var cs = obs.CountingSource{ .inner = src, .count = &seen };
+    var scan = op.Scan{ .src = cs.source() };
+    const chain = try chainOps(ar.allocator(), env.errctx, recs, .{ .scan = &scan });
+    var kept: u64 = 0;
+    while (seen.load(.monotonic) < limit) {
+        const b = (try chain.next(ar.allocator())) orelse break;
+        kept += b.len;
+    }
+    const n = seen.load(.monotonic);
+    if (n == 0) return total;
+    return @intCast(std.math.mulWide(u64, kept, total) / n);
 }

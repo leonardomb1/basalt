@@ -33,6 +33,7 @@ const drive = @import("morsels.zig").drive;
 const parallel = @import("../parallel.zig");
 const parquetSplit = @import("sources.zig").parquetSplit;
 const csvSplitFile = @import("sources.zig").csvSplitFile;
+const passingRows = @import("sources.zig").passingRows;
 const csv = @import("../../format/csv.zig");
 const estimate = @import("../plan/estimate.zig");
 const joinorder = @import("../plan/joinorder.zig");
@@ -488,7 +489,10 @@ pub const Flip = struct {
 /// The first join of a lane aggregate flipped, as the serial plan flips one
 /// (`joinorder.zig`), when its kind has a mirror, nothing forbids it, its left side
 /// (`left`, the head read and the stages before the join) is estimated `flip_ratio`
-/// times smaller than its right and within the lane cap, and its right side is a
+/// times smaller than its right and within the lane cap (a right side that filters,
+/// against a left side of `sample_left` rows or more, is taken at the pass rate of
+/// its first rows, `passingRows`: q12's lineitem leaves 31K of 6M rows, which index
+/// far cheaper than its 1.5M orders), and its right side is a
 /// local Parquet or CSV read followed only by map stages, which the lanes read as
 /// they read a head. The join is resolved as written; the flipped one indexes the
 /// left rows on the written left keys and probes with the right rows, its kind
@@ -506,7 +510,13 @@ pub fn flipFirstJoin(env: *Env, left: []const ast.Stage, js: ast.Stage, suffix: 
     if (rstages.len == 0 or rstages[0].node != .read or rstages[0].hints.len > 0) return null;
     for (rstages[1..]) |st| if (!analyze.isMap(st.node, false)) return null;
     const cap = try laneJoinCap(env, j, js.hints);
-    const p = joinorder.decide(estimate.ofSide(env, left), estimate.ofSide(env, rstages), cap) orelse return null;
+    const left_est = estimate.ofSide(env, left);
+    const right_est = estimate.ofSide(env, rstages);
+    var p = joinorder.decide(left_est, right_est, cap) orelse return null;
+    if (filters(rstages[1..]) and (left_est.rows orelse 0) >= sample_left) if (right_est.rows) |total| {
+        const kept = try passingRows(env, rstages, w, opts, total, turn_sample);
+        p = joinorder.decide(left_est, .{ .rows = kept }, cap) orelse return null;
+    };
 
     const src_base = env.sources.items.len;
     var done = false;
@@ -583,6 +593,20 @@ pub fn flipFirstJoin(env: *Env, left: []const ast.Stage, js: ast.Stage, suffix: 
         .note = note,
         .read_at = profile.keyOf(rstages[0].pos),
     };
+}
+
+/// The rows a filtered right side's pass rate is taken over: enough for a ratio of
+/// `joinorder.flip_ratio`, too few to cost what a row group's text costs to decode.
+const turn_sample: u64 = 1 << 14;
+
+/// The left rows from which indexing them costs more than sampling the right side
+/// does (opening and decoding one of its row groups); below it the turn is taken on
+/// the estimates, as q13's 150K customers against 1.5M orders.
+const sample_left: u64 = 1 << 19;
+
+fn filters(stages: []const ast.Stage) bool {
+    for (stages) |st| if (st.node == .filter) return true;
+    return false;
 }
 
 fn mirror(kind: ast.JoinKind) ast.JoinKind {

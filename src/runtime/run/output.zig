@@ -71,6 +71,7 @@ const chainOps = @import("../plan.zig").chainOps;
 const obs = @import("../obs.zig");
 const parquetSplit = @import("../lanes/sources.zig").parquetSplit;
 const csvSplitFile = @import("../lanes/sources.zig").csvSplitFile;
+const passingRows = @import("../lanes/sources.zig").passingRows;
 const connect = @import("../connect.zig");
 const SinkShape = @import("../lanes.zig").SinkShape;
 const runParallelAgg = @import("../lanes/agg.zig").runParallelAgg;
@@ -307,7 +308,7 @@ const min_flip_rows: u64 = 1 << 16;
 /// goes as planned, having spent at most that many; so does one where the turn is
 /// declined. A first join is taken the same way when a filter on the head can leave
 /// few rows (q12: 31K of 6M lineitem rows against 1.5M orders), and its first rows'
-/// pass rate does not put it past the cap (`headPasses`).
+/// pass rate does not put it past the cap (`passingRows`).
 fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!bool {
     if (env.materialized.contains(flip_left)) return false;
     var last: ?usize = null;
@@ -344,7 +345,7 @@ fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: ast.
     inner[pre_len] = .{ .node = .{ .select = keep }, .hints = &.{}, .pos = pos };
     const mw = ast.Write{ .connector = mem_connector, .form = null, .target = "", .mode = .overwrite };
     inner[pre_len + 1] = .{ .node = .{ .write = mw }, .hints = &.{}, .pos = pos };
-    if (ji == 0 and try headPasses(env, inner[0 .. pre_len + 1], mw, opts, head_rows) > cap) return false;
+    if (ji == 0 and try passingRows(env, inner[0 .. pre_len + 1], mw, opts, head_rows, std.math.maxInt(u64)) > cap) return false;
     var ms = env_mod.MemSink{ .arena = env.shared orelse env.arena, .batches = std.array_list.Managed(Batch).init(env.shared orelse env.arena), .cap_rows = cap, .keep_rels = true };
     const before = if (ji == 0) "the filtered rows before" else "the joins before";
     {
@@ -376,41 +377,6 @@ fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: ast.
         try p.describe(profile.keyOf(pos), .scan, try msgfmt.allocPrint(env.arena, "{s}, in memory", .{what}));
     }
     return true;
-}
-
-/// The rows the filtered head `pre` is estimated to leave of its `total`: its first
-/// morsel run through it on this thread, the pass rate scaled up. A head the lanes
-/// cannot split counts as passing every row.
-fn headPasses(env: *Env, pre: []const ast.Stage, w: ast.Write, opts: RunOptions, total: u64) !u64 {
-    const src_base = env.sources.items.len;
-    defer {
-        for (env.sources.items[src_base..]) |sc| sc.close();
-        env.sources.shrinkRetainingCapacity(src_base);
-    }
-    const rd = pre[0].node.read;
-    var mapped: ?*MappedCsv = null;
-    defer if (mapped) |mc| mc.close();
-    const m: Morsels = if (try parquetSplit(env, rd, pre[0].hints, pre[1..], w, opts)) |pm| pm else blk: {
-        mapped = (try csvSplitFile(env, rd, pre[0].hints, w)) orelse return total;
-        break :blk Morsels.ofCsv(mapped.?, &mapped.?.schema, opts.morsel_bytes);
-    };
-    if (m.count() == 0) return 0;
-    const recs = (try chainAt(env, m.schema().*, pre[1..])).recs;
-    var ar = std.heap.ArenaAllocator.init(env.gpa);
-    defer ar.deinit();
-    var rdr = Reader.init(env.gpa);
-    defer rdr.deinit();
-    const src = (try m.open(0, &rdr, ar.allocator())) orelse return total;
-    defer src.close();
-    var seen = obs.RowCounter{};
-    var cs = obs.CountingSource{ .inner = src, .count = &seen };
-    var scan = op.Scan{ .src = cs.source() };
-    const chain = try chainOps(ar.allocator(), env.errctx, recs, .{ .scan = &scan });
-    var kept: u64 = 0;
-    while (try chain.next(ar.allocator())) |b| kept += b.len;
-    const n = seen.load(.monotonic);
-    if (n == 0) return total;
-    return @intCast(std.math.mulWide(u64, kept, total) / n);
 }
 
 /// The columns `rest` reads from what `pre` leaves, as select items written the way

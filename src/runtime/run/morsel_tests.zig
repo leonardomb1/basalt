@@ -258,6 +258,30 @@ test "a lane LEFT JOIN whose left side is smaller indexes it, reads the right si
     const keyed = "SELECT b.k, s.c, COUNT(*) AS n, SUM(b.id) AS t FROM '$B/small.csv' s LEFT JOIN '$B/in.csv' b ON s.sk = b.k GROUP BY b.k, s.c ORDER BY b.k, s.c";
     try testing.expectEqualStrings(try resultOf(a, tmp.dir, base, "", keyed, 4, opts), try resultOf(a, tmp.dir, base, "", keyed, 4, tight));
 }
+test "a first lane join whose right side filters to few rows gives the rows it gives as written, turned around or not, at every -j" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try writeCsv(tmp.dir, "in.csv", a);
+    var small = std.array_list.Managed(u8).init(a);
+    try small.appendSlice("sk,c\n");
+    for (0..2000) |i| try small.writer().print("{d},c{d}\n", .{ i * 3, i % 4 });
+    try tmp.dir.writeFile(.{ .sub_path = "small.csv", .data = small.items });
+    const opts = env_mod.RunOptions{ .morsel_bytes = 16 << 10 };
+
+    for ([_][]const u8{ "JOIN", "LEFT JOIN" }) |kind| {
+        const q = try msgfmt.allocPrint(a, "SELECT s.c, COUNT(*) AS n, COUNT(b.id) AS m, SUM(b.id) AS t FROM '$B/small.csv' s {s} '$B/in.csv' b ON s.sk = b.k AND b.id % 97 = 0 $W GROUP BY s.c ORDER BY s.c", .{kind});
+        const plain = try std.mem.replaceOwned(u8, a, q, "$W", "");
+        const as_written = try std.mem.replaceOwned(u8, a, q, "$W", "WITH (join_order = 'written')");
+        const auto = try resultOf(a, tmp.dir, base, "", plain, 4, opts);
+        try testing.expectEqualStrings(try resultOf(a, tmp.dir, base, "", as_written, 4, opts), auto);
+        try testing.expectEqualStrings(try resultOf(a, tmp.dir, base, "", plain, 1, opts), auto);
+    }
+}
+
 test "a later join's runtime filter narrows a Parquet build side the lanes read, rows the same with it and without, at every -j" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
