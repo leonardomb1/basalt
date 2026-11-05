@@ -130,7 +130,7 @@ pub fn evalVecNode(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch
         .is_null => |n| return isNullVec(arena, n, batch),
         .binary => |b| return binaryVec(arena, b, batch),
         .cast => |c| return castVec(arena, c, batch),
-        .index => return error.Unsupported,
+        .index => |x| return indexVec(arena, x, batch),
         .cond => |c| return condVec(arena, c, batch),
         .call => |c| return callVec(arena, c, batch),
         .match => |m| return matchVec(arena, m, batch),
@@ -662,6 +662,70 @@ fn castColVec(arena: std.mem.Allocator, col: Column, ty: Type, n: usize) VecErro
         else => castColWith(p[0], p[1], arena, column.fixedOf(comptime column.storageOf(p[0]), col.data), col, ty, n),
     };
     return error.Unsupported;
+}
+
+/// `e[key]` over a column: a struct's field by its constant name is the child
+/// column itself; a list's element or a map's value one gather of the child by
+/// the row each row picks, a row that picks none (past the end, no such key, a
+/// null list or key) null. A nested element is copied row by row instead, so a
+/// row that picks none is a null whose own children are null too.
+fn indexVec(arena: std.mem.Allocator, x: ast.Expr.Index, batch: Batch) VecError!Vec {
+    const base = switch (try evalVec(arena, x.e, batch)) {
+        .col => |c| c,
+        .scalar => return error.Unsupported,
+    };
+    if (base.data != .nested) return error.Unsupported;
+    const nd = base.data.nested;
+    const n = base.len;
+    switch (nd.body) {
+        .fields => |fs| {
+            if (x.key.* != .str_lit) return error.Unsupported;
+            for (nd.ty.fields orelse &.{}, fs) |f, c| if (std.mem.eql(u8, f.name, x.key.str_lit)) return .{ .col = c };
+            return error.Unsupported;
+        },
+        .list => |l| {
+            const keys = try evalVec(arena, x.key, batch);
+            const idx = try arena.alloc(usize, n);
+            const hit = try arena.alloc(bool, n);
+            const map = nd.ty.kind == .map;
+            const kv = if (map) l.child.data.nested.body.fields else &.{};
+            for (0..n) |r| {
+                hit[r] = false;
+                idx[r] = 0;
+                if (!base.validity.get(r)) continue;
+                const k: Value = switch (keys) {
+                    .scalar => |s| s,
+                    .col => |kc| kc.getValue(r),
+                };
+                if (k.isNull()) continue;
+                const lo: usize = @intCast(l.offsets[r]);
+                const hi: usize = @intCast(l.offsets[r + 1]);
+                if (!map) {
+                    if (k != .int or k.int < 1 or k.int > hi - lo) continue;
+                    idx[r] = lo + @as(usize, @intCast(k.int)) - 1;
+                    hit[r] = true;
+                    continue;
+                }
+                for (lo..hi) |e| if (compareValues(kv[0].getValue(e), k) == .eq) {
+                    idx[r] = e;
+                    hit[r] = true;
+                    break;
+                };
+            }
+            const vals = if (map) kv[1] else l.child;
+            if (vals.len == 0 or vals.data == .nested) {
+                var b = try column.Builder.initCapacity(arena, vals.ty.asNullable(), n);
+                for (0..n) |r| try b.append(if (hit[r]) vals.getValue(idx[r]) else .null);
+                return .{ .col = try b.finish() };
+            }
+            var out = try column.permute(arena, vals, idx);
+            var bm = try Bitmap.initFull(arena, n);
+            for (0..n) |r| if (!hit[r] or !out.validity.get(r)) bm.setValid(r, false);
+            out.validity = bm;
+            out.ty = out.ty.asNullable();
+            return .{ .col = out };
+        },
+    }
 }
 
 /// A column cast to nested type `ty`: JSON text parsed into one builder for the

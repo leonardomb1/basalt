@@ -519,3 +519,39 @@ test "nested columns are taken apart in place: list index, struct field, map loo
     defer alloc.free(c);
     try std.testing.expectEqualStrings("id,k,v\n2,0,\n4,0,\"[{\"\"a\"\":2,\"\"b\"\":\"\"y\"\"}]\"\n", c);
 }
+
+test "the list lambdas filter, transform, test and fold a LIST in place, its elements' fields and the row's columns in reach" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "l.parquet", .data = fixtures.lists_v1_parquet });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+    const script = try std.fmt.allocPrint(alloc,
+        \\LOAD INTO '{s}/n.csv' AS SELECT id, recs[1].b AS b, xs[id] AS x FROM '{s}/l.parquet' ORDER BY id;
+        \\LOAD INTO '{s}/q.csv' AS SELECT id FROM '{s}/l.parquet' WHERE EXISTS (SELECT 1 FROM '{s}/l.parquet' t WHERE t.recs[1].a = 2) ORDER BY id;
+        \\LOAD INTO '{s}' AS SELECT id, list_filter(xs, x -> x > 1) AS f, list_transform(xs, (x, i) -> x * 10 + i) AS t,
+        \\  list_any(xs, x -> x = 2) AS an, list_all(xs, x -> x > 0) AS al, list_reduce(xs, 0, (a, x) -> a + x) AS s,
+        \\  list_transform(recs, r -> concat(r.b, id)) AS rb
+        \\FROM '{s}/l.parquet' ORDER BY id;
+    , .{ base, base, base, base, base, out_path, base });
+    defer alloc.free(script);
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "id,f,t,an,al,s,rb\n" ++
+            "1,[2],\"[11,22]\",true,true,3,\"[\"\"x1\"\"]\"\n" ++
+            "2,[],[],false,true,0,\n" ++
+            "3,,,,,,[]\n" ++
+            "4,[5],\"[null,52]\",false,false,,\"[\"\"y4\"\"]\"\n",
+        out,
+    );
+    const n = try tmp.dir.readFileAlloc(alloc, "n.csv", 1 << 16);
+    defer alloc.free(n);
+    try std.testing.expectEqualStrings("id,b,x\n1,x,1\n2,,\n3,,\n4,y,\n", n);
+    const q = try tmp.dir.readFileAlloc(alloc, "q.csv", 1 << 16);
+    defer alloc.free(q);
+    try std.testing.expectEqualStrings("id\n1\n2\n3\n4\n", q);
+}

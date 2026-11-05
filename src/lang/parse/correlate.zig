@@ -60,12 +60,15 @@ pub fn captureSubquery(self: *Parser) Error!Captured {
     return .{ .pipe = pipe, .where_end = we, .refs = refs };
 }
 
-/// Refuses a correlated column whose table the outer query, now parsed, lacks.
+/// Refuses a correlated column whose table the outer query, now parsed, lacks. A
+/// subquery's own struct column's field is written with its table (`b.s.city`):
+/// a bare `s.city` there is taken for a column of the query around it, which is
+/// decided before either query's columns are known.
 pub fn checkCorrRefs(self: *Parser, refs: []const QualRef, aliases: *const AliasSet) Error!void {
     for (refs) |r| {
         const t = r.q.parts[0];
         if (!aliases.knows(t))
-            return self.fail(r.pos, "unknown table `{s}` in `{s}.{s}` — neither this subquery's FROM nor that of the query directly around it names or aliases `{s}` (a subquery may reference only the query directly around it)", .{ t, t, r.q.last(), t });
+            return self.fail(r.pos, "unknown table `{s}` in `{s}.{s}` — neither this subquery's FROM nor that of the query directly around it names or aliases `{s}` (a subquery may reference only the query directly around it; a struct column's field takes its own table there: `<table>.{s}.{s}`)", .{ t, t, r.q.last(), t, t, r.q.last() });
     }
 }
 

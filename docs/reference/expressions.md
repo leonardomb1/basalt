@@ -116,11 +116,24 @@ columns it has not seen.
   - `s.city` is a struct's field, `t.s.city` with its table named, to any depth
     (`s.addr.zip`). A name is a table's column first: `s.city` is the struct
     `s`'s field only when no table of the FROM is named or aliased `s`. The
-    column it gives is named for the field (`city`).
+    column it gives is named for the field (`city`). Inside a subquery a bare
+    `s.city` is read as the query around it naming its table `s`, since that is
+    settled before either query's columns are known: name the subquery's own
+    table there (`b.s.city`).
   - `l[i]` is a list's element, counted from 1; `m['k']` a map's value for a key;
     `s['city']` a struct's field. Past the end, or with no such key, it is NULL;
     `l[1].name` reaches into an element.
   - `cardinality(x)` is a list's or a map's length.
+  - `list_filter(l, x -> cond)`, `list_transform(l, x -> value)`,
+    `list_any(l, x -> cond)`, `list_all(l, x -> cond)` and
+    `list_reduce(l, initial, (acc, x) -> value)` work on a list's elements in
+    place, as the `json_*` lambdas do on a JSON array. The body sees the element
+    as `x` (`x.name` for a struct's field), its position from 1 as an optional
+    second parameter (`(x, i) -> …`), and the row's columns; a parameter
+    shadows a column of its name. A condition that is not true (false or NULL)
+    does not hold, and an empty list is false for `list_any`, true for
+    `list_all`. The body runs once over all of a batch's elements, not row by
+    row; `list_reduce` alone folds them one at a time.
   - `s.*` is a struct's fields as columns of their own.
   - `CROSS JOIN UNNEST(l) AS e` gives a row per element of a list (a map's
     entries as `e.key`, `e.value`), the row's other columns repeated; a NULL or

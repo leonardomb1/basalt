@@ -46,8 +46,10 @@ in place, without `UNNEST` and re-aggregating: the lambda's body is evaluated
 once per element with its parameter bound to it. `json_filter` keeps the
 elements whose condition is true, as written; `json_transform` returns the
 array of the body's values; `json_any` / `json_all` whether the condition is
-true for some / every element (an empty array: false / true). A Parquet list
-column cast to text (`CAST(tags AS STRING)`) is exactly such an array.
+true for some / every element (an empty array: false / true). A `LIST`
+column, a Parquet list for one, takes the `list_*` lambdas instead
+(`list_filter`, `list_transform`, … in [Expressions](expressions.md)), which
+read its elements in place.
 
 ```sql
 SELECT id,

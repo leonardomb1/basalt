@@ -14,6 +14,7 @@ const VecError = @import("vec.zig").VecError;
 const ast = @import("../../lang/ast.zig");
 const fn_search = @import("fn_search.zig");
 const per_row = @import("fn_row.zig").per_row;
+const fn_list = @import("fn_list.zig");
 const std = @import("std");
 const typing = @import("fn_typing.zig").typing;
 const vectorized = @import("fn_vec.zig").vectorized;
@@ -161,6 +162,11 @@ const base = [_]Builtin{
     .{ .name = "chr", .type_fn = typing.chr, .eval_fn = S(f.Chr).eval, .vec_fn = S(f.Chr).vec },
     .{ .name = "json_get", .type_fn = typing.jsonGet, .eval_fn = S(f.JsonGet).eval, .vec_fn = S(f.JsonGet).vec },
     .{ .name = "json_filter", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
+    .{ .name = "list_filter", .type_fn = fn_list.typing, .eval_fn = fn_list.rowFn, .vec_fn = fn_list.vecFn },
+    .{ .name = "list_transform", .type_fn = fn_list.typing, .eval_fn = fn_list.rowFn, .vec_fn = fn_list.vecFn },
+    .{ .name = "list_any", .type_fn = fn_list.typing, .eval_fn = fn_list.rowFn, .vec_fn = fn_list.vecFn },
+    .{ .name = "list_all", .type_fn = fn_list.typing, .eval_fn = fn_list.rowFn, .vec_fn = fn_list.vecFn },
+    .{ .name = "list_reduce", .type_fn = fn_list.typing, .eval_fn = fn_list.rowFn, .vec_fn = fn_list.vecFn },
     .{ .name = "json_transform", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
     .{ .name = "json_any", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },
     .{ .name = "json_all", .type_fn = typing.jsonLambda, .eval_fn = per_row.jsonLambda },

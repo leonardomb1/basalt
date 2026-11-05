@@ -198,7 +198,7 @@ pub const TypeCtx = struct {
                 return Type.init(.bool);
             },
             .let_in => return self.err("internal: `let … in` should have been expanded before type-checking", .{}),
-            .lambda => return self.err("a lambda (`x -> …`) is only an argument of json_filter, json_transform, json_any, json_all or json_reduce", .{}),
+            .lambda => return self.err("a lambda (`x -> …`) is only an argument of the json_* and list_* lambdas: filter, transform, any, all and reduce", .{}),
             .lambda_var => |n| return self.err("internal: lambda parameter `{s}` typed outside its function", .{n}),
         }
     }
