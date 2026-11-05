@@ -174,8 +174,11 @@ it still creates a table, and a `REPLACE` of no rows empties one.
 A created table is version 0 with protocol 1/2 and the rows' schema: `INT` as
 `long`, `FLOAT` as `double`, `DECIMAL(p,s)` as `decimal(p,s)`, `TIMESTAMP` as
 `timestamp` (UTC-adjusted in its files), `BOOL`, `STRING`, `BYTES` and `DATE` as
-`boolean`, `string`, `binary` and `date`, every column nullable. A `TIME`, a
-list, map or struct, or an untyped NULL column is refused, to be cast first.
+`boolean`, `string`, `binary` and `date`, every column nullable; a `STRUCT`,
+`LIST` or `MAP` as Delta's `struct`, `array` and `map` of those types, every
+field, element and value nullable. A `TIME` (at any depth) or an untyped NULL
+column is refused, to be cast first, and a list, map or struct cannot partition
+a table.
 `WITH (partition_by = 'c1, c2')` partitions it; a later write takes the table's
 own partition columns, and naming different ones is refused. A write to an
 existing table must give exactly its columns — by name, in any order; one
@@ -183,8 +186,12 @@ missing or one more is refused, as the schema is never changed — each of the
 table's type: an integer column of the table's `integer`, `short` or `byte` is
 written as one, its range checked; `float` as a 4-byte float; a decimal whose
 scale and integer digits fit the table's is rescaled to it, and a wider one is
-refused; `timestamp_ntz` as a local timestamp. A NULL in a column the table
-declares not nullable fails the write naming the column.
+refused; `timestamp_ntz` as a local timestamp. A struct, array or map column
+takes rows of its shape — the same field names in order, leaves of the same
+kinds, a decimal leaf the table's holds — its leaves written as the table types
+them, so a Spark table's `struct<id: integer>` gets a 4-byte `id`, and a value
+past it fails the write. A NULL in a column the table declares not nullable
+fails the write naming the column.
 
 Data files are `part-<uuid>.snappy.parquet` (`compression = 'gzip'` or `'none'`
 picks another codec), under Hive-style `col=value/` folders for a partitioned
@@ -199,7 +206,9 @@ NULL, as Delta reads it. Each `add` carries the
 file's statistics: `numRecords`, every data column's `nullCount`, and `minValues`
 and `maxValues` for numbers, dates, timestamps (cut to the millisecond, as the
 protocol allows) and strings (a string over 32 bytes has its 32-byte prefix as
-its minimum and no maximum); booleans and binary have none. At most 16 files are
+its minimum and no maximum); booleans and binary have none. A struct's fields
+have theirs nested under its name (`"minValues":{"s":{"id":1}}`), as Spark
+writes them; a list or a map has none. At most 16 files are
 open at once — the least recently written is closed when another partition
 needs one — and a file is closed at 128 MiB, so the data written holds memory
 near 16 Parquet row groups, and an object store's upload buffer each, however
@@ -209,8 +218,21 @@ files written, by its `add` line (a few hundred bytes) and path per file. The
 file count is what interleaving drives up: rows of more than 16 partitions
 interleaved across batches reopen a file per partition per batch, so ordering
 the rows by the partition columns keeps one file per partition, and with it the
-commit small. No checkpoint is written; a table basalt alone writes is replayed
-from its JSON commits.
+commit small.
+
+A commit landing at every tenth version (or every `delta.checkpointInterval`th,
+when the table sets it) is followed by a checkpoint of that version,
+`_delta_log/<version>.checkpoint.parquet`, and `_last_checkpoint` pointing at it,
+so a reader replays from there rather than from version 0. The checkpoint is the
+table's state as the protocol lays it out, one action a row: the protocol, the
+metadata, each application's last `txn`, each live `domainMetadata`, every live
+file's `add` whole (its statistics, tags and deletion vector as the log had
+them, whoever wrote it) and each `remove` still within
+`delta.deletedFileRetentionDuration` (a week by default), with Spark's column
+types, so Spark, delta-rs and DuckDB read it. It is written under a hidden name
+and renamed into place; one that cannot be written is a warning, never the
+write's failure, as the commit it follows has landed. A newer `_last_checkpoint`
+another writer left is not moved back.
 
 `UPSERT ON (k1, k2)` merges the rows into the table copy-on-write, in one
 commit: a row whose key matches a live row replaces it, a row with a new key is

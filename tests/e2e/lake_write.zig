@@ -184,6 +184,92 @@ test "Delta write: an existing table's types, narrower than basalt's, are writte
     try testing.expectEqualStrings("i,b,f,d,n\n7,-8,1.5,2.500,x2\n8,1,2.5,3.250,y2\n", try rows(a, &tmp, "SELECT * FROM '$B/n/' ORDER BY i"));
 }
 
+test "Delta write: lists, structs and maps create, append and UPSERT, a struct's fields with nested statistics, a table's narrow leaves kept" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const nest = "CAST(json_object('k', id, 'addr', json_object('city', grp), 'amt', amt) AS STRUCT(k INT, addr STRUCT(city STRING), amt DECIMAL(10,2))) AS s, CAST(json_array(id, amt) AS LIST(INT)) AS l, CAST(json_object(grp, id) AS MAP(STRING, INT)) AS m";
+    try load(&tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT id, {s} FROM '$B/a.csv';", .{nest}), 1);
+    const v0 = try logFile(a, &tmp, "t", 0);
+    try testing.expect(std.mem.indexOf(u8, v0, "\\\"type\\\":{\\\"type\\\":\\\"array\\\",\\\"elementType\\\":\\\"long\\\",\\\"containsNull\\\":true}") != null);
+    try testing.expect(std.mem.indexOf(u8, v0, "\\\"type\\\":{\\\"type\\\":\\\"map\\\",\\\"keyType\\\":\\\"string\\\",\\\"valueType\\\":\\\"long\\\",\\\"valueContainsNull\\\":true}") != null);
+    try testing.expect(std.mem.indexOf(u8, v0, "\\\"minValues\\\":{\\\"id\\\":1,\\\"s\\\":{\\\"k\\\":1,\\\"addr\\\":{\\\"city\\\":\\\"a\\\"},\\\"amt\\\":5.00}}") != null);
+    try testing.expect(std.mem.indexOf(u8, v0, "\\\"nullCount\\\":{\\\"id\\\":0,\\\"s\\\":{\\\"k\\\":0,\\\"addr\\\":{\\\"city\\\":0},\\\"amt\\\":0}}") != null);
+
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT id + 10 AS id, s, l, m FROM '$B/t/' WHERE id = 1;", 1);
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT id, CAST('{\"k\":99}' AS STRUCT(k INT, addr STRUCT(city STRING), amt DECIMAL(10,2))) AS s, l, m FROM '$B/t/' WHERE id = 2;", 4);
+    try testing.expectEqualStrings(
+        "id,k,city,amt,l,ma\n1,1,a,10.00,\"[1,10]\",1\n2,99,,,\"[2,20]\",2\n3,3,b,5.00,\"[3,5]\",\n11,1,a,10.00,\"[1,10]\",1\n",
+        try rows(a, &tmp, "SELECT id, s.k AS k, s.addr.city AS city, s.amt AS amt, l, m['a'] AS ma FROM '$B/t/' ORDER BY id"),
+    );
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' AS SELECT id, CAST('{\"k\":1}' AS STRUCT(k INT)) AS s, CAST(NULL AS LIST(INT)) AS l, CAST(NULL AS MAP(STRING, INT)) AS m FROM '$B/a.csv';", "column `s` is struct(k int) in the rows but struct(k int, addr struct(city string), amt decimal(10, 2)) in Delta table");
+    try harness.expectRefusedAlike(gpa, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/p/' WITH (format = 'delta', partition_by = 's') AS SELECT id, {s} FROM '$B/a.csv';", .{nest}), "cannot be partitioned by `s`, a list, map or struct");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/x/' WITH (format = 'delta') AS SELECT CAST('{\"t\":\"01:02:03\"}' AS STRUCT(t TIME)) AS s;", "holds a time of day");
+
+    const fields = "{\\\"name\\\":\\\"s\\\",\\\"type\\\":{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[{\\\"name\\\":\\\"i\\\",\\\"type\\\":\\\"integer\\\",\\\"nullable\\\":true,\\\"metadata\\\":{}},{\\\"name\\\":\\\"ts\\\",\\\"type\\\":\\\"timestamp\\\",\\\"nullable\\\":true,\\\"metadata\\\":{}}]},\\\"nullable\\\":true,\\\"metadata\\\":{}},{\\\"name\\\":\\\"l\\\",\\\"type\\\":{\\\"type\\\":\\\"array\\\",\\\"elementType\\\":\\\"short\\\",\\\"containsNull\\\":true},\\\"nullable\\\":true,\\\"metadata\\\":{}}";
+    try tmp.dir.makePath("n/_delta_log");
+    try tmp.dir.writeFile(.{ .sub_path = "n/_delta_log/00000000000000000000.json", .data = try std.fmt.allocPrint(a,
+        \\{{"protocol":{{"minReaderVersion":1,"minWriterVersion":2}}}}
+        \\{{"metaData":{{"id":"n","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{{\"type\":\"struct\",\"fields\":[{s}]}}","partitionColumns":[],"configuration":{{}},"createdTime":0}}}}
+        \\
+    , .{fields}) });
+    try load(&tmp, "LOAD INTO '$B/n/' AS SELECT CAST('{\"i\":7,\"ts\":\"2026-01-02 03:04:05\"}' AS STRUCT(i INT, ts TIMESTAMP)) AS s, CAST('[1,-2]' AS LIST(INT)) AS l;", 1);
+    try testing.expectEqualStrings("i,ts,l2\n7,2026-01-02 03:04:05,-2\n", try rows(a, &tmp, "SELECT s.i AS i, s.ts AS ts, l[2] AS l2 FROM '$B/n/'"));
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "n", 1), "\\\"maxValues\\\":{\\\"s\\\":{\\\"i\\\":7,\\\"ts\\\":\\\"2026-01-02T03:04:05.000Z\\\"}}") != null);
+    try runRefuses(a, &tmp, "LOAD INTO '$B/n/' AS SELECT CAST('{\"i\":3000000000}' AS STRUCT(i INT, ts TIMESTAMP)) AS s, CAST('[1]' AS LIST(INT)) AS l;", "a number inside a list, map or struct past its `integer`");
+    try runRefuses(a, &tmp, "LOAD INTO '$B/n/' AS SELECT CAST('{\"i\":3}' AS STRUCT(i INT, ts TIMESTAMP)) AS s, CAST('[40000]' AS LIST(INT)) AS l;", "past its `integer`, `short` or `byte`");
+    try testing.expect(!exists(&tmp, "n/_delta_log/00000000000000000002.json"));
+}
+
+test "Delta checkpoint: a commit at the table's interval writes one, carrying another writer's txn, domain and tags and the live tombstones, and reads start there" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT id, grp, amt FROM '$B/a.csv';", 1);
+    const v0 = try logFile(a, &tmp, "t", 0);
+    var lines = std.mem.splitScalar(u8, v0, '\n');
+    var meta: []const u8 = "";
+    var add: []const u8 = "";
+    while (lines.next()) |l| {
+        if (std.mem.startsWith(u8, l, "{\"metaData\":")) meta = l;
+        if (std.mem.startsWith(u8, l, "{\"add\":")) add = l;
+    }
+    const now = std.time.milliTimestamp();
+    const v1 = try std.mem.join(a, "\n", &.{
+        try std.mem.replaceOwned(u8, a, meta, "\"configuration\":{}", "\"configuration\":{\"delta.checkpointInterval\":\"2\"}"),
+        "{\"txn\":{\"appId\":\"app\",\"version\":5,\"lastUpdated\":1}}",
+        "{\"domainMetadata\":{\"domain\":\"d\",\"configuration\":\"{}\",\"removed\":false}}",
+        try std.mem.replaceOwned(u8, a, add, "{\"add\":{", "{\"add\":{\"tags\":{\"t\":\"1\"},"),
+        "{\"remove\":{\"path\":\"old.parquet\",\"deletionTimestamp\":1,\"dataChange\":true}}",
+        try std.fmt.allocPrint(a, "{{\"remove\":{{\"path\":\"new.parquet\",\"deletionTimestamp\":{d},\"dataChange\":true}}}}", .{now}),
+        "",
+    });
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000001.json", .data = v1 });
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT id + 10 AS id, grp, amt FROM '$B/a.csv' WHERE id = 1;", 1);
+    try testing.expect(exists(&tmp, "t/_delta_log/00000000000000000002.checkpoint.parquet"));
+    try testing.expect(std.mem.startsWith(u8, try tmp.dir.readFileAlloc(a, "t/_delta_log/_last_checkpoint", 1 << 10), "{\"version\":2,\"size\":7,"));
+    const cp = "'$B/t/_delta_log/00000000000000000002.checkpoint.parquet'";
+    try testing.expectEqualStrings("a,v\napp,5\n", try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT txn.appId AS a, txn.version AS v FROM {s} WHERE txn.appId IS NOT NULL", .{cp})));
+    try testing.expectEqualStrings("d\nd\n", try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT domainMetadata.domain AS d FROM {s} WHERE domainMetadata.domain IS NOT NULL", .{cp})));
+    try testing.expectEqualStrings("t,n\n1,2\n", try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT max(add.tags['t']) AS t, count(add.path) AS n FROM {s}", .{cp})));
+    try testing.expectEqualStrings("p,c\nnew.parquet,false\n", try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT remove.path AS p, remove.dataChange AS c FROM {s} WHERE remove.path IS NOT NULL", .{cp})));
+    try testing.expectEqualStrings("r,w\n1,2\n", try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT protocol.minReaderVersion AS r, protocol.minWriterVersion AS w FROM {s} WHERE protocol.minReaderVersion IS NOT NULL", .{cp})));
+    try tmp.dir.deleteFile("t/_delta_log/00000000000000000000.json");
+    try tmp.dir.deleteFile("t/_delta_log/00000000000000000001.json");
+    try testing.expectEqualStrings("id,grp,amt\n1,a,10\n2,a,20\n3,b,5\n11,a,10\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT id + 20 AS id, grp, amt FROM '$B/a.csv' WHERE id = 1;", 1);
+    try testing.expect(!exists(&tmp, "t/_delta_log/00000000000000000003.checkpoint.parquet"));
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT id + 30 AS id, grp, amt FROM '$B/a.csv' WHERE id = 1;", 1);
+    try testing.expect(std.mem.startsWith(u8, try tmp.dir.readFileAlloc(a, "t/_delta_log/_last_checkpoint", 1 << 10), "{\"version\":4,"));
+    try testing.expectEqualStrings("n\n6\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/t/'"));
+    const cp4 = "'$B/t/_delta_log/00000000000000000004.checkpoint.parquet'";
+    try testing.expectEqualStrings("a,t,n,d\napp,1,4,d\n", try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT max(txn.appId) AS a, max(add.tags['t']) AS t, count(add.path) AS n, max(domainMetadata.domain) AS d FROM {s}", .{cp4})));
+}
+
 test "Delta write: what is refused, at check where it can be seen" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();

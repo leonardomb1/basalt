@@ -111,8 +111,9 @@ fn planColumns(arena: std.mem.Allocator, schema: types.Schema, phys: []const Phy
                     error.UnsupportedNestedType => Error.UnsupportedParquetNestedType,
                 };
                 lay.* = .{ .first = @intCast(maps.items.len), .n = @intCast(sh.leaves.len), .shape = sh };
-                for (sh.leaves, sh.paths) |l, path| {
-                    var m = mapType(l.ty) catch return Error.UnsupportedParquetNestedType;
+                const lp: []const Physical = if (i < phys.len) phys[i].leaves else &.{};
+                for (sh.leaves, sh.paths, 0..) |l, path, j| {
+                    var m = mapPhysical(l.ty, if (j < lp.len) lp[j] else .{}) catch return Error.UnsupportedParquetNestedType;
                     m.optional = l.nullable;
                     try maps.append(m);
                     try paths.append(path);
@@ -178,11 +179,14 @@ const Mapping = struct {
 
 /// A column laid out narrower than its basalt type, or naming a timezone, for a
 /// file that must match a table's schema: an 8-, 16- or 32-bit integer, a 32-bit
-/// float, a timestamp adjusted to UTC.
+/// float, a timestamp adjusted to UTC; a nested column's `leaves` lay out its
+/// leaves so, in schema order (a struct's fields, a list's element, a map's key
+/// then value), each past the slice taking its type's own.
 pub const Physical = struct {
     int_bits: u8 = 64,
     float32: bool = false,
     utc: bool = false,
+    leaves: []const Physical = &.{},
 };
 
 fn mapType(t: types.Type) Error!Mapping {
@@ -832,8 +836,19 @@ pub const Writer = struct {
     }
 
     /// One column's statistics over the whole file: `bounded` false when a row
-    /// group held values but no min and max (a NaN), so the file has none.
-    pub const ColumnStats = struct { nulls: i64 = 0, min: ?Value = null, max: ?Value = null, bounded: bool = true };
+    /// group held values but no min and max (a NaN), so the file has none. A
+    /// nested column has none of its own but `leaves`, one per leaf no list or map
+    /// lies above (a struct's fields, to any depth), each with its `path` below the
+    /// column and its index among the column's leaves (`leaf`), in schema order.
+    pub const ColumnStats = struct {
+        nulls: i64 = 0,
+        min: ?Value = null,
+        max: ?Value = null,
+        bounded: bool = true,
+        path: []const []const u8 = &.{},
+        leaf: u32 = 0,
+        leaves: []ColumnStats = &.{},
+    };
 
     pub const Summary = struct { rows: i64, bytes: u64, columns: []ColumnStats };
 
@@ -847,32 +862,44 @@ pub const Writer = struct {
         const cols = try out.alloc(ColumnStats, self.lays.len);
         for (cols, self.lays) |*c, lay| {
             c.* = .{};
-            if (lay.shape != null) {
-                c.bounded = false;
+            const sh = lay.shape orelse {
+                try self.foldStats(out, c, lay.first);
                 continue;
+            };
+            c.bounded = false;
+            var leaves = std.ArrayList(ColumnStats).empty;
+            for (sh.leaves, sh.paths, 0..) |l, path, j| {
+                if (l.rep != 0) continue;
+                var ls = ColumnStats{ .path = try out.dupe([]const u8, path[1..]), .leaf = @intCast(j) };
+                try self.foldStats(out, &ls, lay.first + j);
+                try leaves.append(out, ls);
             }
-            const k = lay.first;
-            for (self.groups.items) |g| {
-                const ch = g.chunks[k];
-                c.nulls += ch.nulls;
-                if (ch.num_values - ch.nulls == 0) continue;
-                const mn = ch.min orelse {
-                    c.bounded = false;
-                    continue;
-                };
-                const mx = ch.max orelse {
-                    c.bounded = false;
-                    continue;
-                };
-                if (c.min == null or (eval.compareValues(mn, c.min.?) orelse .eq) == .lt) c.min = try own(out, mn);
-                if (c.max == null or (eval.compareValues(mx, c.max.?) orelse .eq) == .gt) c.max = try own(out, mx);
-            }
-            if (!c.bounded) {
-                c.min = null;
-                c.max = null;
-            }
+            c.leaves = leaves.items;
         }
         return .{ .rows = self.total_rows, .bytes = @intCast(self.offset), .columns = cols };
+    }
+
+    /// Leaf `k`'s chunks folded into `c`: their nulls summed, their bounds widened.
+    fn foldStats(self: *Writer, out: std.mem.Allocator, c: *ColumnStats, k: usize) !void {
+        for (self.groups.items) |g| {
+            const ch = g.chunks[k];
+            c.nulls += ch.nulls;
+            if (ch.num_values - ch.nulls == 0) continue;
+            const mn = ch.min orelse {
+                c.bounded = false;
+                continue;
+            };
+            const mx = ch.max orelse {
+                c.bounded = false;
+                continue;
+            };
+            if (c.min == null or (eval.compareValues(mn, c.min.?) orelse .eq) == .lt) c.min = try own(out, mn);
+            if (c.max == null or (eval.compareValues(mx, c.max.?) orelse .eq) == .gt) c.max = try own(out, mx);
+        }
+        if (!c.bounded) {
+            c.min = null;
+            c.max = null;
+        }
     }
 
     fn finish(self: *Writer, out: ?std.mem.Allocator) !?Summary {

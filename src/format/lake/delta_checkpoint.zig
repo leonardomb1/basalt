@@ -1,0 +1,252 @@
+//! Writing a Delta table's classic checkpoint: after a commit lands at a version
+//! that is a multiple of `delta.checkpointInterval` (10 when unset, as Spark has
+//! it), the table's state at that version is written to
+//! `_delta_log/<20-digit version>.checkpoint.parquet`, one action a row, and
+//! `_last_checkpoint` points at it. The state is replayed anew at that version with
+//! every action kept whole (`delta.snapshotWhole`), so what another writer put in
+//! the log (tags, `txn`, `domainMetadata`, a deletion vector) is carried, not only
+//! what basalt reads by.
+//!
+//! A row holds one of `protocol`, `metaData`, `txn`, `domainMetadata`, `add` or
+//! `remove`, the others NULL, each a struct column as the protocol lays it out;
+//! the fields the protocol types `int` (a protocol's versions, a deletion vector's
+//! offset and size) are written as INT32, as Spark's reader insists. An `add` or
+//! `remove` is written with `dataChange` false. A `remove` is kept until
+//! `delta.deletedFileRetentionDuration` (a week when unset) past its
+//! `deletionTimestamp`, as the tombstone a concurrent reader of an older version
+//! and VACUUM rely on.
+//!
+//! A local checkpoint is written under a hidden name and renamed into place, so a
+//! reader never lists a partial one; an object store's upload lands whole. A
+//! checkpoint is an optimisation: the commit it follows has landed, so a failure
+//! here is the caller's to report as a warning, never the write's failure.
+//! `_last_checkpoint` is not moved back past a newer checkpoint another writer made.
+//!
+//! The columns (`columns`) are typed as `schemaString` would type them, so the
+//! reader's own type mapping and leaf layouts serve; rows (`Rows`) are built a
+//! batch at a time; `Written` is what `_last_checkpoint` records.
+
+const std = @import("std");
+const delta = @import("delta.zig");
+const dlog = @import("delta_log.zig");
+const dtypes = @import("delta_types.zig");
+const table = @import("table.zig");
+const column = @import("../../exec/column.zig");
+const msgfmt = @import("../msgfmt.zig");
+const objstore = @import("../../store/objstore.zig");
+const pqwrite = @import("../parquet/write.zig");
+const types = @import("../../lang/types.zig");
+const testing = std.testing;
+
+/// Commits between checkpoints when the table does not set `delta.checkpointInterval`.
+pub const default_interval = 10;
+
+const default_retention_ms: i64 = 7 * 24 * 3600 * 1000;
+
+const rows_per_batch = 4096;
+
+const map_ss = "{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":\"string\",\"valueContainsNull\":true}";
+const dv_type = "{\"type\":\"struct\",\"fields\":[" ++
+    f("storageType", "\"string\"") ++ "," ++ f("pathOrInlineDv", "\"string\"") ++ "," ++ f("offset", "\"integer\"") ++ "," ++
+    f("sizeInBytes", "\"integer\"") ++ "," ++ f("cardinality", "\"long\"") ++ "," ++ f("maxRowIndex", "\"long\"") ++ "]}";
+
+fn f(comptime name: []const u8, comptime ty: []const u8) []const u8 {
+    return "{\"name\":\"" ++ name ++ "\",\"type\":" ++ ty ++ ",\"nullable\":true,\"metadata\":{}}";
+}
+
+fn st(comptime fields: []const u8) []const u8 {
+    return "{\"type\":\"struct\",\"fields\":[" ++ fields ++ "]}";
+}
+
+const columns = [_]struct { []const u8, []const u8 }{
+    .{ "txn", st(f("appId", "\"string\"") ++ "," ++ f("version", "\"long\"") ++ "," ++ f("lastUpdated", "\"long\"")) },
+    .{ "add", st(f("path", "\"string\"") ++ "," ++ f("partitionValues", map_ss) ++ "," ++ f("size", "\"long\"") ++ "," ++
+        f("modificationTime", "\"long\"") ++ "," ++ f("dataChange", "\"boolean\"") ++ "," ++ f("tags", map_ss) ++ "," ++
+        f("deletionVector", dv_type) ++ "," ++ f("baseRowId", "\"long\"") ++ "," ++ f("defaultRowCommitVersion", "\"long\"") ++ "," ++
+        f("clusteringProvider", "\"string\"") ++ "," ++ f("stats", "\"string\"")) },
+    .{ "remove", st(f("path", "\"string\"") ++ "," ++ f("deletionTimestamp", "\"long\"") ++ "," ++ f("dataChange", "\"boolean\"") ++ "," ++
+        f("extendedFileMetadata", "\"boolean\"") ++ "," ++ f("partitionValues", map_ss) ++ "," ++ f("size", "\"long\"") ++ "," ++
+        f("tags", map_ss) ++ "," ++ f("deletionVector", dv_type) ++ "," ++ f("baseRowId", "\"long\"") ++ "," ++
+        f("defaultRowCommitVersion", "\"long\"") ++ "," ++ f("stats", "\"string\"")) },
+    .{ "metaData", st(f("id", "\"string\"") ++ "," ++ f("name", "\"string\"") ++ "," ++ f("description", "\"string\"") ++ "," ++
+        f("format", st(f("provider", "\"string\"") ++ "," ++ f("options", map_ss))) ++ "," ++ f("schemaString", "\"string\"") ++ "," ++
+        f("partitionColumns", "{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true}") ++ "," ++
+        f("configuration", map_ss) ++ "," ++ f("createdTime", "\"long\"")) },
+    .{ "protocol", st(f("minReaderVersion", "\"integer\"") ++ "," ++ f("minWriterVersion", "\"integer\"") ++ "," ++
+        f("readerFeatures", "{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true}") ++ "," ++
+        f("writerFeatures", "{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true}")) },
+    .{ "domainMetadata", st(f("domain", "\"string\"") ++ "," ++ f("configuration", "\"string\"") ++ "," ++ f("removed", "\"boolean\"")) },
+};
+
+const Col = enum { txn, add, remove, metaData, protocol, domainMetadata };
+
+/// The checkpoint interval `st` asks for: `delta.checkpointInterval` when it is a
+/// positive number, else `default_interval`.
+pub fn interval(st_: *const delta.State) u64 {
+    const t = st_.property("delta.checkpointInterval") orelse return default_interval;
+    const n = std.fmt.parseInt(u64, std.mem.trim(u8, t, " "), 10) catch return default_interval;
+    return if (n == 0) default_interval else n;
+}
+
+/// Whether a commit at `version` is followed by a checkpoint, the table asking
+/// for one every `every` commits.
+pub fn due(version: u64, every: u64) bool {
+    return version > 0 and every > 0 and version % every == 0;
+}
+
+/// `delta.deletedFileRetentionDuration` (`interval 7 days`, Spark's spelling, in
+/// seconds to weeks) in milliseconds; a week when unset or unreadable.
+pub fn retentionMs(text: ?[]const u8) i64 {
+    const t = std.mem.trim(u8, text orelse return default_retention_ms, " ");
+    var it = std.mem.tokenizeScalar(u8, t, ' ');
+    var word = it.next() orelse return default_retention_ms;
+    if (std.ascii.eqlIgnoreCase(word, "interval")) word = it.next() orelse return default_retention_ms;
+    const n = std.fmt.parseInt(i64, word, 10) catch return default_retention_ms;
+    const unit = it.next() orelse return default_retention_ms;
+    const units = [_]struct { []const u8, i64 }{
+        .{ "millisecond", 1 },    .{ "second", 1000 },          .{ "minute", 60 * 1000 },
+        .{ "hour", 3600 * 1000 }, .{ "day", 24 * 3600 * 1000 }, .{ "week", 7 * 24 * 3600 * 1000 },
+    };
+    for (units) |u| {
+        const base = if (unit.len > 0 and (unit[unit.len - 1] == 's' or unit[unit.len - 1] == 'S')) unit[0 .. unit.len - 1] else unit;
+        if (std.ascii.eqlIgnoreCase(base, u[0])) return std.math.mul(i64, n, u[1]) catch default_retention_ms;
+    }
+    return default_retention_ms;
+}
+
+pub const Written = struct { version: u64, rows: u64, bytes: u64, adds: u64 };
+
+/// The checkpoint of `root`'s table at `version`, written, and `_last_checkpoint`
+/// pointed at it; `now_ms` decides which tombstones have expired.
+pub fn write(arena: std.mem.Allocator, root: []const u8, version: u64, now_ms: i64) !Written {
+    const s = try delta.snapshotWhole(arena, root, version);
+    const whole = s.whole.?;
+    const schema = try checkpointSchema(arena, s.name);
+    const final = try msgfmt.allocPrint(arena, "{s}{s}{d:0>20}.checkpoint.parquet", .{ root, delta.log_dir, version });
+    const local = !objstore.isRemote(final);
+    const path = if (local) try msgfmt.allocPrint(arena, "{s}{s}.{d:0>20}.checkpoint.parquet.{s}.tmp", .{ root, delta.log_dir, version, &dlog.uuid() }) else final;
+    const w = try pqwrite.Writer.openPhysical(arena, path, schema.schema, .snappy, .truncate, schema.phys);
+    var done = false;
+    defer if (!done) {
+        w.abort();
+        if (local) std.fs.cwd().deleteFile(path) catch {};
+    };
+    var rows = Rows{ .arena = arena, .w = w, .schema = schema.schema };
+    try rows.init();
+    if (whole.protocol) |v| try rows.put(.protocol, v);
+    if (whole.meta) |v| try rows.put(.metaData, v);
+    for (whole.txns.values()) |v| try rows.put(.txn, v);
+    for (whole.domains.values()) |v| try rows.put(.domainMetadata, v);
+    for (whole.adds.values()) |v| try rows.put(.add, try settled(v));
+    const keep_ms = retentionMs(s.property("delta.deletedFileRetentionDuration"));
+    for (whole.removes.values()) |v| {
+        const at = if (v.object.get("deletionTimestamp")) |t| (if (t == .integer) t.integer else 0) else 0;
+        if (at +| keep_ms < now_ms) continue;
+        try rows.put(.remove, try settled(v));
+    }
+    try rows.flush();
+    const sum = try w.closeSummary(arena);
+    done = true;
+    if (local) {
+        std.fs.cwd().rename(path, final) catch |e| {
+            std.fs.cwd().deleteFile(path) catch {};
+            return e;
+        };
+        try dlog.syncDir(dlog.trimDir(try std.mem.concat(arena, u8, &.{ root, delta.log_dir })));
+    }
+    const out = Written{ .version = version, .rows = rows.total, .bytes = sum.bytes, .adds = whole.adds.count() };
+    try pointAt(arena, root, out);
+    return out;
+}
+
+const Schema = struct { schema: types.Schema, phys: []const pqwrite.Physical };
+
+fn checkpointSchema(arena: std.mem.Allocator, name: []const u8) !Schema {
+    const fields = try arena.alloc(types.Schema.Field, columns.len);
+    const phys = try arena.alloc(pqwrite.Physical, columns.len);
+    for (columns, fields, phys) |c, *fd, *ph| {
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, c[1], .{});
+        fd.* = .{ .name = c[0], .ty = try delta.tableType(arena, name, c[0], v) };
+        ph.* = .{ .leaves = try dtypes.leafPhysicals(arena, v) };
+    }
+    return .{ .schema = .{ .fields = fields }, .phys = phys };
+}
+
+/// An `add` or `remove` as a checkpoint holds it: `dataChange` false.
+fn settled(v: std.json.Value) !std.json.Value {
+    var o = try v.object.clone();
+    try o.put("dataChange", .{ .bool = false });
+    return .{ .object = o };
+}
+
+const Rows = struct {
+    arena: std.mem.Allocator,
+    w: *pqwrite.Writer,
+    schema: types.Schema,
+    builders: [columns.len]column.Builder = undefined,
+    n: usize = 0,
+    total: u64 = 0,
+    text: std.Io.Writer.Allocating = undefined,
+
+    fn init(self: *Rows) !void {
+        for (&self.builders, self.schema.fields) |*b, fd| b.* = column.Builder.init(self.arena, fd.ty);
+        self.text = std.Io.Writer.Allocating.init(self.arena);
+    }
+
+    fn put(self: *Rows, which: Col, v: std.json.Value) !void {
+        self.text.clearRetainingCapacity();
+        try std.json.Stringify.value(v, .{}, &self.text.writer);
+        for (&self.builders, 0..) |*b, i| {
+            if (i == @intFromEnum(which)) try b.append(.{ .string = self.text.written() }) else try b.append(.null);
+        }
+        self.n += 1;
+        self.total += 1;
+        if (self.n == rows_per_batch) try self.flush();
+    }
+
+    fn flush(self: *Rows) !void {
+        if (self.n == 0) return;
+        const cols = try self.arena.alloc(column.Column, columns.len);
+        for (&self.builders, cols, self.schema.fields) |*b, *c, fd| {
+            c.* = try b.finish();
+            b.* = column.Builder.init(self.arena, fd.ty);
+        }
+        try self.w.writeBatch(self.arena, .{ .schema = &self.schema, .columns = cols, .len = self.n });
+        self.n = 0;
+    }
+};
+
+/// `_last_checkpoint` set to `c`, unless it already names a newer version.
+fn pointAt(arena: std.mem.Allocator, root: []const u8, c: Written) !void {
+    const at = try std.mem.concat(arena, u8, &.{ root, delta.log_dir, "_last_checkpoint" });
+    if (table.readWhole(arena, at)) |old| {
+        if (std.json.parseFromSliceLeaky(std.json.Value, arena, old, .{})) |v| {
+            if (v == .object) if (v.object.get("version")) |n| if (n == .integer and n.integer > @as(i64, @intCast(c.version))) return;
+        } else |_| {}
+    } else |_| {}
+    const text = try msgfmt.allocPrint(arena, "{{\"version\":{d},\"size\":{d},\"sizeInBytes\":{d},\"numOfAddFiles\":{d}}}", .{ c.version, c.rows, c.bytes, c.adds });
+    if (try objstore.openRemote(arena, at, "application/json")) |w| {
+        errdefer w.abort();
+        w.io.writeAll(text) catch |e| return w.specific(e);
+        w.io.flush() catch |e| return w.specific(e);
+        return w.finish();
+    }
+    const tmp = try msgfmt.allocPrint(arena, "{s}{s}._last_checkpoint.{s}.tmp", .{ root, delta.log_dir, &dlog.uuid() });
+    try std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = text });
+    std.fs.cwd().rename(tmp, at) catch |e| {
+        std.fs.cwd().deleteFile(tmp) catch {};
+        return e;
+    };
+}
+
+test "a checkpoint interval and a tombstone's retention read as Spark spells them" {
+    try testing.expect(!due(0, 10));
+    try testing.expect(due(10, 10));
+    try testing.expect(!due(11, 10));
+    try testing.expect(due(3, 1));
+    try testing.expectEqual(default_retention_ms, retentionMs(null));
+    try testing.expectEqual(@as(i64, 2 * 3600 * 1000), retentionMs("interval 2 hours"));
+    try testing.expectEqual(@as(i64, 24 * 3600 * 1000), retentionMs("interval 1 day"));
+    try testing.expectEqual(@as(i64, 30 * 1000), retentionMs("30 seconds"));
+    try testing.expectEqual(default_retention_ms, retentionMs("interval fortnight"));
+}

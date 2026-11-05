@@ -54,13 +54,18 @@ const testing = std.testing;
 
 pub const Error = error{ DeltaNullKey, DeltaDuplicateKey, DeltaUpsertTooLarge };
 
-/// What the merge reads: the run's spill space, the join's memory, its threads.
+/// What the merge reads: the run's spill space, the join's memory, its threads;
+/// and where the write sends a warning it does not fail on (`warn`, its `f`
+/// called with its `ctx` and the message).
 pub const Opts = struct {
     space: ?Space = null,
     op_memory: usize = 2 << 30,
     threads: usize = 1,
     err: ?*op.ErrCtx = null,
+    warn: ?Warn = null,
 };
+
+pub const Warn = struct { ctx: *anyopaque, f: *const fn (*anyopaque, []const u8) void };
 
 /// The file tag a read of the table's files carries, a column no table can name.
 const tag_name = "\x00file";

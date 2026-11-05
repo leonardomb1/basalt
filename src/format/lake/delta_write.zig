@@ -13,7 +13,10 @@
 //! table's (by name, any order; no column added or dropped) or whose types differ.
 //! A value is written as the table types it: an `integer` column as INT32 with its
 //! range checked, a `float` as FLOAT, a `decimal(p,s)` at its scale, a `timestamp`
-//! as UTC-adjusted microseconds and a `timestamp_ntz` as local ones.
+//! as UTC-adjusted microseconds and a `timestamp_ntz` as local ones. A struct, an
+//! array or a map is written as a nested Parquet column, each leaf laid out as the
+//! table's primitive there has it; a new table types one as Delta's struct, array
+//! or map, every part nullable, and the rows must have an existing one's shape.
 //!
 //! A partitioned table's rows are routed by their partition values, each to a
 //! file of its own under Hive-style `col=value/` folders (Spark's escaping, with
@@ -28,14 +31,17 @@
 //! Each `add` carries the file's statistics: `numRecords`, and per data column
 //! `nullCount`, with `minValues` and `maxValues` where they are exact and cheap
 //! (numbers, dates, timestamps cut to milliseconds as the protocol allows, strings
-//! of up to 32 bytes; a longer string's minimum is its 32-byte prefix).
+//! of up to 32 bytes; a longer string's minimum is its 32-byte prefix). A struct's
+//! fields have theirs, nested as objects under the struct's name, as Spark writes
+//! them; a list or map, and what lies inside one, has none.
 //!
 //! An UPSERT matches rows by its key columns and rewrites the files holding a
 //! matched row (`delta_merge.zig`); under PARTIAL COLS the rows may leave out
 //! table columns other than the key and the listed ones.
 //!
-//! No checkpoint is written: the Parquet writer writes flat columns, and a
-//! checkpoint's actions are nested structs and maps.
+//! A commit landing at a version the table checkpoints at (every tenth, or
+//! `delta.checkpointInterval`) is followed by a checkpoint (`delta_checkpoint.zig`);
+//! one that cannot be written is a warning, as the commit stands.
 
 const std = @import("std");
 const pagecache = @import("../../exec/pagecache.zig");
@@ -46,6 +52,7 @@ const codecs = @import("../compress/codecs.zig");
 const column = @import("../../exec/column.zig");
 const delta = @import("delta.zig");
 const dlog = @import("delta_log.zig");
+const ckpt = @import("delta_checkpoint.zig");
 const dtypes = @import("delta_types.zig");
 const merge = @import("delta_merge.zig");
 const driver = @import("../../connect/driver.zig");
@@ -197,10 +204,10 @@ pub fn plan(arena: std.mem.Allocator, root: []const u8, mode: Mode, create: bool
                 return refuse("{s}'s column `{s}` has a default value (`CURRENT_DEFAULT`), which basalt does not apply, so a row an UPSERT inserts would not take it; give `{s}` in the rows", .{ name, f.name, f.name });
             var none = types.Type.init(.string);
             none.unknown = true;
-            c.* = try tableCol(name, f, none, absent);
+            c.* = try tableCol(arena, name, f, none, absent);
             continue;
         };
-        c.* = try tableCol(name, f, schema.fields[src].ty, src);
+        c.* = try tableCol(arena, name, f, schema.fields[src].ty, src);
     }
     for (schema.fields) |f| if (indexOfField(fields, f.name) == null)
         return refuse("the rows have column `{s}`, which {s} lacks; basalt does not add columns to a Delta table", .{ f.name, name });
@@ -268,6 +275,7 @@ fn split(self: *Plan, arena: std.mem.Allocator, part_cols: []const []const u8) !
         } else return refuse("{s} has no column `{s}` to partition by", .{ self.name, pc });
         for (parts[0..i]) |prev| if (prev == o.*) return refuse("{s} names partition column `{s}` twice", .{ self.name, pc });
         if (self.cols[o.*].ty.kind == .bytes) return refuse("{s} cannot be partitioned by binary column `{s}`", .{ self.name, pc });
+        if (self.cols[o.*].ty.isNested()) return refuse("{s} cannot be partitioned by `{s}`, a list, map or struct; partition by one of its fields taken out as a column", .{ self.name, pc });
     }
     if (parts.len == self.cols.len) return refuse("{s} would be partitioned by every column, leaving none for its data files", .{self.name});
     const data = try arena.alloc(usize, self.cols.len - parts.len);
@@ -292,7 +300,10 @@ fn planCreate(arena: std.mem.Allocator, name: []const u8, root: []const u8, mode
         if (i > 0) try w.writeByte(',');
         try w.writeAll("{\"name\":");
         try jsontext.string(w, f.name);
-        try w.print(",\"type\":\"{s}\",\"nullable\":true,\"metadata\":{{}}}}", .{c.delta_type});
+        if (c.ty.isNested())
+            try w.print(",\"type\":{s},\"nullable\":true,\"metadata\":{{}}}}", .{c.delta_type})
+        else
+            try w.print(",\"type\":\"{s}\",\"nullable\":true,\"metadata\":{{}}}}", .{c.delta_type});
     }
     try w.writeAll("]}");
     var p = Plan{ .name = name, .root = root, .mode = mode, .codec = codec, .snap = null, .cols = cols, .parts = &.{}, .data = &.{}, .schema_string = aw.written(), .in_fields = schema.fields };
@@ -314,15 +325,62 @@ fn createCol(arena: std.mem.Allocator, name: []const u8, f: types.Schema.Field, 
             return .{ .name = f.name, .delta_type = try msgfmt.allocPrint(arena, "decimal({d},{d})", .{ d.precision, d.scale }), .ty = d, .src = src };
         },
         .time => return refuse("column `{s}` is a time of day, which Delta has no type for; cast it to a string or store microseconds as a number", .{f.name}),
-        .array, .@"struct", .map => return refuse("column `{s}` is {s}; basalt writes Delta tables of scalar columns", .{ f.name, switch (t.kind) {
-            .array => "an array",
-            .map => "a map",
-            else => "a struct",
-        } }),
+        .array, .@"struct", .map => {
+            var aw = std.Io.Writer.Allocating.init(arena);
+            try createdJson(&aw.writer, f.name, t, 0);
+            const text = aw.written();
+            const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{});
+            return .{ .name = f.name, .delta_type = text, .ty = try delta.tableType(arena, name, f.name, v), .phys = .{ .leaves = try dtypes.leafPhysicals(arena, v) }, .src = src };
+        },
         else => {},
     }
     const dt = dtypes.deltaName(t.kind).?;
     return .{ .name = f.name, .delta_type = dt, .ty = types.Type.init(t.kind), .phys = dtypes.physical(dt), .src = src };
+}
+
+/// A new table's nested column type `t` as `schemaString` spells it: a struct's
+/// fields, an array's element and a map's value each nullable, every primitive
+/// named as a top-level column of its type would be.
+fn createdJson(w: *std.Io.Writer, col: []const u8, t_in: types.Type, depth: usize) !void {
+    if (depth >= table.max_depth) return refuse("column `{s}` is nested deeper than {d} levels", .{ col, table.max_depth });
+    const t = if (t_in.unknown and t_in.kind == .string) t_in.sinkType() else t_in;
+    switch (t.kind) {
+        .@"struct" => {
+            try w.writeAll("{\"type\":\"struct\",\"fields\":[");
+            for (t.fields orelse &.{}, 0..) |f, i| {
+                if (i > 0) try w.writeByte(',');
+                try w.writeAll("{\"name\":");
+                try jsontext.string(w, f.name);
+                try w.writeAll(",\"type\":");
+                try createdJson(w, col, f.ty, depth + 1);
+                try w.writeAll(",\"nullable\":true,\"metadata\":{}}");
+            }
+            try w.writeAll("]}");
+        },
+        .array => {
+            try w.writeAll("{\"type\":\"array\",\"elementType\":");
+            try createdJson(w, col, (t.elem orelse return refuse("column `{s}` is a list of no element type", .{col})).*, depth + 1);
+            try w.writeAll(",\"containsNull\":true}");
+        },
+        .map => {
+            const kv = t.fields orelse return refuse("column `{s}` is a map of no key and value types", .{col});
+            try w.writeAll("{\"type\":\"map\",\"keyType\":");
+            try createdJson(w, col, kv[0].ty, depth + 1);
+            try w.writeAll(",\"valueType\":");
+            try createdJson(w, col, kv[1].ty, depth + 1);
+            try w.writeAll(",\"valueContainsNull\":true}");
+        },
+        .decimal => {
+            const d = dtypes.createdDecimal(t) orelse
+                return refuse("column `{s}` holds a decimal({d},{d}), whose scale exceeds its precision", .{ col, dtypes.createdPrecision(t), t.scale });
+            try w.print("\"decimal({d},{d})\"", .{ d.precision, d.scale });
+        },
+        .time => return refuse("column `{s}` holds a time of day, which Delta has no type for; cast it to a string or store microseconds as a number", .{col}),
+        else => {
+            if (t.unknown) return refuse("column `{s}` holds a part with no type (a bare NULL); CAST it", .{col});
+            try w.print("\"{s}\"", .{dtypes.deltaName(t.kind).?});
+        },
+    }
 }
 
 const Field = dtypes.Field;
@@ -341,8 +399,9 @@ fn tableFields(arena: std.mem.Allocator, name: []const u8, text: []const u8) ![]
 }
 
 /// A table column `f` as the rows' column of type `in` is written to it.
-fn tableCol(name: []const u8, f: Field, in: types.Type, src: usize) !Col {
-    const t = if (f.ty == .string) f.ty.string else return refuse("{s} has column `{s}` of a nested type; basalt writes Delta tables of scalar columns", .{ name, f.name });
+fn tableCol(arena: std.mem.Allocator, name: []const u8, f: Field, in: types.Type, src: usize) !Col {
+    if (f.ty != .string) return nestedCol(arena, name, f, in, src);
+    const t = f.ty.string;
     const c = Col{ .name = f.name, .delta_type = t, .ty = dtypes.scalarType(t, .write) orelse
         return refuse("{s} has column `{s}` of type `{s}`, which basalt does not write", .{ name, f.name, t }), .phys = dtypes.physical(t), .nullable = f.nullable, .src = src };
     if (in.unknown) return c;
@@ -354,6 +413,45 @@ fn tableCol(name: []const u8, f: Field, in: types.Type, src: usize) !Col {
             return refuse("column `{s}` is decimal({d},{d}) in the rows but `{s}` in {s}, which cannot hold every value; cast it", .{ f.name, ip, in.scale, t, name });
     }
     return c;
+}
+
+/// A table's nested column `f`, written as the table types it, each leaf laid out
+/// as the table's primitive there says (an `integer` as INT32, a `timestamp` as
+/// UTC); the rows' column must have its shape, field names and leaf kinds, a
+/// decimal leaf one the table's holds every value of.
+fn nestedCol(arena: std.mem.Allocator, name: []const u8, f: Field, in: types.Type, src: usize) !Col {
+    const ty = try delta.tableType(arena, name, f.name, f.ty);
+    var aw = std.Io.Writer.Allocating.init(arena);
+    try std.json.Stringify.value(f.ty, .{}, &aw.writer);
+    const c = Col{ .name = f.name, .delta_type = aw.written(), .ty = ty, .phys = .{ .leaves = try dtypes.leafPhysicals(arena, f.ty) }, .nullable = f.nullable, .src = src };
+    if (in.unknown) return c;
+    if (!fitsNested(in, ty))
+        return refuse("column `{s}` is {s} in the rows but {s} in {s}; cast it", .{ f.name, try in.name(arena), try ty.name(arena), name });
+    return c;
+}
+
+/// Whether values of `in` write as `t`: the same shape and field names, leaves of
+/// one kind, a decimal leaf at most `t`'s scale and fitting its integer digits.
+fn fitsNested(in: types.Type, t: types.Type) bool {
+    if (in.kind != t.kind) return false;
+    switch (t.kind) {
+        .@"struct", .map => {
+            const a = in.fields orelse return false;
+            const b = t.fields orelse return false;
+            if (a.len != b.len) return false;
+            for (a, b) |x, y| {
+                if (t.kind == .@"struct" and !std.mem.eql(u8, x.name, y.name)) return false;
+                if (!fitsNested(x.ty, y.ty)) return false;
+            }
+            return true;
+        },
+        .array => return fitsNested((in.elem orelse return false).*, (t.elem orelse return false).*),
+        .decimal => {
+            const ip: u8 = if (in.precision == 0) 38 else in.precision;
+            return in.scale <= t.scale and ip -| in.scale <= t.precision - t.scale;
+        },
+        else => return true,
+    }
 }
 
 /// The writer features basalt honours: the ones that ask nothing of a writer
@@ -433,28 +531,68 @@ fn statsJson(arena: std.mem.Allocator, p: *const Plan, sum: pqwrite.Writer.Summa
     var aw = std.Io.Writer.Allocating.init(arena);
     const w = &aw.writer;
     try w.print("{{\"numRecords\":{d}", .{sum.rows});
-    for ([_]dtypes.Bound{ .min, .max }) |which| {
-        try w.print(",\"{s}\":{{", .{which.key()});
+    var items = std.ArrayList(Stat).empty;
+    for ([_]?dtypes.Bound{ .min, .max, null }) |which| {
+        try w.print(",\"{s}\":{{", .{if (which) |b| b.key() else "nullCount"});
         var first = true;
         for (p.data, sum.columns) |k, cs| {
-            const v = (if (which == .max) cs.max else cs.min) orelse continue;
-            const text = (try dtypes.statText(arena, p.cols[k].phys, v, which)) orelse continue;
+            const c = p.cols[k];
+            items.clearRetainingCapacity();
+            if (c.ty.isNested()) {
+                for (cs.leaves) |l| {
+                    const ph = if (l.leaf < c.phys.leaves.len) c.phys.leaves[l.leaf] else pqwrite.Physical{};
+                    if (try statOf(arena, ph, l, which)) |text| try items.append(arena, .{ .path = l.path, .text = text });
+                }
+                if (items.items.len == 0) continue;
+            } else if (try statOf(arena, c.phys, cs, which)) |text| {
+                try items.append(arena, .{ .path = &.{}, .text = text });
+            } else continue;
             if (!first) try w.writeByte(',');
             first = false;
-            try jsontext.string(w, p.cols[k].name);
+            try jsontext.string(w, c.name);
             try w.writeByte(':');
-            try w.writeAll(text);
+            if (c.ty.isNested()) {
+                try w.writeByte('{');
+                try statTree(w, items.items, 0);
+                try w.writeByte('}');
+            } else try w.writeAll(items.items[0].text);
         }
         try w.writeByte('}');
     }
-    try w.writeAll(",\"nullCount\":{");
-    for (p.data, sum.columns, 0..) |k, cs, i| {
-        if (i > 0) try w.writeByte(',');
-        try jsontext.string(w, p.cols[k].name);
-        try w.print(":{d}", .{cs.nulls});
-    }
-    try w.writeAll("}}");
+    try w.writeByte('}');
     return aw.written();
+}
+
+const Stat = struct { path: []const []const u8, text: []const u8 };
+
+/// A column's `which` bound as JSON text, or its null count when `which` is null.
+fn statOf(arena: std.mem.Allocator, ph: pqwrite.Physical, cs: pqwrite.Writer.ColumnStats, which: ?dtypes.Bound) !?[]const u8 {
+    const b = which orelse return try msgfmt.allocPrint(arena, "{d}", .{cs.nulls});
+    const v = (if (b == .max) cs.max else cs.min) orelse return null;
+    return try dtypes.statText(arena, ph, v, b);
+}
+
+/// A struct's leaf statistics as nested objects, as Delta keeps a struct field's:
+/// the leaves in schema order, so those sharing a field below `depth` are adjacent.
+fn statTree(w: *std.Io.Writer, items: []const Stat, depth: usize) !void {
+    var i: usize = 0;
+    while (i < items.len) {
+        if (i > 0) try w.writeByte(',');
+        const name = items[i].path[depth];
+        try jsontext.string(w, name);
+        try w.writeByte(':');
+        if (items[i].path.len == depth + 1) {
+            try w.writeAll(items[i].text);
+            i += 1;
+            continue;
+        }
+        var j = i + 1;
+        while (j < items.len and items[j].path.len > depth + 1 and std.mem.eql(u8, items[j].path[depth], name)) j += 1;
+        try w.writeByte('{');
+        try statTree(w, items[i..j], depth + 1);
+        try w.writeByte('}');
+        i = j;
+    }
 }
 
 /// A data file being written, its names and values on its own arena.
@@ -493,6 +631,7 @@ pub const Sink = struct {
     spilled: bool = false,
     /// The version the commit became, once it is made.
     committed: ?u64 = null,
+    warn: ?merge.Warn = null,
     /// Set once `close` or `abort` has freed everything, so an `abort` after a
     /// failed `close` does nothing.
     done: bool = false,
@@ -500,7 +639,7 @@ pub const Sink = struct {
     /// A sink on `plan_arena` (which outlives it), its buffers on `gpa`.
     pub fn open(gpa: std.mem.Allocator, plan_arena: std.mem.Allocator, p: *const Plan, opts: merge.Opts) !*Sink {
         const self = try plan_arena.create(Sink);
-        self.* = .{ .gpa = gpa, .mem = std.heap.ArenaAllocator.init(gpa), .plan = p, .file_schema = undefined, .phys = &.{}, .adds = std.Io.Writer.Allocating.init(gpa) };
+        self.* = .{ .gpa = gpa, .mem = std.heap.ArenaAllocator.init(gpa), .plan = p, .file_schema = undefined, .phys = &.{}, .adds = std.Io.Writer.Allocating.init(gpa), .warn = opts.warn };
         errdefer {
             self.adds.deinit();
             self.mem.deinit();
@@ -672,8 +811,10 @@ pub const Sink = struct {
     }
 
     fn explainWrite(self: *Sink, e: anyerror) anyerror {
-        if (e == pqwrite.Error.UnsupportedParquetDecimal or e == pqwrite.Error.ParquetValueOutOfRange)
+        if (e == pqwrite.Error.UnsupportedParquetDecimal)
             return eval.explain(e, msgfmt.allocPrint(self.mem.allocator(), "a value does not fit its column's type in {s} (a decimal past its precision)", .{self.plan.name}) catch return e);
+        if (e == pqwrite.Error.ParquetValueOutOfRange)
+            return eval.explain(e, msgfmt.allocPrint(self.mem.allocator(), "a value does not fit its column's type in {s} (a decimal past its precision, or a number inside a list, map or struct past its `integer`, `short` or `byte`)", .{self.plan.name}) catch return e);
         return e;
     }
 
@@ -819,6 +960,23 @@ pub const Sink = struct {
             return e;
         };
         self.begun.clearRetainingCapacity();
+        self.checkpointAfter();
+    }
+
+    /// The table's checkpoint at the version just committed, when that version is
+    /// one the table checkpoints at; a failure is warned of, as the commit stands.
+    fn checkpointAfter(self: *Sink) void {
+        const v = self.committed orelse return;
+        const every = if (self.plan.snap) |s| ckpt.interval(s) else ckpt.default_interval;
+        if (!ckpt.due(v, every)) return;
+        var mem = std.heap.ArenaAllocator.init(pagecache.process);
+        defer mem.deinit();
+        _ = ckpt.write(mem.allocator(), self.plan.root, v, std.time.milliTimestamp()) catch |e| {
+            const why = eval.takeFailure(e) orelse @errorName(e);
+            const w = self.warn orelse return;
+            const msg = msgfmt.allocPrint(mem.allocator(), "{s} committed version {d}, but its checkpoint could not be written ({s}); the table reads as before, from its commits", .{ self.plan.name, v, why }) catch return;
+            w.f(w.ctx, msg);
+        };
     }
 
     pub fn abort(self: *Sink) void {
@@ -984,18 +1142,18 @@ test "a table's column types: narrower integers and floats, decimals that hold e
             return .{ .name = "c", .ty = .{ .string = t }, .nullable = true, .metadata = null };
         }
     };
-    const i = try tableCol("T", F.of("integer"), types.Type.init(.int), 0);
+    const i = try tableCol(testing.failing_allocator, "T", F.of("integer"), types.Type.init(.int), 0);
     try testing.expectEqual(@as(u8, 32), i.phys.int_bits);
-    try testing.expect((try tableCol("T", F.of("float"), types.Type.init(.float), 0)).phys.float32);
-    try testing.expect((try tableCol("T", F.of("timestamp"), types.Type.init(.timestamp), 0)).phys.utc);
-    try testing.expect(!(try tableCol("T", F.of("timestamp_ntz"), types.Type.init(.timestamp), 0)).phys.utc);
-    const d = try tableCol("T", F.of("decimal(12,3)"), types.Type.decimal(10, 2), 0);
+    try testing.expect((try tableCol(testing.failing_allocator, "T", F.of("float"), types.Type.init(.float), 0)).phys.float32);
+    try testing.expect((try tableCol(testing.failing_allocator, "T", F.of("timestamp"), types.Type.init(.timestamp), 0)).phys.utc);
+    try testing.expect(!(try tableCol(testing.failing_allocator, "T", F.of("timestamp_ntz"), types.Type.init(.timestamp), 0)).phys.utc);
+    const d = try tableCol(testing.failing_allocator, "T", F.of("decimal(12,3)"), types.Type.decimal(10, 2), 0);
     try testing.expectEqual(@as(u8, 3), d.ty.scale);
-    try testing.expectError(table.Error.LakeTableRefused, tableCol("T", F.of("decimal(12,3)"), types.Type.decimal(12, 2), 0));
+    try testing.expectError(table.Error.LakeTableRefused, tableCol(testing.failing_allocator, "T", F.of("decimal(12,3)"), types.Type.decimal(12, 2), 0));
     try testing.expect(std.mem.indexOf(u8, eval.takeFailure(table.Error.LakeTableRefused).?, "cannot hold every value") != null);
-    try testing.expectError(table.Error.LakeTableRefused, tableCol("T", F.of("date"), types.Type.init(.string), 0));
+    try testing.expectError(table.Error.LakeTableRefused, tableCol(testing.failing_allocator, "T", F.of("date"), types.Type.init(.string), 0));
     try testing.expectEqualStrings("column `c` is string in the rows but `date` in T; cast it", eval.takeFailure(table.Error.LakeTableRefused).?);
-    try testing.expectError(table.Error.LakeTableRefused, tableCol("T", F.of("variant"), types.Type.init(.string), 0));
+    try testing.expectError(table.Error.LakeTableRefused, tableCol(testing.failing_allocator, "T", F.of("variant"), types.Type.init(.string), 0));
     try testing.expect(std.mem.indexOf(u8, eval.takeFailure(table.Error.LakeTableRefused).?, "`variant`, which basalt does not write") != null);
 }
 

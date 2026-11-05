@@ -364,6 +364,7 @@ test "partitionValue: every type, empty and null text as NULL, both timestamp fo
 
 test {
     _ = @import("delta.zig");
+    _ = @import("delta_checkpoint.zig");
     _ = @import("delta_dv.zig");
     _ = @import("delta_log.zig");
     _ = @import("delta_merge.zig");

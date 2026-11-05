@@ -106,6 +106,35 @@ pub fn deltaName(k: types.TypeKind) ?[]const u8 {
     };
 }
 
+/// A `schemaString` type's leaves laid out as the writer gives a table's column,
+/// in the Parquet shape's order: a struct's fields, an array's element, a map's
+/// key then value. A primitive is its own one leaf.
+pub fn leafPhysicals(arena: std.mem.Allocator, t: std.json.Value) ![]const pqwrite.Physical {
+    var out = std.ArrayList(pqwrite.Physical).empty;
+    try addLeaves(arena, &out, t, 0);
+    return out.items;
+}
+
+fn addLeaves(arena: std.mem.Allocator, out: *std.ArrayList(pqwrite.Physical), t: std.json.Value, depth: usize) !void {
+    if (depth >= table.max_depth) return;
+    const o = switch (t) {
+        .string => |s| return out.append(arena, physical(s)),
+        .object => |o| o,
+        else => return,
+    };
+    const kind = if (o.get("type")) |k| (if (k == .string) k.string else "") else "";
+    if (std.mem.eql(u8, kind, "array")) return addLeaves(arena, out, o.get("elementType") orelse .null, depth + 1);
+    if (std.mem.eql(u8, kind, "map")) {
+        try addLeaves(arena, out, o.get("keyType") orelse .null, depth + 1);
+        return addLeaves(arena, out, o.get("valueType") orelse .null, depth + 1);
+    }
+    const fs = switch (try fields(arena, t, .lenient)) {
+        .fields => |fs| fs,
+        .problem => return,
+    };
+    for (fs) |f| try addLeaves(arena, out, f.ty, depth + 1);
+}
+
 /// The precision a new table gives a decimal column: 0 (unbounded) as 38, at most 38.
 pub fn createdPrecision(t: types.Type) u8 {
     return if (t.precision == 0) 38 else @min(38, t.precision);
@@ -692,4 +721,25 @@ test "delta_types: a string that is not UTF-8 has no statistic, so it never boun
         try testing.expect(try statText(a, .{}, .{ .string = s }, which) == null);
     try testing.expectEqualStrings("\"" ++ "a" ** 32 ++ "\"", (try statText(a, .{}, .{ .string = "a" ** 40 ++ "\xfe" }, .min)).?);
     try testing.expectEqualStrings("\"caf\u{e9}\\n\"", (try statText(a, .{}, .{ .string = "caf\u{e9}\n" }, .max)).?);
+}
+
+test "a nested type's leaves are laid out in the Parquet shape's order: struct fields, array element, map key then value" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const text =
+        \\{"type":"struct","fields":[
+        \\  {"name":"i","type":"integer","nullable":true,"metadata":{}},
+        \\  {"name":"l","type":{"type":"array","elementType":"short","containsNull":true},"nullable":true,"metadata":{}},
+        \\  {"name":"m","type":{"type":"map","keyType":"byte","valueType":"timestamp","valueContainsNull":true},"nullable":true,"metadata":{}},
+        \\  {"name":"f","type":"float","nullable":true,"metadata":{}}]}
+    ;
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
+    const got = try leafPhysicals(a, v);
+    try testing.expectEqual(@as(usize, 5), got.len);
+    try testing.expectEqual(@as(u8, 32), got[0].int_bits);
+    try testing.expectEqual(@as(u8, 16), got[1].int_bits);
+    try testing.expectEqual(@as(u8, 8), got[2].int_bits);
+    try testing.expect(got[3].utc);
+    try testing.expect(got[4].float32);
 }

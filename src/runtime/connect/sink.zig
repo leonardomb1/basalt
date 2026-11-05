@@ -51,6 +51,12 @@ const eval = @import("../../exec/eval.zig");
 const formats = @import("../../format/formats.zig");
 const delta_write = @import("../../format/lake/delta_write.zig");
 
+/// A Delta write's warning (`delta_merge.Warn`) logged at `warn`.
+fn warnLog(ctx: *anyopaque, msg: []const u8) void {
+    const log: *obs.Logger = @ptrCast(@alignCast(ctx));
+    log.log(.warn, "{s}", .{msg});
+}
+
 /// Bare `upsert` takes its keys from the source table's primary key; a non-table
 /// source gets an error pointing at `upsert on <col>`.
 pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
@@ -272,7 +278,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                     return planErr(env.diag, try msgfmt.allocPrint(env.arena, "`UPSERT` into Delta table `{s}` has no key; name it with `UPSERT ON (col)`", .{w.target}));
                 const p = delta_write.plan(env.arena, w.target, delta_write.modeOf(w.mode), env.fmt_out == .delta, o.partition_by, o.codec, schema) catch |e|
                     return planErrT(env.diag, e, try pathFail(env.arena, w.target, e));
-                const ds = delta_write.Sink.open(env.gpa, env.arena, p, .{ .space = env.space, .op_memory = env.op_memory, .threads = env.pipe.threads, .err = env.errctx }) catch |e|
+                const ds = delta_write.Sink.open(env.gpa, env.arena, p, .{ .space = env.space, .op_memory = env.op_memory, .threads = env.pipe.threads, .err = env.errctx, .warn = .{ .ctx = env.log, .f = warnLog } }) catch |e|
                     return planErrT(env.diag, e, try pathFail(env.arena, w.target, e));
                 return ds.sink();
             },

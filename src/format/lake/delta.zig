@@ -18,6 +18,12 @@
 //! honour is refused naming it, where reading on would return wrong rows: V2
 //! checkpoints, catalog-managed commits, type widening, variants, and any feature
 //! basalt does not know.
+//!
+//! A read keeps only what it reads by. A replay for a checkpoint
+//! (`snapshotWhole`) also keeps every action whole in `State.whole`: the last
+//! `protocol` and `metaData`, each live file's `add` and each removed file's last
+//! `remove` (keyed as `files` is), each application's last `txn`, and each
+//! domain's `domainMetadata` until one removes it.
 
 const std = @import("std");
 const pagecache = @import("../../exec/pagecache.zig");
@@ -226,6 +232,16 @@ pub const State = struct {
     mapping: ?[]const u8 = null,
     v2: ?[]const u8 = null,
     files: std.StringArrayHashMapUnmanaged(Add) = .empty,
+    whole: ?*Whole = null,
+
+    pub const Whole = struct {
+        protocol: ?std.json.Value = null,
+        meta: ?std.json.Value = null,
+        adds: std.StringArrayHashMapUnmanaged(std.json.Value) = .empty,
+        removes: std.StringArrayHashMapUnmanaged(std.json.Value) = .empty,
+        txns: std.StringArrayHashMapUnmanaged(std.json.Value) = .empty,
+        domains: std.StringArrayHashMapUnmanaged(std.json.Value) = .empty,
+    };
 
     /// A file's identity in the log: its path resolved against the root, and its
     /// deletion vector's id. A path whose scheme basalt does not read keys as written.
@@ -237,7 +253,7 @@ pub const State = struct {
 
     /// Keeps `a`, copied: what it borrows (a commit line's parse, a checkpoint
     /// batch) is freed once its line or batch is replayed.
-    fn put(self: *State, a: Add) !void {
+    fn put(self: *State, a: Add) ![]const u8 {
         const raw = try self.arena.dupe(u8, a.path);
         const x = Add{
             .path = try table.percentDecode(self.arena, raw),
@@ -247,11 +263,42 @@ pub const State = struct {
             .dv = if (a.dv) |v| try ownJson(self.arena, v, 2) else null,
             .stats = if (a.stats) |t| try self.arena.dupe(u8, t) else null,
         };
-        try self.files.put(self.arena, try self.key(self.arena, x.path, try jsonDv(self.arena, x.dv)), x);
+        const k = try self.key(self.arena, x.path, try jsonDv(self.arena, x.dv));
+        try self.files.put(self.arena, k, x);
+        return k;
     }
 
-    fn drop(self: *State, scratch: std.mem.Allocator, path: []const u8, dv: ?[]const u8) !void {
-        _ = self.files.swapRemove(try self.key(scratch, try table.percentDecode(scratch, path), dv));
+    fn drop(self: *State, scratch: std.mem.Allocator, path: []const u8, dv: ?[]const u8) ![]const u8 {
+        const k = try self.key(scratch, try table.percentDecode(scratch, path), dv);
+        _ = self.files.swapRemove(k);
+        return k;
+    }
+
+    /// Keeps action `kind`'s body `o` whole, when the state is kept so; `file` is
+    /// the key an `add` or `remove` put or dropped.
+    fn keep(self: *State, kind: []const u8, o: std.json.ObjectMap, file: ?[]const u8) !void {
+        const w = self.whole orelse return;
+        const body = try ownJson(self.arena, .{ .object = o }, whole_depth);
+        if (std.mem.eql(u8, kind, "add")) {
+            _ = w.removes.swapRemove(file.?);
+            try w.adds.put(self.arena, file.?, body);
+        } else if (std.mem.eql(u8, kind, "remove")) {
+            _ = w.adds.swapRemove(file.?);
+            try w.removes.put(self.arena, try self.arena.dupe(u8, file.?), body);
+        } else if (std.mem.eql(u8, kind, "metaData")) {
+            w.meta = body;
+        } else if (std.mem.eql(u8, kind, "protocol")) {
+            w.protocol = body;
+        } else if (std.mem.eql(u8, kind, "txn")) {
+            const app = str(o.get("appId")) orelse return;
+            try w.txns.put(self.arena, try self.arena.dupe(u8, app), body);
+        } else if (std.mem.eql(u8, kind, "domainMetadata")) {
+            const d = str(o.get("domain")) orelse return;
+            const gone = if (o.get("removed")) |r| r == .bool and r.bool else false;
+            if (gone) {
+                _ = w.domains.swapRemove(d);
+            } else try w.domains.put(self.arena, try self.arena.dupe(u8, d), body);
+        }
     }
 
     fn protocol(self: *State, version: i64, writer: ?i64, features: ?std.json.Value, writer_features: ?std.json.Value) !void {
@@ -303,22 +350,28 @@ pub const State = struct {
             const k = kv.key_ptr.*;
             if (std.mem.eql(u8, k, "add")) {
                 const p = str(o.get("path")) orelse continue;
-                try self.put(.{
+                const file = try self.put(.{
                     .path = p,
                     .size = if (o.get("size")) |s| (if (s == .integer and s.integer >= 0) @as(u64, @intCast(s.integer)) else null) else null,
                     .parts = o.get("partitionValues"),
                     .dv = if (o.get("deletionVector")) |d| (if (d == .object) d else null) else null,
                     .stats = str(o.get("stats")),
                 });
+                try self.keep(k, o, file);
             } else if (std.mem.eql(u8, k, "remove")) {
-                try self.drop(scratch, str(o.get("path")) orelse continue, try jsonDv(scratch, o.get("deletionVector")));
+                const file = try self.drop(scratch, str(o.get("path")) orelse continue, try jsonDv(scratch, o.get("deletionVector")));
+                try self.keep(k, o, file);
             } else if (std.mem.eql(u8, k, "metaData")) {
                 try self.meta(str(o.get("id")), str(o.get("schemaString")) orelse continue, o.get("partitionColumns"), o.get("configuration"));
+                try self.keep(k, o, null);
             } else if (std.mem.eql(u8, k, "protocol")) {
                 const rv = o.get("minReaderVersion") orelse continue;
                 if (rv != .integer) continue;
                 const wv: ?i64 = if (o.get("minWriterVersion")) |w| (if (w == .integer) w.integer else null) else null;
                 try self.protocol(rv.integer, wv, o.get("readerFeatures"), o.get("writerFeatures"));
+                try self.keep(k, o, null);
+            } else if (std.mem.eql(u8, k, "txn") or std.mem.eql(u8, k, "domainMetadata")) {
+                try self.keep(k, o, null);
             }
         }
     }
@@ -328,6 +381,7 @@ pub const State = struct {
     /// Each row group is decoded into memory freed once its rows are kept, and the
     /// file map is sized for the rows up front, as an arena keeps every outgrown table.
     fn checkpoint(self: *State, url: []const u8) !void {
+        if (self.whole != null) return self.checkpointWhole(url);
         var reader_mem = std.heap.ArenaAllocator.init(pagecache.process);
         defer reader_mem.deinit();
         var batch_mem = std.heap.ArenaAllocator.init(pagecache.process);
@@ -379,7 +433,7 @@ pub const State = struct {
                         dv = .{ .object = o };
                     }
                     const stats = cell(c_stats, i);
-                    try self.put(.{
+                    _ = try self.put(.{
                         .path = cell(c_path, i).string,
                         .size = if (size == .int and size.int >= 0) @intCast(size.int) else null,
                         .parts = jsonOf(scratch, cell(c_parts, i)),
@@ -396,6 +450,39 @@ pub const State = struct {
                     try self.protocol(cell(c_rv, i).int, if (wv == .int) wv.int else null, jsonOf(scratch, cell(c_feat, i)), jsonOf(scratch, cell(c_wfeat, i)));
                 }
             }
+        }
+    }
+
+    /// `checkpoint` keeping every action whole: each row's action columns read as
+    /// nested values and replayed as the commit line they stand for.
+    fn checkpointWhole(self: *State, url: []const u8) !void {
+        var reader_mem = std.heap.ArenaAllocator.init(pagecache.process);
+        defer reader_mem.deinit();
+        var batch_mem = std.heap.ArenaAllocator.init(pagecache.process);
+        defer batch_mem.deinit();
+        const scratch = batch_mem.allocator();
+        const names = [_][]const u8{ "protocol", "metaData", "add", "remove", "txn", "domainMetadata", "checkpointMetadata", "sidecar" };
+        const r = try Reader.openProjected(reader_mem.allocator(), url, &names);
+        defer r.close();
+        while (try r.next(scratch)) |b| {
+            defer _ = batch_mem.reset(.retain_capacity);
+            var cols: [names.len]?column.Column = undefined;
+            for (&cols, names) |*c, n| c.* = if (b.schema.indexOf(n)) |i| b.columns[i] else null;
+            var line = std.Io.Writer.Allocating.init(scratch);
+            for (0..b.len) |i| for (cols, names) |c, n| {
+                const v = cell(c, i);
+                if (v == .null) continue;
+                if (std.mem.eql(u8, n, "checkpointMetadata") or std.mem.eql(u8, n, "sidecar")) {
+                    self.v2 = url;
+                    continue;
+                }
+                if (v != .nested) continue;
+                line.clearRetainingCapacity();
+                try line.writer.print("{{\"{s}\":", .{n});
+                try nested_json.writeJson(&line.writer, v.nested.node, v.nested.row);
+                try line.writer.writeByte('}');
+                try self.action(scratch, line.written());
+            };
         }
     }
 
@@ -478,6 +565,10 @@ fn strings(arena: std.mem.Allocator, v: ?std.json.Value) ![]const []const u8 {
 /// `v` copied into `arena`, so it outlives the parse it came from. Kept action
 /// fields (partition values, a deletion vector, the configuration) are flat maps;
 /// nesting past `depth` is dropped.
+/// How deep a whole action (`State.Whole`) is kept: a `metaData`'s format options
+/// are three levels down.
+const whole_depth = 8;
+
 fn ownJson(arena: std.mem.Allocator, v: std.json.Value, depth: u8) !std.json.Value {
     switch (v) {
         .string => |s| return .{ .string = try arena.dupe(u8, s) },
@@ -584,6 +675,11 @@ fn structFields(arena: std.mem.Allocator, name: []const u8, col: []const u8, v: 
     return out;
 }
 
+/// Column `col`'s `schemaString` type `t` as basalt's, as the reader types it.
+pub fn tableType(arena: std.mem.Allocator, name: []const u8, col: []const u8, t: std.json.Value) !types.Type {
+    return (try typeOf(arena, name, col, t, 0)).asNullable();
+}
+
 /// A schemaString type as basalt's: a primitive, a struct of its fields, an array
 /// as a list of its element and a map of its key (never null) and value.
 fn typeOf(arena: std.mem.Allocator, name: []const u8, col: []const u8, t: std.json.Value, depth: usize) anyerror!types.Type {
@@ -687,6 +783,18 @@ pub fn layoutOf(arena: std.mem.Allocator, st: *const State, root: []const u8, ad
 /// only what makes the replay itself unreliable; what a reader or a writer
 /// cannot honour each judges from the state.
 pub fn snapshot(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?[]const []const u8) !*State {
+    return replay(arena, root, at, listed_in, null);
+}
+
+/// `snapshot` at `version`, every action kept whole (`State.whole`), as a
+/// checkpoint of that version holds them.
+pub fn snapshotWhole(arena: std.mem.Allocator, root: []const u8, version: u64) !*State {
+    const w = try arena.create(State.Whole);
+    w.* = .{};
+    return replay(arena, root, .{ .version = version }, null, w);
+}
+
+fn replay(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?[]const []const u8, whole: ?*State.Whole) !*State {
     _ = replays.fetchAdd(1, .monotonic);
     const name = try msgfmt.allocPrint(arena, "Delta table `{s}`", .{root});
     if (table.isHttp(root))
@@ -708,7 +816,7 @@ pub fn snapshot(arena: std.mem.Allocator, root: []const u8, at: table.At, listed
         return refuse("{s} has no version {d} (versions {d} to {d} can be read)", .{ name, target, log.oldest(newest), newest });
     const from = try log.base(target);
 
-    var st = State{ .arena = arena, .name = name, .key_root = try table.absoluteRoot(arena, root) };
+    var st = State{ .arena = arena, .name = name, .key_root = try table.absoluteRoot(arena, root), .whole = whole };
     if (from) |c| {
         const files = log.checkpoints.get(c).?;
         var k: u32 = 1;
