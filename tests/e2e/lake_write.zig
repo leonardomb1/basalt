@@ -270,6 +270,35 @@ test "Delta checkpoint: a commit at the table's interval writes one, carrying an
     try testing.expectEqualStrings("a,t,n,d\napp,1,4,d\n", try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT max(txn.appId) AS a, max(add.tags['t']) AS t, count(add.path) AS n, max(domainMetadata.domain) AS d FROM {s}", .{cp4})));
 }
 
+test "Delta file skipping: a filter on a column or a struct's field leaves out the files whose statistics rule it out, unopened, on one lane or four" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT 1 AS id, CAST('{\"k\":1}' AS STRUCT(k INT)) AS s, 'p' AS tag;", 1);
+    for ([_]u8{ 2, 3, 4 }) |i| try load(&tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/t/' AS SELECT {d}0 AS id, CAST('{{\"k\":{d}0}}' AS STRUCT(k INT)) AS s, CAST(NULL AS STRING) AS tag;", .{ i, i }), 1);
+    const v1 = try logFile(a, &tmp, "t", 1);
+    const at = std.mem.indexOf(u8, v1, "part-").?;
+    const kept = v1[at .. at + std.mem.indexOfScalar(u8, v1[at..], '"').?];
+    var dir = try tmp.dir.openDir("t", .{ .iterate = true });
+    defer dir.close();
+    var gone = std.array_list.Managed([]const u8).init(a);
+    var it = dir.iterate();
+    while (try it.next()) |e| if (e.kind == .file and !std.mem.eql(u8, e.name, kept)) try gone.append(try a.dupe(u8, e.name));
+    for (gone.items) |n| try dir.deleteFile(n);
+    try testing.expectEqual(@as(usize, 3), gone.items.len);
+    for ([_]usize{ 1, 4 }) |threads| {
+        for ([_][]const u8{ "s.k = 20", "id BETWEEN 15 AND 25", "id > 10 AND id < 30", "s.k >= 11 AND s.k <= 29" }) |w| {
+            try load(&tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/out.csv' AS SELECT id FROM '$B/t/' WHERE {s};", .{w}), threads);
+            try testing.expectEqualStrings("id\n20\n", try tmp.dir.readFileAlloc(a, "out.csv", 1 << 10));
+        }
+    }
+    try load(&tmp, "LOAD INTO '$B/out.csv' AS SELECT COUNT(*) AS n FROM '$B/t/' WHERE tag = 'p' AND id = 20;", 1);
+    try testing.expectEqualStrings("n\n0\n", try tmp.dir.readFileAlloc(a, "out.csv", 1 << 10));
+    try runRefuses(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT id FROM '$B/t/' WHERE id >= 20;", "could not read its file");
+}
+
 test "Delta write: what is refused, at check where it can be seen" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();

@@ -731,6 +731,21 @@ test "an UPSERT into a table with deletion vectors rewrites a file without its d
     try testing.expect(std.mem.indexOf(u8, log, "\"deletionVector\":{\"storageType\":\"u\",\"pathOrInlineDv\":\"vBn[lx{q8@P<9BNH/isA\"") != null);
 }
 
+test "Delta column mapping: files are skipped by statistics keyed by physical name" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try golden(&tmp, "dat-column_mapping");
+    try tmp.dir.deleteFile("dat-column_mapping/part-00000-f94de347-a288-43fe-9ea3-257ef31d0382-c000.snappy.parquet");
+    try tmp.dir.deleteFile("dat-column_mapping/part-00000-fc640cb1-6ec2-4d05-9f23-0959e2dfd6b3-c000.snappy.parquet");
+    try testing.expectEqualStrings("n\n0\n", try lanesAgree(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/dat-column_mapping/' WHERE new_int > 692"));
+    try testing.expectEqualStrings("n\n0\n", try lanesAgree(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/dat-column_mapping/' WHERE letter = 'z' AND date >= '1970-01-01'"));
+    const r = try runIn(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT COUNT(*) AS n FROM '$B/dat-column_mapping/' WHERE new_int = 25;", 1);
+    try testing.expect(r.err != null and std.mem.indexOf(u8, r.msg, "could not read its file") != null);
+}
+
 test "Delta column mapping: a struct field dropped inside a list element or a map value is neither read nor shown" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

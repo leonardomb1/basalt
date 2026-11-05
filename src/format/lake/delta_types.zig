@@ -328,10 +328,25 @@ fn numText(v: std.json.Value) ?[]const u8 {
 
 /// Whether a file's statistics say every value of `name` is NULL.
 pub fn allNull(s: std.json.ObjectMap, name: []const u8) bool {
+    return allNullAt(s, &.{name});
+}
+
+/// The entry `path` names below a statistics map (`minValues`, `maxValues` or
+/// `nullCount`): a top-level column, then a struct's field at each step, as a
+/// struct's statistics nest.
+fn entryAt(s: std.json.ObjectMap, map: []const u8, path: []const []const u8) ?std.json.Value {
+    var cur = s.get(map) orelse return null;
+    for (path) |k| {
+        if (cur != .object) return null;
+        cur = cur.object.get(k) orelse return null;
+    }
+    return cur;
+}
+
+/// `allNull` of the column or struct field `path` names.
+pub fn allNullAt(s: std.json.ObjectMap, path: []const []const u8) bool {
     const n = numText(s.get("numRecords") orelse return false) orelse return false;
-    const nc = s.get("nullCount") orelse return false;
-    if (nc != .object) return false;
-    const c = numText(nc.object.get(name) orelse return false) orelse return false;
+    const c = numText(entryAt(s, "nullCount", path) orelse return false) orelse return false;
     const rows = std.fmt.parseInt(u64, n, 10) catch return false;
     return rows > 0 and (std.fmt.parseInt(u64, c, 10) catch return false) == rows;
 }
@@ -341,9 +356,12 @@ pub fn allNull(s: std.json.ObjectMap, name: []const u8) bool {
 /// may cut one to, any binary, a NaN. A timestamp is kept to milliseconds, so a
 /// maximum is widened by the rest of its millisecond.
 pub fn statValue(arena: std.mem.Allocator, s: std.json.ObjectMap, which: Bound, name: []const u8, ty: types.Type) !?Value {
-    const m = s.get(which.key()) orelse return null;
-    if (m != .object) return null;
-    const text = numText(m.object.get(name) orelse return null) orelse return null;
+    return statValueAt(arena, s, which, &.{name}, ty);
+}
+
+/// `statValue` of the column or struct field `path` names.
+pub fn statValueAt(arena: std.mem.Allocator, s: std.json.ObjectMap, which: Bound, path: []const []const u8, ty: types.Type) !?Value {
+    const text = numText(entryAt(s, which.key(), path) orelse return null) orelse return null;
     if (ty.kind == .string and which == .max and text.len >= stat_prefix) return null;
     if (ty.kind == .bytes) return null;
     const v = (try table.partitionValue(arena, text, ty)) orelse return null;
@@ -351,6 +369,28 @@ pub fn statValue(arena: std.mem.Allocator, s: std.json.ObjectMap, which: Bound, 
     if (which == .max and v == .timestamp) return .{ .timestamp = v.timestamp + 999 };
     return v;
 }
+
+/// Whether a file's statistics prove no row of it passes `column op value` on the
+/// column or struct field `path` names (as its statistics key it) of type `ty`:
+/// every value there NULL, which no comparison passes, or its minimum or maximum
+/// on the far side of `value`. Statistics that do not say keep the file.
+pub fn excludes(arena: std.mem.Allocator, s: std.json.ObjectMap, path: []const []const u8, ty: types.Type, op: Op, value: Value) !bool {
+    if (allNullAt(s, path)) return true;
+    const lo = try statValueAt(arena, s, .min, path, ty);
+    const hi = try statValueAt(arena, s, .max, path, ty);
+    const below = if (lo) |x| order(x, value) else null;
+    const above = if (hi) |x| order(x, value) else null;
+    return switch (op) {
+        .eq => (if (below) |o| o == .gt else false) or (if (above) |o| o == .lt else false),
+        .lt => if (below) |o| o != .lt else false,
+        .le => if (below) |o| o == .gt else false,
+        .gt => if (above) |o| o != .gt else false,
+        .ge => if (above) |o| o == .lt else false,
+    };
+}
+
+pub const Op = @import("../parquet/stats.zig").Bound.Op;
+const order = @import("../parquet/stats.zig").cmp;
 
 test "delta_types: every primitive name, read and write, with its layout" {
     const T = types.Type;
@@ -742,4 +782,34 @@ test "a nested type's leaves are laid out in the Parquet shape's order: struct f
     try testing.expectEqual(@as(u8, 8), got[2].int_bits);
     try testing.expect(got[3].utc);
     try testing.expect(got[4].float32);
+}
+
+test "a file's statistics exclude it when a bound's value lies past its minimum or maximum, or its column is all NULL" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const s = parseStats(a,
+        \\{"numRecords":3,"minValues":{"id":10,"s":{"k":5},"ts":"2026-01-02T03:04:05.123Z","name":"bb"},
+        \\"maxValues":{"id":20,"s":{"k":9},"ts":"2026-01-02T03:04:05.123Z"},
+        \\"nullCount":{"id":0,"s":{"k":0,"z":3},"name":1}}
+    ).?;
+    const T = types.Type;
+    const int = T.init(.int);
+    const id = &[_][]const u8{"id"};
+    try testing.expect(try excludes(a, s, id, int, .eq, .{ .int = 9 }));
+    try testing.expect(!try excludes(a, s, id, int, .eq, .{ .int = 10 }));
+    try testing.expect(try excludes(a, s, id, int, .gt, .{ .int = 20 }));
+    try testing.expect(!try excludes(a, s, id, int, .ge, .{ .int = 20 }));
+    try testing.expect(try excludes(a, s, id, int, .lt, .{ .int = 10 }));
+    try testing.expect(!try excludes(a, s, id, int, .le, .{ .int = 10 }));
+    try testing.expect(!try excludes(a, s, id, int, .gt, .{ .float = 19.5 }));
+    try testing.expect(try excludes(a, s, &.{ "s", "k" }, int, .gt, .{ .int = 9 }));
+    try testing.expect(try excludes(a, s, &.{ "s", "z" }, int, .eq, .{ .int = 1 }));
+    try testing.expect(!try excludes(a, s, &.{ "s", "q" }, int, .eq, .{ .int = 1 }));
+    const ts = T.init(.timestamp);
+    const at = civil.daysFromCivil(2026, 1, 2) * 86_400_000_000 + civil.clockMicros(3, 4, 5, 123_456).?;
+    try testing.expect(!try excludes(a, s, &.{"ts"}, ts, .eq, .{ .timestamp = at }));
+    try testing.expect(try excludes(a, s, &.{"ts"}, ts, .gt, .{ .timestamp = at + 1000 }));
+    try testing.expect(try excludes(a, s, &.{"name"}, T.init(.string), .lt, .{ .string = "ba" }));
+    try testing.expect(!try excludes(a, s, &.{"name"}, T.init(.string), .gt, .{ .string = "zz" }));
 }

@@ -94,8 +94,15 @@ as NULL, as one added after the file was written does, and a file whose column
 is of another type fails the read naming the file. A partition column's value
 comes from the log, as the protocol asks, whether or not the file holds it too;
 an empty or null value is NULL. A filter on a partition column skips the files
-whose value it rules out without opening them, and everything a Parquet folder
-does still applies: lanes under `-j`, projection, row-group statistics, a join's
+whose value it rules out without opening them, and so does a comparison (`=`,
+`<`, `<=`, `>`, `>=`, `BETWEEN`, joined by `AND`) on any other column or a
+struct's field (`WHERE s.id > 5`), by each file's statistics in the log: a file
+whose `minValues` and `maxValues` put every row outside the comparison, or whose
+`nullCount` says the column is NULL in every row, is never opened. Statistics
+keyed by physical name under column mapping are read as such; a file without
+statistics for the column is read, and a string cut to its prefix or a timestamp
+kept to the millisecond bounds as loosely as the protocol allows. Everything a
+Parquet folder does still applies: lanes under `-j`, projection, row-group statistics, a join's
 keys, ranged reads of remote files. Delta types map as Parquet's do — `long`,
 `integer`, `short` and `byte` to `INT`, `float` and `double` to `FLOAT`,
 `timestamp` and `timestamp_ntz` to `TIMESTAMP`, and a struct, an array or a map

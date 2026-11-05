@@ -4,7 +4,10 @@
 //! a partition column is the file's constant from the table's log and wins over any
 //! copy in the file, and a column whose kind differs from the table's is refused
 //! naming the file. A decimal differing in precision alone is relabelled.
-//! A pushed bound on a partition column skips a whole file without opening it.
+//! A pushed bound skips a whole file without opening it when the file's partition
+//! constant fails it, or when the file's statistics from the table's log (`stats`,
+//! Delta's `add.stats`) prove no row passes it: the column (or a struct's field)
+//! all NULL there, or its minimum or maximum past the bound's value.
 //!
 //! A table may name its files' columns otherwise than itself (`Mapping`, Delta's
 //! column mapping): by a physical name or a Parquet field id. A file's footer is
@@ -27,6 +30,7 @@ const column = @import("../../exec/column.zig");
 const eval = @import("../../exec/eval.zig");
 const parseFooterOf = @import("folder.zig").parseFooterOf;
 const roaring = @import("../lake/roaring.zig");
+const dtypes = @import("../lake/delta_types.zig");
 const types = @import("../../lang/types.zig");
 const testing = std.testing;
 
@@ -47,6 +51,7 @@ pub const Layout = struct {
         size: ?u64 = null,
         parts: []const Value = &.{},
         deletes: ?Deletes = null,
+        stats: ?[]const u8 = null,
     };
 
     pub fn paths(self: *const Layout, arena: std.mem.Allocator) ![]const []const u8 {
@@ -79,13 +84,22 @@ pub const Layout = struct {
         return v;
     }
 
-    /// Whether a file's partition constants rule out every row a bound keeps; a
-    /// null constant fails every comparison.
+    /// Whether a file's partition constants or its statistics rule out every row a
+    /// bound keeps; a null constant fails every comparison.
     pub fn pruned(self: *const Layout, i: usize, bounds: []const Bound) bool {
         const file = self.files[i];
+        var mem = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        defer mem.deinit();
+        var stats: ?std.json.ObjectMap = null;
         for (bounds) |b| {
-            const fi = self.schema.indexOf(b.column) orelse continue;
-            const p = self.partOf(fi) orelse continue;
+            const part = if (self.schema.indexOf(b.column)) |fi| self.partOf(fi) else null;
+            const p = part orelse {
+                const text = file.stats orelse continue;
+                if (stats == null) stats = dtypes.parseStats(mem.allocator(), text) orelse return false;
+                const at = (self.statPath(mem.allocator(), b.column) catch null) orelse continue;
+                if (dtypes.excludes(mem.allocator(), stats.?, at.keys, at.ty, b.op, b.value) catch false) return true;
+                continue;
+            };
             if (p >= file.parts.len) continue;
             const c = file.parts[p];
             if (c == .null) return true;
@@ -100,6 +114,38 @@ pub const Layout = struct {
             if (!keeps) return true;
         }
         return false;
+    }
+
+    /// Column `name` (a top-level column, or a struct's field as `s.city`) as a
+    /// file's statistics key it, by physical names under column mapping, with its
+    /// type; null for a list, map or struct, or a path through a list or map.
+    fn statPath(self: *const Layout, arena: std.mem.Allocator, name: []const u8) !?struct { keys: []const []const u8, ty: types.Type } {
+        var parts = std.array_list.Managed([]const u8).init(arena);
+        if (self.schema.indexOf(name) != null) try parts.append(name) else {
+            var it = std.mem.splitScalar(u8, name, '.');
+            while (it.next()) |x| try parts.append(x);
+        }
+        const top = self.schema.indexOf(parts.items[0]) orelse return null;
+        var ty = self.schema.fields[top].ty;
+        for (parts.items[1..]) |x| {
+            if (ty.kind != .@"struct") return null;
+            ty = for (ty.fields orelse return null) |f| {
+                if (std.mem.eql(u8, f.name, x)) break f.ty;
+            } else return null;
+        }
+        if (ty.isNested()) return null;
+        const m = self.mapping orelse return .{ .keys = parts.items, .ty = ty };
+        const keys = try arena.alloc([]const u8, parts.items.len);
+        var nodes = m.fields;
+        for (parts.items, keys) |x, *k| {
+            const n = for (nodes) |*n| {
+                if (n.name != null and std.mem.eql(u8, n.name.?, x)) break n;
+            } else return null;
+            if (n.physical.len == 0) return null;
+            k.* = n.physical;
+            nodes = n.children;
+        }
+        return .{ .keys = keys, .ty = ty };
     }
 
     /// File `i` opened for `v`, its batches fitted to it; null when `bounds` prune it.

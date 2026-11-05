@@ -767,7 +767,7 @@ pub fn layoutOf(arena: std.mem.Allocator, st: *const State, root: []const u8, ad
             p.* = (try table.partitionValue(arena, text, schema.fields[fi].ty)) orelse
                 return refuse("{s} has file `{s}` with partition value `{s}` for column `{s}`, which is not a {s}", .{ name, decoded, text.?, c, try schema.fields[fi].ty.name(arena) });
         }
-        f.* = .{ .path = try table.mapPath(arena, root, decoded), .size = a.size, .parts = parts };
+        f.* = .{ .path = try table.mapPath(arena, root, decoded), .size = a.size, .parts = parts, .stats = a.stats };
         if (a.dv) |dv| {
             const ref = try arena.create(dvs.Ref);
             ref.* = .{ .name = name, .root = root, .file = decoded, .d = try dvs.descriptor(name, decoded, dv) };
