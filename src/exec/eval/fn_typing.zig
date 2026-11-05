@@ -155,6 +155,13 @@ pub const typing = struct {
         return Type.init(if (bytes) .bytes else .string).withNull(nn);
     }
 
+    pub fn cardinality(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        if (c.args.len != 1) return self.err("`cardinality` takes one argument, a list or a map", .{});
+        const t = try self.argType(c, 0);
+        if (t.kind != .array and t.kind != .map and !t.unknown) return self.err("`cardinality` takes a list or a map, got {s}", .{t.name(self.arena) catch "?"});
+        return Type.init(.int).withNull(t.nullable);
+    }
+
     pub fn coalesce(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
         if (c.args.len == 0) return self.err("`coalesce` needs at least one argument", .{});
         var result: ?Type = null;

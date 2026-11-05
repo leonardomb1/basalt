@@ -103,6 +103,12 @@ pub fn exprKey(self: *Parser, e: *const ast.Expr, buf: *std.array_list.Managed(u
             try self.exprKey(b.r, buf);
             try buf.append(')');
         },
+        .index => |x| {
+            try self.exprKey(x.e, buf);
+            try buf.append('[');
+            try self.exprKey(x.key, buf);
+            try buf.append(']');
+        },
         .cast => |c| {
             try buf.appendSlice("cast(");
             try self.exprKey(c.e, buf);

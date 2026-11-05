@@ -382,7 +382,7 @@ test "LogicalType-only parquet timestamps and times read back as wall-clock valu
     );
 }
 
-test "a parquet LIST column unnests through JSON_EACH of its JSON text, one row per element" {
+test "a parquet LIST column unnests, one row per element, its nulls kept" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -394,7 +394,7 @@ test "a parquet LIST column unnests through JSON_EACH of its JSON text, one row 
 
     const script = try std.fmt.allocPrint(
         alloc,
-        "LOAD INTO '{s}' AS SELECT id, x FROM (SELECT id, CAST(xs AS STRING) AS t FROM '{s}/l.parquet') CROSS JOIN UNNEST(JSON_EACH(t)) AS x ORDER BY id;",
+        "LOAD INTO '{s}' AS SELECT id, x FROM '{s}/l.parquet' CROSS JOIN UNNEST(xs) AS x ORDER BY id;",
         .{ out_path, base },
     );
     defer alloc.free(script);
@@ -487,4 +487,35 @@ test "a CSV header's quoted names lose their quotes, a delimiter inside one incl
         defer alloc.free(got);
         try std.testing.expectEqualStrings("v,ab\n1,2\n4,5\n", got);
     }
+}
+
+test "nested columns are taken apart in place: list index, struct field, map lookup, cardinality, s.* and UNNEST, and keyed on a struct's field" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "l.parquet", .data = fixtures.lists_v1_parquet });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const out_path = try std.fs.path.join(alloc, &.{ base, "out.csv" });
+    defer alloc.free(out_path);
+    const script = try std.fmt.allocPrint(alloc,
+        \\LOAD INTO '{s}/nest.parquet' AS SELECT id, CAST(json_object('k', id % 2, 'v', CAST(recs AS STRING)) AS STRUCT(k INT, v LIST(STRUCT(a INT, b STRING)))) AS s FROM '{s}/l.parquet';
+        \\LOAD INTO '{s}/a.csv' AS SELECT id, recs[1].b AS b1, recs[1]['a'] AS a1, m['k'] AS mk, cardinality(recs) AS n, s.k, s.v[1].a AS va FROM '{s}/nest.parquet' t JOIN '{s}/l.parquet' USING (id) ORDER BY id;
+        \\LOAD INTO '{s}/b.csv' AS SELECT s.k, COUNT(*) AS n FROM '{s}/nest.parquet' GROUP BY s.k ORDER BY s.k;
+        \\LOAD INTO '{s}' AS SELECT id, r.a, r.b FROM '{s}/l.parquet' CROSS JOIN UNNEST(recs) AS r ORDER BY id;
+        \\LOAD INTO '{s}/c.csv' AS SELECT id, s.* FROM '{s}/nest.parquet' WHERE s.k = 0 ORDER BY id;
+    , .{ base, base, base, base, base, base, base, out_path, base, base, base });
+    defer alloc.free(script);
+    const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id,a,b\n1,1,x\n4,2,y\n", out);
+    const a = try tmp.dir.readFileAlloc(alloc, "a.csv", 1 << 16);
+    defer alloc.free(a);
+    try std.testing.expectEqualStrings("id,b1,a1,mk,n,k,va\n1,x,1,1,1,1,1\n2,,,,,0,\n3,,,,0,1,\n4,y,2,,1,0,2\n", a);
+    const b = try tmp.dir.readFileAlloc(alloc, "b.csv", 1 << 16);
+    defer alloc.free(b);
+    try std.testing.expectEqualStrings("k,n\n0,2\n1,2\n", b);
+    const c = try tmp.dir.readFileAlloc(alloc, "c.csv", 1 << 16);
+    defer alloc.free(c);
+    try std.testing.expectEqualStrings("id,k,v\n2,0,\n4,0,\"[{\"\"a\"\":2,\"\"b\"\":\"\"y\"\"}]\"\n", c);
 }

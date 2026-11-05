@@ -129,7 +129,11 @@ pub const TypeCtx = struct {
                 if (q.safe.len > 0) return self.err("`?.` (safe navigation) only applies to JSON-param paths, not column `{s}`", .{lastPart(q)});
                 if (q.parts.len == 1 and (self.schema.ambiguous(q.parts[0]) or self.schema.clashes(q.parts[0], q.sides))) return self.err("column reference `{s}` is ambiguous", .{q.parts[0]});
                 const idx = fieldIndex(self.schema, q) orelse {
-                    if (q.parts.len > 1) return self.err("unknown column `{s}.{s}`", .{ q.parts[q.parts.len - 2], lastPart(q) });
+                    if (structPath(self.schema, q)) |p| {
+                        self.span = null;
+                        return pathType(self.schema.fields[p.col].ty, p.fields).?;
+                    }
+                    if (q.parts.len > 1) return self.pathErr(q);
                     return self.err("unknown field `{s}`", .{lastPart(q)});
                 };
                 self.span = null;
@@ -154,6 +158,31 @@ pub const TypeCtx = struct {
                 return u.withNull(u.nullable or ct.nullable);
             },
             .match => |m| return self.typeOfMatch(m),
+            .index => |x| {
+                const t = try self.typeOf(x.e);
+                const k = try self.typeOf(x.key);
+                switch (t.kind) {
+                    .array => {
+                        if (!k.unknown and k.kind != .int) return self.err("a list's index must be an INT (counted from 1), got {s}", .{k.name(self.arena) catch "?"});
+                        return (if (t.elem) |e| e.* else Type.init(.string)).asNullable();
+                    },
+                    .map => {
+                        const kv = t.fields orelse return self.err("a MAP without key and value types cannot be indexed", .{});
+                        if (!k.unknown and Type.unify(k, kv[0].ty) == null and !(k.kind.isNumeric() and kv[0].ty.kind.isNumeric()))
+                            return self.err("this map's keys are {s}, not {s}", .{ kv[0].ty.name(self.arena) catch "?", k.name(self.arena) catch "?" });
+                        return kv[1].ty.asNullable();
+                    },
+                    .@"struct" => {
+                        if (x.key.* != .str_lit) return self.err("a struct's field is named by a constant: `s.name` or `s['name']`", .{});
+                        for (t.fields orelse &.{}) |f| if (std.mem.eql(u8, f.name, x.key.str_lit)) return f.ty.asNullable();
+                        return self.err("struct has no field `{s}` (its fields: {s})", .{ x.key.str_lit, fieldList(self.arena, t) catch "?" });
+                    },
+                    else => {
+                        if (t.unknown) return Type.unknownNull();
+                        return self.err("`[ ]` takes a list, a map or a struct, got {s}", .{t.name(self.arena) catch "?"});
+                    },
+                }
+            },
             .cast => |c| {
                 const s = try self.typeOf(c.e);
                 if (c.ty.isNested() and !s.unknown and s.kind != .string and !s.isNested())
@@ -289,6 +318,34 @@ pub const TypeCtx = struct {
         return self.typeOf(c.args[i]);
     }
 
+    /// A dotted name that is neither a table's column nor a struct's field: which
+    /// part is missing, in the terms the name was meant in.
+    fn pathErr(self: *TypeCtx, q: ast.QualName) TypeError {
+        const i = self.schema.indexOf(q.parts[0]) orelse {
+            if (q.parts.len == 2 and !self.schema.hasRel(q.parts[0]))
+                return self.err("unknown table `{s}` in `{s}.{s}` — no table of this FROM is named or aliased `{s}`, and no column of that name is a struct", .{ q.parts[0], q.parts[0], q.parts[1], q.parts[0] });
+            return self.err("unknown column `{s}.{s}`", .{ q.parts[q.parts.len - 2], lastPart(q) });
+        };
+        var t = self.schema.fields[i].ty;
+        for (q.parts[1..], 1..) |name, k| {
+            const at = std.mem.join(self.arena, ".", q.parts[0..k]) catch "?";
+            if (t.kind != .@"struct") return self.err("`{s}` is {s}, not a struct, so it has no field `{s}`", .{ at, t.name(self.arena) catch "?", name });
+            t = for (t.fields orelse &.{}) |f| {
+                if (std.mem.eql(u8, f.name, name)) break f.ty;
+            } else return self.err("struct `{s}` has no field `{s}` (its fields: {s})", .{ at, name, fieldList(self.arena, t) catch "?" });
+        }
+        return self.err("unknown column `{s}.{s}`", .{ q.parts[q.parts.len - 2], lastPart(q) });
+    }
+
+    fn fieldList(arena: std.mem.Allocator, t: Type) ![]const u8 {
+        var out = std.array_list.Managed(u8).init(arena);
+        for (t.fields orelse &.{}, 0..) |f, i| {
+            if (i > 0) try out.appendSlice(", ");
+            try out.appendSlice(f.name);
+        }
+        return out.items;
+    }
+
     pub fn err(self: *TypeCtx, comptime fmt: []const u8, args: anytype) TypeError {
         @branchHint(.cold);
         self.msg = msgfmt.allocPrint(self.arena, fmt, args) catch "out of memory";
@@ -420,6 +477,8 @@ pub const parseTimestampText = @import("eval/time.zig").parseTimestampText;
 pub const civilFromDays = @import("eval/time.zig").civilFromDays;
 const formatDecimal = decimal.formatDecimal;
 const fieldIndex = @import("eval/support.zig").fieldIndex;
+pub const structPath = @import("eval/support.zig").structPath;
+const pathType = @import("eval/support.zig").pathType;
 const lastPart = @import("eval/support.zig").lastPart;
 pub const toF64 = @import("eval/support.zig").toF64;
 pub const explain = @import("eval/support.zig").explain;

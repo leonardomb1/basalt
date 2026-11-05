@@ -110,6 +110,7 @@ pub const Expr = union(enum) {
     match: Match,
     cast: Cast,
     is_null: IsNull,
+    index: Index,
     let_in: LetIn,
     lambda: Lambda,
     lambda_var: []const u8,
@@ -153,6 +154,9 @@ pub const Expr = union(enum) {
     pub const LetIn = struct { name: []const u8, value: *Expr, body: *Expr };
     pub const Lambda = struct { params: []const []const u8, body: *Expr };
     pub const Cast = struct { e: *Expr, ty: types.Type, safe: bool = false };
+    /// `e[key]`: a list's element (1-based), a map's value, or a struct's field by
+    /// its constant name (`e.name` after an index parses so).
+    pub const Index = struct { e: *Expr, key: *Expr };
     pub const NullTest = enum { is_null, is_empty };
     pub const IsNull = struct { e: *Expr, negated: bool, kind: NullTest = .is_null };
 };
@@ -186,6 +190,7 @@ pub fn rebuildExpr(arena: std.mem.Allocator, e: *const Expr, ctx: anytype, compt
         .binary => |b| try mkExpr(arena, .{ .binary = .{ .op = b.op, .l = try recur(ctx, b.l), .r = try recur(ctx, b.r) } }),
         .cond => |c| try mkExpr(arena, .{ .cond = .{ .cond = try recur(ctx, c.cond), .then = try recur(ctx, c.then), .els = try recur(ctx, c.els) } }),
         .cast => |c| try mkExpr(arena, .{ .cast = .{ .e = try recur(ctx, c.e), .ty = c.ty, .safe = c.safe } }),
+        .index => |x| try mkExpr(arena, .{ .index = .{ .e = try recur(ctx, x.e), .key = try recur(ctx, x.key) } }),
         .is_null => |n| try mkExpr(arena, .{ .is_null = .{ .e = try recur(ctx, n.e), .negated = n.negated, .kind = n.kind } }),
         .let_in => |l| try mkExpr(arena, .{ .let_in = .{ .name = l.name, .value = try recur(ctx, l.value), .body = try recur(ctx, l.body) } }),
         .call => |c| blk: {
@@ -377,6 +382,7 @@ pub fn anyExpr(e: *const Expr, ctx: anytype, comptime pred: fn (@TypeOf(ctx), *c
         .binary => |b| anyExpr(b.l, ctx, pred) or anyExpr(b.r, ctx, pred),
         .cond => |c| anyExpr(c.cond, ctx, pred) or anyExpr(c.then, ctx, pred) or anyExpr(c.els, ctx, pred),
         .cast => |c| anyExpr(c.e, ctx, pred),
+        .index => |x| anyExpr(x.e, ctx, pred) or anyExpr(x.key, ctx, pred),
         .is_null => |n| anyExpr(n.e, ctx, pred),
         .let_in => |l| anyExpr(l.value, ctx, pred) or anyExpr(l.body, ctx, pred),
         .call => |c| for (c.args) |a| {

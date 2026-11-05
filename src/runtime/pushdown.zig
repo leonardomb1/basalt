@@ -373,36 +373,14 @@ pub fn serialWhereWith(arena: std.mem.Allocator, dialect: Dialect, stages: []con
 /// Every source column an expression references, by `parts[0]`; a lambda's
 /// parameter is not one.
 pub fn collectFields(e: *const ast.Expr, set: *std.StringHashMap(void)) !void {
-    switch (e.*) {
-        .field => |q| try set.put(q.parts[0], {}),
-        .lambda => |l| try collectFields(l.body, set),
-        .unary => |u| try collectFields(u.e, set),
-        .binary => |b| {
-            try collectFields(b.l, set);
-            try collectFields(b.r, set);
-        },
-        .cond => |c| {
-            try collectFields(c.cond, set);
-            try collectFields(c.then, set);
-            try collectFields(c.els, set);
-        },
-        .cast => |c| try collectFields(c.e, set),
-        .is_null => |n| try collectFields(n.e, set),
-        .let_in => |l| {
-            try collectFields(l.value, set);
-            try collectFields(l.body, set);
-        },
-        .call => |c| for (c.args) |a| try collectFields(a, set),
-        .match => |m| {
-            if (m.subject) |s| try collectFields(s, set);
-            for (m.arms) |arm| {
-                for (arm.pats) |p| try collectFields(p, set);
-                if (arm.guard) |g| try collectFields(g, set);
-                try collectFields(arm.value, set);
-            }
-        },
-        else => {},
-    }
+    const S = struct {
+        fn add(m: *std.StringHashMap(void), n: *const ast.Expr) ?bool {
+            if (n.* != .field) return null;
+            m.put(n.field.parts[0], {}) catch return true;
+            return false;
+        }
+    };
+    if (ast.anyExpr(e, set, S.add)) return error.OutOfMemory;
 }
 
 pub fn qual(arena: std.mem.Allocator, parts: []const []const u8) !ast.QualName {

@@ -541,15 +541,15 @@ test "Delta column mapping: a renamed column reads under its new name, by physic
     try testing.expectEqualStrings("letter,int\nb,228\n", try rows(a, &tmp, "SELECT letter, int FROM '$B/dat-column_mapping/' WITH (version = 1) WHERE letter = 'b'", 1));
     try testing.expectEqualStrings("new_int\n604\n604\n692\n692\n", try rows(a, &tmp, "SELECT new_int FROM '$B/dat-column_mapping/' WHERE new_int > 600 ORDER BY new_int", 1));
 
-    const q = "SELECT ByteType, IntegerType, decimal, StringType, DateType, TimestampType, nested_struct, array_of_map_of_arrays, array_of_structs, struct_of_arrays_maps_of_structs, map_of_rows, map_of_maps FROM '$B/table-with-columnmapping-mode-id/' ORDER BY IntegerType";
+    const q = "SELECT ByteType, IntegerType, decimal, StringType, DateType, TimestampType, nested_struct.ac.aca AS \"nested_struct.ac.aca\", array_of_map_of_arrays, array_of_structs, struct_of_arrays_maps_of_structs.ab AS \"struct_of_arrays_maps_of_structs.ab\", map_of_rows, map_of_maps FROM '$B/table-with-columnmapping-mode-id/' ORDER BY IntegerType";
     const by_id = try lanesAgree(a, &tmp, q);
     try testing.expectEqualStrings(
-        \\ByteType,IntegerType,decimal,StringType,DateType,TimestampType,nested_struct,array_of_map_of_arrays,array_of_structs,struct_of_arrays_maps_of_structs,map_of_rows,map_of_maps
-        \\0,0,0.00,0,2021-11-18,1970-01-01 00:00:00,"{""aa"":""0"",""ac"":{""aca"":0}}","[{""0"":[2,3],""1"":[4,5]}]","[{""ab"":0},{""ab"":0}]","{""aa"":[0,1],""ab"":{""[0,1]"":{""aca"":2}}}","{""1"":{""ab"":0}}","{""0"":{""0"":0},""1"":{""2"":0}}"
-        \\1,1,1.00,1,2021-11-18,1970-01-01 00:00:00.001000,"{""aa"":""1"",""ac"":{""aca"":1}}","[{""1"":[2,3],""2"":[4,5]}]","[{""ab"":1},{""ab"":1}]","{""aa"":[1,2],""ab"":{""[1,2]"":{""aca"":3}}}","{""2"":{""ab"":20}}","{""1"":{""1"":1},""2"":{""3"":1}}"
-        \\2,2,2.00,2,2021-11-18,1970-01-01 00:00:00.002000,"{""aa"":""2"",""ac"":{""aca"":2}}","[{""2"":[2,3],""3"":[4,5]}]","[{""ab"":2},{""ab"":2}]","{""aa"":[2,3],""ab"":{""[2,3]"":{""aca"":4}}}","{""3"":{""ab"":40}}","{""2"":{""2"":2},""3"":{""4"":2}}"
-        \\3,3,3.00,3,2021-11-18,1970-01-01 00:00:00.003000,"{""aa"":""3"",""ac"":{""aca"":3}}","[{""3"":[2,3],""4"":[4,5]}]","[{""ab"":3},{""ab"":3}]","{""aa"":[3,4],""ab"":{""[3,4]"":{""aca"":5}}}","{""4"":{""ab"":60}}","{""3"":{""3"":3},""4"":{""5"":3}}"
-        \\4,4,4.00,4,2021-11-18,1970-01-01 00:00:00.004000,"{""aa"":""4"",""ac"":{""aca"":4}}","[{""4"":[2,3],""5"":[4,5]}]","[{""ab"":4},{""ab"":4}]","{""aa"":[4,5],""ab"":{""[4,5]"":{""aca"":6}}}","{""5"":{""ab"":80}}","{""4"":{""4"":4},""5"":{""6"":4}}"
+        \\ByteType,IntegerType,decimal,StringType,DateType,TimestampType,nested_struct.ac.aca,array_of_map_of_arrays,array_of_structs,struct_of_arrays_maps_of_structs.ab,map_of_rows,map_of_maps
+        \\0,0,0.00,0,2021-11-18,1970-01-01 00:00:00,0,"[{""0"":[2,3],""1"":[4,5]}]","[{""ab"":0},{""ab"":0}]","{""[0,1]"":{""aca"":2}}","{""1"":{""ab"":0}}","{""0"":{""0"":0},""1"":{""2"":0}}"
+        \\1,1,1.00,1,2021-11-18,1970-01-01 00:00:00.001000,1,"[{""1"":[2,3],""2"":[4,5]}]","[{""ab"":1},{""ab"":1}]","{""[1,2]"":{""aca"":3}}","{""2"":{""ab"":20}}","{""1"":{""1"":1},""2"":{""3"":1}}"
+        \\2,2,2.00,2,2021-11-18,1970-01-01 00:00:00.002000,2,"[{""2"":[2,3],""3"":[4,5]}]","[{""ab"":2},{""ab"":2}]","{""[2,3]"":{""aca"":4}}","{""3"":{""ab"":40}}","{""2"":{""2"":2},""3"":{""4"":2}}"
+        \\3,3,3.00,3,2021-11-18,1970-01-01 00:00:00.003000,3,"[{""3"":[2,3],""4"":[4,5]}]","[{""ab"":3},{""ab"":3}]","{""[3,4]"":{""aca"":5}}","{""4"":{""ab"":60}}","{""3"":{""3"":3},""4"":{""5"":3}}"
+        \\4,4,4.00,4,2021-11-18,1970-01-01 00:00:00.004000,4,"[{""4"":[2,3],""5"":[4,5]}]","[{""ab"":4},{""ab"":4}]","{""[4,5]"":{""aca"":6}}","{""5"":{""ab"":80}}","{""4"":{""4"":4},""5"":{""6"":4}}"
         \\,,,,,,,,,,,
         \\
     , by_id);

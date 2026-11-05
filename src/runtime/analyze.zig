@@ -1075,6 +1075,7 @@ fn exprHasDynamicName(e: *const ast.Expr) bool {
         .binary => |b| exprHasDynamicName(b.l) or exprHasDynamicName(b.r),
         .cond => |c| exprHasDynamicName(c.cond) or exprHasDynamicName(c.then) or exprHasDynamicName(c.els),
         .cast => |c| exprHasDynamicName(c.e),
+        .index => |x| exprHasDynamicName(x.e) or exprHasDynamicName(x.key),
         .is_null => |n| exprHasDynamicName(n.e),
         .let_in => |l| exprHasDynamicName(l.value) or exprHasDynamicName(l.body),
         .call => |c| for (c.args) |a| {

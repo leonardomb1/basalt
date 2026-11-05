@@ -253,6 +253,14 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                     q = try self.singleName(resolveExprAlias(first.expr_aliases, synth));
                     if (q.parts[0].ptr == synth.ptr)
                         return self.fail(kpos, "a window function in ORDER BY must repeat one the SELECT list computes — or give that one an alias and order by it", .{});
+                } else if (e.* == .field and !structish(e.field, &first.aliases)) {
+                    const f = e.field;
+                    if (f.parts.len == 1 and first.out_keys != null and namesOutput(first.out_keys, f.parts[0]))
+                        if (self.col_uses) |u| u.outputUse(f);
+                    if (f.parts.len == 1) try unambiguous(self, first.dups, f.parts[0], "ORDER BY", kpos);
+                    q = try distinctSortKey(self, stages.items, f, stripQual(f, &first.aliases), kpos);
+                    was_qual = q.parts.len < f.parts.len;
+                    if (f.parts.len == 1 and namesOutput(first.out_keys, f.parts[0])) q.sides = &.{};
                 } else switch (e.*) {
                     .int_lit => |n| {
                         const outs = first.out_keys orelse
@@ -264,14 +272,6 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                     .str_lit => |s| {
                         try unambiguous(self, first.dups, s, "ORDER BY", kpos);
                         q = try self.singleName(s);
-                    },
-                    .field => |f| {
-                        if (f.parts.len == 1 and first.out_keys != null and namesOutput(first.out_keys, f.parts[0]))
-                            if (self.col_uses) |u| u.outputUse(f);
-                        if (f.parts.len == 1) try unambiguous(self, first.dups, f.parts[0], "ORDER BY", kpos);
-                        q = try distinctSortKey(self, stages.items, f, stripQual(f, &first.aliases), kpos);
-                        was_qual = q.parts.len < f.parts.len;
-                        if (f.parts.len == 1 and namesOutput(first.out_keys, f.parts[0])) q.sides = &.{};
                     },
                     else => {
                         const b = try self.bindName(e, first.expr_aliases);
@@ -585,6 +585,14 @@ fn nameRepeats(
 /// expression it spells is that key's column, an aggregate the SELECT list leaves out
 /// is computed beside the others and named in `added` (dropped after the LIMIT, as
 /// HAVING's are), and any other column is refused, as in the SELECT list.
+/// Whether a dotted name can only be a struct column's field: its first part names
+/// no table of the FROM, or it has more parts than a table's column takes. Such a
+/// key is computed, as an expression key is, since no column has its name.
+fn structish(q: ast.QualName, aliases: *const AliasSet) bool {
+    if (q.dollar) return false;
+    return q.parts.len > 2 or (q.parts.len == 2 and !aliases.knows(q.parts[0]));
+}
+
 fn groupedSortKey(self: *Parser, e: *ast.Expr, group: []const ast.QualName, first: Core, stages: []ast.Stage, added: *std.array_list.Managed([]const u8), pos: Pos) Error!*ast.Expr {
     const keyed = try self.stripExpr(try self.groupKeyRefs(e, group, first.expr_aliases), &first.aliases);
     var ai = stages.len;
@@ -1023,7 +1031,8 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     continue;
                 }
                 if (c.* == .binary and c.binary.op == .eq and c.binary.l.* == .field and c.binary.r.* == .field and
-                    !c.binary.l.field.dollar and !c.binary.r.field.dollar)
+                    !c.binary.l.field.dollar and !c.binary.r.field.dollar and
+                    !structish(c.binary.l.field, &aliases) and !structish(c.binary.r.field, &aliases))
                 {
                     const a = c.binary.l.field;
                     const b = c.binary.r.field;
@@ -1050,7 +1059,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                         const le = if (l_left) c.binary.l else c.binary.r;
                         const re = if (l_left) c.binary.r else c.binary.l;
                         try pins.append(.{ .left = le.* == .field and le.field.parts.len > 1, .right = true });
-                        if (le.* == .field) {
+                        if (le.* == .field and !structish(le.field, &aliases)) {
                             try left_keys.append(stripQual(le.field, &aliases));
                         } else {
                             const k = try self.freshName("__jk{d}");
@@ -1058,7 +1067,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                             try key_cols.append(k);
                             try left_keys.append(try self.singleName(k));
                         }
-                        if (re.* == .field) {
+                        if (re.* == .field and !structish(re.field, &aliases)) {
                             try right_keys.append(stripPrefix(re.field, rname));
                         } else {
                             const k = try self.freshName("__jk{d}");
@@ -1257,7 +1266,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     },
                     else => return self.fail(gpos, "GROUP BY position {d} refers to `*`", .{n}),
                 };
-            } else if (ge.* == .field) {
+            } else if (ge.* == .field and !structish(ge.field, &aliases)) {
                 if (ge.field.parts.len == 1) {
                     const n = ge.field.parts[0];
                     switch (try groupNameHome(self, raw_items.items, n, &aliases)) {
@@ -1328,13 +1337,19 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         const q = ri.item.field;
         if (!q.dollar and q.parts.len == 2 and aliases.usingCopy(q.parts[0], q.parts[1]) != null)
             ri.* = .{ .item = .{ .computed = .{ .name = q.last(), .expr = try self.mk(.{ .field = q }) } } };
+        if (structish(q, &aliases) and !std.mem.eql(u8, q.last(), "*"))
+            ri.* = .{ .item = .{ .computed = .{ .name = q.last(), .expr = try self.mk(.{ .field = q }) } } };
     };
     for (raw_items.items) |ri| {
         switch (ri) {
             .win => |wi| try post.append(.{ .computed = .{ .name = win_calls.items[wi].out.?, .expr = try self.mk(.{ .field = try self.singleName(win_calls.items[wi].hidden) }) } }),
             .qstar => |alias| {
-                if (!aliases.knows(alias))
-                    return self.fail(pos, "unknown alias `{s}` in `{s}.*`", .{ alias, alias });
+                if (!aliases.knows(alias)) {
+                    const parts = try self.arena.dupe([]const u8, &.{ alias, "*" });
+                    try items.append(if (win_calls.items.len > 0) .star else .{ .field = .{ .parts = parts } });
+                    try post.append(.{ .field = .{ .parts = parts } });
+                    continue;
+                }
                 const rights = try aliases.rights(self.arena);
                 if (rights.len == 0) {
                     try items.append(.star);

@@ -87,6 +87,7 @@ const listed = [_]Builtin{
     .{ .name = "concat_ws", .sig = "concat_ws(sep, a, …)" },
     .{ .name = "chars", .sig = "chars(s)" },
     .{ .name = "coalesce", .sig = "coalesce(a, …)" },
+    .{ .name = "cardinality", .sig = "cardinality(list or map)" },
     .{ .name = "starts_with", .sig = "starts_with(s, prefix)" },
     .{ .name = "ends_with", .sig = "ends_with(s, suffix)" },
     .{ .name = "contains", .sig = "contains(s, sub)" },

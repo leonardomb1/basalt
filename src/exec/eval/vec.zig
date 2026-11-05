@@ -17,7 +17,7 @@ const nested_json = @import("../nested.zig");
 const decimalArithType = @import("../decimal.zig").decimalArithType;
 const decimalOp = @import("../decimal.zig").decimalOp;
 const evalRow = @import("row.zig").evalRow;
-const fieldIndex = @import("support.zig").fieldIndex;
+const fieldColumn = @import("support.zig").fieldColumn;
 const forgetFailure = @import("support.zig").forgetFailure;
 const rescaleTo = @import("../decimal.zig").rescaleTo;
 const addAtScale = @import("../decimal.zig").addAtScale;
@@ -124,13 +124,13 @@ pub fn evalVecNode(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch
         .dec_lit => |d| return .{ .scalar = .{ .decimal = .{ .unscaled = d.unscaled, .scale = d.scale } } },
         .str_lit => |s| return .{ .scalar = .{ .string = s } },
         .field => |q| {
-            const idx = fieldIndex(batch.schema.*, q) orelse return error.TypeMismatch;
-            return .{ .col = batch.columns[idx] };
+            return .{ .col = fieldColumn(batch, q) orelse return error.TypeMismatch };
         },
         .unary => |u| return unaryVec(arena, u, batch),
         .is_null => |n| return isNullVec(arena, n, batch),
         .binary => |b| return binaryVec(arena, b, batch),
         .cast => |c| return castVec(arena, c, batch),
+        .index => return error.Unsupported,
         .cond => |c| return condVec(arena, c, batch),
         .call => |c| return callVec(arena, c, batch),
         .match => |m| return matchVec(arena, m, batch),
@@ -1073,7 +1073,7 @@ fn numKind(e: *const ast.Expr, batch: Batch) ?types.TypeKind {
         .int_lit => .int,
         .dec_lit => .decimal,
         .float_lit => .float,
-        .field => |q| batch.columns[fieldIndex(batch.schema.*, q) orelse return null].ty.kind,
+        .field => |q| (fieldColumn(batch, q) orelse return null).ty.kind,
         .unary => |u| if (u.op == .neg) numKind(u.e, batch) else null,
         .binary => |b| switch (b.op) {
             .add, .sub, .mul, .div, .mod => {

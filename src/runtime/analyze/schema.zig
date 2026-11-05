@@ -10,6 +10,7 @@ const ParamMap = std.StringHashMap(*const ast.Expr);
 const aggregates = @import("../../lang/aggregates.zig");
 const ast = @import("../../lang/ast.zig");
 const civil = @import("../../exec/civil.zig");
+const column = @import("../../exec/column.zig");
 const decimal = @import("../../exec/decimal.zig");
 const exprType = @import("../analyze.zig").exprType;
 const fail = @import("../analyze.zig").fail;
@@ -96,6 +97,16 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
         .field => |q| {
             try single(in, q, diag);
             const idx = in.resolve(q.parts) orelse {
+                if (std.mem.eql(u8, lastPart(q), "*")) {
+                    try structStar(arena, in, q, &cols, diag);
+                    continue;
+                }
+                if (eval.structPath(in, q)) |_| {
+                    const e = try mk(arena, .{ .field = q });
+                    try cols.append(.{ .name = try freeName(arena, cols.items, lastPart(q), lastPart(q)), .ty = try exprType(arena, in, e, diag), .source = .{ .expr = e } });
+                    continue;
+                }
+                if (q.parts.len > 1) _ = try exprType(arena, in, try mk(arena, .{ .field = q }), diag);
                 if (q.parts.len > 1) return failAt(diag, q.span, "unknown column `{s}`", .{try std.mem.join(arena, ".", q.parts)});
                 return failAt(diag, q.span, "unknown field `{s}`", .{lastPart(q)});
             };
@@ -109,6 +120,18 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
         },
     };
     return cols.toOwnedSlice();
+}
+
+/// `s.*`: the fields of struct column `s` (or of a struct path to one) as columns
+/// of their own, each named for its field.
+fn structStar(arena: std.mem.Allocator, in: types.Schema, q: ast.QualName, cols: *std.array_list.Managed(Col), diag: *Diag) Error!void {
+    const base = ast.QualName{ .parts = q.parts[0 .. q.parts.len - 1], .span = q.span };
+    const t = try exprType(arena, in, try mk(arena, .{ .field = base }), diag);
+    if (t.kind != .@"struct") return failAt(diag, q.span, "unknown alias `{s}` in `{s}.*`: no table of this FROM is named so, and `{s}` is {s}, not a struct", .{ base.parts[0], base.parts[0], base.parts[0], try t.name(arena) });
+    for (t.fields orelse &.{}) |f| {
+        const e = try mk(arena, .{ .field = .{ .parts = try std.mem.concat(arena, []const u8, &.{ base.parts, &.{f.name} }), .span = q.span } });
+        try cols.append(.{ .name = try freeName(arena, cols.items, f.name, f.name), .ty = try exprType(arena, in, e, diag), .source = .{ .expr = e } });
+    }
 }
 
 /// Refuses an unqualified name two columns of `in` share, as SQL does: a derived
@@ -475,11 +498,14 @@ pub fn explodePlan(arena: std.mem.Allocator, in: types.Schema, ex: ast.Explode, 
     if (in.ambiguous(ex.field)) return fail(diag, "column reference `{s}` is ambiguous", .{ex.field});
     const idx = in.indexOf(ex.field) orelse return fail(diag, "unknown field `{s}`", .{ex.field});
     const fty = in.fields[idx].ty;
-    if (!(fty.kind == .string or fty.kind == .bytes))
-        return fail(diag, "explode needs a string column (it splits a delimited value or a JSON array)", .{});
+    const listed = fty.kind == .array or fty.kind == .map;
+    if (listed and (ex.json or ex.delim != null))
+        return fail(diag, "`{s}` is {s}: UNNEST({s}) takes it as it is, with no JSON_EACH or SPLIT", .{ ex.field, try fty.name(arena), ex.field });
+    if (!(fty.kind == .string or fty.kind == .bytes or listed))
+        return fail(diag, "UNNEST needs a list, a map, or a string column (it splits a delimited value or a JSON array)", .{});
     const fields = try arena.alloc(types.Schema.Field, in.fields.len);
     for (in.fields, fields, 0..) |f, *out, i| {
-        const ty = if (ex.json) types.Type.init(.string).asNullable() else types.Type.init(.string);
+        const ty = if (listed) column.childType(fty).asNullable() else if (ex.json) types.Type.init(.string).asNullable() else types.Type.init(.string);
         out.* = if (i == idx) .{ .name = ex.as_name orelse f.name, .ty = ty } else f;
     }
     return .{ .idx = idx, .schema = .{ .fields = fields } };

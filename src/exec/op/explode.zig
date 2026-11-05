@@ -33,9 +33,15 @@ pub const Explode = struct {
         return self.explodeBatch(arena, b);
     }
 
+    fn listed(self: *Explode, arena: std.mem.Allocator, b: Batch) !Batch {
+        return listedBatch(arena, b, self.field_idx, self.out_schema);
+    }
+
     /// Split a delimited string column, or with `json` a JSON array, into one row per
-    /// element, other columns repeated. Null or missing cells produce zero rows.
+    /// element, other columns repeated; a list or a map column is taken as it is
+    /// (`listed`). Null or missing cells produce zero rows.
     fn explodeBatch(self: *Explode, arena: std.mem.Allocator, b: Batch) anyerror!Batch {
+        if (b.columns[self.field_idx].data == .nested) return self.listed(arena, b);
         const ncols = b.columns.len;
         const builders = try arena.alloc(column.Builder, ncols);
         for (builders, self.out_schema.fields) |*bd, f| bd.* = column.Builder.init(arena, f.ty);
@@ -76,6 +82,34 @@ pub const Explode = struct {
         return Batch{ .schema = self.out_schema, .columns = cols, .len = n };
     }
 };
+
+/// A list or map column's rows as rows: each other column's row gathered once per
+/// element, the elements (a map's key and value structs) the child column's own
+/// rows, so nothing is boxed or rendered.
+fn listedBatch(arena: std.mem.Allocator, b: Batch, at: usize, schema: *const types.Schema) !Batch {
+    const col = b.columns[at];
+    const l = col.data.nested.body.list;
+    var total: usize = 0;
+    for (0..b.len) |r| if (col.validity.get(r)) {
+        total += @intCast(l.offsets[r + 1] - l.offsets[r]);
+    };
+    const parent = try arena.alloc(usize, total);
+    const elems = try arena.alloc(usize, total);
+    var w: usize = 0;
+    for (0..b.len) |r| if (col.validity.get(r)) {
+        for (@as(usize, @intCast(l.offsets[r]))..@as(usize, @intCast(l.offsets[r + 1]))) |x| {
+            parent[w] = r;
+            elems[w] = x;
+            w += 1;
+        }
+    };
+    const cols = try arena.alloc(column.Column, b.columns.len);
+    for (cols, b.columns, schema.fields, 0..) |*o, c, f, i| {
+        o.* = if (i == at) try column.permute(arena, l.child, elems) else try column.permute(arena, c, parent);
+        o.ty = f.ty;
+    }
+    return .{ .schema = schema, .columns = cols, .len = total };
+}
 
 /// The elements of the JSON array `text` as cells; a JSON null is no elements.
 fn jsonElems(arena: std.mem.Allocator, text: []const u8) ![]const Value {

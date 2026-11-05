@@ -452,7 +452,8 @@ pub fn groupKeyRefs(self: *Parser, e: *ast.Expr, group: []const ast.QualName, ma
     const S = struct {
         fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
             switch (node.*) {
-                .field, .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit, .lambda_var => return @constCast(node),
+                .field => |q| if (q.parts.len == 1) return @constCast(node),
+                .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit, .lambda_var => return @constCast(node),
                 .call => |c| if (aggregates.lookup(c.name) != null) return @constCast(node),
                 else => {},
             }

@@ -2011,7 +2011,7 @@ test "join: a qualified column is that table's alone, the FROM table's and a lat
     try refuse(alloc, &tmp, "SELECT * FROM '$B/t.csv' a JOIN '$B/items.csv' b ON a.name = b.name JOIN '$B/emp.csv' c ON c.id = a.q;", "unknown column `a.q`");
     try refuse(alloc, &tmp, "SELECT count(*) FROM '$B/t.csv' a JOIN '$B/items.csv' b ON a.name = b.name GROUP BY a.item;", "unknown column `a.item`");
     try refuse(alloc, &tmp, "SELECT * FROM '$B/t.csv' a JOIN '$B/items.csv' b ON a.name = b.name ORDER BY a.item;", "unknown column `a.item`");
-    try refuse(alloc, &tmp, "SELECT * FROM '$B/t.csv' a JOIN '$B/items.csv' b ON c.id = a.id JOIN '$B/emp.csv' c ON c.id = a.id;", "unknown column `c.id`");
+    try refuse(alloc, &tmp, "SELECT * FROM '$B/t.csv' a JOIN '$B/items.csv' b ON c.id = a.id JOIN '$B/emp.csv' c ON c.id = a.id;", "unknown table `c` in `c.id`");
 }
 
 test "join: a second column of one name is named apart, hidden sort and DISTINCT ON keys too" {

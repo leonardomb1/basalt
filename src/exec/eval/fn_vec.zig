@@ -39,6 +39,21 @@ pub const vectorized = struct {
         return .{ .scalar = .{ .date = @intCast(civil.dayOf(clockOf(c))) } };
     }
 
+    /// A list's or map's length per row, straight from its offsets.
+    pub fn cardinality(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+        const col = switch (try evalVec(arena, c.args[0], batch)) {
+            .col => |x| x,
+            .scalar => return error.Unsupported,
+        };
+        if (col.data != .nested or col.data.nested.body != .list) return error.Unsupported;
+        const o = col.data.nested.body.list.offsets;
+        const out = try arena.alloc(i64, col.len);
+        for (out, 0..) |*x, r| x.* = o[r + 1] - o[r];
+        const bm = try Bitmap.initFull(arena, col.len);
+        @memcpy(bm.bits, col.validity.bits[0..bm.bits.len]);
+        return .{ .col = column.Column.derived(Type.init(.int).asNullable(), col.len, bm, .{ .i64 = out }) };
+    }
+
     pub fn coalesce(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
         const n = batch.len;
         if (c.args.len == 0) return error.Unsupported;

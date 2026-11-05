@@ -111,6 +111,24 @@ columns it has not seen.
   database columns as its text, and in a Parquet file as Parquet's own
   `LIST`, `MAP` and nested groups, laid out as the format's spec has them.
   Arrow, Avro and Excel outputs refuse a nested column.
+- **Taking nested values apart**, each read from the column's own child
+  columns, nothing parsed:
+  - `s.city` is a struct's field, `t.s.city` with its table named, to any depth
+    (`s.addr.zip`). A name is a table's column first: `s.city` is the struct
+    `s`'s field only when no table of the FROM is named or aliased `s`. The
+    column it gives is named for the field (`city`).
+  - `l[i]` is a list's element, counted from 1; `m['k']` a map's value for a key;
+    `s['city']` a struct's field. Past the end, or with no such key, it is NULL;
+    `l[1].name` reaches into an element.
+  - `cardinality(x)` is a list's or a map's length.
+  - `s.*` is a struct's fields as columns of their own.
+  - `CROSS JOIN UNNEST(l) AS e` gives a row per element of a list (a map's
+    entries as `e.key`, `e.value`), the row's other columns repeated; a NULL or
+    empty list gives no rows.
+  - A struct's field can be a `GROUP BY`, `ORDER BY` or join key
+    (`GROUP BY s.city`, `ON a.s.id = b.id`). The nested value itself cannot,
+    nor go into `MIN`, `MAX` or a `DISTINCT`: lists, maps and structs are not
+    compared or ordered yet.
 - **DECIMAL arithmetic is exact.** `+`, `-` and `%` over two decimals (or a
   decimal and an int) answer a decimal at the wider operand's scale, `*` one at
   the summed scale — `1.1 + 0.3` is `1.4`, not `1.4000000000000001`, so a `SUM`

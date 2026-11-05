@@ -527,7 +527,8 @@ pub const Parser = struct {
     /// its own is fine, unless the column came from a nested query that was not
     /// decorrelated (`parse/correlate.zig` takes those of a subquery in the SELECT
     /// list or WHERE first); any other is handed out to `outer`, the query around
-    /// this one, or with none an unknown table.
+    /// this one. With none it is a struct column's field (`s.city`), or else an
+    /// unknown table, which the type check tells apart once the columns are known.
     pub fn settleQuals(self: *Parser, refs: []const QualRef, aliases: *const AliasSet, outer: ?*std.array_list.Managed(QualRef)) Error!void {
         for (refs) |r| {
             const t = r.q.parts[0];
@@ -542,7 +543,6 @@ pub const Parser = struct {
                 try o.append(up);
                 continue;
             }
-            return self.fail(r.pos, "unknown table `{s}` in `{s}.{s}` — no table of this FROM is named or aliased `{s}`", .{ t, t, r.q.last(), t });
         }
     }
 

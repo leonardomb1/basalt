@@ -68,6 +68,12 @@ pub fn expr(w: W, e: *const ast.Expr) Error!void {
             }
             try w.writeAll(" END");
         },
+        .index => |x| {
+            try operand(w, x.e);
+            try w.writeByte('[');
+            try expr(w, x.key);
+            try w.writeByte(']');
+        },
         .cast => |c| {
             try w.writeAll(if (c.safe) "TRY_CAST(" else "CAST(");
             try expr(w, c.e);

@@ -21,6 +21,7 @@ const Value = @import("value.zig").Value;
 const castValueTyped = @import("eval/cast.zig").castValueTyped;
 const EvalError = @import("eval.zig").EvalError;
 const column = @import("column.zig");
+const compareValues = @import("eval/support.zig").compareValues;
 const Builder = column.Builder;
 
 const Writer = std.Io.Writer;
@@ -150,6 +151,29 @@ fn writeKey(w: *Writer, k: Value) Writer.Error!void {
         },
         else => try jsontext.scalar(w, k, jsontext.nested),
     }
+}
+
+/// `r[key]`: a list's element `key` counted from 1, a map's value under `key` (the
+/// first entry with that key) or a struct's field named `key`; null past the end
+/// or when no entry has it.
+pub fn get(r: @import("value.zig").NestedRef, key: Value) Value {
+    const l = switch (r.node.body) {
+        .list => |x| x,
+        .fields => |fs| {
+            if (key != .string) return .null;
+            for (r.node.ty.fields orelse &.{}, fs) |f, c| if (std.mem.eql(u8, f.name, key.string)) return c.getValue(r.row);
+            return .null;
+        },
+    };
+    const lo: usize = @intCast(l.offsets[r.row]);
+    const hi: usize = @intCast(l.offsets[r.row + 1]);
+    if (r.node.ty.kind != .map) {
+        if (key != .int or key.int < 1 or key.int > hi - lo) return .null;
+        return l.child.getValue(lo + @as(usize, @intCast(key.int)) - 1);
+    }
+    const kv = l.child.data.nested.body.fields;
+    for (lo..hi) |x| if (compareValues(kv[0].getValue(x), key) == .eq) return kv[1].getValue(x);
+    return .null;
 }
 
 /// A nested value's JSON text in `arena`.

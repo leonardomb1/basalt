@@ -283,6 +283,12 @@ pub const Schema = struct {
     /// Whether two columns share the unqualified `name`, so that a reference to it
     /// is ambiguous, as SQL reads it. A hidden name the parser gave (`__…`) is one
     /// expression wherever it repeats, so never.
+    /// Whether a column came from a table named or aliased `rel`.
+    pub fn hasRel(self: Schema, rel: []const u8) bool {
+        for (self.fields) |f| if (std.mem.eql(u8, f.rel, rel)) return true;
+        return false;
+    }
+
     pub fn ambiguous(self: Schema, name: []const u8) bool {
         if (std.mem.startsWith(u8, name, "__")) return false;
         var n: usize = 0;

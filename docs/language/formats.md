@@ -565,9 +565,11 @@ objects, maps as objects keyed by each key's text (`{"k1":3}`), `NULL` for a
 null column value and `null` for a null element or field, dates and timestamps
 as quoted text, a NaN or infinite float as `null`, and a binary leaf or map key
 (`BYTE_ARRAY` with no `STRING` annotation, a `UUID`) as base64, as the JSON
-writer spells `BYTES`, so no byte is lost. A struct's fields are no longer
-separate dotted columns (`"addr.city"`); `CAST(addr AS STRING)` is its JSON,
-which `json_get` and `CROSS JOIN UNNEST(JSON_EACH(...))` take apart.
+writer spells `BYTES`, so no byte is lost. A struct's fields are not separate
+dotted columns (`"addr.city"`): `addr.city` reads the field, `tags[1]` an
+element, `m['k']` a map's value and `CROSS JOIN UNNEST(tags)` a row per element
+(see [Expressions](../reference/expressions.md)); `CAST(addr AS STRING)` is its
+JSON, for the JSON functions.
 `LOAD INTO 'copy.parquet' AS SELECT * FROM 'x.parquet'` carries every column,
 the nested ones as the spec's three-level `LIST`, its `MAP` and nested groups,
 each leaf encoded as a flat column of its type is, with repetition and

@@ -800,16 +800,19 @@ test "sql: IN (SELECT ...) under OR / outside WHERE / multi-column are parse err
     try testing.expect(prog.stmts[1].output.stages[1].node == .filter);
 }
 
-test "sql: a qualifier must name a table of its query; one of the query around is a correlated subquery" {
+test "sql: a qualifier naming no table of its query is a correlated subquery's, or a struct column's field the type check settles" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
 
+    for ([_][]const u8{
+        "SELECT zz.k FROM 'l.csv' a WHERE zz.k > 2;",
+        "SELECT a.k FROM 'l.csv' a ORDER BY zz.k;",
+        "SELECT a.k FROM 'l.csv' a JOIN 'r.csv' b ON a.k = zz.k;",
+    }) |src| _ = try parseSource(a, src, &diag);
+
     const refused = [_]struct { src: []const u8, want: []const u8 }{
-        .{ .src = "SELECT zz.k FROM 'l.csv' a WHERE zz.k > 2;", .want = "unknown table `zz`" },
-        .{ .src = "SELECT a.k FROM 'l.csv' a ORDER BY zz.k;", .want = "unknown table `zz`" },
-        .{ .src = "SELECT a.k FROM 'l.csv' a JOIN 'r.csv' b ON a.k = zz.k;", .want = "unknown table `zz`" },
         .{ .src = "SELECT * FROM 'l.csv' a JOIN (SELECT * FROM 'r.csv' b WHERE b.s = a.s) d ON a.k = d.k;", .want = "`a.s` names `a` of the query around this subquery — only a subquery in the SELECT list or WHERE" },
         .{ .src = "SELECT k FROM 'l.csv' a GROUP BY k HAVING count(*) > (SELECT max(k) FROM 'r.csv' b WHERE b.s = a.k);", .want = "`a.k` names `a` of the query around this subquery" },
         .{ .src = "SELECT * FROM 'l.csv' a ORDER BY (SELECT max(k) FROM 'r.csv' b WHERE b.s = a.s);", .want = "`a.s` names `a` of the query around this subquery" },

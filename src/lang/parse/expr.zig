@@ -92,6 +92,7 @@ pub fn deeperThan(e: *const ast.Expr, limit: usize) bool {
         .unary => |u| deeperThan(u.e, l),
         .is_null => |n| deeperThan(n.e, l),
         .cast => |c| deeperThan(c.e, l),
+        .index => |x| deeperThan(x.e, l) or deeperThan(x.key, l),
         .call => |c| for (c.args) |a| {
             if (deeperThan(a, l)) break true;
         } else false,
@@ -331,7 +332,18 @@ pub fn parseUnary(self: *Parser) Error!*ast.Expr {
         const e = try self.parseBin(25);
         return self.mk(.{ .unary = .{ .op = .not, .e = e } });
     }
-    return self.parsePrimary();
+    var e = try self.parsePrimary();
+    while (self.eat(.lbracket)) {
+        const key = try self.parseExpr();
+        _ = try self.expect(.rbracket);
+        e = try self.mk(.{ .index = .{ .e = e, .key = key } });
+        while (self.at(.dot) and (self.peekTag() == .ident or self.peekTag() == .qident)) {
+            _ = self.advance();
+            const name = try self.expectIdent();
+            e = try self.mk(.{ .index = .{ .e = e, .key = try self.mk(.{ .str_lit = name }) } });
+        }
+    }
+    return e;
 }
 
 /// An integer that fits INT is one; one with a point is an exact DECIMAL, as is an

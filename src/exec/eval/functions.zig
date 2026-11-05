@@ -117,6 +117,7 @@ const base = [_]Builtin{
     .{ .name = "from_hex", .type_fn = typing.fromHex, .eval_fn = S(f.FromHex).eval, .vec_fn = S(f.FromHex).vec },
     .{ .name = "concat", .type_fn = typing.concat, .eval_fn = S(f.Concat).eval, .vec_fn = S(f.Concat).vec },
     .{ .name = "coalesce", .type_fn = typing.coalesce, .eval_fn = per_row.coalesce, .vec_fn = vectorized.coalesce },
+    .{ .name = "cardinality", .type_fn = typing.cardinality, .eval_fn = per_row.cardinality, .vec_fn = vectorized.cardinality },
     .{ .name = "starts_with", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.starts_with)).eval, .vec_fn = S(f.Match(.starts_with)).vec },
     .{ .name = "ends_with", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.ends_with)).eval, .vec_fn = S(f.Match(.ends_with)).vec },
     .{ .name = "contains", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.contains)).eval, .vec_fn = S(f.Match(.contains)).vec },

@@ -2,7 +2,9 @@
 
 JSON documents travel as text: a `JSON` column, a nested Arrow column, a JSON
 file's nested object, a REST response's. A Parquet or Delta struct, list or map
-is a typed nested column instead; `CAST(col AS STRING)` is its JSON text. These functions build and take them apart;
+is a typed nested column instead, taken apart with `s.field`, `l[i]`, `m['k']`
+and `UNNEST` (see [Expressions](expressions.md)); `CAST(col AS STRING)` is its
+JSON text. These functions build and take them apart;
 `CROSS JOIN UNNEST(JSON_EACH(col))` turns an array into rows (see
 [Queries](../language/queries.md#operators)).
 

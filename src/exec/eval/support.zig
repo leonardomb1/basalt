@@ -35,6 +35,51 @@ pub fn fieldIndex(schema: types.Schema, q: ast.QualName) ?usize {
     return idx;
 }
 
+/// Where a dotted name no column has reads from: a struct column, by its name or
+/// its table's (`s.f`, `t.s.f`), then each further part one field of the struct
+/// before it. Struct paths come after columns, so a table's column always wins.
+pub const StructPath = struct { col: usize, fields: []const []const u8 };
+
+pub fn structPath(schema: types.Schema, q: ast.QualName) ?StructPath {
+    if (q.parts.len < 2) return null;
+    var k: usize = @min(q.parts.len - 1, 2);
+    while (k >= 1) : (k -= 1) {
+        const at = schema.resolve(q.parts[0..k]) orelse continue;
+        if (schema.fields[at].ty.kind != .@"struct") continue;
+        if (pathType(schema.fields[at].ty, q.parts[k..]) != null) return .{ .col = at, .fields = q.parts[k..] };
+    }
+    return null;
+}
+
+/// The type struct type `t` gives the field path `fields`, null when one is missing.
+pub fn pathType(t: Type, fields: []const []const u8) ?Type {
+    var cur = t;
+    for (fields) |name| {
+        if (cur.kind != .@"struct") return null;
+        const f = for (cur.fields orelse return null) |x| {
+            if (std.mem.eql(u8, x.name, name)) break x;
+        } else return null;
+        cur = f.ty.withNull(f.ty.nullable or cur.nullable);
+    }
+    return cur;
+}
+
+/// The column `q` reads in `batch`: its own, or a struct path's field column, which
+/// is null wherever the struct is (every nested builder keeps a null parent's
+/// children null).
+pub fn fieldColumn(batch: anytype, q: ast.QualName) ?@import("../column.zig").Column {
+    if (fieldIndex(batch.schema.*, q)) |i| return batch.columns[i];
+    const p = structPath(batch.schema.*, q) orelse return null;
+    var col = batch.columns[p.col];
+    for (p.fields) |name| {
+        const k = for (col.ty.fields orelse return null, 0..) |f, i| {
+            if (std.mem.eql(u8, f.name, name)) break i;
+        } else return null;
+        col = col.data.nested.body.fields[k];
+    }
+    return col;
+}
+
 pub fn lastPart(q: ast.QualName) []const u8 {
     return q.parts[q.parts.len - 1];
 }

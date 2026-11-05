@@ -14,7 +14,7 @@ const ast = @import("../../lang/ast.zig");
 const castFailure = @import("support.zig").castFailure;
 const castValueTyped = @import("cast.zig").castValueTyped;
 const compareValues = @import("support.zig").compareValues;
-const fieldIndex = @import("support.zig").fieldIndex;
+const fieldColumn = @import("support.zig").fieldColumn;
 const forgetFailure = @import("support.zig").forgetFailure;
 const isEmptyVal = @import("vec.zig").isEmptyVal;
 const json = @import("../json.zig");
@@ -38,8 +38,7 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
         .dec_lit => |d| return .{ .decimal = .{ .unscaled = d.unscaled, .scale = d.scale } },
         .str_lit => |s| return .{ .string = s },
         .field => |q| {
-            const idx = fieldIndex(batch.schema.*, q) orelse return error.TypeMismatch;
-            return batch.columns[idx].getValue(row);
+            return (fieldColumn(batch, q) orelse return error.TypeMismatch).getValue(row);
         },
         .unary => |u| {
             const v = try evalRow(arena, u.e, batch, row);
@@ -84,6 +83,13 @@ pub fn evalRow(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch, ro
                 return e;
             };
             return out;
+        },
+        .index => |x| {
+            const v = try evalRow(arena, x.e, batch, row);
+            if (v != .nested) return .null;
+            const k = try evalRow(arena, x.key, batch, row);
+            if (k.isNull()) return .null;
+            return @import("../nested.zig").get(v.nested, k);
         },
         .match => |m| return evalMatch(arena, m, batch, row),
         .call => |c| return evalCall(arena, c, batch, row),

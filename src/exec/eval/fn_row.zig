@@ -90,6 +90,13 @@ pub const per_row = struct {
         return .{ .string = out.written() };
     }
 
+    pub fn cardinality(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (v != .nested or v.nested.node.body != .list) return .null;
+        const o = v.nested.node.body.list.offsets;
+        return .{ .int = o[v.nested.row + 1] - o[v.nested.row] };
+    }
+
     pub fn coalesce(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         for (c.args) |a| {
             const v = try evalRow(arena, a, batch, row);
