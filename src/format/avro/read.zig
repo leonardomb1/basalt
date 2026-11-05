@@ -358,7 +358,7 @@ fn file(a: std.mem.Allocator, schema_json: []const u8, codec: []const u8, count:
     return out.items;
 }
 
-test "nested records flatten, nullable unions read NULL, arrays, maps and mixed unions read as JSON" {
+test "a nested record is a struct, an array a list and a map a map, nullable unions read NULL, mixed unions read as JSON" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -379,28 +379,29 @@ test "nested records flatten, nullable unions read NULL, arrays, maps and mixed 
         0x04, 0x00, 0x00, 0x00, 0x02, 0x7F, 0x00, 0xCF, 0x0F, 0xFF, 0xFF, 0xFF, 0xFF,
     };
     const got = try readAll(a, try file(a, schema_json, "null", 2, &body));
-    const names = [_][]const u8{ "id", "addr.city", "addr.n", "tags", "m", "mix", "e", "ts", "amt" };
+    const names = [_][]const u8{ "id", "addr", "tags", "m", "mix", "e", "ts", "amt" };
     try testing.expectEqual(names.len, got.schema.fields.len);
     for (names, got.schema.fields) |n, f| try testing.expectEqualStrings(n, f.name);
+    try testing.expectEqualStrings("struct(city string, n int)", try got.schema.fields[1].ty.name(a));
     try testing.expectEqual(@as(usize, 2), got.rows.len);
+    const js = @import("../../exec/nested.zig").jsonText;
     const r0 = got.rows[0];
     try testing.expectEqual(@as(i64, 1), r0[0].int);
-    try testing.expectEqualStrings("Lis", r0[1].string);
-    try testing.expectEqual(@as(i64, -8), r0[2].int);
-    try testing.expectEqualStrings("[\"a\",\"b\"]", r0[3].string);
-    try testing.expectEqualStrings("{\"k\":1.5}", r0[4].string);
-    try testing.expectEqualStrings("\"x\"", r0[5].string);
-    try testing.expectEqualStrings("HIGH", r0[6].string);
-    try testing.expectEqual(@as(i64, 1000_000), r0[7].timestamp);
-    try testing.expectEqual(@as(i128, 12345), r0[8].decimal.unscaled);
+    try testing.expectEqualStrings("{\"city\":\"Lis\",\"n\":-8}", try js(a, r0[1].nested));
+    try testing.expectEqualStrings("[\"a\",\"b\"]", try js(a, r0[2].nested));
+    try testing.expectEqualStrings("{\"k\":1.5}", try js(a, r0[3].nested));
+    try testing.expectEqualStrings("\"x\"", r0[4].string);
+    try testing.expectEqualStrings("HIGH", r0[5].string);
+    try testing.expectEqual(@as(i64, 1000_000), r0[6].timestamp);
+    try testing.expectEqual(@as(i128, 12345), r0[7].decimal.unscaled);
     const r1 = got.rows[1];
-    try testing.expect(r1[1].isNull() and r1[2].isNull());
-    try testing.expectEqualStrings("[]", r1[3].string);
-    try testing.expectEqualStrings("{}", r1[4].string);
-    try testing.expectEqualStrings("-64", r1[5].string);
-    try testing.expectEqualStrings("LOW", r1[6].string);
-    try testing.expectEqual(@as(i64, -1_000_000), r1[7].timestamp);
-    try testing.expectEqual(@as(i128, -1), r1[8].decimal.unscaled);
+    try testing.expect(r1[1].isNull());
+    try testing.expectEqualStrings("[]", try js(a, r1[2].nested));
+    try testing.expectEqualStrings("{}", try js(a, r1[3].nested));
+    try testing.expectEqualStrings("-64", r1[4].string);
+    try testing.expectEqualStrings("LOW", r1[5].string);
+    try testing.expectEqual(@as(i64, -1_000_000), r1[6].timestamp);
+    try testing.expectEqual(@as(i128, -1), r1[7].decimal.unscaled);
 }
 
 test "not Avro, a bad sync marker, a short block, stray bytes and an unknown codec are refused" {
@@ -469,11 +470,11 @@ test "fastavro's files read alike through every codec it writes, several blocks 
     const ts = "ts_ms=2026-10-24 12:30:15.123000\nts_us=2026-10-24 12:30:15.123456\nlts_us=2026-10-24 09:30:15.123456\n";
     const first = "id=1\nname=order 1 a\xc3\xa7\xc3\xa3o\nprice=19.99\nqty=3\nok=true\nratio=0.25\namount=12345678.90\n" ++
         "big=12345678901234567890123456789012.345678\nday=2026-10-24\nt_ms=01:02:03.004000\nt_us=01:02:03.004005\n" ++ ts ++
-        "uid=00000000-0000-0000-1234-567890abcdef\nstatus=NEW\naddr.city=Lisboa\naddr.zip=1001\ntags=[\"a\",\"b \\\"q\\\"\"]\n" ++
+        "uid=00000000-0000-0000-1234-567890abcdef\nstatus=NEW\naddr={\"city\":\"Lisboa\",\"zip\":1001}\ntags=[\"a\",\"b \\\"q\\\"\"]\n" ++
         "attrs={\"k\":1,\"z\":-2}\nraw=\x00\x01\xff\nchoice=7\nparent=NULL\n--\n";
     const second = "id=2\nname=NULL\nprice=-0.5\nqty=-2147483648\nok=false\nratio=-1.5\namount=-0.01\nbig=-1.000001\nday=1969-12-31\n" ++
         "t_ms=00:00:00\nt_us=00:00:00\nts_ms=1969-12-31 23:59:59.999000\nts_us=1900-01-01 00:00:00\nlts_us=1970-01-01 00:00:00\n" ++
-        "uid=00000000-0000-0000-2468-acf121579bde\nstatus=PAID\naddr.city=NULL\naddr.zip=NULL\ntags=[]\nattrs={}\nraw=\nchoice=NULL\nparent=NULL\n--\n";
+        "uid=00000000-0000-0000-2468-acf121579bde\nstatus=PAID\naddr=NULL\ntags=[]\nattrs={}\nraw=\nchoice=NULL\nparent=NULL\n--\n";
     const parent = "{\"id\":1,\"name\":\"order 1 a\xc3\xa7\xc3\xa3o\",\"price\":19.99,\"qty\":3,\"ok\":true,\"ratio\":0.25,\"amount\":\"12345678.90\"," ++
         "\"big\":\"12345678901234567890123456789012.345678\",\"day\":\"2026-10-24\",\"t_ms\":\"01:02:03.004000\",\"t_us\":\"01:02:03.004005\"," ++
         "\"ts_ms\":\"2026-10-24 12:30:15.123000\",\"ts_us\":\"2026-10-24 12:30:15.123456\",\"lts_us\":\"2026-10-24 09:30:15.123456\"," ++
@@ -481,7 +482,7 @@ test "fastavro's files read alike through every codec it writes, several blocks 
         "\"attrs\":{\"k\":1,\"z\":-2},\"raw\":\"AAH/\",\"choice\":7,\"parent\":null}";
     const third = "id=3\nname=order 3 a\xc3\xa7\xc3\xa3o\nprice=1" ++ "0" ** 300 ++ "\nqty=2147483647\nok=true\nratio=3\namount=0.00\nbig=0.000000\n" ++
         "day=0001-01-01\nt_ms=23:59:59.999000\nt_us=23:59:59.999999\nts_ms=1970-01-01 00:00:00\nts_us=2262-04-11 23:47:16.854775\n" ++
-        "lts_us=2000-02-29 12:00:00\nuid=00000000-0000-0000-369d-0369b20369cd\nstatus=SHIPPED\naddr.city=S\xc3\xa3o Paulo\naddr.zip=NULL\n" ++
+        "lts_us=2000-02-29 12:00:00\nuid=00000000-0000-0000-369d-0369b20369cd\nstatus=SHIPPED\naddr={\"city\":\"S\xc3\xa3o Paulo\",\"zip\":null}\n" ++
         "tags=[\"x\"]\nattrs={\"big\":9223372036854775807}\nraw=plain\nchoice=\"seven\"\nparent=" ++ parent ++ "\n--\n";
     for ([_][]const u8{ @embedFile("../testdata/avro/orders_null.avro"), @embedFile("../testdata/avro/orders_deflate.avro"), @embedFile("../testdata/avro/orders_snappy.avro"), @embedFile("../testdata/avro/orders_zstandard.avro") }) |bytes|
         try testing.expectEqualStrings(first ++ second ++ third, try dump(a, bytes));

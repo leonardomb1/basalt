@@ -302,7 +302,7 @@ pub const TopK = struct {
         const t = self.threshold orelse return;
         if (self.keys.len == 0) return;
         const v = self.chunks.items[thr.chunk].cols[self.keys[0].idx].getValue(thr.row);
-        if (v == .null or v == .string or v == .bytes) return;
+        if (v == .null or v == .string or v == .bytes or v == .nested) return;
         t.value = v;
         t.full = true;
     }

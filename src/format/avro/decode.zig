@@ -153,6 +153,7 @@ pub const Code = enum(u8) {
     dec_bytes,
     dec_fixed,
     text,
+    nested,
     slow,
     choice,
 
@@ -165,7 +166,7 @@ pub const Code = enum(u8) {
             .float, .double => .f64,
             .bytes, .fixed, .@"enum" => .bytes,
             .dec_bytes, .dec_fixed => .dec,
-            .null, .text, .slow, .choice => null,
+            .null, .text, .nested, .slow, .choice => null,
         };
     }
 
@@ -275,7 +276,7 @@ inline fn decodeLeaf(cur: *Cursor, comptime c: Code, args: anytype) Error!Read(c
             const raw = if (c == .dec_bytes) try cur.bytes() else try cur.take(d.size);
             break :blk .{ .unscaled = try unscaledOf(raw, d.precision), .scale = d.scale };
         },
-        .text, .slow, .choice => comptime unreachable,
+        .text, .nested, .slow, .choice => comptime unreachable,
     };
 }
 
@@ -369,6 +370,11 @@ const Compiler = struct {
         switch (step) {
             .leaf => |t| try self.push(try self.leaf(t.node, t.col)),
             .text => |t| try self.push(.{ .code = .text, .col = self.colOf(t.col), .a = try self.node(t.node) }),
+            .nested => |t| {
+                if (self.routes[t.col].cast)
+                    return unsupported("a nested column `{s}` differs from the first file's, which basalt does not convert", .{self.own.fields[t.col].name});
+                try self.push(.{ .code = .nested, .col = self.colOf(t.col), .a = try self.node(t.node) });
+            },
             .record => |steps| for (steps) |s| try self.emit(s),
             .choice => |ch| try self.choice(ch),
             .nulls => unreachable,
@@ -395,7 +401,7 @@ const Compiler = struct {
     fn choice(self: *Compiler, ch: schema.Step.Choice) Error!void {
         if (ch.branches.len == 2) for (ch.branches, 0..) |b, i| {
             const other = ch.branches[1 - i];
-            if (b == .nulls and (other == .leaf or other == .text)) {
+            if (b == .nulls and (other == .leaf or other == .text or other == .nested)) {
                 try self.emit(other);
                 self.ops.items[self.ops.items.len - 1].nulls = if (i == 0) .first else .second;
                 return;
@@ -483,6 +489,13 @@ pub const Machine = struct {
                 try m.json(m.prog.nodes[op.a], &m.text.writer, 0);
                 if (op.col != Op.none) try m.out[op.col].appendStr(m.text.written());
             },
+            .nested => {
+                if (op.col == Op.none) {
+                    m.text.clearRetainingCapacity();
+                    return m.json(m.prog.nodes[op.a], &m.text.writer, 0);
+                }
+                try m.decodeInto(&m.out[op.col], m.prog.nodes[op.a], 0);
+            },
             .slow => try m.slow(arena, op),
             .choice => unreachable,
             inline else => |c| try m.leaf(c, op),
@@ -514,10 +527,60 @@ pub const Machine = struct {
         };
     }
 
+    /// The value at the cursor into nested builder `b` (or a part of one): a record's
+    /// fields into its children, an array's items and a map's entries into its list,
+    /// a union's branch as the branch, and a part held as JSON text (a recursing
+    /// record, a union of several types) rendered as `json` writes it.
+    fn decodeInto(m: *Machine, b: *column.Builder, n: *const Node, depth: usize) Error!void {
+        if (depth > schema.max_depth) return corrupt("a value nests deeper than {d}", .{schema.max_depth});
+        const c = &m.cur;
+        if (n.kind == .@"union") {
+            const i = try c.long();
+            if (i < 0 or i >= n.branches.len) return corrupt("a union branch {d} of {d}", .{ i, n.branches.len });
+            const br = n.branches[@intCast(i)];
+            if (br.kind == .null) return appendTo(b, .null);
+            if (!b.ty.isNested() and b.ty.kind == .string and (schema.leafType(br) == null or schema.leafType(br).?.kind != .string))
+                return m.textInto(b, br, depth);
+            return m.decodeInto(b, br, depth + 1);
+        }
+        if (!b.ty.isNested()) {
+            if (schema.leafType(n) == null) return m.textInto(b, n, depth);
+            return appendTo(b, try m.value(n));
+        }
+        const nb = b.openNested() catch return error.OutOfMemory;
+        switch (n.kind) {
+            .record => for (n.fields, nb.fields) |f, *k| try m.decodeInto(k, f.node, depth + 1),
+            .array, .map => {
+                while (true) {
+                    const k = try c.blockCount(n.items.?);
+                    if (k == 0) break;
+                    for (0..k) |_| {
+                        if (n.kind == .array) {
+                            try m.decodeInto(&nb.list.child, n.items.?, depth + 1);
+                            continue;
+                        }
+                        const kv = nb.list.child.openNested() catch return error.OutOfMemory;
+                        try appendTo(&kv.fields[0], .{ .string = try c.bytes() });
+                        try m.decodeInto(&kv.fields[1], n.items.?, depth + 1);
+                    }
+                }
+                column.Builder.endEntries(nb) catch return error.OutOfMemory;
+            },
+            else => return corrupt("a nested value of an unexpected Avro type", .{}),
+        }
+    }
+
+    fn textInto(m: *Machine, b: *column.Builder, n: *const Node, depth: usize) Error!void {
+        var w = std.Io.Writer.Allocating.init(m.text.allocator);
+        defer w.deinit();
+        try m.json(n, &w.writer, depth + 1);
+        try appendTo(b, .{ .string = w.written() });
+    }
+
     /// The value at the cursor as a `Value`, for JSON text and a cast.
     pub fn value(m: *Machine, n: *const Node) Error!Value {
         return switch (Code.of(n)) {
-            .text, .slow, .choice => unreachable,
+            .text, .nested, .slow, .choice => unreachable,
             inline else => |c| valueOf(c, schema.leafType(n).?.kind, try decodeLeaf(&m.cur, c, NodeArgs{ .n = n })),
         };
     }
@@ -571,6 +634,13 @@ pub const Machine = struct {
     }
 };
 
+fn appendTo(b: *column.Builder, v: Value) Error!void {
+    b.append(v) catch |e| return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.CastFailed => corrupt("a value that does not fit its column's type", .{}),
+    };
+}
+
 fn put(w: *std.Io.Writer, s: []const u8) Error!void {
     w.writeAll(s) catch return error.OutOfMemory;
 }
@@ -602,7 +672,7 @@ test "the cursor reads a varint alike by its fast and careful paths, at every le
     try testing.expectError(error.CorruptAvro, cut.long());
 }
 
-test "a nullable leaf compiles to one op marked nullable, a union of records to inline branches" {
+test "a nullable leaf compiles to one op marked nullable, and so does a nullable record, as one nested op" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -618,15 +688,14 @@ test "a nullable leaf compiles to one op marked nullable, a union of records to 
     for (routes, 0..) |*r, i| r.* = .{ .to = i };
     routes[2].to = null;
     const prog = try compile(a, p, routes);
-    const codes = [_]Code{ .long, .choice, .int, .bytes, .date };
+    const codes = [_]Code{ .long, .nested, .date };
     try testing.expectEqual(codes.len, prog.ops.len);
     for (codes, prog.ops) |c, op| try testing.expectEqual(c, op.code);
     try testing.expectEqual(Op.Nulls.first, prog.ops[0].nulls);
-    try testing.expectEqual(Op.Nulls.none, prog.ops[2].nulls);
-    try testing.expectEqual(@as(u32, 4), prog.ops[1].col);
-    try testing.expectEqual(@as(u32, Op.none), prog.ops[3].col);
-    try testing.expectEqual(@as(usize, 1), prog.cols.len);
-    try testing.expectEqual(@as(u32, 1), prog.cols[0]);
+    try testing.expectEqual(Op.Nulls.first, prog.ops[1].nulls);
+    try testing.expectEqual(@as(u32, 1), prog.ops[1].col);
+    try testing.expectEqual(@as(u32, Op.none), prog.ops[2].col);
+    try testing.expectEqualStrings("struct(x int, y string)", try p.schema.fields[1].ty.name(a));
 }
 
 fn valueBefore(c: *Cursor, n: *const Node) Error!Value {
@@ -720,7 +789,7 @@ fn readBefore(cur: *Cursor, comptime c: Code, op: Op, nodes: []const *const Node
             const raw = if (c == .dec_bytes) try cur.bytes() else try cur.take(d.size);
             break :blk .{ .unscaled = try unscaledOf(raw, d.precision), .scale = d.scale };
         },
-        .text, .slow, .choice => comptime unreachable,
+        .text, .nested, .slow, .choice => comptime unreachable,
     };
 }
 
@@ -811,7 +880,7 @@ test "a compiled leaf op and its decode equal the per-kind op and read they repl
     for (0..20_000) |_| {
         const buf = try randomBlock(r, a);
         for (ops.items, progs.items) |op, pn| switch (op.code) {
-            .text, .slow, .choice => unreachable,
+            .text, .nested, .slow, .choice => unreachable,
             inline else => |c| {
                 var old = Cursor{ .buf = buf };
                 var new = Cursor{ .buf = buf };

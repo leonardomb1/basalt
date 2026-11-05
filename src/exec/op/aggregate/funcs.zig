@@ -284,6 +284,7 @@ pub fn ExtremeValue(comptime want: std.math.Order) type {
             s.v = switch (x) {
                 .string => |b| .{ .string = try keep(s, b, cx) },
                 .bytes => |b| .{ .bytes = try keep(s, b, cx) },
+                .nested => |r| .{ .nested = try @import("../../nested.zig").own(cx.alloc, r) },
                 else => x,
             };
         }
@@ -517,6 +518,7 @@ pub fn dupeValue(alloc: std.mem.Allocator, v: Value) !Value {
     return switch (v) {
         .string => |s| .{ .string = try alloc.dupe(u8, s) },
         .bytes => |s| .{ .bytes = try alloc.dupe(u8, s) },
+        .nested => |r| .{ .nested = try @import("../../nested.zig").own(alloc, r) },
         else => v,
     };
 }

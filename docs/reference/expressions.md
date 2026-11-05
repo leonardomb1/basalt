@@ -108,9 +108,11 @@ columns it has not seen.
   missing `NOT NULL` part, or an object where a list belongs fails the cast;
   `TRY_CAST` gives null. JSON `null` is SQL `NULL`. A nested value is shown and
   written as its JSON: in a JSON file as the object or array itself, in CSV and
-  database columns as its text, and in a Parquet file as Parquet's own
-  `LIST`, `MAP` and nested groups, laid out as the format's spec has them.
-  Arrow, Avro and Excel outputs refuse a nested column.
+  database columns as its text, in a Parquet file as Parquet's own
+  `LIST`, `MAP` and nested groups, laid out as the format's spec has them, in
+  an Arrow file as Arrow's `list`, `struct` and `map`, and in an Avro file as
+  its arrays, records and maps (a map keyed by `string` only). An Excel output
+  refuses a nested column.
 - **Taking nested values apart**, each read from the column's own child
   columns, nothing parsed:
   - `s.city` is a struct's field, `t.s.city` with its table named, to any depth
@@ -139,9 +141,15 @@ columns it has not seen.
     entries as `e.key`, `e.value`), the row's other columns repeated; a NULL or
     empty list gives no rows.
   - A struct's field can be a `GROUP BY`, `ORDER BY` or join key
-    (`GROUP BY s.city`, `ON a.s.id = b.id`). The nested value itself cannot,
-    nor go into `MIN`, `MAX` or a `DISTINCT`: lists, maps and structs are not
-    compared or ordered yet.
+    (`GROUP BY s.city`, `ON a.s.id = b.id`), and so can the nested value
+    itself, which also goes into `MIN`, `MAX`, `DISTINCT`, `PARTITION BY`, `=`,
+    `<` and `IN`. Nested values compare part by part: a struct field by field in
+    its type's order, a list element by element and then the shorter first, a
+    map entry by entry (key, then value) in its stored order. A NULL part sorts
+    after every value whatever the `NULLS FIRST` or `LAST`, which places only a
+    NULL value itself, and floats inside compare as numbers (`-0.0` is `0.0`,
+    which a group or DISTINCT keeps). A join key's two sides must be the same
+    nested type.
 - **DECIMAL arithmetic is exact.** `+`, `-` and `%` over two decimals (or a
   decimal and an int) answer a decimal at the wider operand's scale, `*` one at
   the summed scale — `1.1 + 0.3` is `1.4`, not `1.4000000000000001`, so a `SUM`

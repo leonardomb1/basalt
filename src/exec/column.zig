@@ -851,7 +851,7 @@ fn newNested(arena: std.mem.Allocator, ty: types.Type, body: Nested.Body) error{
 }
 
 /// Rows `rows` of nested storage `n`, its children gathered by them.
-fn permuteNested(arena: std.mem.Allocator, n: *const Nested, rows: []const usize) error{OutOfMemory}!*const Nested {
+pub fn permuteNested(arena: std.mem.Allocator, n: *const Nested, rows: []const usize) error{OutOfMemory}!*const Nested {
     return newNested(arena, n.ty, switch (n.body) {
         .fields => |fs| blk: {
             const kids = try arena.alloc(Column, fs.len);

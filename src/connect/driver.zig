@@ -32,6 +32,14 @@ const Batch = @import("../exec/batch.zig").Batch;
 var g_abort = std.atomic.Value(bool).init(false);
 
 /// One atomic store: async-signal-safe, callable from a signal handler.
+/// Whether a projection `want` reads column `name`: it names the column, or a
+/// path into it (`s.city` for struct column `s`), which a reader that cannot
+/// read part of a column reads the whole column for.
+pub fn wantsColumn(want: []const []const u8, name: []const u8) bool {
+    for (want) |w| if (std.mem.startsWith(u8, w, name) and (w.len == name.len or w[name.len] == '.')) return true;
+    return false;
+}
+
 pub fn requestAbort() void {
     g_abort.store(true, .seq_cst);
 }

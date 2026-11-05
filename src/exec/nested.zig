@@ -176,6 +176,76 @@ pub fn get(r: @import("value.zig").NestedRef, key: Value) Value {
     return .null;
 }
 
+/// The order nested values sort, group and join by: a struct field by field in its
+/// type's order, a list element by element and then the shorter first, a map entry
+/// by entry (key, then value) in its stored order; a NULL part after every value.
+/// Null for two values of different shapes, as for scalars of unlike kinds.
+/// `keyhash.hashValue` walks the same parts, so values equal here hash alike.
+pub fn order(a: @import("value.zig").NestedRef, b: @import("value.zig").NestedRef) ?std.math.Order {
+    switch (a.node.body) {
+        .fields => |fa| {
+            const fb = switch (b.node.body) {
+                .fields => |x| x,
+                .list => return null,
+            };
+            if (fa.len != fb.len) return null;
+            for (fa, fb) |ca, cb| {
+                const o = partOrder(ca.getValue(a.row), cb.getValue(b.row)) orelse return null;
+                if (o != .eq) return o;
+            }
+            return .eq;
+        },
+        .list => |la| {
+            const lb = switch (b.node.body) {
+                .list => |x| x,
+                .fields => return null,
+            };
+            if ((a.node.ty.kind == .map) != (b.node.ty.kind == .map)) return null;
+            const alo: usize = @intCast(la.offsets[a.row]);
+            const na: usize = @as(usize, @intCast(la.offsets[a.row + 1])) - alo;
+            const blo: usize = @intCast(lb.offsets[b.row]);
+            const nb: usize = @as(usize, @intCast(lb.offsets[b.row + 1])) - blo;
+            for (0..@min(na, nb)) |i| {
+                const o = partOrder(la.child.getValue(alo + i), lb.child.getValue(blo + i)) orelse return null;
+                if (o != .eq) return o;
+            }
+            return std.math.order(na, nb);
+        },
+    }
+}
+
+fn partOrder(x: Value, y: Value) ?std.math.Order {
+    const xn = x.isNull();
+    const yn = y.isNull();
+    if (xn or yn) return if (xn and yn) .eq else if (xn) .gt else .lt;
+    return compareValues(x, y);
+}
+
+/// Row `r` copied out of its batch into `arena`, its own one-row storage, its floats
+/// canonical (`keyhash.canonF64`), so which of two equal keys a group keeps (`0.0`
+/// or `-0.0` inside) never depends on row order or lanes.
+pub fn own(arena: std.mem.Allocator, r: @import("value.zig").NestedRef) error{OutOfMemory}!@import("value.zig").NestedRef {
+    const node = try column.permuteNested(arena, r.node, &.{r.row});
+    canonFloats(node);
+    return .{ .node = node, .row = 0 };
+}
+
+/// Every float under `n` made canonical in place; `n` must be storage of its own.
+pub fn canonFloats(n: *const column.Nested) void {
+    const canonF64 = @import("keyhash.zig").canonF64;
+    const kids: []const column.Column = switch (n.body) {
+        .fields => |fs| fs,
+        .list => |*l| (&l.child)[0..1],
+    };
+    for (kids) |c| switch (c.data) {
+        .f64 => |xs| for (xs) |*x| {
+            x.* = canonF64(x.*);
+        },
+        .nested => |nd| canonFloats(nd),
+        else => {},
+    };
+}
+
 /// A nested value's JSON text in `arena`.
 pub fn jsonText(arena: std.mem.Allocator, r: @import("value.zig").NestedRef) error{OutOfMemory}![]const u8 {
     var out = Writer.Allocating.init(arena);

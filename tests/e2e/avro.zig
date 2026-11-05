@@ -70,7 +70,7 @@ test "an Avro write refuses a gzip suffix, APPEND and zstandard in check and run
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t.csv' WITH (compression = 'snappy') AS SELECT id FROM '$B/a.csv';", "`compression` does not apply to a CSV file");
 }
 
-test "fastavro's nested file reads through a run: flattened records, nullable unions, JSON arrays and maps, on 1 and 4 lanes" {
+test "fastavro's nested file reads through a run: records as structs, nullable unions, arrays and maps, on 1 and 4 lanes" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
     const a = ar.allocator();
@@ -78,7 +78,7 @@ test "fastavro's nested file reads through a run: flattened records, nullable un
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "orders.avro", .data = @import("basalt").fixtures.avro_orders_snappy });
     for ([_]usize{ 1, 4 }) |threads| {
-        try harness.checkAndRun(gpa, &tmp, "LOAD INTO '$B/out.csv' AS SELECT id, name, \"addr.city\" AS city, \"addr.zip\" AS zip, json_get(tags, '[1]') AS tag2, json_get(attrs, 'k') AS k, choice, amount + 0 AS amount, day FROM '$B/orders.avro' WHERE ok OR name IS NULL ORDER BY id;", threads, &.{});
+        try harness.checkAndRun(gpa, &tmp, "LOAD INTO '$B/out.csv' AS SELECT id, name, addr.city AS city, addr.zip AS zip, tags[2] AS tag2, attrs['k'] AS k, choice, amount + 0 AS amount, day FROM '$B/orders.avro' WHERE ok OR name IS NULL ORDER BY id;", threads, &.{});
         const got = try tmp.dir.readFileAlloc(a, "out.csv", 1 << 16);
         try testing.expectEqualStrings(
             \\id,name,city,zip,tag2,k,choice,amount,day

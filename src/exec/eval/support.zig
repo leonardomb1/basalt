@@ -237,6 +237,7 @@ pub fn compareValues(a: Value, b: Value) ?std.math.Order {
     if (a == .timestamp and b == .string) return std.math.order(a.timestamp, parseTimestampText(b.string) orelse return null);
     if (a == .string and b == .timestamp) return std.math.order(parseTimestampText(a.string) orelse return null, b.timestamp);
     if (a == .time and b == .time) return std.math.order(a.time, b.time);
+    if (a == .nested and b == .nested) return @import("../nested.zig").order(a.nested, b.nested);
     return null;
 }
 

@@ -125,15 +125,22 @@ pub fn hashValue(h: *std.hash.Wyhash, v: Value) void {
     }
 }
 
-/// A nested value hashed by its canonical JSON (`nested.writeJson`), streamed into
-/// the hasher, so equal values hash alike with nothing allocated.
+/// A nested value hashed part by part, as `nested.order` compares it, each part by
+/// `hashValue`, so values equal there (`-0.0` and `0.0` inside, every NaN) hash alike.
 fn hashNested(h: *std.hash.Wyhash, r: @import("value.zig").NestedRef) void {
-    hashTagged(h, .nested, &.{});
-    var buf: [256]u8 = undefined;
-    var hw = std.Io.Writer.Hashing(std.hash.Wyhash).initHasher(h.*, &buf);
-    @import("nested.zig").writeJson(&hw.writer, r.node, r.row) catch unreachable;
-    hw.writer.flush() catch unreachable;
-    h.* = hw.hasher;
+    switch (r.node.body) {
+        .fields => |fs| {
+            hashTagged(h, .nested, "s");
+            for (fs) |c| hashValue(h, c.getValue(r.row));
+        },
+        .list => |l| {
+            const lo: usize = @intCast(l.offsets[r.row]);
+            const hi: usize = @intCast(l.offsets[r.row + 1]);
+            hashTagged(h, .nested, if (r.node.ty.kind == .map) "m" else "l");
+            h.update(std.mem.asBytes(&(hi - lo)));
+            for (lo..hi) |x| hashValue(h, l.child.getValue(x));
+        },
+    }
 }
 
 /// `hashValue` of valid row `row` of `col`, read from its storage without boxing
@@ -175,11 +182,12 @@ pub fn valueEq(a: Value, b: Value) bool {
     };
 }
 
-/// A text or bytes value copied into `a`, out of a batch that may be freed.
+/// A text, bytes or nested value copied into `a`, out of a batch that may be freed.
 pub fn ownValue(a: std.mem.Allocator, v: Value) !Value {
     return switch (v) {
         .string => |s| .{ .string = try a.dupe(u8, s) },
         .bytes => |s| .{ .bytes = try a.dupe(u8, s) },
+        .nested => |r| .{ .nested = try @import("nested.zig").own(a, r) },
         else => v,
     };
 }

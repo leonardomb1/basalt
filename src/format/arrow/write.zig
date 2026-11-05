@@ -19,8 +19,9 @@
 //! is written at init, so a run that produced no rows still yields a valid
 //! stream, which is what lets a consumer tell an empty result from a failed one.
 //! Every column is declared nullable, since the engine's nullability flag is a
-//! plan-time promise and the bitmap is the truth. Arrays and structs are refused;
-//! nothing produces them.
+//! plan-time promise and the bitmap is the truth. A list, struct or map is written
+//! as Arrow's own nested types, which share basalt's layout: a list's i32 offsets
+//! over one child, a struct's children, a map's list of key and value structs.
 //!
 //! Self-description: a script may print several results back to back, so each
 //! stream says which one it is. The schema message carries `custom_metadata`
@@ -51,7 +52,7 @@ const version_v5: i16 = 4;
 
 const Header = enum(u8) { schema = 1, record_batch = 3 };
 
-const TypeTag = enum(u8) { int = 2, floating_point = 3, binary = 4, utf8 = 5, bool = 6, decimal = 7, date = 8, time = 9, timestamp = 10 };
+const TypeTag = enum(u8) { int = 2, floating_point = 3, binary = 4, utf8 = 5, bool = 6, decimal = 7, date = 8, time = 9, timestamp = 10, list = 12, struct_ = 13, map = 17 };
 
 pub const KeyValue = struct { key: []const u8, value: []const u8 };
 
@@ -131,22 +132,36 @@ pub const StreamWriter = struct {
         const kv = try keyValues(fb, gpa, meta);
         const offs = try gpa.alloc(u32, schema.fields.len);
         defer gpa.free(offs);
-        for (schema.fields, offs) |f, *o| {
-            const name = try fb.createString(f.name);
-            const ty = try typeTable(fb, f.ty.sinkType());
-            const children = try fb.createOffsetVector(&.{});
-            try fb.startTable(7);
-            try fb.addOffset(0, name);
-            try fb.addBool(1, true);
-            try fb.addUnion(2, @intFromEnum(ty.tag), ty.off);
-            try fb.addOffset(5, children);
-            o.* = try fb.endTable();
-        }
+        for (schema.fields, offs) |f, *o| o.* = try fieldTable(fb, gpa, f.name, f.ty.sinkType(), true);
         const fields = try fb.createOffsetVector(offs);
         try fb.startTable(4);
         try fb.addInt(i16, 0, 0);
         try fb.addOffset(1, fields);
         if (kv) |o| try fb.addOffset(2, o);
+        return fb.endTable();
+    }
+
+    /// A field and, for a nested type, its children: a list's `item`, a struct's
+    /// fields, a map's `entries` struct of a never-null `key` and its `value`. Every
+    /// other field is declared nullable, as the bitmap is the truth; only the
+    /// entries struct is not (`nullable` false), and its first field, the key.
+    fn fieldTable(fb: *flatbuf.Builder, gpa: std.mem.Allocator, name: []const u8, ty: types.Type, nullable: bool) anyerror!u32 {
+        var kids = std.array_list.Managed(u32).init(gpa);
+        defer kids.deinit();
+        switch (ty.kind) {
+            .array => try kids.append(try fieldTable(fb, gpa, "item", column.childType(ty), true)),
+            .@"struct" => for (ty.fields orelse &.{}, 0..) |f, i| try kids.append(try fieldTable(fb, gpa, f.name, f.ty, nullable or i > 0)),
+            .map => try kids.append(try fieldTable(fb, gpa, "entries", column.entryType(ty), false)),
+            else => {},
+        }
+        const n = try fb.createString(name);
+        const t = try typeTable(fb, ty);
+        const children = try fb.createOffsetVector(kids.items);
+        try fb.startTable(7);
+        try fb.addOffset(0, n);
+        try fb.addBool(1, nullable);
+        try fb.addUnion(2, @intFromEnum(t.tag), t.off);
+        try fb.addOffset(5, children);
         return fb.endTable();
     }
 
@@ -157,12 +172,17 @@ pub const StreamWriter = struct {
         var body = Body{ .bufs = std.array_list.Managed([]const u8).init(arena), .meta = std.array_list.Managed(i64).init(arena) };
         var nodes = std.array_list.Managed(i64).init(arena);
         for (batch.columns, self.schema.fields) |*col, f| {
-            const nb = (n + 7) / 8;
-            if (col.validity.bits.len < nb) return error.ArrowValidityTooShort;
-            const validity = col.validity.bits[0..nb];
-            try nodes.appendSlice(&.{ @intCast(n), @intCast(n - validCount(validity, n)) });
-            try body.push(validity);
-            if (f.ty.unknown) try pushNullText(arena, &body, n) else try pushData(arena, &body, col, n);
+            if (f.ty.unknown) {
+                const nb = (n + 7) / 8;
+                if (col.validity.bits.len < nb) return error.ArrowValidityTooShort;
+                const validity = col.validity.bits[0..nb];
+                try nodes.appendSlice(&.{ @intCast(n), @intCast(n - validCount(validity, n)) });
+                try body.push(validity);
+                try pushNullText(arena, &body, n);
+                continue;
+            }
+            const c = if (col.data == .nested) try column.copy(arena, col.*) else col.*;
+            try pushColumn(arena, &body, &nodes, &c, n);
         }
         const fb = &self.fb;
         fb.reset();
@@ -312,7 +332,39 @@ fn typeTable(fb: *flatbuf.Builder, ty: types.Type) !struct { tag: TypeTag, off: 
             try fb.addInt(i16, 0, 2);
             return .{ .tag = .timestamp, .off = try fb.endTable() };
         },
-        .array, .@"struct", .map => return error.ArrowUnsupportedType,
+        .array => {
+            try fb.startTable(0);
+            return .{ .tag = .list, .off = try fb.endTable() };
+        },
+        .@"struct" => {
+            try fb.startTable(0);
+            return .{ .tag = .struct_, .off = try fb.endTable() };
+        },
+        .map => {
+            try fb.startTable(1);
+            try fb.addBool(0, false);
+            return .{ .tag = .map, .off = try fb.endTable() };
+        },
+    }
+}
+
+/// A column's node, validity and buffers, a nested one's children after its own
+/// (a list's or map's offsets, then the child; a struct's fields in order), as
+/// Arrow lays a record batch out depth first. A nested column comes compact
+/// (`column.copy`), so its offsets start at 0 and its children at their first row.
+fn pushColumn(arena: std.mem.Allocator, body: *Body, nodes: *std.array_list.Managed(i64), col: *const Column, n: usize) anyerror!void {
+    const nb = (n + 7) / 8;
+    if (col.validity.bits.len < nb) return error.ArrowValidityTooShort;
+    const validity = col.validity.bits[0..nb];
+    try nodes.appendSlice(&.{ @intCast(n), @intCast(n - validCount(validity, n)) });
+    try body.push(validity);
+    if (col.data != .nested) return pushData(arena, body, col, n);
+    switch (col.data.nested.body) {
+        .list => |l| {
+            try body.push(std.mem.sliceAsBytes(l.offsets[0 .. n + 1]));
+            try pushColumn(arena, body, nodes, &l.child, @intCast(l.offsets[n]));
+        },
+        .fields => |fs| for (fs) |*f| try pushColumn(arena, body, nodes, f, n),
     }
 }
 
@@ -370,7 +422,7 @@ fn pushData(arena: std.mem.Allocator, body: *Body, col: *const Column, n: usize)
             }
             try body.push(b.values[base..end]);
         },
-        .array, .@"struct", .map => return error.ArrowUnsupportedType,
+        .array, .@"struct", .map => unreachable,
     }
 }
 
@@ -829,5 +881,48 @@ test "an untyped NULL column is written as an all-null utf8 column, whatever sto
             rows += b.len;
         }
         try std.testing.expectEqual(@as(usize, 2), rows);
+    }
+}
+
+test "file sink: lists, structs and maps go out as Arrow's own nested types and read back as nested columns, a sliced list rebased" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const arrowread = @import("read.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "n.arrow" });
+    const int = types.Type.init(.int).asNullable();
+    const rec = types.Type{ .kind = .@"struct", .nullable = true, .fields = &.{ .{ .name = "a", .ty = int }, .{ .name = "b", .ty = types.Type.init(.string).asNullable() } } };
+    const recs = types.Type{ .kind = .array, .nullable = true, .elem = &rec };
+    const m = types.Type{ .kind = .map, .nullable = true, .fields = &.{ .{ .name = "key", .ty = types.Type.init(.string) }, .{ .name = "value", .ty = int } } };
+    const schema = types.Schema{ .fields = &.{ .{ .name = "r", .ty = recs }, .{ .name = "m", .ty = m } } };
+    const rows_r = [_]?[]const u8{ "[{\"a\":1,\"b\":\"x\"},null]", null, "[]", "[{\"a\":null,\"b\":\"y\"}]" };
+    const rows_m = [_]?[]const u8{ "{\"k\":1}", "{}", null, "{\"z\":null}" };
+    var rb = column.Builder.init(a, recs);
+    var mb = column.Builder.init(a, m);
+    for (rows_r ++ rows_r, rows_m ++ rows_m) |x, y| {
+        try rb.append(if (x) |t| .{ .string = t } else .null);
+        try mb.append(if (y) |t| .{ .string = t } else .null);
+    }
+    var cols = [_]Column{ try column.slice(a, try rb.finish(), 0, 8), try mb.finish() };
+    cols[0] = try column.slice(a, cols[0], 0, 4);
+    cols[1] = try column.slice(a, cols[1], 0, 4);
+    const sink = try FileSink.open(std.testing.allocator, path, schema);
+    try sink.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 4 });
+    try sink.close();
+
+    const r = try arrowread.Reader.open(a, path);
+    defer r.close();
+    try std.testing.expectEqualStrings("list(struct(a int, b string))", try r.schema.fields[0].ty.name(a));
+    try std.testing.expectEqualStrings("map(string, int)", try r.schema.fields[1].ty.name(a));
+    const b = (try r.next(a)).?;
+    const nested = @import("../../exec/nested.zig");
+    for (rows_r, rows_m, 0..) |x, y, i| {
+        const vr = b.columns[0].getValue(i);
+        if (x) |t| try std.testing.expectEqualStrings(t, try nested.jsonText(a, vr.nested)) else try std.testing.expect(vr == .null);
+        const vm = b.columns[1].getValue(i);
+        if (y) |t| try std.testing.expectEqualStrings(t, try nested.jsonText(a, vm.nested)) else try std.testing.expect(vm == .null);
     }
 }

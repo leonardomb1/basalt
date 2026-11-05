@@ -30,9 +30,9 @@
 //! timestamps in any unit to basalt's day / microsecond types (a zoned
 //! timestamp reads as its UTC wall-clock, as Parquet's does), a duration to its
 //! count of microseconds as an `int` (the engine has no interval type),
-//! dictionary encodings to their values, and the nested types — lists, structs,
-//! maps — to JSON text, so `json_get` and `UNNEST(JSON_EACH(...))` reach inside
-//! them. Every column is nullable: the bitmap is the truth. A null-typed column is
+//! dictionary encodings to their values, and the nested types — lists of any
+//! layout, structs, maps — to basalt's own nested columns (`nestedColumn`), which
+//! share Arrow's layout. Every column is nullable: the bitmap is the truth. A null-typed column is
 //! an all-null `string`. A union is refused by name in `Reader.why` only when a
 //! column the query reads holds one; otherwise its buffers are stepped past (a
 //! dense union has offsets, and before IPC V5 a union has a validity buffer).
@@ -551,13 +551,7 @@ pub const Reader = struct {
 
         var keep = std.array_list.Managed(usize).init(self.arena);
         for (self.fields, 0..) |f, i| {
-            if (want) |w| {
-                var hit = false;
-                for (w) |n| if (std.mem.eql(u8, n, f.name)) {
-                    hit = true;
-                };
-                if (!hit) continue;
-            }
+            if (want) |w| if (!driver.wantsColumn(w, f.name)) continue;
             try keep.append(i);
         }
         if (keep.items.len == 0 and self.fields.len > 0) {
@@ -574,7 +568,7 @@ pub const Reader = struct {
                 try msgfmt.allocPrint(self.arena, "column `{s}`: its field `{s}` is an Arrow Union, which is not supported", .{ f.name, u }));
         };
         const out = try self.arena.alloc(types.Schema.Field, self.keep.len);
-        for (out, self.keep) |*o, i| o.* = .{ .name = self.fields[i].name, .ty = self.fields[i].basaltType() };
+        for (out, self.keep) |*o, i| o.* = .{ .name = self.fields[i].name, .ty = (try fieldType(self.arena, self.fields[i])).asNullable() };
         self.schema = .{ .fields = out };
 
         for (dict_blocks) |b| {
@@ -776,8 +770,12 @@ pub const Reader = struct {
     }
 
     /// Rows `off .. off + n` of a checked array as an engine column; `off` is a multiple of eight.
-    fn toColumn(arena: std.mem.Allocator, cur: *const Cursor, off: usize, n: usize) !column.Column {
+    fn toColumn(arena: std.mem.Allocator, cur: *const Cursor, off: usize, n: usize) anyerror!column.Column {
         const f = cur.f;
+        if (cur.dict == null) switch (f.kind) {
+            .list, .large_list, .fixed_list, .struct_, .map => return nestedColumn(arena, cur, off, n),
+            else => {},
+        };
         const ty = f.basaltType();
         const fixed = cur.dict == null and switch (f.kind) {
             .int => f.bit_width == 64 and f.signed,
@@ -1060,6 +1058,110 @@ const Cursor = struct {
     }
 };
 
+/// The basalt type an Arrow field reads as: its own for a scalar, a list of its
+/// item for any of the list layouts, a struct of its fields, a map of its entries'
+/// key (never null) and value.
+fn fieldType(arena: std.mem.Allocator, f: Field) Error!types.Type {
+    switch (f.kind) {
+        .list, .large_list, .fixed_list => {
+            if (f.children.len != 1) return Error.CorruptArrow;
+            const e = try arena.create(types.Type);
+            e.* = try fieldType(arena, f.children[0]);
+            return .{ .kind = .array, .nullable = true, .elem = e };
+        },
+        .struct_ => {
+            const fs = try arena.alloc(types.Type.Field, f.children.len);
+            for (fs, f.children) |*o, c| o.* = .{ .name = c.name, .ty = try fieldType(arena, c) };
+            return .{ .kind = .@"struct", .nullable = true, .fields = fs };
+        },
+        .map => {
+            if (f.children.len != 1 or f.children[0].children.len != 2) return Error.CorruptArrow;
+            const kv = f.children[0].children;
+            const pair = try arena.dupe(types.Type.Field, &.{
+                .{ .name = "key", .ty = (try fieldType(arena, kv[0])).withNull(false) },
+                .{ .name = "value", .ty = try fieldType(arena, kv[1]) },
+            });
+            return .{ .kind = .map, .nullable = true, .fields = pair };
+        },
+        else => return f.basaltType(),
+    }
+}
+
+/// Rows `off .. off + n` of a list, struct or map cursor as basalt's nested
+/// storage, the children converted as columns of their own. Arrow lets a null
+/// struct's children and a null list's slot hold values; basalt holds a null
+/// parent's children null and its list empty, so a struct's children are nulled
+/// under its nulls and a list keeps only its present rows' entries.
+fn nestedColumn(arena: std.mem.Allocator, cur: *const Cursor, off: usize, n: usize) anyerror!column.Column {
+    const ty = (try fieldType(arena, cur.f)).asNullable();
+    const valid = try windowValidity(arena, cur, off, n);
+    const node = try arena.create(column.Nested);
+    node.* = .{ .ty = ty, .body = undefined };
+    if (cur.f.kind == .struct_) {
+        const kids = try arena.alloc(column.Column, cur.kids.len);
+        for (kids, cur.kids) |*k, kc| k.* = try nulledUnder(arena, try Reader.toColumn(arena, kc, off, n), valid);
+        node.body = .{ .fields = kids };
+        return column.Column.derived(ty, n, valid, .{ .nested = node });
+    }
+    const offsets = try arena.alloc(i32, n + 1);
+    offsets[0] = 0;
+    var idx = std.array_list.Managed(usize).init(arena);
+    var lo_all: usize = std.math.maxInt(usize);
+    var hi_all: usize = 0;
+    for (0..n) |i| {
+        if (valid.get(i)) {
+            const sp: struct { lo: usize, hi: usize } = if (cur.f.kind == .fixed_list) .{ .lo = (off + i) * cur.f.fixed_size, .hi = (off + i + 1) * cur.f.fixed_size } else blk: {
+                const x = try cur.span(off + i);
+                break :blk .{ .lo = x.lo, .hi = x.hi };
+            };
+            for (sp.lo..sp.hi) |x| try idx.append(x);
+            if (sp.hi > sp.lo) {
+                lo_all = @min(lo_all, sp.lo);
+                hi_all = @max(hi_all, sp.hi);
+            }
+        }
+        offsets[i + 1] = @intCast(try column.checkSpan(idx.items.len));
+    }
+    if (idx.items.len == 0) lo_all = 0;
+    const rel = try arena.alloc(usize, idx.items.len);
+    for (rel, idx.items) |*r, x| r.* = x - lo_all;
+    const whole = rel.len == hi_all -| lo_all;
+    const child: column.Column = if (cur.f.kind == .map) blk: {
+        const entries = cur.kids[0];
+        if (entries.kids.len != 2) return Error.CorruptArrow;
+        const kv = try arena.alloc(column.Column, 2);
+        for (kv, entries.kids) |*o, kc| {
+            const c = try Reader.toColumn(arena, kc, lo_all, hi_all -| lo_all);
+            o.* = if (whole) c else try column.permute(arena, c, rel);
+        }
+        const et = column.entryType(ty);
+        const en = try arena.create(column.Nested);
+        en.* = .{ .ty = et, .body = .{ .fields = kv } };
+        break :blk column.Column.derived(et, rel.len, try column.Bitmap.initFull(arena, rel.len), .{ .nested = en });
+    } else blk: {
+        const c = try Reader.toColumn(arena, cur.kids[0], lo_all, hi_all -| lo_all);
+        break :blk if (whole) c else try column.permute(arena, c, rel);
+    };
+    node.body = .{ .list = .{ .offsets = offsets, .child = child } };
+    return column.Column.derived(ty, n, valid, .{ .nested = node });
+}
+
+/// `c` with its rows null wherever `valid` is not: a scalar's validity narrowed,
+/// a nested column's rows copied anew so their own children are null too.
+fn nulledUnder(arena: std.mem.Allocator, c: column.Column, valid: column.Bitmap) !column.Column {
+    if (valid.allSet(c.len)) return c;
+    if (c.data == .nested) {
+        var b = try column.Builder.initCapacity(arena, c.ty.asNullable(), c.len);
+        for (0..c.len) |r| try b.append(if (valid.get(r)) c.getValue(r) else .null);
+        return b.finish();
+    }
+    var out = c;
+    var bm = try column.Bitmap.initFull(arena, c.len);
+    for (0..c.len) |r| if (!valid.get(r) or !c.validity.get(r)) bm.setValid(r, false);
+    out.validity = bm;
+    return out;
+}
+
 fn copyAs(comptime T: type, arena: std.mem.Allocator, src: []const u8, n: usize) Error![]T {
     if (src.len < n * @sizeOf(T)) return Error.CorruptArrow;
     const out = try arena.alloc(T, n);
@@ -1067,11 +1169,14 @@ fn copyAs(comptime T: type, arena: std.mem.Allocator, src: []const u8, n: usize)
     return out;
 }
 
-/// The validity of rows `off .. off + n`, copied as bytes since `off` is a multiple of eight.
+/// The validity of rows `off .. off + n`: copied as bytes when `off` is a multiple
+/// of eight (a window of a batch), else bit by bit (a nested child's rows).
 fn windowValidity(arena: std.mem.Allocator, cur: *const Cursor, off: usize, n: usize) Error!column.Bitmap {
-    std.debug.assert(off % 8 == 0);
     if (cur.a.null_count == 0 or cur.bits.len == 0) return column.Bitmap.initFull(arena, n);
-    return .{ .bits = try arena.dupe(u8, cur.bits[off / 8 ..][0 .. (n + 7) / 8]), .len = n };
+    if (off % 8 == 0) return .{ .bits = try arena.dupe(u8, cur.bits[off / 8 ..][0 .. (n + 7) / 8]), .len = n };
+    var bm = try column.Bitmap.initFull(arena, n);
+    for (0..n) |i| if (cur.isNull(off + i)) bm.setValid(i, false);
+    return bm;
 }
 
 /// The fixed-width kinds whose engine storage is not Arrow's own, converted in one
@@ -1354,12 +1459,12 @@ test "types map onto the engine's, every column nullable" {
     defer r.close();
     const Want = struct { name: []const u8, kind: types.TypeKind };
     const want = [_]Want{
-        .{ .name = "i8", .kind = .int },      .{ .name = "u64", .kind = .decimal },
-        .{ .name = "f32", .kind = .float },   .{ .name = "d64", .kind = .date },
-        .{ .name = "t32s", .kind = .time },   .{ .name = "ts_ns_utc", .kind = .timestamp },
-        .{ .name = "dec", .kind = .decimal }, .{ .name = "ls", .kind = .string },
-        .{ .name = "bin", .kind = .bytes },   .{ .name = "fsb", .kind = .bytes },
-        .{ .name = "st", .kind = .string },   .{ .name = "nul", .kind = .string },
+        .{ .name = "i8", .kind = .int },       .{ .name = "u64", .kind = .decimal },
+        .{ .name = "f32", .kind = .float },    .{ .name = "d64", .kind = .date },
+        .{ .name = "t32s", .kind = .time },    .{ .name = "ts_ns_utc", .kind = .timestamp },
+        .{ .name = "dec", .kind = .decimal },  .{ .name = "ls", .kind = .string },
+        .{ .name = "bin", .kind = .bytes },    .{ .name = "fsb", .kind = .bytes },
+        .{ .name = "st", .kind = .@"struct" }, .{ .name = "nul", .kind = .string },
         .{ .name = "dict", .kind = .string },
     };
     for (want) |w| {

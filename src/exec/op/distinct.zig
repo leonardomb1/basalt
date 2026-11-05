@@ -290,15 +290,17 @@ fn newIn(a: std.mem.Allocator, v: anytype) !*@TypeOf(v) {
 
 /// The `keep`-marked rows of `b` copied into `arena`, string bytes included, for a
 /// source batch whose scratch is about to be freed. A float key column's values are
-/// `keyhash.canonF64`, as GROUP BY keeps its keys.
+/// `keyhash.canonF64`, as GROUP BY keeps its keys, and so are the floats inside a
+/// nested key column.
 fn gatherKept(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize, key_idx: []const usize) anyerror!Batch {
     const outcols = try arena.alloc(column.Column, b.columns.len);
     try column.gatherColumns(arena, b.columns, outcols, keep, kept);
     for (b.columns, outcols, 0..) |col, *o, ci| {
-        if (col.ty.kind == .float and std.mem.indexOfScalar(usize, key_idx, ci) != null)
-            for (o.data.f64[0..kept]) |*x| {
-                x.* = keyhash.canonF64(x.*);
-            };
+        if (std.mem.indexOfScalar(usize, key_idx, ci) == null) continue;
+        if (col.ty.kind == .float) for (o.data.f64[0..kept]) |*x| {
+            x.* = keyhash.canonF64(x.*);
+        };
+        if (o.data == .nested) @import("../nested.zig").canonFloats(o.data.nested);
     }
     return Batch{ .schema = b.schema, .columns = outcols, .len = kept };
 }

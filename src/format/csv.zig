@@ -778,11 +778,10 @@ pub const Projection = struct {
         var fields = std.array_list.Managed(types.Schema.Field).init(arena);
         for (full.fields, slot) |f, *sl| {
             sl.* = -1;
-            for (names) |n| if (std.mem.eql(u8, n, f.name)) {
+            if (driver.wantsColumn(names, f.name)) {
                 sl.* = @intCast(fields.items.len);
                 try fields.append(f);
-                break;
-            };
+            }
         }
         if (fields.items.len == full.fields.len) return null;
         if (fields.items.len == 0 and full.fields.len > 0) {

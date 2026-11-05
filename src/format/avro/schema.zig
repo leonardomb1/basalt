@@ -2,14 +2,15 @@
 //! `Node`s with named types resolved (a record may name itself, as a linked list
 //! does), and the columns a read gives them (`Plan`).
 //!
-//! A read is a table, so the top record's fields are its columns, a nested record's
-//! fields flattened to dotted names (`addr.city`) as a Parquet struct's are, and a
-//! value of any other type a single column `value`. A union of `null` and one type
-//! is that type, nullable; one of numbers only is INT or FLOAT, of strings and enums
-//! STRING. Arrays, maps, a record that recurses and any other union are one STRING
-//! column holding the value as compact JSON, bytes as base64 and temporal values as
-//! ISO text, as basalt's JSON writer writes them; a `null` branch of any union is a
-//! SQL NULL, never the text `null`.
+//! A read is a table, so the top record's fields are its columns, and a value of
+//! any other type a single column `value`. A nested record is a STRUCT of its
+//! fields, an array a LIST of its items and a map a MAP of STRING keys to its
+//! values, decoded into the column's own nested storage (`Step.nested`). A union
+//! of `null` and one type is that type, nullable; one of numbers only is INT or
+//! FLOAT, of strings and enums STRING. A record that recurses and any other union
+//! are a STRING holding the value as compact JSON, bytes as base64 and temporal
+//! values as ISO text, as basalt's JSON writer writes them, a column or a nested
+//! part alike; a `null` branch of any union is a SQL NULL, never the text `null`.
 //!
 //! Logical types map to what basalt keeps: `date` to DATE, `time-*` to TIME,
 //! `timestamp-*` and `local-timestamp-*` to TIMESTAMP (nanoseconds floored to the
@@ -281,12 +282,14 @@ const Parser = struct {
 };
 
 /// How each value of a row reaches the columns: `leaf` decodes into one column,
-/// `text` renders as JSON into one, `record` runs its fields' steps in order, and
+/// `text` renders as JSON into one, `nested` decodes a record, array or map into
+/// one nested column's builder, `record` runs its fields' steps in order, and
 /// `choice` reads a union's branch and runs that branch's step, a `nulls` branch
 /// setting every column of the union NULL.
 pub const Step = union(enum) {
     leaf: Target,
     text: Target,
+    nested: Target,
     record: []const Step,
     choice: Choice,
     nulls,
@@ -338,11 +341,55 @@ const Planner = struct {
 
     fn valueStep(self: *Planner, n: *const Node, name: []const u8, nullable: bool) Error!Step {
         switch (n.kind) {
-            .record => if (!self.recursive(n)) return self.recordStep(n, name, nullable),
+            .record, .array, .map => if (n.kind != .record or !self.recursive(n))
+                return .{ .nested = .{ .col = try self.add(name, (try self.typeOf(n)).withNull(nullable)), .node = n } },
             .@"union" => return self.unionStep(n, name, nullable),
             else => if (leafType(n)) |ty| return .{ .leaf = .{ .col = try self.add(name, ty.withNull(nullable or n.kind == .null)), .node = n } },
         }
         return .{ .text = .{ .col = try self.add(name, types.Type.init(.string).withNull(nullable)), .node = n } };
+    }
+
+    /// The basalt type a value of `n` is held as inside a nested column: a struct
+    /// of a record's fields, a list of an array's items, a map of STRING keys to a
+    /// map's values, a `null`-and-one union that type nullable, and a recursing
+    /// record or any other union JSON text, as a column of them is.
+    fn typeOf(self: *Planner, n: *const Node) Error!types.Type {
+        switch (n.kind) {
+            .record => {
+                if (self.recursive(n)) return types.Type.init(.string);
+                try self.open.append(self.arena, n.name);
+                defer _ = self.open.pop();
+                const fs = try self.arena.alloc(types.Type.Field, n.fields.len);
+                for (fs, n.fields) |*o, f| o.* = .{ .name = f.name, .ty = try self.typeOf(f.node) };
+                return .{ .kind = .@"struct", .fields = fs };
+            },
+            .array => {
+                const e = try self.arena.create(types.Type);
+                e.* = try self.typeOf(n.items.?);
+                return .{ .kind = .array, .elem = e };
+            },
+            .map => {
+                const kv = try self.arena.dupe(types.Type.Field, &.{
+                    .{ .name = "key", .ty = types.Type.init(.string) },
+                    .{ .name = "value", .ty = try self.typeOf(n.items.?) },
+                });
+                return .{ .kind = .map, .fields = kv };
+            },
+            .@"union" => {
+                var real: ?*const Node = null;
+                var count: usize = 0;
+                for (n.branches) |b| if (b.kind != .null) {
+                    real = b;
+                    count += 1;
+                };
+                const has_null = count < n.branches.len;
+                if (count == 0) return types.Type.init(.string).asNullable();
+                if (count == 1) return (try self.typeOf(real.?)).withNull(has_null);
+                if (commonType(n.branches)) |ty| return ty.withNull(has_null);
+                return types.Type.init(.string).withNull(has_null);
+            },
+            else => return (leafType(n) orelse types.Type.init(.string)).withNull(n.kind == .null),
+        }
     }
 
     fn unionStep(self: *Planner, n: *const Node, name: []const u8, nullable: bool) Error!Step {
@@ -450,7 +497,7 @@ fn planOf(a: std.mem.Allocator, text: []const u8) !Plan {
     return plan(a, try parse(a, text));
 }
 
-test "a record's fields are its columns, nested records flattened and the rest typed" {
+test "a record's fields are its columns, a nested record a struct, an array a list, and the rest typed" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -473,12 +520,11 @@ test "a record's fields are its columns, nested records flattened and the rest t
         \\]}
     );
     const want = [_]struct { []const u8, types.TypeKind, bool }{
-        .{ "id", .int, false },      .{ "name", .string, true },        .{ "addr.city", .string, true },
-        .{ "addr.zip", .int, true }, .{ "again.city", .string, false }, .{ "again.zip", .int, false },
-        .{ "tags", .string, false }, .{ "n", .int, false },             .{ "x", .float, true },
-        .{ "mix", .string, false },  .{ "d", .date, false },            .{ "ts", .timestamp, false },
-        .{ "amt", .decimal, false }, .{ "f", .decimal, false },         .{ "e", .string, false },
-        .{ "odd", .string, false },
+        .{ "id", .int, false },          .{ "name", .string, true },  .{ "addr", .@"struct", true },
+        .{ "again", .@"struct", false }, .{ "tags", .array, false },  .{ "n", .int, false },
+        .{ "x", .float, true },          .{ "mix", .string, false },  .{ "d", .date, false },
+        .{ "ts", .timestamp, false },    .{ "amt", .decimal, false }, .{ "f", .decimal, false },
+        .{ "e", .string, false },        .{ "odd", .string, false },
     };
     try testing.expectEqual(want.len, p.schema.fields.len);
     for (want, p.schema.fields) |w, f| {
@@ -486,8 +532,10 @@ test "a record's fields are its columns, nested records flattened and the rest t
         try testing.expectEqual(w[1], f.ty.kind);
         try testing.expectEqual(w[2], f.ty.nullable);
     }
-    try testing.expectEqual(@as(u8, 18), p.schema.fields[13].ty.precision);
-    try testing.expectEqual(@as(u8, 4), p.schema.fields[13].ty.scale);
+    try testing.expectEqualStrings("struct(city string, zip int)", try p.schema.fields[2].ty.name(a));
+    try testing.expectEqualStrings("list(string)", try p.schema.fields[4].ty.name(a));
+    try testing.expectEqual(@as(u8, 18), p.schema.fields[11].ty.precision);
+    try testing.expectEqual(@as(u8, 4), p.schema.fields[11].ty.scale);
 }
 
 test "a record that names itself reads its recursion as JSON text; a bare type is one column" {

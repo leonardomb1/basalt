@@ -7,9 +7,12 @@
 //! `decimal` logical type (precision 38 when the column's is unknown), DATE as `date`,
 //! TIME as `time-micros` and TIMESTAMP as `local-timestamp-micros`, since basalt's
 //! timestamps carry no timezone (as its Parquet files say with `isAdjustedToUTC`
-//! false). A list, map or struct column, and a column name Avro does not allow
-//! (`[A-Za-z_][A-Za-z0-9_]*`, so not a flattened `addr.city`), are refused up front
-//! naming the column, rather than written under another name.
+//! false). A struct is a record (named `r1`, `r2`… in the order the schema
+//! meets them, as Avro names every record), a list an array, a map a map, every
+//! part of them a union of `null` and its type as a column is, a map's keys aside,
+//! which Avro holds as strings: a map whose keys are not STRING is refused. A
+//! column or field name Avro does not allow (`[A-Za-z_][A-Za-z0-9_]*`) is refused
+//! up front naming it, rather than written under another name.
 //!
 //! Each batch is one block, encoded and compressed on its own (`renderBatch`), so
 //! lanes encode in parallel and only the finished bytes are written in turn; every
@@ -30,6 +33,7 @@ const codecs = @import("../compress/codecs.zig");
 const deflate = @import("../compress/deflate.zig");
 const driver = @import("../../connect/driver.zig");
 const jsontext = @import("../../exec/jsontext.zig");
+const column_mod = @import("../../exec/column.zig");
 const civil = @import("../../exec/civil.zig");
 const read = @import("read.zig");
 const schema_mod = @import("schema.zig");
@@ -48,10 +52,27 @@ pub const Error = error{ AvroUnsupportedType, AvroBadName, AvroCodecUnsupported,
 /// Why a column cannot be written, null when every one can.
 pub fn schemaProblem(schema: types.Schema) ?anyerror {
     for (schema.fields) |f| {
-        if (f.ty.isNested())
-            return stream.explainf(error.AvroUnsupportedType, "column `{s}` is a list, map or struct, which basalt does not write to Avro", .{f.name});
         if (!schema_mod.validName(f.name))
             return stream.explainf(error.AvroBadName, "column `{s}` is not a name Avro allows (letters, digits and `_`, not starting with a digit); rename it with AS", .{f.name});
+        if (typeProblem(f.name, f.ty)) |e| return e;
+    }
+    return null;
+}
+
+fn typeProblem(col: []const u8, ty: types.Type) ?anyerror {
+    switch (ty.kind) {
+        .@"struct" => for (ty.fields orelse &.{}) |f| {
+            if (!schema_mod.validName(f.name))
+                return stream.explainf(error.AvroBadName, "column `{s}` has a field `{s}`, which is not a name Avro allows (letters, digits and `_`, not starting with a digit)", .{ col, f.name });
+            if (typeProblem(col, f.ty)) |e| return e;
+        },
+        .array => return typeProblem(col, column_mod.childType(ty)),
+        .map => {
+            const kv = ty.fields orelse return null;
+            if (kv[0].ty.kind != .string) return stream.explainf(error.AvroUnsupportedType, "column `{s}` is a MAP with {s} keys; Avro's map keys are strings, so cast the keys to STRING first", .{ col, @tagName(kv[0].ty.kind) });
+            return typeProblem(col, kv[1].ty);
+        },
+        else => {},
     }
     return null;
 }
@@ -61,27 +82,62 @@ pub fn schemaJson(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
     var aw = std.Io.Writer.Allocating.init(arena);
     const w = &aw.writer;
     try w.writeAll("{\"type\":\"record\",\"name\":\"row\",\"fields\":[");
-    for (schema.fields, 0..) |f, i| {
+    var records: usize = 0;
+    try fieldsJson(w, schema.fields, &records);
+    try w.writeAll("]}");
+    return aw.written();
+}
+
+/// A record's fields, each a union of null and its type.
+fn fieldsJson(w: *std.Io.Writer, fields: []const types.Schema.Field, records: *usize) !void {
+    for (fields, 0..) |f, i| {
         if (i > 0) try w.writeByte(',');
         try w.writeAll("{\"name\":\"");
         try jsontext.chars(w, f.name);
-        try w.writeAll("\",\"type\":[\"null\",");
-        switch (f.ty.kind) {
-            .bool => try w.writeAll("\"boolean\""),
-            .int => try w.writeAll("\"long\""),
-            .float => try w.writeAll("\"double\""),
-            .string => try w.writeAll("\"string\""),
-            .bytes => try w.writeAll("\"bytes\""),
-            .decimal => try w.print("{{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":{d},\"scale\":{d}}}", .{ precisionOf(f.ty), f.ty.scale }),
-            .date => try w.writeAll("{\"type\":\"int\",\"logicalType\":\"date\"}"),
-            .time => try w.writeAll("{\"type\":\"long\",\"logicalType\":\"time-micros\"}"),
-            .timestamp => try w.writeAll("{\"type\":\"long\",\"logicalType\":\"local-timestamp-micros\"}"),
-            .array, .@"struct", .map => unreachable,
-        }
-        try w.writeAll("],\"default\":null}");
+        try w.writeAll("\",\"type\":");
+        try unionJson(w, f.ty, records);
+        try w.writeAll(",\"default\":null}");
     }
-    try w.writeAll("]}");
-    return aw.written();
+}
+
+fn unionJson(w: *std.Io.Writer, ty: types.Type, records: *usize) anyerror!void {
+    try w.writeAll("[\"null\",");
+    try typeJson(w, ty, records);
+    try w.writeByte(']');
+}
+
+fn typeJson(w: *std.Io.Writer, ty: types.Type, records: *usize) anyerror!void {
+    switch (ty.kind) {
+        .bool => try w.writeAll("\"boolean\""),
+        .int => try w.writeAll("\"long\""),
+        .float => try w.writeAll("\"double\""),
+        .string => try w.writeAll("\"string\""),
+        .bytes => try w.writeAll("\"bytes\""),
+        .decimal => try w.print("{{\"type\":\"bytes\",\"logicalType\":\"decimal\",\"precision\":{d},\"scale\":{d}}}", .{ precisionOf(ty), ty.scale }),
+        .date => try w.writeAll("{\"type\":\"int\",\"logicalType\":\"date\"}"),
+        .time => try w.writeAll("{\"type\":\"long\",\"logicalType\":\"time-micros\"}"),
+        .timestamp => try w.writeAll("{\"type\":\"long\",\"logicalType\":\"local-timestamp-micros\"}"),
+        .@"struct" => {
+            records.* += 1;
+            try w.print("{{\"type\":\"record\",\"name\":\"r{d}\",\"fields\":[", .{records.*});
+            const fs = ty.fields orelse &.{};
+            const sf = try std.heap.smp_allocator.alloc(types.Schema.Field, fs.len);
+            defer std.heap.smp_allocator.free(sf);
+            for (fs, sf) |f, *o| o.* = .{ .name = f.name, .ty = f.ty };
+            try fieldsJson(w, sf, records);
+            try w.writeAll("]}");
+        },
+        .array => {
+            try w.writeAll("{\"type\":\"array\",\"items\":");
+            try unionJson(w, column_mod.childType(ty), records);
+            try w.writeByte('}');
+        },
+        .map => {
+            try w.writeAll("{\"type\":\"map\",\"values\":");
+            try unionJson(w, (ty.fields orelse &.{})[1].ty, records);
+            try w.writeByte('}');
+        },
+    }
 }
 
 fn precisionOf(ty: types.Type) u8 {
@@ -191,11 +247,40 @@ fn encoderFor(data: Column.Data) Encoder {
                     .f64 => try out.appendSlice(&std.mem.toBytes(std.mem.nativeToLittle(u64, @bitCast(col.data.f64[row])))),
                     .bytes => try bytesOf(out, col.data.bytes.at(row)),
                     .dec, .d64 => try decimalBytes(out, decimals(col.*).at(row), fld),
-                    .nested => unreachable,
+                    .nested => try nestedBody(out, col, row),
                 }
             }
         }.f,
     };
+}
+
+/// A nested value's body: a struct's fields in order, an array's items or a map's
+/// entries in one block, each part as a column's cell is (a union of null and it),
+/// a map's key as its string.
+fn nestedBody(out: *std.array_list.Managed(u8), col: *const Column, row: usize) anyerror!void {
+    const nd = col.data.nested;
+    switch (nd.body) {
+        .fields => |fs| for (fs, nd.ty.fields orelse &.{}) |*c, f| try encoderFor(c.data)(out, c, row, .{ .name = f.name, .ty = f.ty }),
+        .list => |l| {
+            const lo: usize = @intCast(l.offsets[row]);
+            const hi: usize = @intCast(l.offsets[row + 1]);
+            if (hi > lo) {
+                try long(out, @intCast(hi - lo));
+                if (nd.ty.kind == .map) {
+                    const kv = l.child.data.nested.body.fields;
+                    const vf = types.Schema.Field{ .name = "value", .ty = kv[1].ty };
+                    for (lo..hi) |x| {
+                        try bytesOf(out, kv[0].data.bytes.at(x));
+                        try encoderFor(kv[1].data)(out, &kv[1], x, vf);
+                    }
+                } else {
+                    const ef = types.Schema.Field{ .name = "item", .ty = l.child.ty };
+                    for (lo..hi) |x| try encoderFor(l.child.data)(out, &l.child, x, ef);
+                }
+            }
+            try long(out, 0);
+        },
+    }
 }
 
 /// A decimal restated at the column's scale, as Parquet's writer restates it, in the
@@ -245,6 +330,14 @@ fn same(want: Value, got: Value, ty: types.Type) bool {
         .decimal => |d| decimal.rescaleTo(d, ty.scale).?.order(got.decimal) == .eq,
         .string => |s| std.mem.eql(u8, s, got.string),
         .bytes => |s| std.mem.eql(u8, s, got.bytes),
+        .nested => |r| blk: {
+            const nested = @import("../../exec/nested.zig");
+            var ar = std.heap.ArenaAllocator.init(testing.allocator);
+            defer ar.deinit();
+            const x = nested.jsonText(ar.allocator(), r) catch break :blk false;
+            const y = nested.jsonText(ar.allocator(), got.nested) catch break :blk false;
+            break :blk std.mem.eql(u8, x, y);
+        },
         else => std.meta.eql(want, got),
     };
 }
@@ -316,13 +409,16 @@ test "an empty table is a header and no blocks, read back as no rows" {
     try testing.expect((try f.next(a)) == null);
 }
 
-test "an array column, a name Avro forbids and a zstandard write are refused naming why" {
+test "a map keyed by other than STRING, a name Avro forbids and a zstandard write are refused naming why" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const nested = types.Schema{ .fields = &.{.{ .name = "x", .ty = types.Type.init(.array) }} };
+    const int_keys = types.Type{ .kind = .map, .fields = &.{ .{ .name = "key", .ty = types.Type.init(.int) }, .{ .name = "value", .ty = types.Type.init(.int) } } };
+    const nested = types.Schema{ .fields = &.{.{ .name = "x", .ty = int_keys }} };
     try testing.expectEqual(error.AvroUnsupportedType, schemaProblem(nested).?);
     try testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.AvroUnsupportedType).?, "`x`") != null);
+    const bad_field = types.Type{ .kind = .@"struct", .fields = &.{.{ .name = "a b", .ty = types.Type.init(.int) }} };
+    try testing.expectEqual(error.AvroBadName, schemaProblem(.{ .fields = &.{.{ .name = "s", .ty = bad_field }} }).?);
     const dotted = types.Schema{ .fields = &.{.{ .name = "addr.city", .ty = types.Type.init(.string) }} };
     try testing.expectEqual(error.AvroBadName, schemaProblem(dotted).?);
     try testing.expectError(error.AvroCodecUnsupported, Writer.open(a, "unused.avro", .{ .fields = &.{} }, .zstandard));

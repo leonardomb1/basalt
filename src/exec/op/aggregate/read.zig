@@ -175,7 +175,7 @@ pub fn laneKind(comptime In: type, comptime l: Lane) ?types.TypeKind {
 }
 
 /// Row `i` of a column of `kind` as `In`, or null when it is NULL; a nested value
-/// counts as present but reads as NULL otherwise. The one per-row read every
+/// reads whole for an aggregate of whole values (MIN, MAX) and as NULL otherwise. The one per-row read every
 /// aggregate loop makes.
 pub inline fn at(comptime In: type, comptime kind: types.TypeKind, c: column.Column, i: usize, cx: Ctx) !?In {
     return atIn(In, kind, .any, c, i, cx);
@@ -194,6 +194,7 @@ pub inline fn atValid(comptime In: type, comptime kind: types.TypeKind, c: colum
 
 pub inline fn atValidIn(comptime In: type, comptime kind: types.TypeKind, comptime lay: Layout, c: column.Column, i: usize, cx: Ctx) !?In {
     if (In == void) return {};
+    if (comptime In == Value and Phys(kind) == null) return c.getValue(i);
     const S = comptime Phys(kind) orelse return null;
     if (comptime In != Value and converts(S, In)) return conv(S, In, get(S, lay, c, i));
     return try fromValue(In, c.getValue(i), cx);

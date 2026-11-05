@@ -157,11 +157,7 @@ fn keepIn(arena: std.mem.Allocator, n: *NNode, path: []const u8, want: []const [
     if (kids.items.len > 0) n.children = kids.items;
 }
 
-/// Whether a name in `want` is `path` or below it.
-pub fn reaches(want: []const []const u8, path: []const u8) bool {
-    for (want) |w| if (std.mem.startsWith(u8, w, path) and (w.len == path.len or w[path.len] == '.')) return true;
-    return false;
-}
+const reaches = @import("../../connect/driver.zig").wantsColumn;
 
 fn number(n: *NNode, next: *usize) void {
     n.first_leaf = next.*;

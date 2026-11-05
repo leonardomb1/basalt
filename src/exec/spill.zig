@@ -124,13 +124,7 @@ pub const Writer = struct {
     }
 
     fn valuesLen(c: Column, rows: usize) u64 {
-        if (c.data == .nested) {
-            var n: u64 = 0;
-            for (0..rows) |r| if (c.validity.get(r)) {
-                n += celltext.nestedText(&c, r).len;
-            };
-            return n;
-        }
+        if (c.data == .nested) return bodyLen(c.data.nested, rows);
         if (c.data != .bytes) return 0;
         if (c.codes_only) {
             var n: u64 = 0;
@@ -146,15 +140,38 @@ pub const Writer = struct {
     fn batchLen(b: Batch) u64 {
         var n = headerLen(b.columns.len);
         for (b.columns) |c| {
-            n += pad((b.len + 7) / 8) + pad(dataLen(c.data, b.len)) + pad(valuesLen(c, b.len));
+            n += pad((b.len + 7) / 8) + if (c.data == .nested) valuesLen(c, b.len) else pad(dataLen(c.data, b.len)) + pad(valuesLen(c, b.len));
         }
         return n;
     }
 
+    /// The bytes nested storage `nd`'s first `rows` rows take: each child column as
+    /// `putChild` writes it, a list's offsets before its child.
+    fn bodyLen(nd: *const column.Nested, rows: usize) u64 {
+        return switch (nd.body) {
+            .fields => |fs| blk: {
+                var n: u64 = 0;
+                for (fs) |f| n += childLen(f, rows);
+                break :blk n;
+            },
+            .list => |l| pad((rows + 1) * @sizeOf(i32)) + childLen(l.child, @intCast(l.offsets[rows] - l.offsets[0])),
+        };
+    }
+
+    fn childLen(c: Column, rows: usize) u64 {
+        return 16 + pad((rows + 7) / 8) + switch (c.data) {
+            .nested => |nd| bodyLen(nd, rows),
+            else => pad(dataLen(c.data, rows)) + pad(valuesLen(c, rows)),
+        };
+    }
+
     /// Appends one batch (any length, 0 allowed), charging its bytes to the space first.
-    pub fn write(self: *Writer, b: Batch) !void {
+    pub fn write(self: *Writer, b_in: Batch) !void {
         std.debug.assert(self.state == .open);
-        if (b.columns.len != self.schema.fields.len) return error.SpillSchemaMismatch;
+        if (b_in.columns.len != self.schema.fields.len) return error.SpillSchemaMismatch;
+        var tmp = std.heap.ArenaAllocator.init(std.heap.smp_allocator);
+        defer tmp.deinit();
+        const b = try compacted(tmp.allocator(), b_in);
         const total = batchLen(b);
         try self.space.charge(total);
         errdefer self.space.release(total);
@@ -197,19 +214,39 @@ pub const Writer = struct {
         try self.zeros(pad(total) - total);
     }
 
-    /// A nested column as each row's JSON text (`celltext.nestedText`), laid out as
-    /// `putBytes` lays strings, which the reader builds back into the column.
-    fn putNested(self: *Writer, c: Column, rows: usize) !void {
-        var w: i32 = 0;
-        try self.put(std.mem.asBytes(&w));
-        for (0..rows) |r| {
-            if (c.validity.get(r)) w += @intCast(celltext.nestedText(&c, r).len);
-            try self.put(std.mem.asBytes(&w));
+    /// `b` with each nested column copied compact (`column.copy`): every list's
+    /// offsets from 0 and its child cut to the rows they span, so the children are
+    /// written from their first row.
+    fn compacted(arena: std.mem.Allocator, b: Batch) !Batch {
+        for (b.columns) |c| if (c.data == .nested) break else return b;
+        const cols = try arena.alloc(Column, b.columns.len);
+        for (cols, b.columns) |*o, c| o.* = if (c.data == .nested) try column.copy(arena, c) else c;
+        return .{ .schema = b.schema, .columns = cols, .len = b.len };
+    }
+
+    /// A compact nested column's children, each as `putChild` writes one: the list's
+    /// offsets then its child, or the struct's fields in order.
+    fn putNested(self: *Writer, c: Column, rows: usize) anyerror!void {
+        switch (c.data.nested.body) {
+            .fields => |fs| for (fs) |f| try self.putChild(f, rows),
+            .list => |l| {
+                try self.putPadded(std.mem.sliceAsBytes(l.offsets[0 .. rows + 1]));
+                try self.putChild(l.child, @intCast(l.offsets[rows]));
+            },
         }
-        const n = (rows + 1) * @sizeOf(i32);
-        try self.zeros(pad(n) - n);
-        for (0..rows) |r| if (c.validity.get(r)) try self.put(celltext.nestedText(&c, r));
-        try self.zeros(pad(@intCast(w)) - @as(u64, @intCast(w)));
+    }
+
+    /// A child column as a batch's column is written, its storage and the word a
+    /// batch's header holds for it ahead of it, as the child is not in the header.
+    fn putChild(self: *Writer, c: Column, rows: usize) anyerror!void {
+        try self.putU64(@intFromEnum(@as(Tag, c.data)));
+        try self.putU64(if (c.data == .d64) c.data.d64.scale else valuesLen(c, rows));
+        try self.putPadded(c.validity.bits[0 .. (rows + 7) / 8]);
+        switch (c.data) {
+            .bytes => |by| if (c.codes_only) try self.putCodes(c, rows) else try self.putBytes(by, rows),
+            .nested => try self.putNested(c, rows),
+            inline else => |_, t| try self.putPadded(std.mem.sliceAsBytes(column.fixedOf(t, c.data)[0..rows])),
+        }
     }
 
     fn putBytes(self: *Writer, by: column.Bytes, rows: usize) !void {
@@ -259,9 +296,10 @@ pub const Reader = struct {
     released: usize = 0,
     /// Where the batch last handed out starts.
     last: usize = 0,
-    /// Nested columns are rebuilt from their JSON, not mapped: each batch's into an
-    /// arena of its own (`live`), handed back to `spare` by `releaseRead` for every
-    /// batch but the last, which is when a caller is done with the earlier ones.
+    /// A nested column's children are mapped as its own columns are, but its tree's
+    /// nodes are allocated: each batch's into an arena of its own (`live`), handed
+    /// back to `spare` by `releaseRead` for every batch but the last, which is when a
+    /// caller is done with the earlier ones.
     live: std.ArrayListUnmanaged(*std.heap.ArenaAllocator) = .empty,
     spare: std.ArrayListUnmanaged(*std.heap.ArenaAllocator) = .empty,
 
@@ -339,7 +377,6 @@ pub const Reader = struct {
                 vlen: u64,
                 arena: std.mem.Allocator,
                 ty: types.Type,
-                bits: []const u8,
                 pub fn fixed(o: @This(), comptime tag: Tag) ![]column.Elem(tag) {
                     return o.r.takeSlice(column.Elem(tag), o.rows);
                 }
@@ -348,21 +385,11 @@ pub const Reader = struct {
                     return .{ .offsets = offsets, .values = try o.r.take(o.vlen) };
                 }
                 pub fn nested(o: @This()) !*const column.Nested {
-                    const text = try o.bytes();
-                    var b = column.Builder.init(o.arena, o.ty);
-                    const valid = column.Bitmap{ .bits = @constCast(o.bits), .len = @intCast(o.rows) };
-                    for (0..@intCast(o.rows)) |row| {
-                        if (!valid.get(row)) {
-                            try b.appendNull();
-                            continue;
-                        }
-                        b.append(.{ .string = text.at(row) }) catch return error.CorruptSpill;
-                    }
-                    return (try b.finish()).data.nested;
+                    return o.r.readBody(o.arena, o.ty, o.rows);
                 }
             };
             const shape: column.Shape = .{ .tag = t, .scale = if (t == .d64) std.math.cast(u8, vlen) orelse return error.CorruptSpill else 0 };
-            const data = try column.mapTag(shape, Op{ .r = self, .rows = rows, .vlen = vlen, .arena = nest_arena, .ty = f.ty, .bits = bits });
+            const data = try column.mapTag(shape, Op{ .r = self, .rows = rows, .vlen = vlen, .arena = nest_arena, .ty = f.ty });
             c.* = .{
                 .ty = f.ty,
                 .len = @intCast(rows),
@@ -371,6 +398,52 @@ pub const Reader = struct {
             };
         }
         return .{ .schema = self.schema, .columns = cols, .len = @intCast(rows) };
+    }
+
+    /// Nested storage of type `ty` for `rows` rows, its children mapped in place as a
+    /// batch's columns are; only the tree's own nodes are allocated.
+    fn readBody(self: *Reader, arena: std.mem.Allocator, ty: types.Type, rows: u64) anyerror!*const column.Nested {
+        const node = try arena.create(column.Nested);
+        node.* = .{ .ty = ty, .body = switch (ty.kind) {
+            .@"struct" => blk: {
+                const fs = ty.fields orelse &.{};
+                const kids = try arena.alloc(Column, fs.len);
+                for (fs, kids) |f, *k| k.* = try self.readChild(arena, f.ty, rows);
+                break :blk .{ .fields = kids };
+            },
+            else => blk: {
+                const offsets = try self.takeSlice(i32, rows + 1);
+                if (offsets[0] != 0 or offsets[rows] < 0) return error.CorruptSpill;
+                break :blk .{ .list = .{ .offsets = offsets, .child = try self.readChild(arena, column.childType(ty), @intCast(offsets[rows])) } };
+            },
+        } };
+        return node;
+    }
+
+    fn readChild(self: *Reader, arena: std.mem.Allocator, ty: types.Type, rows: u64) anyerror!Column {
+        const t = std.meta.intToEnum(Tag, try self.takeU64()) catch return error.CorruptSpill;
+        const aux = try self.takeU64();
+        const bits = try self.take((rows + 7) / 8);
+        const shape: column.Shape = .{ .tag = t, .scale = if (t == .d64) std.math.cast(u8, aux) orelse return error.CorruptSpill else 0 };
+        const Op = struct {
+            r: *Reader,
+            rows: u64,
+            aux: u64,
+            arena: std.mem.Allocator,
+            ty: types.Type,
+            pub fn fixed(o: @This(), comptime tag: Tag) ![]column.Elem(tag) {
+                return o.r.takeSlice(column.Elem(tag), o.rows);
+            }
+            pub fn bytes(o: @This()) !column.Bytes {
+                const offsets = try o.r.takeSlice(i32, o.rows + 1);
+                return .{ .offsets = offsets, .values = try o.r.take(o.aux) };
+            }
+            pub fn nested(o: @This()) anyerror!*const column.Nested {
+                return o.r.readBody(o.arena, o.ty, o.rows);
+            }
+        };
+        const data = try column.mapTag(shape, Op{ .r = self, .rows = rows, .aux = aux, .arena = arena, .ty = ty });
+        return .{ .ty = ty, .len = @intCast(rows), .validity = .{ .bits = bits, .len = @intCast(rows) }, .data = data };
     }
 
     fn nestArena(self: *Reader) !std.mem.Allocator {
@@ -688,22 +761,31 @@ test "spill reader rejects a file without the magic" {
     try testing.expectError(error.CorruptSpill, Reader.open(.{ .path = f.path, .schema = &all_schema, .rows = 0, .bytes = 16 }));
 }
 
-test "spill writes a nested column as JSON and reads it back as nested storage, across batches the reader releases" {
+test "spill writes a nested column's children as columns and maps them back, across batches the reader releases" {
     var td = try TestDir.init(1 << 20);
     defer td.deinit();
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const int = types.Type.init(.int).asNullable();
+    const str = types.Type.init(.string).asNullable();
     const ty = types.Type{ .kind = .array, .nullable = true, .elem = &int };
-    const schema = types.Schema{ .fields = &.{.{ .name = "l", .ty = ty }} };
+    const tags = types.Type{ .kind = .array, .nullable = true, .elem = &str };
+    const rec = types.Type{ .kind = .@"struct", .nullable = true, .fields = &.{ .{ .name = "amt", .ty = types.Type.decimal(10, 2).asNullable() }, .{ .name = "tags", .ty = tags } } };
+    const schema = types.Schema{ .fields = &.{ .{ .name = "l", .ty = ty }, .{ .name = "r", .ty = rec } } };
     var w = try Writer.init(td.ds.space(), a, &schema, "nested");
     errdefer w.abort();
     const texts = [_]?[]const u8{ "[1,2]", null, "[]", "[null,3]" };
-    for (0..3) |_| {
+    const recs = [_]?[]const u8{ "{\"amt\":1.25,\"tags\":[\"a\",null]}", "{\"amt\":null,\"tags\":[]}", null, "{\"amt\":-3.50,\"tags\":null}" };
+    for (0..3) |k| {
         var b = column.Builder.init(a, ty);
-        for (texts) |t| try b.append(if (t) |x| .{ .string = x } else .null);
-        var cols = [_]Column{try b.finish()};
+        var rb = column.Builder.init(a, rec);
+        for (texts, recs) |t, x| {
+            try b.append(if (t) |v| .{ .string = v } else .null);
+            try rb.append(if (x) |v| .{ .string = v } else .null);
+        }
+        var cols = [_]Column{ try b.finish(), try rb.finish() };
+        if (k == 1) cols[0] = try column.slice(a, try column.concat(a, &.{ cols[0], cols[0] }, 8), 0, 4);
         try w.write(.{ .schema = &schema, .columns = &cols, .len = texts.len });
     }
     const run = try w.finish();
@@ -712,9 +794,11 @@ test "spill writes a nested column as JSON and reads it back as nested storage, 
     var n: usize = 0;
     while (try r.next(a)) |got| : (n += 1) {
         try testing.expectEqual(Tag.nested, @as(Tag, got.columns[0].data));
-        for (texts, 0..) |t, row| {
+        for (texts, recs, 0..) |t, x, row| {
             const v = got.columns[0].getValue(row);
-            if (t) |x| try testing.expectEqualStrings(x, celltext.nestedText(&got.columns[0], row)) else try testing.expect(v == .null);
+            if (t) |y| try testing.expectEqualStrings(y, celltext.nestedText(&got.columns[0], row)) else try testing.expect(v == .null);
+            const rv = got.columns[1].getValue(row);
+            if (x) |y| try testing.expectEqualStrings(y, celltext.nestedText(&got.columns[1], row)) else try testing.expect(rv == .null);
         }
         r.releaseRead();
     }

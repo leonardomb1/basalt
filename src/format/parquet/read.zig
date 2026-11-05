@@ -100,7 +100,7 @@ pub const buildNested = @import("nested.zig").buildNested;
 const leafIndices = @import("nested.zig").leafIndices;
 const fieldType = @import("nested.zig").fieldType;
 const keepPaths = @import("nested.zig").keepPaths;
-const reaches = @import("nested.zig").reaches;
+const reaches = driver.wantsColumn;
 pub const assembleNested = @import("nested.zig").assembleNested;
 pub const Bound = @import("stats.zig").Bound;
 pub const KeyBound = @import("stats.zig").KeyBound;
@@ -209,7 +209,7 @@ pub const Reader = struct {
             const idx = at;
             at = try subtreeEnd(md.schema, idx);
             const e = md.schema[idx];
-            if (!wanted(want, e.name) and !(want != null and reaches(want.?, e.name))) continue;
+            if (want) |w| if (!reaches(w, e.name)) continue;
             if (e.isLeaf() and e.repetition != .repeated) {
                 const lf = for (all) |x| {
                     if (x.schema_idx == idx) break x;

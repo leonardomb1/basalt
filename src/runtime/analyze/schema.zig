@@ -154,20 +154,6 @@ pub fn checkFilter(arena: std.mem.Allocator, in: types.Schema, pred0: *const ast
     return coerceLits(arena, in, pred);
 }
 
-/// Refuses a list, map or struct column as a `what` (a GROUP BY key, a sort key,
-/// a DISTINCT column): nested values are not compared or ordered yet.
-pub fn plainKeys(arena: std.mem.Allocator, in: types.Schema, idxs: []const usize, what: []const u8, diag: *Diag) Error!void {
-    for (idxs) |i| try plainKey(arena, in.fields[i].name, in.fields[i].ty, what, diag);
-}
-
-pub fn plainKey(arena: std.mem.Allocator, name: []const u8, ty: types.Type, what: []const u8, diag: *Diag) Error!void {
-    if (ty.isNested()) return fail(diag, "`{s}` is {s}, which cannot be {s}: lists, maps and structs are not compared or ordered yet", .{ name, try ty.name(arena), what });
-}
-
-fn unordered(arena: std.mem.Allocator, func: []const u8, ty: types.Type, diag: *Diag) Error!void {
-    if (ty.isNested()) return fail(diag, "`{s}` cannot take a {s}: lists, maps and structs are not compared or ordered yet", .{ func, try ty.name(arena) });
-}
-
 pub fn fieldIndices(arena: std.mem.Allocator, in: types.Schema, names: []const ast.QualName, diag: *Diag) Error![]usize {
     const idxs = try arena.alloc(usize, names.len);
     for (names) |q| try single(in, q, diag);
@@ -189,7 +175,6 @@ pub fn aggregatePlan(arena: std.mem.Allocator, in: types.Schema, ag: ast.Aggrega
         try single(in, q, diag);
         const idx = in.resolve(q.parts) orelse return fail(diag, "unknown group field `{s}`", .{lastPart(q)});
         by[i] = idx;
-        try plainKey(arena, lastPart(q), in.fields[idx].ty, "a GROUP BY key", diag);
         try fields.append(.{ .name = lastPart(q), .ty = in.fields[idx].ty, .rel = in.fields[idx].rel, .base = in.fields[idx].base });
     }
     const aggs = try arena.alloc(Agg, ag.aggs.len);
@@ -198,7 +183,6 @@ pub fn aggregatePlan(arena: std.mem.Allocator, in: types.Schema, ag: ast.Aggrega
         const ty = try aggResultType(arena, item.func, sub, in, diag);
         const arg_ty: ?types.Type = if (sub) |a| try exprType(arena, in, a, diag) else null;
         const arg: ?*const ast.Expr = if (sub) |a| try coerceLits(arena, in, a) else null;
-        if (item.distinct) if (arg_ty) |t| try plainKey(arena, item.name, t, "a DISTINCT aggregate's argument", diag);
         aggs[i] = .{ .func = item.func, .arg = arg, .ty = ty, .name = item.name, .distinct = item.distinct, .arg_ty = arg_ty };
         try fields.append(.{ .name = item.name, .ty = ty });
     }
@@ -218,7 +202,6 @@ pub fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const a
     const at = try exprType(arena, in, a, diag);
     if (!sp.arg.accepts(at))
         return fail(diag, "`{s}` needs {s} argument, got {s}", .{ sp.names[0], sp.arg.word(), try at.name(arena) });
-    if (sp.result == .same) try unordered(arena, sp.names[0], at, diag);
     return switch (sp.result) {
         .count => types.Type.init(.int),
         .sum => aggregates.sumType(at),
@@ -266,11 +249,9 @@ pub const WindowPlan = struct {
 /// parameters.
 pub fn windowPlan(arena: std.mem.Allocator, in: types.Schema, wd: ast.Window, diag: *Diag) Error!WindowPlan {
     const part = try fieldIndices(arena, in, wd.partition_by, diag);
-    try plainKeys(arena, in, part, "a PARTITION BY key", diag);
     const oqs = try arena.alloc(ast.QualName, wd.order_by.len);
     for (wd.order_by, oqs) |sk, *q| q.* = sk.field;
     const ord = try fieldIndices(arena, in, oqs, diag);
-    try plainKeys(arena, in, ord, "a window ORDER BY key", diag);
     var conv: op.Window.RangeConv = .{};
     var key_kind: types.TypeKind = .int;
     for (wd.funcs) |f| if (f.frame) |fr| if (fr.unit == .range and fr.hasOffset()) {
@@ -294,8 +275,6 @@ pub fn windowPlan(arena: std.mem.Allocator, in: types.Schema, wd: ast.Window, di
             const sp = aggregates.spec(f.func.agg);
             if (sp.arg != .star_or_any and !sp.arg.accepts(src))
                 return fail(diag, "`{s}` needs {s} argument, got {s}", .{ sp.names[0], sp.arg.word(), try src.name(arena) });
-            if (sp.result == .same) try unordered(arena, sp.names[0], src, diag);
-            if (f.distinct) try plainKey(arena, sp.names[0], src, "a DISTINCT aggregate's argument", diag);
         }
         fields[in.fields.len + i] = .{ .name = f.out, .ty = windowFuncType(f.func, src) };
         o.* = .{
@@ -687,8 +666,6 @@ pub fn joinPlan(arena: std.mem.Allocator, left: types.Schema, right: types.Schem
         ro.* = pair[1];
         const lt = left.fields[pair[0]].ty;
         const rt = right.fields[pair[1]].ty;
-        try plainKey(arena, left.fields[pair[0]].name, lt, "a join key", diag);
-        try plainKey(arena, right.fields[pair[1]].name, rt, "a join key", diag);
         if (types.Type.unify(lt, rt) == null and !(isNumeric(lt.kind) and isNumeric(rt.kind)) and std.mem.startsWith(u8, right.fields[pair[1]].name, "__sq"))
             return fail(diag, "a correlated subquery compares {s} ({s}) with a column of its own ({s}) — make them one type in the subquery's WHERE: `CAST(x AS string) = y`", .{ try keyLabel(arena, left.fields[pair[0]].name, lq.last()), @tagName(lt.kind), @tagName(rt.kind) });
         if (types.Type.unify(lt, rt) == null and !(isNumeric(lt.kind) and isNumeric(rt.kind)))
@@ -798,14 +775,12 @@ pub fn resolve(arena: std.mem.Allocator, in: types.Schema, st: ast.Stage, params
         },
         .distinct => |d| blk: {
             const on: ?[]usize = if (d.on) |f| try fieldIndices(arena, in, f, diag) else null;
-            if (on) |idxs| try plainKeys(arena, in, idxs, "a DISTINCT ON key", diag) else for (in.fields) |f| try plainKey(arena, f.name, f.ty, "a DISTINCT column", diag);
             break :blk .{ .distinct = on };
         },
         .sort => |s| blk: {
             const qs = try arena.alloc(ast.QualName, s.keys.len);
             for (s.keys, qs) |sk, *q| q.* = sk.field;
             const idxs = try fieldIndices(arena, in, qs, diag);
-            try plainKeys(arena, in, idxs, "an ORDER BY key", diag);
             const ks = try arena.alloc(op.Sort.Key, s.keys.len);
             for (s.keys, idxs, ks) |sk, idx, *k| k.* = .{ .idx = idx, .desc = sk.desc, .nulls_first = sk.nulls_first };
             break :blk .{ .sort = ks };

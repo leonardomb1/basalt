@@ -520,6 +520,51 @@ test "nested columns are taken apart in place: list index, struct field, map loo
     try std.testing.expectEqualStrings("id,k,v\n2,0,\n4,0,\"[{\"\"a\"\":2,\"\"b\"\":\"\"y\"\"}]\"\n", c);
 }
 
+test "a struct or list is a GROUP BY, DISTINCT, ORDER BY, join and PARTITION BY key and a MIN or MAX, alike on 1 and 4 lanes and spilled" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "id,k,f,g\n1,1,-0.0,a\n2,1,0.0,a\n3,2,1.5,b\n4,,1.5,b\n5,1,0.0,c\n" });
+    try tmp.dir.makePath("spill");
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const spill_dir = try std.fs.path.join(alloc, &.{ base, "spill" });
+    defer alloc.free(spill_dir);
+    const tmpl =
+        \\LOAD INTO '$B/n.parquet' AS SELECT id, g, CAST(json_object('k', k, 'f', CAST(f AS FLOAT)) AS STRUCT(k INT, f FLOAT)) AS s, CAST(json_array(id % 2, k) AS LIST(INT)) AS l FROM '$B/t.csv';
+        \\LOAD INTO '$B/a.csv' AS SELECT s, COUNT(*) AS n, COUNT(DISTINCT l) AS dl FROM '$B/n.parquet' GROUP BY s ORDER BY s;
+        \\LOAD INTO '$B/b.csv' AS SELECT DISTINCT l FROM '$B/n.parquet' ORDER BY l DESC NULLS FIRST;
+        \\LOAD INTO '$B/c.csv' AS SELECT g, MIN(s) AS lo, MAX(s) AS hi, MAX(l) AS ml, COUNT(DISTINCT s) AS ds FROM '$B/n.parquet' GROUP BY g ORDER BY g;
+        \\LOAD INTO '$B/d.csv' AS SELECT a.id, COUNT(*) AS n FROM '$B/n.parquet' a JOIN '$B/n.parquet' b ON a.s = b.s GROUP BY a.id ORDER BY a.id;
+        \\LOAD INTO '$B/e.csv' AS SELECT id, COUNT(*) OVER (PARTITION BY l) AS pl, ROW_NUMBER() OVER (ORDER BY s DESC, id) AS rn FROM '$B/n.parquet' WHERE l = CAST('[1,1]' AS LIST(INT)) OR s > CAST('{"k":1}' AS STRUCT(k INT, f FLOAT)) ORDER BY id;
+        \\LOAD INTO '$B/f.csv' AS SELECT DISTINCT s FROM '$B/n.parquet' WHERE g = 'a';
+    ;
+    const script = try std.mem.replaceOwned(u8, alloc, tmpl, "$B", base);
+    defer alloc.free(script);
+    const want = [_][2][]const u8{
+        .{ "a.csv", "s,n,dl\n\"{\"\"k\"\":1,\"\"f\"\":0}\",3,2\n\"{\"\"k\"\":2,\"\"f\"\":1.5}\",1,1\n\"{\"\"k\"\":null,\"\"f\"\":1.5}\",1,1\n" },
+        .{ "b.csv", "l\n\"[1,2]\"\n\"[1,1]\"\n\"[0,null]\"\n\"[0,1]\"\n" },
+        .{ "c.csv", "g,lo,hi,ml,ds\na,\"{\"\"k\"\":1,\"\"f\"\":0}\",\"{\"\"k\"\":1,\"\"f\"\":0}\",\"[1,1]\",1\nb,\"{\"\"k\"\":2,\"\"f\"\":1.5}\",\"{\"\"k\"\":null,\"\"f\"\":1.5}\",\"[1,2]\",2\nc,\"{\"\"k\"\":1,\"\"f\"\":0}\",\"{\"\"k\"\":1,\"\"f\"\":0}\",\"[1,1]\",1\n" },
+        .{ "d.csv", "id,n\n1,3\n2,3\n3,1\n4,1\n5,3\n" },
+        .{ "e.csv", "id,pl,rn\n1,2,3\n3,1,2\n4,1,1\n5,2,4\n" },
+        .{ "f.csv", "s\n\"{\"\"k\"\":1,\"\"f\"\":0}\"\n" },
+    };
+    for ([_]basalt.env.RunOptions{ .{ .threads = 1 }, .{ .threads = 4 }, .{ .threads = 4, .op_memory = 1, .spill_dir = spill_dir } }) |opts| {
+        var rdiag: Diag = .{};
+        var o = opts;
+        o.log = .{ .quiet = true };
+        _ = try exec(alloc, script, o, &rdiag);
+        for (want) |w| {
+            const got = try tmp.dir.readFileAlloc(alloc, w[0], 1 << 16);
+            defer alloc.free(got);
+            std.testing.expectEqualStrings(w[1], got) catch |e| {
+                std.debug.print("{s} at {?d} lanes\n", .{ w[0], opts.threads });
+                return e;
+            };
+        }
+    }
+}
+
 test "the list lambdas filter, transform, test and fold a LIST in place, its elements' fields and the row's columns in reach" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
