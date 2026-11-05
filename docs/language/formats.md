@@ -574,9 +574,14 @@ JSON, for the JSON functions.
 the nested ones as the spec's three-level `LIST`, its `MAP` and nested groups,
 each leaf encoded as a flat column of its type is, with repetition and
 definition levels; a `CAST(... AS STRUCT(...))`, `LIST(...)` or `MAP(K, V)` (see
-[Expressions](../reference/expressions.md)) makes one from JSON text. A filter
-on a nested column is never used to skip row groups: the file's statistics
-describe its leaves.
+[Expressions](../reference/expressions.md)) makes one from JSON text. A query
+that reads only some of a struct's fields (`doc.id`, `doc.addr.zip`) decodes
+only theirs. A filter on a struct's field (`WHERE doc.id > 5`) skips row groups
+by that field's statistics, as a flat column's does, unless a list lies above
+it (a list's statistics describe its elements, not a row); a filter on a nested
+value as a whole never does. Files basalt writes declare their statistics' sort
+order, which Arrow-based readers (pyarrow, DuckDB, Polars) require before they
+use a min or max.
 
 ## Compressed files and archives
 

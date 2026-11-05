@@ -251,10 +251,18 @@ const Needs = struct {
 
     fn field(self: *Needs, q: ast.QualName) !void {
         if (q.parts.len > 1) {
-            if (self.own) |o| if (std.ascii.eqlIgnoreCase(o, q.parts[0])) return self.name(q.parts[1]);
+            if (self.own) |o| if (std.ascii.eqlIgnoreCase(o, q.parts[0])) return self.path(q.parts[1..]);
             for (self.right.items) |r| if (std.ascii.eqlIgnoreCase(r, q.parts[0])) return;
         }
-        try self.name(q.parts[0]);
+        try self.path(q.parts);
+    }
+
+    /// A column, or a struct path into one (`s.city`), which a Parquet read prunes
+    /// the struct to; `s.*` asks for all of `s`.
+    fn path(self: *Needs, parts: []const []const u8) !void {
+        const n = if (std.mem.eql(u8, parts[parts.len - 1], "*")) parts[0 .. parts.len - 1] else parts;
+        if (n.len == 1 or self.made.contains(n[0])) return self.name(n[0]);
+        try self.name(try std.mem.join(self.env.arena, ".", n));
     }
 
     fn key(self: *Needs, q: ast.QualName) !void {
@@ -265,10 +273,16 @@ const Needs = struct {
     fn expr(self: *Needs, e: *const ast.Expr) !void {
         if (ast.hasSearch(e)) self.whole_row = true;
         if (!self.joined) {
-            var names = std.StringHashMap(void).init(self.env.arena);
-            try pushdown.collectFields(e, &names);
-            var it = names.keyIterator();
-            while (it.next()) |k| try self.name(k.*);
+            var quals = std.array_list.Managed(ast.QualName).init(self.env.arena);
+            const S = struct {
+                fn add(o: *std.array_list.Managed(ast.QualName), n: *const ast.Expr) ?bool {
+                    if (n.* != .field) return null;
+                    o.append(n.field) catch return true;
+                    return false;
+                }
+            };
+            if (ast.anyExpr(e, &quals, S.add)) return error.OutOfMemory;
+            for (quals.items) |q| try self.path(q.parts);
             return;
         }
         var quals = std.array_list.Managed(ast.QualName).init(self.env.arena);
@@ -483,6 +497,9 @@ pub fn filterBounds(env: *Env, stages: []const ast.Stage) ![]pqdecode.Bound {
     return out.toOwnedSlice();
 }
 
+/// A struct path (`doc.id`) bounds the leaf of that dotted name, whose chunk
+/// statistics are its rows' values when no list lies above it; a read's own table
+/// qualifier is stripped before this.
 fn collectBounds(e: *const ast.Expr, out: *std.array_list.Managed(pqdecode.Bound)) !void {
     const b = switch (e.*) {
         .binary => |x| x,
@@ -494,7 +511,7 @@ fn collectBounds(e: *const ast.Expr, out: *std.array_list.Managed(pqdecode.Bound
         return;
     }
     const name = switch (b.l.*) {
-        .field => |q| if (q.parts.len == 1) q.parts[0] else return,
+        .field => |q| if (q.parts.len == 1) q.parts[0] else try std.mem.join(out.allocator, ".", q.parts),
         else => return,
     };
     const v: Value = switch (b.r.*) {

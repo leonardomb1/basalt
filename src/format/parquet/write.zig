@@ -34,6 +34,10 @@
 //! of the PLAIN size for that comparison; giving it up rebuilds PLAIN from them,
 //! which the byte cap bounds.
 //!
+//! The footer gives every leaf column its sort order (`column_orders`, each the
+//! type-defined order): Arrow-based readers trust a chunk's min and max only when
+//! it is given, and without it ignored every statistic basalt wrote.
+//!
 //! Both chunk size totals include page headers, per ColumnMetaData's "including
 //! the headers": without them a reader that bounds a chunk by
 //! `total_compressed_size` (Arrow-based ones do) found the last page short.
@@ -967,6 +971,14 @@ pub const Writer = struct {
         try w.listBegin(4, .@"struct", self.groups.items.len);
         for (self.groups.items) |g| try self.writeRowGroup(&w, g);
         try w.writeBinary(6, "basalt");
+        try w.listBegin(7, .@"struct", self.cols.len);
+        for (self.cols) |_| {
+            try w.structBegin();
+            try w.fieldBegin(.@"struct", 1);
+            try w.structBegin();
+            try w.structEnd();
+            try w.structEnd();
+        }
         try w.structEnd();
     }
 
@@ -1924,6 +1936,7 @@ test "nested columns write the spec's groups and levels, and read back as the ne
     try testing.expectEqual(names.len, md.schema.len);
     for (names, md.schema) |want, e| try testing.expectEqualStrings(want, e.name);
     try testing.expectEqual(@as(usize, 5), md.row_groups[0].columns.len);
+    try testing.expectEqual(@as(usize, 5), md.column_orders);
 }
 
 fn expectText(want: ?[]const u8, got: Value) !void {
@@ -2693,4 +2706,68 @@ test "a column of unknown type (a bare NULL) is written as a nullable string, no
     defer r.close();
     try testing.expectEqual(types.TypeKind.string, r.schema.fields[0].ty.kind);
     try testing.expect(r.schema.fields[0].ty.nullable);
+}
+
+test "a projection naming a struct's field reads only that field's leaves, the struct typed by what it keeps" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "p.parquet" });
+    const str = types.Type.init(.string).asNullable();
+    const tags = types.Type{ .kind = .array, .nullable = true, .elem = &str };
+    const inner = types.Type{ .kind = .@"struct", .nullable = true, .fields = &.{ .{ .name = "x", .ty = types.Type.init(.int).asNullable() }, .{ .name = "y", .ty = str } } };
+    const rec = types.Type{ .kind = .@"struct", .nullable = true, .fields = &.{ .{ .name = "a", .ty = types.Type.init(.int).asNullable() }, .{ .name = "tags", .ty = tags }, .{ .name = "in", .ty = inner } } };
+    const schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = rec }} };
+    var b = column.Builder.init(a, rec);
+    try b.append(.{ .string = "{\"a\":1,\"tags\":[\"t\"],\"in\":{\"x\":7,\"y\":\"q\"}}" });
+    try b.append(.null);
+    var cols = [_]column.Column{try b.finish()};
+    var w = try Writer.open(a, path, schema, .snappy, .truncate);
+    try w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 2 });
+    try w.close();
+
+    const want = [_][]const u8{ "s.a", "s.in.x" };
+    const r = try pqdecode.Reader.openProjected(a, path, &want);
+    try testing.expectEqual(@as(usize, 2), r.leaves.len);
+    try testing.expectEqualStrings("struct(a int, in struct(x int))", try r.schema.fields[0].ty.name(a));
+    const got = (try r.next(a)).?;
+    try expectText("{\"a\":1,\"in\":{\"x\":7}}", got.columns[0].getValue(0));
+    try testing.expect(got.columns[0].getValue(1).isNull());
+
+    const whole = [_][]const u8{ "s.a", "s" };
+    const rw = try pqdecode.Reader.openProjected(a, path, &whole);
+    try testing.expectEqual(@as(usize, 4), rw.leaves.len);
+}
+
+test "a bound on a struct's field skips the row groups its leaf's statistics rule out; one under a list never does" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "g.parquet" });
+    const int = types.Type.init(.int).asNullable();
+    const ids = types.Type{ .kind = .array, .nullable = true, .elem = &int };
+    const rec = types.Type{ .kind = .@"struct", .nullable = true, .fields = &.{ .{ .name = "id", .ty = int }, .{ .name = "ids", .ty = ids } } };
+    const schema = types.Schema{ .fields = &.{.{ .name = "doc", .ty = rec }} };
+    var w = try Writer.open(a, path, schema, .snappy, .truncate);
+    w.group_rows = 2;
+    var b = column.Builder.init(a, rec);
+    for (0..6) |i| try b.append(.{ .string = try std.fmt.allocPrint(a, "{{\"id\":{d},\"ids\":[{d}]}}", .{ i, i }) });
+    var cols = [_]column.Column{try b.finish()};
+    try w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 6 });
+    try w.close();
+
+    const r = try pqdecode.Reader.open(a, path);
+    try testing.expectEqual(@as(usize, 3), r.md.row_groups.len);
+    const hits = [_]pqdecode.Bound{.{ .column = "doc.id", .op = .ge, .value = .{ .int = 4 } }};
+    var kept: usize = 0;
+    for (r.md.row_groups) |g| kept += @intFromBool(pqdecode.groupMayMatch(r.md.schema, r.leaves, g, &hits));
+    try testing.expectEqual(@as(usize, 1), kept);
+    const listed = [_]pqdecode.Bound{.{ .column = "doc.ids.list.element", .op = .ge, .value = .{ .int = 4 } }};
+    for (r.md.row_groups) |g| try testing.expect(pqdecode.groupMayMatch(r.md.schema, r.leaves, g, &listed));
 }

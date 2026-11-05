@@ -65,9 +65,7 @@ pub const Layout = struct {
     pub fn view(self: *const Layout, arena: std.mem.Allocator, want: ?[]const []const u8) !*const View {
         var idx = std.array_list.Managed(usize).init(arena);
         for (self.schema.fields, 0..) |f, i| {
-            const keep = if (want) |w| for (w) |n| {
-                if (std.mem.eql(u8, n, f.name)) break true;
-            } else false else true;
+            const keep = if (want) |w| @import("nested.zig").reaches(w, f.name) else true;
             if (keep) try idx.append(i);
         }
         if (idx.items.len == 0) {
@@ -77,7 +75,7 @@ pub const Layout = struct {
         const fields = try arena.alloc(types.Schema.Field, idx.items.len);
         for (fields, idx.items) |*f, i| f.* = self.schema.fields[i];
         const v = try arena.create(View);
-        v.* = .{ .schema = .{ .fields = fields }, .fields = idx.items };
+        v.* = .{ .schema = .{ .fields = fields }, .fields = idx.items, .want = want };
         return v;
     }
 
@@ -109,7 +107,22 @@ pub const Layout = struct {
         if (self.pruned(i, bounds)) return null;
         const file = self.files[i];
         var names = std.array_list.Managed([]const u8).init(arena);
-        for (v.fields) |fi| if (self.partOf(fi) == null) try names.append(self.schema.fields[fi].name);
+        for (v.fields) |fi| if (self.partOf(fi) == null) {
+            const name = self.schema.fields[fi].name;
+            const w = v.want orelse {
+                try names.append(name);
+                continue;
+            };
+            var whole = true;
+            for (w) |n| {
+                if (std.mem.eql(u8, n, name)) break;
+                if (std.mem.startsWith(u8, n, name) and n.len > name.len and n[name.len] == '.') {
+                    try names.append(n);
+                    whole = false;
+                }
+            } else if (!whole) continue;
+            try names.append(name);
+        };
         const r = self.openFile(arena, file, names.items) catch |e| {
             if (e == error.OutOfMemory) return e;
             const why = eval.peekFailure(e) orelse @errorName(e);
@@ -373,6 +386,7 @@ fn below(path: []const u8, root: []const u8) []const u8 {
 pub const View = struct {
     schema: types.Schema,
     fields: []const usize,
+    want: ?[]const []const u8 = null,
 };
 
 /// One file's batches as the table's: each output a column of the file's batch or

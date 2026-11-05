@@ -148,6 +148,7 @@ pub const FileMetaData = struct {
     num_rows: i64 = 0,
     row_groups: []RowGroup = &.{},
     created_by: []const u8 = "",
+    column_orders: usize = 0,
 
     /// Leaf columns, in the order their chunks appear. The first schema element is
     /// the synthetic root and is never a column.
@@ -192,6 +193,11 @@ pub fn parseFooter(arena: std.mem.Allocator, footer: []const u8) Error!FileMetaD
             3 => md.num_rows = try r.readZigZag(),
             4 => md.row_groups = try readList(RowGroup, arena, &r, readRowGroup),
             6 => md.created_by = try r.readBinary(),
+            7 => {
+                const h = try r.readListHeader();
+                for (0..h.size) |_| try r.skip(h.elem);
+                md.column_orders = h.size;
+            },
             else => try r.skip(f.ty),
         }
     }
