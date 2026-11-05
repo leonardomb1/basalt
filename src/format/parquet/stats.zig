@@ -173,20 +173,16 @@ pub fn wanted(want: ?[]const []const u8, name: []const u8) bool {
     return false;
 }
 
-/// A list column never matches: its chunk statistics describe the elements, not
-/// the JSON text, so a bound on it proves nothing.
+/// A repeated leaf never matches: its chunk statistics describe the elements, not
+/// a row's value, so a bound on it proves nothing.
 fn findLeaf(leaves: []const Leaf, name: []const u8) ?Leaf {
     for (leaves) |lf| {
-        if (std.mem.eql(u8, lf.name, name)) return if (lf.list != null) null else lf;
+        if (std.mem.eql(u8, lf.name, name)) return if (lf.isRepeated()) null else lf;
     }
     return null;
 }
 
-pub fn leafType(e: parquet.SchemaElement, lf: Leaf) Error!types.Type {
-    if (lf.list != null) {
-        _ = try basaltType(e);
-        return types.Type.init(.string).asNullable();
-    }
+pub fn leafType(e: parquet.SchemaElement) Error!types.Type {
     return (try basaltType(e)).asNullable();
 }
 
@@ -511,7 +507,7 @@ test "top-N threshold skips only groups it can prove cannot contribute" {
     try testing.expect(groupBeatsThreshold(&schema, &leaves, g2, .{ .column = "v", .desc = true, .full = true, .value = .{ .int = 500 } }));
 }
 
-test "a nested column is typed string and no bound prunes on it" {
+test "a nested column is typed by its shape and no bound prunes on it" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -521,11 +517,11 @@ test "a nested column is typed string and no bound prunes on it" {
     const dir = try tmp.dir.realpathAlloc(a, ".");
     const r = try Reader.open(a, try std.fs.path.join(a, &.{ dir, "l.parquet" }));
     defer r.close();
-    try testing.expectEqual(types.TypeKind.string, r.schema.fields[r.schema.indexOf("xs").?].ty.kind);
+    try testing.expectEqual(types.TypeKind.array, r.schema.fields[r.schema.indexOf("xs").?].ty.kind);
     const names = [_][]const u8{ "id", "xs", "nest", "ds", "recs", "m" };
     try testing.expectEqual(names.len, r.schema.fields.len);
     for (names, r.schema.fields) |n, f| try testing.expectEqualStrings(n, f.name);
-    try testing.expectEqual(types.TypeKind.string, r.schema.fields[4].ty.kind);
+    try testing.expectEqualStrings("list(struct(a int, b string))", try r.schema.fields[4].ty.name(a));
     const rb = [_]Bound{.{ .column = "recs", .op = .eq, .value = .{ .string = "zzz" } }};
     for (r.md.row_groups) |g| try testing.expect(groupMayMatch(r.md.schema, r.leaves, g, &rb));
     const b = [_]Bound{.{ .column = "xs", .op = .gt, .value = .{ .int = 100 } }};

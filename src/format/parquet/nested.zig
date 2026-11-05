@@ -1,18 +1,34 @@
-//! Nested columns (lists and structs) assembled from their leaves' repetition and
-//! definition levels into one JSON text value per row.
+//! Nested columns (lists, maps and structs) assembled from their leaves'
+//! repetition and definition levels into basalt's nested storage (`column.Nested`).
+//!
+//! A column's tree (`NNode`) gives its type (`fieldType`): a group is a struct of
+//! its fields (hidden ones left out, `isHidden`), a LIST group a list of its
+//! element, a MAP group a map of its key and value, and a bare repeated field (the
+//! legacy two-level form, or a repeated group of several fields, `array` or
+//! `*_tuple`) a list of the field itself. A node is nullable when it is OPTIONAL.
+//!
+//! The assembly is Dremel's, top down over instances (`Inst`). An instance is,
+//! for every leaf under a node, the span of that leaf's entries one value of the
+//! node covers; a column's instances are its rows, each leaf's span running from
+//! a repetition level of 0 to the next. The first entry of a node's first leaf
+//! answers whether the node is there (its definition level reaches the node's).
+//! A list's instance splits into its elements wherever its repeated node's
+//! repetition level starts an entry, every leaf alike, and the elements are the
+//! child's instances. A leaf's values are one gather of its entries by their
+//! index (`column.permute`), never boxed or rendered, so a read moves typed
+//! buffers as a flat column's read does.
 
 const Entries = @import("chunk.zig").Entries;
 const Error = @import("read.zig").Error;
-const ListShape = @import("schema.zig").ListShape;
 const RootRef = @import("schema.zig").RootRef;
 const Value = @import("../../exec/value.zig").Value;
-const capacity_hint = @import("encoding.zig").capacity_hint;
+const basaltType = @import("logical.zig").basaltType;
 const column = @import("../../exec/column.zig");
 const eval = @import("../../exec/eval.zig");
 const jsontext = @import("../../exec/jsontext.zig");
+const json_out = @import("../../exec/nested.zig");
 const parquet = @import("footer.zig");
 const std = @import("std");
-const pagecache = @import("../../exec/pagecache.zig");
 const types = @import("../../lang/types.zig");
 const entriesOf = @import("testing_util.zig").entriesOf;
 const testing = std.testing;
@@ -37,6 +53,7 @@ pub const Nested = struct {
     name: []const u8,
     root: NNode,
     leaves: []const usize,
+    ty: types.Type,
 };
 
 /// Leaves are numbered depth-first, the order their chunks appear in. LIST and MAP
@@ -116,6 +133,36 @@ fn prune(arena: std.mem.Allocator, n: *NNode) Error!void {
     n.children = kids;
 }
 
+/// Keeps of struct `n`, named `path`, only the fields a dotted name in `want`
+/// reaches (`add.path` keeps `add`'s `path`), each pruned alike; all of them when
+/// `want` names `n` itself. A list or a map is kept whole. Leaves are renumbered
+/// over what is kept.
+pub fn keepPaths(arena: std.mem.Allocator, n: *NNode, path: []const u8, want: []const []const u8) Error!void {
+    try keepIn(arena, n, path, want);
+    var next: usize = 0;
+    number(n, &next);
+}
+
+fn keepIn(arena: std.mem.Allocator, n: *NNode, path: []const u8, want: []const []const u8) Error!void {
+    if (n.kind != .group or n.repeated) return;
+    for (want) |w| if (std.mem.eql(u8, w, path)) return;
+    var kids = std.array_list.Managed(NNode).init(arena);
+    for (n.children) |c| {
+        const cp = try std.mem.concat(arena, u8, &.{ path, ".", c.name });
+        if (!reaches(want, cp)) continue;
+        var k = c;
+        try keepIn(arena, &k, cp, want);
+        try kids.append(k);
+    }
+    if (kids.items.len > 0) n.children = kids.items;
+}
+
+/// Whether a name in `want` is `path` or below it.
+pub fn reaches(want: []const []const u8, path: []const u8) bool {
+    for (want) |w| if (std.mem.startsWith(u8, w, path) and (w.len == path.len or w[path.len] == '.')) return true;
+    return false;
+}
+
 fn number(n: *NNode, next: *usize) void {
     n.first_leaf = next.*;
     if (n.kind == .leaf and n.children.len == 0) {
@@ -133,277 +180,235 @@ pub fn leafIndices(n: *const NNode, out: *std.array_list.Managed(usize)) Error!v
     for (n.children) |*c| try leafIndices(c, out);
 }
 
-/// Whether assembling `n` shows an object: a struct or a map anywhere in it, as
-/// the assembler reads it. A list of a one-field struct has a single leaf, yet
-/// its elements are objects.
-pub fn holdsStruct(n: *const NNode) bool {
-    return switch (n.kind) {
-        .leaf => false,
-        .group, .map => true,
-        .list => if (Assembler.elementOf(&n.children[0], false)) |el| holdsStruct(el) else holdsStruct(&n.children[0]),
+/// The type `n` reads as where it is a field: a repeated field a list of itself.
+pub fn fieldType(arena: std.mem.Allocator, schema: []const parquet.SchemaElement, n: *const NNode) Error!types.Type {
+    if (!n.repeated) return valueType(arena, schema, n);
+    return listType(arena, try valueType(arena, schema, &asValue(n)), false);
+}
+
+fn valueType(arena: std.mem.Allocator, schema: []const parquet.SchemaElement, n: *const NNode) Error!types.Type {
+    const t: types.Type = switch (n.kind) {
+        .leaf => try basaltType(schema[n.schema_idx]),
+        .group => blk: {
+            var fields = std.array_list.Managed(types.Type.Field).init(arena);
+            for (n.children) |*c| if (!isHidden(c.name)) try fields.append(.{ .name = c.name, .ty = try fieldType(arena, schema, c) });
+            break :blk .{ .kind = .@"struct", .fields = fields.items };
+        },
+        .list => blk: {
+            const rep = &n.children[0];
+            const el = if (elementOf(rep, false)) |e| try fieldType(arena, schema, e) else try valueType(arena, schema, &asValue(rep));
+            break :blk try listType(arena, el, false);
+        },
+        .map => blk: {
+            const kv = n.children[0].children;
+            const pair = try arena.dupe(types.Type.Field, &.{
+                .{ .name = "key", .ty = (try fieldType(arena, schema, &kv[0])).withNull(false) },
+                .{ .name = "value", .ty = try fieldType(arena, schema, &kv[1]) },
+            });
+            break :blk .{ .kind = .map, .fields = pair };
+        },
     };
+    return t.withNull(n.optional);
+}
+
+fn listType(arena: std.mem.Allocator, elem: types.Type, nullable: bool) Error!types.Type {
+    const e = try arena.create(types.Type);
+    e.* = elem;
+    return .{ .kind = .array, .nullable = nullable, .elem = e };
+}
+
+/// A repeated node read as one element of the list it makes: neither repeated nor
+/// optional, as each entry is there.
+fn asValue(rep: *const NNode) NNode {
+    var v = rep.*;
+    v.repeated = false;
+    v.optional = false;
+    return v;
+}
+
+/// The node itself for a bare repeated field, or a repeated group with several
+/// fields or a legacy name (`array`, `*_tuple`); else, three-level, its one child.
+fn elementOf(rep: *const NNode, bare: bool) ?*const NNode {
+    if (bare or rep.kind == .leaf or rep.children.len != 1) return null;
+    if (std.mem.eql(u8, rep.name, "array") or std.mem.endsWith(u8, rep.name, "_tuple")) return null;
+    return &rep.children[0];
 }
 
 const Span = struct { lo: usize, hi: usize };
 
+/// The values of a node: `n` of them, `spans[leaf][i]` the entries of leaf `leaf`
+/// that value `i` covers, for every leaf under the node (the others unused).
+const Inst = struct { n: usize, spans: []const []const Span };
+
 const Assembler = struct {
     arena: std.mem.Allocator,
+    schema: []const parquet.SchemaElement,
     entries: []const Entries,
-    out: *std.array_list.Managed(u8),
 
-    fn firstDef(self: *const Assembler, n: *const NNode, spans: []const Span) Error!u32 {
-        const s = spans[n.first_leaf];
-        if (s.lo >= s.hi) return Error.CorruptParquetPage;
+    fn def(self: *const Assembler, n: *const NNode, inst: Inst, i: usize) Error!u32 {
+        const s = (try spansOf(n, inst))[i];
+        if (s.lo >= s.hi or s.lo >= self.entries[n.first_leaf].defs.len) return Error.CorruptParquetPage;
         return self.entries[n.first_leaf].defs[s.lo];
     }
 
-    fn field(self: *Assembler, n: *const NNode, spans: []const Span) anyerror!void {
-        if (n.repeated) return self.array(n, spans, elementOf(n, true));
-        return self.value(n, spans);
+    /// The first leaf's span of each of `inst`, which a file whose schema gives a
+    /// node no leaf, or whose leaves disagree, does not have.
+    fn spansOf(n: *const NNode, inst: Inst) Error![]const Span {
+        if (n.nleaves == 0 or n.first_leaf >= inst.spans.len or inst.spans[n.first_leaf].len < inst.n) return Error.CorruptParquetPage;
+        return inst.spans[n.first_leaf][0..inst.n];
     }
 
-    fn value(self: *Assembler, n: *const NNode, spans: []const Span) anyerror!void {
-        if (n.optional and try self.firstDef(n, spans) < n.def) return self.out.appendSlice("null");
+    fn field(self: *Assembler, n: *const NNode, inst: Inst) anyerror!column.Column {
+        if (n.repeated) return self.list(n, null, inst, null, try fieldType(self.arena, self.schema, n));
+        return self.value(n, inst);
+    }
+
+    /// Which of `inst` are there: all for a required node, else those whose first
+    /// entry reaches the node's definition level.
+    fn present(self: *Assembler, n: *const NNode, inst: Inst) !column.Bitmap {
+        var bm = try column.Bitmap.initFull(self.arena, inst.n);
+        if (n.optional) for (0..inst.n) |i| if (try self.def(n, inst, i) < n.def) bm.setValid(i, false);
+        return bm;
+    }
+
+    fn value(self: *Assembler, n: *const NNode, inst: Inst) anyerror!column.Column {
+        const ty = try valueType(self.arena, self.schema, n);
         switch (n.kind) {
             .leaf => {
-                const s = spans[n.first_leaf];
-                if (s.hi - s.lo != 1) return Error.CorruptParquetPage;
-                const e = self.entries[n.first_leaf];
-                try jsonValue(self.out, if (e.defs[s.lo] < n.max_def) .null else e.vals.getValue(s.lo));
+                const idx = try self.arena.alloc(usize, inst.n);
+                for (idx, try spansOf(n, inst)) |*x, s| {
+                    if (s.hi - s.lo != 1) return Error.CorruptParquetPage;
+                    x.* = s.lo;
+                }
+                var c = try column.permute(self.arena, self.entries[n.first_leaf].vals, idx);
+                c.ty = ty;
+                return c;
             },
-            .group => try self.object(n, spans),
-            .list => try self.array(&n.children[0], spans, elementOf(&n.children[0], false)),
-            .map => try self.mapObject(&n.children[0], spans),
+            .group => {
+                const bm = try self.present(n, inst);
+                var kids = std.array_list.Managed(column.Column).init(self.arena);
+                for (n.children) |*c| if (!isHidden(c.name)) try kids.append(try self.field(c, inst));
+                return self.nested(ty, inst.n, bm, .{ .fields = kids.items });
+            },
+            .list => {
+                const rep = &n.children[0];
+                return self.list(rep, elementOf(rep, false), inst, try self.present(n, inst), ty);
+            },
+            .map => return self.list(&n.children[0], null, inst, try self.present(n, inst), ty),
         }
     }
 
-    fn object(self: *Assembler, n: *const NNode, spans: []const Span) anyerror!void {
-        try self.out.append('{');
-        var first = true;
-        for (n.children) |*c| {
-            if (isHidden(c.name)) continue;
-            if (!first) try self.out.append(',');
-            first = false;
-            try appendJson(self.out, jsontext.string, .{c.name});
-            try self.out.append(':');
-            try self.field(c, spans);
-        }
-        try self.out.append('}');
-    }
-
-    /// The node itself for a bare repeated field, or a repeated group with several
-    /// fields or a legacy name (`array`, `*_tuple`); else, three-level, its one child.
-    fn elementOf(rep: *const NNode, bare: bool) ?*const NNode {
-        if (bare or rep.kind == .leaf or rep.children.len != 1) return null;
-        if (std.mem.eql(u8, rep.name, "array") or std.mem.endsWith(u8, rep.name, "_tuple")) return null;
-        return &rep.children[0];
-    }
-
-    /// One element per entry of the first leaf at `rep.rep`; none when the first
-    /// entry's definition stops short of `rep.def`.
-    fn array(self: *Assembler, rep: *const NNode, spans: []const Span, element: ?*const NNode) anyerror!void {
-        if (try self.firstDef(rep, spans) < rep.def) return self.out.appendSlice("[]");
-        try self.out.append('[');
-        var count: ?usize = null;
-        const cut = try self.arena.alloc([]Span, rep.nleaves);
-        for (cut, 0..) |*c, k| {
-            const li = rep.first_leaf + k;
-            c.* = try self.split(li, spans[li], rep.rep);
-            if (count) |n| {
-                if (n != c.len) return Error.CorruptParquetPage;
-            } else count = c.len;
-        }
-        const sub = try self.arena.dupe(Span, spans);
-        for (0..count.?) |i| {
-            if (i > 0) try self.out.append(',');
-            for (cut, 0..) |c, k| sub[rep.first_leaf + k] = c[i];
-            if (element) |el| {
-                try self.field(el, sub);
-            } else {
-                var as_value = rep.*;
-                as_value.repeated = false;
-                as_value.optional = false;
-                try self.value(&as_value, sub);
+    /// A list (or a map, when `ty` is one) whose entries are `rep`'s, the instances
+    /// `valid` marks null having none: each instance split where `rep`'s repetition
+    /// level starts an entry, every leaf alike, unless its first entry stops short
+    /// of `rep` (an empty list).
+    fn list(self: *Assembler, rep: *const NNode, element: ?*const NNode, inst: Inst, valid: ?column.Bitmap, ty: types.Type) anyerror!column.Column {
+        const bm = valid orelse try column.Bitmap.initFull(self.arena, inst.n);
+        const offsets = try self.arena.alloc(i32, inst.n + 1);
+        offsets[0] = 0;
+        const parts = try self.arena.alloc(std.ArrayListUnmanaged(Span), self.entries.len);
+        for (parts) |*p| p.* = .empty;
+        var total: usize = 0;
+        for (0..inst.n) |i| {
+            if (bm.get(i) and try self.def(rep, inst, i) >= rep.def) {
+                var count: ?usize = null;
+                for (rep.first_leaf..rep.first_leaf + rep.nleaves) |li| {
+                    if (li >= inst.spans.len or i >= inst.spans[li].len) return Error.CorruptParquetPage;
+                    const before = parts[li].items.len;
+                    try self.split(&parts[li], li, inst.spans[li][i], rep.rep);
+                    const got = parts[li].items.len - before;
+                    if (count) |c| {
+                        if (c != got) return Error.CorruptParquetPage;
+                    } else count = got;
+                }
+                total += count orelse return Error.CorruptParquetPage;
             }
+            offsets[i + 1] = @intCast(try column.checkSpan(total));
         }
-        try self.out.append(']');
+        const spans = try self.arena.alloc([]const Span, self.entries.len);
+        for (spans, parts) |*s, p| s.* = p.items;
+        const child_inst = Inst{ .n = total, .spans = spans };
+        const child = if (ty.kind == .map) try self.entriesOf(rep, child_inst, ty) else if (element) |el| try self.field(el, child_inst) else try self.value(&asValue(rep), child_inst);
+        return self.nested(ty, inst.n, bm, .{ .list = .{ .offsets = offsets, .child = child } });
     }
 
-    fn mapObject(self: *Assembler, kv: *const NNode, spans: []const Span) anyerror!void {
-        if (try self.firstDef(kv, spans) < kv.def) return self.out.appendSlice("{}");
-        try self.out.append('{');
-        const cut = try self.arena.alloc([]Span, kv.nleaves);
-        var count: ?usize = null;
-        for (cut, 0..) |*c, k| {
-            const li = kv.first_leaf + k;
-            c.* = try self.split(li, spans[li], kv.rep);
-            if (count) |n| {
-                if (n != c.len) return Error.CorruptParquetPage;
-            } else count = c.len;
-        }
-        const sub = try self.arena.dupe(Span, spans);
-        const key = &kv.children[0];
-        for (0..count.?) |i| {
-            if (i > 0) try self.out.append(',');
-            for (cut, 0..) |c, k| sub[kv.first_leaf + k] = c[i];
-            var kbuf = std.array_list.Managed(u8).init(self.arena);
-            var ka = Assembler{ .arena = self.arena, .entries = self.entries, .out = &kbuf };
-            if (key.kind == .leaf and key.nleaves == 1) {
-                const s = sub[key.first_leaf];
-                if (s.hi - s.lo != 1) return Error.CorruptParquetPage;
-                const e = self.entries[key.first_leaf];
-                const kv_val = if (e.defs[s.lo] < key.max_def) Value.null else e.vals.getValue(s.lo);
-                try kbuf.appendSlice(try jsontext.keyText(self.arena, kv_val));
-            } else try ka.field(key, sub);
-            try appendJson(self.out, jsontext.string, .{kbuf.items});
-            try self.out.append(':');
-            try self.field(&kv.children[1], sub);
-        }
-        try self.out.append('}');
+    /// A map's entries as the struct of its key and value.
+    fn entriesOf(self: *Assembler, kv: *const NNode, inst: Inst, map: types.Type) anyerror!column.Column {
+        const kids = try self.arena.alloc(column.Column, 2);
+        kids[0] = try self.field(&kv.children[0], inst);
+        kids[1] = try self.field(&kv.children[1], inst);
+        return self.nested(column.entryType(map), inst.n, try column.Bitmap.initFull(self.arena, inst.n), .{ .fields = kids });
     }
 
-    /// Cuts where a new element at repetition level `r` begins. Every entry within an
-    /// instance repeats at `r` or deeper.
-    fn split(self: *Assembler, li: usize, span: Span, r: u32) Error![]Span {
+    fn nested(self: *Assembler, ty: types.Type, n: usize, bm: column.Bitmap, body: column.Nested.Body) !column.Column {
+        const node = try self.arena.create(column.Nested);
+        node.* = .{ .ty = ty, .body = body };
+        return column.Column.derived(ty, n, bm, .{ .nested = node });
+    }
+
+    /// The entries of `span` cut where a new element at repetition level `r` begins,
+    /// appended to `out`. Every entry within an instance repeats at `r` or deeper.
+    fn split(self: *Assembler, out: *std.ArrayListUnmanaged(Span), li: usize, span: Span, r: u32) Error!void {
         const reps = self.entries[li].reps;
-        var out = std.array_list.Managed(Span).init(self.arena);
+        if (span.hi > reps.len or span.lo >= span.hi) return Error.CorruptParquetPage;
         var start = span.lo;
-        var i = span.lo + 1;
-        while (i < span.hi) : (i += 1) {
+        for (span.lo + 1..span.hi) |i| {
             if (reps[i] < r) return Error.CorruptParquetPage;
             if (reps[i] == r) {
-                try out.append(.{ .lo = start, .hi = i });
+                try out.append(self.arena, .{ .lo = start, .hi = i });
                 start = i;
             }
         }
-        try out.append(.{ .lo = start, .hi = span.hi });
-        return out.items;
+        try out.append(self.arena, .{ .lo = start, .hi = span.hi });
     }
 };
 
-/// `f(w, args...)` appended to `buf`, through a writer lent `buf`'s own memory.
-fn appendJson(buf: *std.array_list.Managed(u8), comptime f: anytype, args: anytype) Error!void {
-    const gpa = buf.allocator;
-    var list = buf.moveToUnmanaged();
-    var aw = std.Io.Writer.Allocating.fromArrayList(gpa, &list);
-    const r = @call(.auto, f, .{&aw.writer} ++ args);
-    list = aw.toArrayList();
-    buf.* = list.toManaged(gpa);
-    r catch return error.OutOfMemory;
-}
-
-pub fn assembleNested(arena: std.mem.Allocator, root: *const NNode, entries: []const Entries, rows: usize) anyerror!column.Column {
+/// Column `root` of `rows` rows from its leaves' `entries`, in leaf order: each
+/// row's entries are every leaf's from one repetition level of 0 to the next.
+pub fn assembleNested(arena: std.mem.Allocator, schema: []const parquet.SchemaElement, root: *const NNode, entries: []const Entries, rows: usize) anyerror!column.Column {
     if (entries.len != root.nleaves) return Error.CorruptParquetPage;
-    const starts = try arena.alloc([]usize, entries.len);
-    for (entries, starts) |e, *st| {
-        var list = std.array_list.Managed(usize).init(arena);
-        for (e.reps, 0..) |r, i| if (r == 0) try list.append(i);
-        if (list.items.len != rows or (rows > 0 and list.items[0] != 0)) return Error.CorruptParquetPage;
-        try list.append(e.reps.len);
-        st.* = list.items;
+    const spans = try arena.alloc([]const Span, entries.len);
+    for (entries, spans) |e, *sp| {
+        if (e.reps.len != e.defs.len or e.reps.len != e.vals.len) return Error.CorruptParquetPage;
+        const out = try arena.alloc(Span, rows);
+        var k: usize = 0;
+        for (e.reps, 0..) |r, i| if (r == 0) {
+            if (k == rows) return Error.CorruptParquetPage;
+            if (k > 0) out[k - 1].hi = i;
+            out[k] = .{ .lo = i, .hi = e.reps.len };
+            k += 1;
+        } else if (i == 0) return Error.CorruptParquetPage;
+        if (k != rows) return Error.CorruptParquetPage;
+        sp.* = out;
     }
-    var out = try column.Builder.initCapacity(arena, types.Type.init(.string).asNullable(), @min(rows, capacity_hint));
-    var scratch = std.heap.ArenaAllocator.init(pagecache.process);
-    defer scratch.deinit();
-    const spans = try arena.alloc(Span, entries.len);
-    for (0..rows) |row| {
-        _ = scratch.reset(.retain_capacity);
-        const sa = scratch.allocator();
-        for (spans, starts) |*sp, st| sp.* = .{ .lo = st[row], .hi = st[row + 1] };
-        var buf = std.array_list.Managed(u8).init(sa);
-        var asm_ = Assembler{ .arena = sa, .entries = entries, .out = &buf };
-        try asm_.field(root, spans);
-        if (std.mem.eql(u8, buf.items, "null")) try out.append(.null) else try out.append(.{ .string = buf.items });
-    }
-    return out.finish();
+    var a = Assembler{ .arena = arena, .schema = schema, .entries = entries };
+    var col = try a.field(root, .{ .n = rows, .spans = spans });
+    col.ty = col.ty.asNullable();
+    return col;
 }
 
-pub const Levels = struct {
-    reps: std.array_list.Managed(u32),
-    defs: std.array_list.Managed(u32),
-};
-
-/// Repetition 0 starts a row and `r > 0` a new element at depth `r`; below it,
-/// each level's definition threshold says element, empty list, or null.
-pub fn assembleLists(
-    arena: std.mem.Allocator,
-    elems: column.Column,
-    reps: []const u32,
-    defs: []const u32,
-    max_def: u32,
-    shape: ListShape,
-    rows: usize,
-) Error!column.Column {
-    if (reps.len != defs.len or reps.len != elems.len) return Error.CorruptParquetPage;
-    const depth = shape.rep_def.len;
-    var out = try column.Builder.initCapacity(arena, types.Type.init(.string).asNullable(), @min(rows, capacity_hint));
-    var buf = std.array_list.Managed(u8).init(arena);
-    var open: usize = 0;
-    var in_row = false;
-    var row_null = false;
-    var done: usize = 0;
-
-    for (reps, defs, 0..) |r, d, i| {
-        if (r > depth or d > max_def) return Error.CorruptParquetPage;
-        if (r == 0) {
-            if (in_row) {
-                try finishRow(&out, &buf, &open, row_null);
-                done += 1;
-            }
-            in_row = true;
-            row_null = false;
-            if (d + 1 < shape.rep_def[0]) {
-                row_null = true;
-                continue;
-            }
-            try buf.append('[');
-            open = 1;
-        } else {
-            if (!in_row or row_null or r > open or d < shape.rep_def[r - 1]) return Error.CorruptParquetPage;
-            while (open > r) : (open -= 1) try buf.append(']');
-            try buf.append(',');
-        }
-        var lvl = open;
-        while (true) {
-            if (d < shape.rep_def[lvl - 1]) break;
-            if (lvl == depth) {
-                try jsonValue(&buf, if (d < max_def) .null else elems.getValue(i));
-                break;
-            }
-            if (d + 1 < shape.rep_def[lvl]) {
-                try buf.appendSlice("null");
-                break;
-            }
-            try buf.append('[');
-            lvl += 1;
-            open = lvl;
-        }
-    }
-    if (in_row) {
-        try finishRow(&out, &buf, &open, row_null);
-        done += 1;
-    }
-    if (done != rows) return Error.CorruptParquetPage;
-    return out.finish();
+fn newJson(a: std.mem.Allocator, v: Value) ![]const u8 {
+    var out = std.Io.Writer.Allocating.init(a);
+    try jsontext.scalar(&out.writer, v, jsontext.nested);
+    return out.written();
 }
 
-fn finishRow(out: *column.Builder, buf: *std.array_list.Managed(u8), open: *usize, row_null: bool) Error!void {
-    if (row_null) {
-        out.append(.null) catch return error.OutOfMemory;
-    } else {
-        while (open.* > 0) : (open.* -= 1) try buf.append(']');
-        out.append(.{ .string = buf.items }) catch return error.OutOfMemory;
+/// Row `r` of an assembled column as its JSON, null when the row is.
+fn rowJson(a: std.mem.Allocator, c: column.Column, r: usize) !?[]const u8 {
+    const v = c.getValue(r);
+    if (v == .null) return null;
+    return try json_out.jsonText(a, v.nested);
+}
+
+fn expectRows(a: std.mem.Allocator, c: column.Column, want: []const ?[]const u8) !void {
+    try testing.expectEqual(want.len, c.len);
+    for (want, 0..) |w, r| {
+        const got = try rowJson(a, c, r);
+        if (w) |x| try testing.expectEqualStrings(x, got.?) else try testing.expect(got == null);
     }
-    buf.clearRetainingCapacity();
 }
 
-/// A leaf value as JSON in the nested shape (`jsontext.nested`): decimals bare,
-/// bytes as base64.
-fn jsonValue(buf: *std.array_list.Managed(u8), v: Value) Error!void {
-    return appendJson(buf, jsontext.scalar, .{ v, jsontext.nested });
-}
-
-test "assembleNested: leaves that disagree, or a row count that does not match, are a corrupt page" {
+test "assembleNested: a list of structs from its leaves' levels; leaves that disagree, or a row count that does not match, are a corrupt page" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -416,37 +421,66 @@ test "assembleNested: leaves that disagree, or a row count that does not match, 
         .{ .name = "b", .ty = .int64, .repetition = .optional },
     };
     const root = try buildNested(a, &schema, .{ .idx = 1, .base_def = 0, .base_rep = 0 });
+    const ty = try fieldType(a, &schema, &root);
+    try testing.expectEqualStrings("list(struct(a int, b int))", try ty.name(a));
     const ea = try entriesOf(a, &.{ .{ .int = 1 }, .null, .null, .null, .null }, &.{ 0, 1, 0, 0, 0 }, &.{ 4, 3, 0, 1, 2 });
     const eb = try entriesOf(a, &.{ .{ .int = 2 }, .{ .int = 3 }, .null, .null, .null }, &.{ 0, 1, 0, 0, 0 }, &.{ 4, 4, 0, 1, 2 });
-    const got = try assembleNested(a, &root, &.{ ea, eb }, 4);
-    try testing.expectEqualStrings("[{\"a\":1,\"b\":2},{\"a\":null,\"b\":3}]", got.getValue(0).string);
-    try testing.expect(got.getValue(1) == .null);
-    try testing.expectEqualStrings("[]", got.getValue(2).string);
-    try testing.expectEqualStrings("[null]", got.getValue(3).string);
+    const got = try assembleNested(a, &schema, &root, &.{ ea, eb }, 4);
+    try expectRows(a, got, &.{ "[{\"a\":1,\"b\":2},{\"a\":null,\"b\":3}]", null, "[]", "[null]" });
+    try testing.expectEqual(@as(i64, 3), got.data.nested.body.list.child.data.nested.body.fields[1].getValue(1).int);
 
     const eb3 = try entriesOf(a, &.{ .{ .int = 2 }, .{ .int = 3 }, .{ .int = 9 }, .null, .null, .null }, &.{ 0, 1, 1, 0, 0, 0 }, &.{ 4, 4, 4, 0, 1, 2 });
-    try testing.expectError(Error.CorruptParquetPage, assembleNested(a, &root, &.{ ea, eb3 }, 4));
-    try testing.expectError(Error.CorruptParquetPage, assembleNested(a, &root, &.{ ea, eb }, 5));
-    try testing.expectError(Error.CorruptParquetPage, assembleNested(a, &root, &.{ea}, 4));
+    try testing.expectError(Error.CorruptParquetPage, assembleNested(a, &schema, &root, &.{ ea, eb3 }, 4));
+    try testing.expectError(Error.CorruptParquetPage, assembleNested(a, &schema, &root, &.{ ea, eb }, 5));
+    try testing.expectError(Error.CorruptParquetPage, assembleNested(a, &schema, &root, &.{ea}, 4));
 }
 
-test "assembleLists: a row count past the levels read is a corrupt page, not an allocation" {
+test "assembleNested: null, empty, a null element, nested lists, a legacy bare repeated field and a struct's fields" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var eb = try column.Builder.initCapacity(a, types.Type.init(.int).asNullable(), 1);
-    try eb.append(.{ .int = 7 });
-    const elems = try eb.finish();
-    const shape: ListShape = .{ .rep_def = &.{1} };
-    const one = try assembleLists(a, elems, &.{0}, &.{1}, 1, shape, 1);
-    try testing.expectEqualStrings("[7]", one.getValue(0).string);
-    try testing.expectError(Error.CorruptParquetPage, assembleLists(a, elems, &.{0}, &.{1}, 1, shape, 1 << 47));
-}
+    const flat = [_]parquet.SchemaElement{
+        .{ .name = "root", .num_children = 1 },
+        .{ .name = "l", .repetition = .optional, .num_children = 1, .converted_type = 3 },
+        .{ .name = "list", .repetition = .repeated, .num_children = 1 },
+        .{ .name = "element", .ty = .int64, .repetition = .optional },
+    };
+    const fr = try buildNested(a, &flat, .{ .idx = 1, .base_def = 0, .base_rep = 0 });
+    const fe = try entriesOf(a, &.{ .{ .int = 1 }, .{ .int = 2 }, .null, .null, .null, .{ .int = 5 } }, &.{ 0, 1, 0, 0, 0, 1 }, &.{ 3, 3, 1, 0, 2, 3 });
+    try expectRows(a, try assembleNested(a, &flat, &fr, &.{fe}, 4), &.{ "[1,2]", "[]", null, "[null,5]" });
 
-fn newJson(a: std.mem.Allocator, v: Value) ![]const u8 {
-    var buf = std.array_list.Managed(u8).init(a);
-    try jsonValue(&buf, v);
-    return buf.items;
+    const deep = [_]parquet.SchemaElement{
+        .{ .name = "root", .num_children = 1 },
+        .{ .name = "l", .repetition = .optional, .num_children = 1, .converted_type = 3 },
+        .{ .name = "list", .repetition = .repeated, .num_children = 1 },
+        .{ .name = "element", .repetition = .optional, .num_children = 1, .converted_type = 3 },
+        .{ .name = "list", .repetition = .repeated, .num_children = 1 },
+        .{ .name = "element", .ty = .int64, .repetition = .optional },
+    };
+    const dr = try buildNested(a, &deep, .{ .idx = 1, .base_def = 0, .base_rep = 0 });
+    const de = try entriesOf(a, &.{ .{ .int = 1 }, .{ .int = 2 }, .{ .int = 3 }, .null, .null, .{ .int = 4 } }, &.{ 0, 1, 2, 0, 1, 1 }, &.{ 5, 5, 5, 3, 2, 5 });
+    try expectRows(a, try assembleNested(a, &deep, &dr, &.{de}, 2), &.{ "[[1],[2,3]]", "[[],null,[4]]" });
+
+    const bare = [_]parquet.SchemaElement{
+        .{ .name = "root", .num_children = 1 },
+        .{ .name = "xs", .ty = .int32, .repetition = .repeated },
+    };
+    const br = try buildNested(a, &bare, .{ .idx = 1, .base_def = 0, .base_rep = 0 });
+    try testing.expectEqualStrings("list(int)", try (try fieldType(a, &bare, &br)).name(a));
+    const be = try entriesOf(a, &.{ .{ .int = 7 }, .{ .int = 8 }, .null }, &.{ 0, 1, 0 }, &.{ 1, 1, 0 });
+    try expectRows(a, try assembleNested(a, &bare, &br, &.{be}, 2), &.{ "[7,8]", "[]" });
+
+    const st = [_]parquet.SchemaElement{
+        .{ .name = "root", .num_children = 1 },
+        .{ .name = "s", .repetition = .optional, .num_children = 2 },
+        .{ .name = "x", .ty = .int64, .repetition = .required },
+        .{ .name = "y", .ty = .int64, .repetition = .optional },
+    };
+    const sr = try buildNested(a, &st, .{ .idx = 1, .base_def = 0, .base_rep = 0 });
+    try testing.expectEqualStrings("struct(x int, y int)", try (try fieldType(a, &st, &sr)).name(a));
+    const sx = try entriesOf(a, &.{ .{ .int = 1 }, .null, .{ .int = 3 } }, &.{ 0, 0, 0 }, &.{ 1, 0, 1 });
+    const sy = try entriesOf(a, &.{ .null, .null, .{ .int = 4 } }, &.{ 0, 0, 0 }, &.{ 1, 0, 2 });
+    try expectRows(a, try assembleNested(a, &st, &sr, &.{ sx, sy }, 3), &.{ "{\"x\":1,\"y\":null}", null, "{\"x\":3,\"y\":4}" });
 }
 
 test "jsonValue on jsontext.scalar writes what the old encoder did for valid text and every other kind" {
@@ -543,14 +577,19 @@ test "D8: nested BYTES are base64 in a list, a map value and a map key; \\b and 
     try testing.expectEqualStrings("\"AWFi\"", try newJson(a, .{ .bytes = "\x01ab" }));
     try testing.expectEqualStrings("\"\\u0008\\u000c\"", try newJson(a, .{ .string = "\x08\x0c" }));
 
+    const ls = [_]parquet.SchemaElement{
+        .{ .name = "root", .num_children = 1 },
+        .{ .name = "l", .repetition = .required, .num_children = 1, .converted_type = 3 },
+        .{ .name = "list", .repetition = .repeated, .num_children = 1 },
+        .{ .name = "element", .ty = .byte_array, .repetition = .optional },
+    };
+    const lr = try buildNested(a, &ls, .{ .idx = 1, .base_def = 0, .base_rep = 0 });
     var eb = try column.Builder.initCapacity(a, types.Type.init(.bytes).asNullable(), 3);
     try eb.append(.{ .bytes = "\xff" });
     try eb.append(.{ .bytes = "\xfe" });
     try eb.append(.null);
-    const elems = try eb.finish();
-    const shape: ListShape = .{ .rep_def = &.{1} };
-    const list = try assembleLists(a, elems, &.{ 0, 1, 1 }, &.{ 2, 2, 1 }, 2, shape, 1);
-    try testing.expectEqualStrings("[\"/w==\",\"/g==\",null]", list.getValue(0).string);
+    const elems: Entries = .{ .vals = try eb.finish(), .reps = &.{ 0, 1, 1 }, .defs = &.{ 2, 2, 1 } };
+    try expectRows(a, try assembleNested(a, &ls, &lr, &.{elems}, 1), &.{"[\"/w==\",\"/g==\",null]"});
 
     const schema = [_]parquet.SchemaElement{
         .{ .name = "root", .num_children = 1 },
@@ -568,7 +607,7 @@ test "D8: nested BYTES are base64 in a list, a map value and a map key; \\b and 
     try vb.append(.null);
     const keys: Entries = .{ .vals = try kb.finish(), .reps = &.{ 0, 1 }, .defs = &.{ 2, 2 } };
     const vals: Entries = .{ .vals = try vb.finish(), .reps = &.{ 0, 1 }, .defs = &.{ 3, 2 } };
-    const got = (try assembleNested(a, &root, &.{ keys, vals }, 1)).getValue(0).string;
+    const got = (try rowJson(a, try assembleNested(a, &schema, &root, &.{ keys, vals }, 1), 0)).?;
     try testing.expectEqualStrings("{\"/w==\":\"AWFi\",\"/g==\":null}", got);
     try testing.expect(try std.json.validate(a, got));
 }

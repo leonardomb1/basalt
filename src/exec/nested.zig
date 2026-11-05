@@ -133,13 +133,20 @@ pub fn writeJson(w: *Writer, n: *const column.Nested, row: usize) Writer.Error!v
 }
 
 /// A map key as an object key: text and BYTES (base64) as the strings they are,
-/// temporal values in their quoted ISO text, a number or bool quoted.
+/// temporal values in their quoted ISO text, a number or bool quoted, and a nested
+/// key (a file's map may have one) its JSON text as a string.
 fn writeKey(w: *Writer, k: Value) Writer.Error!void {
     switch (k) {
         .int, .float, .decimal, .bool => {
             try w.writeByte('"');
             try jsontext.scalar(w, k, jsontext.nested);
             try w.writeByte('"');
+        },
+        .nested => |r| {
+            var inner = Writer.Allocating.init(std.heap.smp_allocator);
+            defer inner.deinit();
+            try writeJson(&inner.writer, r.node, r.row);
+            try jsontext.string(w, inner.written());
         },
         else => try jsontext.scalar(w, k, jsontext.nested),
     }

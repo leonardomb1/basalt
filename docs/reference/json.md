@@ -1,7 +1,8 @@
 # JSON functions
 
-JSON documents travel as text: a `JSON` column, a nested Parquet or Arrow column,
-a REST response's nested object. These functions build and take them apart;
+JSON documents travel as text: a `JSON` column, a nested Arrow column, a JSON
+file's nested object, a REST response's. A Parquet or Delta struct, list or map
+is a typed nested column instead; `CAST(col AS STRING)` is its JSON text. These functions build and take them apart;
 `CROSS JOIN UNNEST(JSON_EACH(col))` turns an array into rows (see
 [Queries](../language/queries.md#operators)).
 
@@ -43,15 +44,15 @@ in place, without `UNNEST` and re-aggregating: the lambda's body is evaluated
 once per element with its parameter bound to it. `json_filter` keeps the
 elements whose condition is true, as written; `json_transform` returns the
 array of the body's values; `json_any` / `json_all` whether the condition is
-true for some / every element (an empty array: false / true). A nested
-Parquet list reads as exactly such an array.
+true for some / every element (an empty array: false / true). A Parquet list
+column cast to text (`CAST(tags AS STRING)`) is exactly such an array.
 
 ```sql
 SELECT id,
        json_filter(tags, t -> t LIKE 'vip%')                    AS vip_tags,
        json_transform(items, i -> json_get(i, 'sku'))           AS skus,
        json_any(items, i -> CAST(json_get(i, 'qty') AS INT) = 0) AS has_empty_line
-FROM 'orders.parquet'
+FROM 'orders.ndjson'
 WHERE json_any(tags, t -> t = 'new');
 ```
 

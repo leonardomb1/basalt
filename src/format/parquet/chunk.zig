@@ -8,9 +8,10 @@ const Decimal = @import("../../exec/value.zig").Decimal;
 const Dec64 = @import("../../exec/decimal.zig").Dec64;
 const Value = @import("../../exec/value.zig").Value;
 const Error = @import("read.zig").Error;
-const Levels = @import("nested.zig").Levels;
-const ListShape = @import("schema.zig").ListShape;
-const assembleLists = @import("nested.zig").assembleLists;
+const Levels = struct {
+    reps: std.array_list.Managed(u32),
+    defs: std.array_list.Managed(u32),
+};
 const basaltType = @import("logical.zig").basaltType;
 const bitWidth = @import("encoding.zig").bitWidth;
 const capacity_hint = @import("encoding.zig").capacity_hint;
@@ -44,12 +45,11 @@ pub fn readColumnChunk(
     max_def: u32,
     base_offset: u64,
 ) ReadError!column.Column {
-    return readColumnChunkLevels(arena, file_bytes, meta, elem, rows, max_def, 0, null, base_offset, false);
+    return readColumnChunkLevels(arena, file_bytes, meta, elem, rows, max_def, base_offset, false);
 }
 
-/// With `list` set, the chunk's entries (one per level pair, not per row) are
-/// assembled into a JSON array per row. `codes_only` keeps dictionary-coded strings
-/// as codes (`column.Column.codes_only`).
+/// A flat column's chunk, one value per row. `codes_only` keeps dictionary-coded
+/// strings as codes (`column.Column.codes_only`).
 pub fn readColumnChunkLevels(
     arena: std.mem.Allocator,
     file_bytes: []const u8,
@@ -57,14 +57,10 @@ pub fn readColumnChunkLevels(
     elem: parquet.SchemaElement,
     rows: usize,
     max_def: u32,
-    max_rep: u32,
-    list: ?ListShape,
     base_offset: u64,
     codes_only: bool,
 ) ReadError!column.Column {
-    const d = try readPages(arena, file_bytes, meta, elem, if (list == null) rows else null, max_def, max_rep, base_offset, codes_only and list == null);
-    const shape = list orelse return d.vals;
-    return assembleLists(arena, d.vals, d.levels.?.reps.items, d.levels.?.defs.items, max_def, shape, rows);
+    return (try readPages(arena, file_bytes, meta, elem, rows, max_def, 0, base_offset, codes_only)).vals;
 }
 
 pub const Entries = struct { vals: column.Column, reps: []const u32, defs: []const u32 };

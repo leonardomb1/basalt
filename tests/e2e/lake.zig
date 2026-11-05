@@ -224,16 +224,16 @@ test "a Delta table with every file removed reads no rows, typed by its schema" 
     try testing.expectEqualStrings("id,name\n", try rows(a, &tmp, "SELECT id, name FROM '$B/t/' WHERE id > 0", 4));
 }
 
-/// A flat checkpoint as basalt writes one: each action's fields as dotted columns,
-/// maps and lists as JSON text, which the reader takes as a nested writer's.
-fn flatCheckpoint(a: std.mem.Allocator, tmp: *std.testing.TmpDir, path: []const u8, actions: []const []const u8) !void {
+/// A checkpoint as Delta writers lay one out: each action a struct column of its
+/// fields, maps and lists nested, written by basalt's nested Parquet writer.
+fn nestedCheckpoint(a: std.mem.Allocator, tmp: *std.testing.TmpDir, path: []const u8, actions: []const []const u8) !void {
     const head = "{\"add\":null,\"metaData\":null,\"protocol\":null,\"checkpointMetadata\":null}";
     try put(tmp, "cp.ndjson", try std.mem.join(a, "\n", try std.mem.concat(a, []const u8, &.{ &.{head}, actions })));
     const r = try runIn(a, tmp, try std.fmt.allocPrint(a,
-        \\LOAD INTO '$B/{s}' AS SELECT json_get(add, 'path') AS "add.path", json_get(add, 'partitionValues') AS "add.partitionValues",
-        \\  json_get(metaData, 'schemaString') AS "metaData.schemaString", json_get(metaData, 'partitionColumns') AS "metaData.partitionColumns",
-        \\  CAST(json_get(protocol, 'minReaderVersion') AS INT) AS "protocol.minReaderVersion", json_get(protocol, 'readerFeatures') AS "protocol.readerFeatures",
-        \\  json_get(checkpointMetadata, 'version') AS "checkpointMetadata.version"
+        \\LOAD INTO '$B/{s}' AS SELECT CAST(add AS STRUCT(path STRING, partitionValues MAP(STRING, STRING))) AS add,
+        \\  CAST(metaData AS STRUCT(schemaString STRING, partitionColumns LIST(STRING))) AS "metaData",
+        \\  CAST(protocol AS STRUCT(minReaderVersion INT, readerFeatures LIST(STRING))) AS protocol,
+        \\  CAST(checkpointMetadata AS STRUCT(version INT)) AS "checkpointMetadata"
         \\FROM '$B/cp.ndjson' WITH (format = 'ndjson');
     , .{path}), 1);
     if (r.err) |e| {
@@ -252,7 +252,7 @@ test "Delta checkpoints: single and multi-part, commits after them replayed, an 
     try dataFile(a, &tmp, "t/d.parquet", "id,name\n6,fay\n", "CAST(id AS INT) AS id, name");
     const fields = try std.mem.join(a, ",", &.{ try field(a, "id", "long"), try field(a, "name", "string") });
     const m = try meta(a, fields, "[]", "{}");
-    try flatCheckpoint(a, &tmp, "t/_delta_log/00000000000000000001.checkpoint.parquet", &.{ protocol1, m, try add(a, "b.parquet", "{}"), try add(a, "c.parquet", "{}") });
+    try nestedCheckpoint(a, &tmp, "t/_delta_log/00000000000000000001.checkpoint.parquet", &.{ protocol1, m, try add(a, "b.parquet", "{}"), try add(a, "c.parquet", "{}") });
     try commit(a, &tmp, "t", 2, &.{try add(a, "d.parquet", "{}")});
     try tmp.dir.deleteFile("t/_delta_log/00000000000000000000.json");
     try tmp.dir.deleteFile("t/_delta_log/00000000000000000001.json");
@@ -260,8 +260,8 @@ test "Delta checkpoints: single and multi-part, commits after them replayed, an 
     try testing.expectEqualStrings("id\n3\n4\n5\n", try rows(a, &tmp, "SELECT id FROM '$B/t/' WITH (version = 1) ORDER BY id", 1));
     try refused(a, &tmp, "SELECT id FROM '$B/t/' WITH (version = 0)", "has no version 0 (versions 1 to 2 can be read)", false);
 
-    try flatCheckpoint(a, &tmp, "t/_delta_log/00000000000000000002.checkpoint.0000000001.0000000002.parquet", &.{ protocol1, m, try add(a, "c.parquet", "{}") });
-    try flatCheckpoint(a, &tmp, "t/_delta_log/00000000000000000002.checkpoint.0000000002.0000000002.parquet", &.{try add(a, "d.parquet", "{}")});
+    try nestedCheckpoint(a, &tmp, "t/_delta_log/00000000000000000002.checkpoint.0000000001.0000000002.parquet", &.{ protocol1, m, try add(a, "c.parquet", "{}") });
+    try nestedCheckpoint(a, &tmp, "t/_delta_log/00000000000000000002.checkpoint.0000000002.0000000002.parquet", &.{try add(a, "d.parquet", "{}")});
     try commit(a, &tmp, "t", 3, &.{try remove(a, "d.parquet")});
     try tmp.dir.deleteFile("t/_delta_log/00000000000000000002.json");
     try testing.expectEqualStrings("id\n5\n", try rows(a, &tmp, "SELECT id FROM '$B/t/' ORDER BY id", 1));
@@ -541,15 +541,15 @@ test "Delta column mapping: a renamed column reads under its new name, by physic
     try testing.expectEqualStrings("letter,int\nb,228\n", try rows(a, &tmp, "SELECT letter, int FROM '$B/dat-column_mapping/' WITH (version = 1) WHERE letter = 'b'", 1));
     try testing.expectEqualStrings("new_int\n604\n604\n692\n692\n", try rows(a, &tmp, "SELECT new_int FROM '$B/dat-column_mapping/' WHERE new_int > 600 ORDER BY new_int", 1));
 
-    const q = "SELECT ByteType, IntegerType, decimal, StringType, DateType, TimestampType, \"nested_struct.ac.aca\", array_of_map_of_arrays, array_of_structs, \"struct_of_arrays_maps_of_structs.ab\", map_of_rows, map_of_maps FROM '$B/table-with-columnmapping-mode-id/' ORDER BY IntegerType";
+    const q = "SELECT ByteType, IntegerType, decimal, StringType, DateType, TimestampType, nested_struct, array_of_map_of_arrays, array_of_structs, struct_of_arrays_maps_of_structs, map_of_rows, map_of_maps FROM '$B/table-with-columnmapping-mode-id/' ORDER BY IntegerType";
     const by_id = try lanesAgree(a, &tmp, q);
     try testing.expectEqualStrings(
-        \\ByteType,IntegerType,decimal,StringType,DateType,TimestampType,nested_struct.ac.aca,array_of_map_of_arrays,array_of_structs,struct_of_arrays_maps_of_structs.ab,map_of_rows,map_of_maps
-        \\0,0,0.00,0,2021-11-18,1970-01-01 00:00:00,0,"[{""0"":[2,3],""1"":[4,5]}]","[{""ab"":0},{""ab"":0}]","{""[0,1]"":{""aca"":2}}","{""1"":{""ab"":0}}","{""0"":{""0"":0},""1"":{""2"":0}}"
-        \\1,1,1.00,1,2021-11-18,1970-01-01 00:00:00.001000,1,"[{""1"":[2,3],""2"":[4,5]}]","[{""ab"":1},{""ab"":1}]","{""[1,2]"":{""aca"":3}}","{""2"":{""ab"":20}}","{""1"":{""1"":1},""2"":{""3"":1}}"
-        \\2,2,2.00,2,2021-11-18,1970-01-01 00:00:00.002000,2,"[{""2"":[2,3],""3"":[4,5]}]","[{""ab"":2},{""ab"":2}]","{""[2,3]"":{""aca"":4}}","{""3"":{""ab"":40}}","{""2"":{""2"":2},""3"":{""4"":2}}"
-        \\3,3,3.00,3,2021-11-18,1970-01-01 00:00:00.003000,3,"[{""3"":[2,3],""4"":[4,5]}]","[{""ab"":3},{""ab"":3}]","{""[3,4]"":{""aca"":5}}","{""4"":{""ab"":60}}","{""3"":{""3"":3},""4"":{""5"":3}}"
-        \\4,4,4.00,4,2021-11-18,1970-01-01 00:00:00.004000,4,"[{""4"":[2,3],""5"":[4,5]}]","[{""ab"":4},{""ab"":4}]","{""[4,5]"":{""aca"":6}}","{""5"":{""ab"":80}}","{""4"":{""4"":4},""5"":{""6"":4}}"
+        \\ByteType,IntegerType,decimal,StringType,DateType,TimestampType,nested_struct,array_of_map_of_arrays,array_of_structs,struct_of_arrays_maps_of_structs,map_of_rows,map_of_maps
+        \\0,0,0.00,0,2021-11-18,1970-01-01 00:00:00,"{""aa"":""0"",""ac"":{""aca"":0}}","[{""0"":[2,3],""1"":[4,5]}]","[{""ab"":0},{""ab"":0}]","{""aa"":[0,1],""ab"":{""[0,1]"":{""aca"":2}}}","{""1"":{""ab"":0}}","{""0"":{""0"":0},""1"":{""2"":0}}"
+        \\1,1,1.00,1,2021-11-18,1970-01-01 00:00:00.001000,"{""aa"":""1"",""ac"":{""aca"":1}}","[{""1"":[2,3],""2"":[4,5]}]","[{""ab"":1},{""ab"":1}]","{""aa"":[1,2],""ab"":{""[1,2]"":{""aca"":3}}}","{""2"":{""ab"":20}}","{""1"":{""1"":1},""2"":{""3"":1}}"
+        \\2,2,2.00,2,2021-11-18,1970-01-01 00:00:00.002000,"{""aa"":""2"",""ac"":{""aca"":2}}","[{""2"":[2,3],""3"":[4,5]}]","[{""ab"":2},{""ab"":2}]","{""aa"":[2,3],""ab"":{""[2,3]"":{""aca"":4}}}","{""3"":{""ab"":40}}","{""2"":{""2"":2},""3"":{""4"":2}}"
+        \\3,3,3.00,3,2021-11-18,1970-01-01 00:00:00.003000,"{""aa"":""3"",""ac"":{""aca"":3}}","[{""3"":[2,3],""4"":[4,5]}]","[{""ab"":3},{""ab"":3}]","{""aa"":[3,4],""ab"":{""[3,4]"":{""aca"":5}}}","{""4"":{""ab"":60}}","{""3"":{""3"":3},""4"":{""5"":3}}"
+        \\4,4,4.00,4,2021-11-18,1970-01-01 00:00:00.004000,"{""aa"":""4"",""ac"":{""aca"":4}}","[{""4"":[2,3],""5"":[4,5]}]","[{""ab"":4},{""ab"":4}]","{""aa"":[4,5],""ab"":{""[4,5]"":{""aca"":6}}}","{""5"":{""ab"":80}}","{""4"":{""4"":4},""5"":{""6"":4}}"
         \\,,,,,,,,,,,
         \\
     , by_id);

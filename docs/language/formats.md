@@ -98,8 +98,10 @@ whose value it rules out without opening them, and everything a Parquet folder
 does still applies: lanes under `-j`, projection, row-group statistics, a join's
 keys, ranged reads of remote files. Delta types map as Parquet's do — `long`,
 `integer`, `short` and `byte` to `INT`, `float` and `double` to `FLOAT`,
-`timestamp` and `timestamp_ntz` to `TIMESTAMP`, a struct to its dotted columns
-(`addr.city`), an array or map to one JSON text column.
+`timestamp` and `timestamp_ntz` to `TIMESTAMP`, and a struct, an array or a map
+to one nested column of that type (`STRUCT`, `LIST`, `MAP`). A file written before
+a struct gained a field reads that field as NULL, and a field the table dropped
+is not read.
 
 A file's deletion vector — the rows a `DELETE`, `UPDATE` or `MERGE` removed
 without rewriting the file — is applied as the file is read, so those rows are
@@ -117,7 +119,7 @@ Under column mapping (`delta.columnMapping.mode` `name` or `id`, which counts
 where the protocol enables the feature: reader version 2, or 3 with
 `columnMapping`) a column is found in the files by its physical name or by its
 Parquet field id, nested struct fields too, and partition values by physical
-name; a list's or map's JSON names its struct fields as the table does. A
+name; a list's or map's struct fields take the table's names too. A
 renamed column reads under its new name, a dropped one is not read, a column a
 file lacks reads as NULL, and a column dropped and added again under its old
 name reads NULL from files written before, as their data is the old column's.
@@ -469,8 +471,9 @@ Connect, Spark and Hadoop jobs leave behind. A folder of `.avro` files reads as 
 table, stdin reads one `WITH (format = 'avro')`, and objects, SFTP, SMB, URLs, a
 `.avro.gz` and a zip member work as for CSV. The schema in the file's header fixes
 the columns, so nothing is sampled: the top record's fields are the columns, a
-nested record's fields read as flat dotted columns (`addr.city`) as a Parquet
-struct's do, and a file whose schema is not a record reads as one column, `value`.
+nested record's fields read as flat dotted columns (`addr.city`) (a Parquet
+struct, unlike it, reads as one struct column), and a file whose schema is not a
+record reads as one column, `value`.
 
 ```sql
 SELECT status, count(*) AS n, sum(amount) AS total
@@ -551,26 +554,27 @@ converted twins do; a `UUID` stays `bytes`. An unsigned integer (`UINT8` to
 `UINT64` as the exact `DECIMAL(20,0)`, so a value above 2^63−1 keeps its value
 rather than fail or wrap, and its statistics still prune row groups.
 
-A struct's fields read as flat dotted columns (`addr.city`). Everything
-repeated — a `LIST` of scalars or of structs, a `MAP`, and any nesting of them —
-reads as one `string` column named for it, holding each row's value as JSON:
-lists as arrays (`[1,2]`, `[]` when empty), structs as objects, maps as objects
-keyed by each key's text (`{"k1":3}`), `NULL` for a null column value and
-`null` for a null element or field, dates and timestamps as quoted text, a NaN
-or infinite float as `null`, and a binary leaf or map key (`BYTE_ARRAY` with no
-`STRING` annotation, a `UUID`) as base64, as the JSON writer spells `BYTES`, so
-no byte is lost; `CAST(from_base64(json_get(c, 'k')) AS STRING)` gives the text
-of a binary leaf that holds text.
-`CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag` gives a row per element and
-`json_get` reaches into one. No column of the file is left out, so
-`LOAD INTO 'copy.parquet' AS SELECT * FROM 'x.parquet'` carries every one — the
-nested ones as JSON text, since that is how basalt holds them. Cast one to its
-type to write it nested again: `CAST(tags AS LIST(STRING))`, a `STRUCT(...)` or
-a `MAP(K, V)` (see [Expressions](../reference/expressions.md)) is written as the
-spec's three-level `LIST`, its `MAP` and nested groups, each leaf encoded as a
-flat column of its type is, with repetition and definition levels. A filter on a
-nested column is never used to skip row groups: the file's statistics describe
-its leaves, not the JSON.
+Each top-level field of a file is one column. A struct, a `LIST` (three-level,
+or the legacy two-level and bare repeated forms), a `MAP`, and any nesting of
+them read as one nested column of that type: `STRUCT(...)`, `LIST(...)`,
+`MAP(K, V)`, as `DESCRIBE` shows, a field OPTIONAL in the file nullable, a
+REQUIRED one not. They are assembled from the leaves' repetition and definition
+levels into columns of their own, nothing parsed or rendered, and shown or
+written as text as JSON: lists as arrays (`[1,2]`, `[]` when empty), structs as
+objects, maps as objects keyed by each key's text (`{"k1":3}`), `NULL` for a
+null column value and `null` for a null element or field, dates and timestamps
+as quoted text, a NaN or infinite float as `null`, and a binary leaf or map key
+(`BYTE_ARRAY` with no `STRING` annotation, a `UUID`) as base64, as the JSON
+writer spells `BYTES`, so no byte is lost. A struct's fields are no longer
+separate dotted columns (`"addr.city"`); `CAST(addr AS STRING)` is its JSON,
+which `json_get` and `CROSS JOIN UNNEST(JSON_EACH(...))` take apart.
+`LOAD INTO 'copy.parquet' AS SELECT * FROM 'x.parquet'` carries every column,
+the nested ones as the spec's three-level `LIST`, its `MAP` and nested groups,
+each leaf encoded as a flat column of its type is, with repetition and
+definition levels; a `CAST(... AS STRUCT(...))`, `LIST(...)` or `MAP(K, V)` (see
+[Expressions](../reference/expressions.md)) makes one from JSON text. A filter
+on a nested column is never used to skip row groups: the file's statistics
+describe its leaves.
 
 ## Compressed files and archives
 

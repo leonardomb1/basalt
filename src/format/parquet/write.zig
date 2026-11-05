@@ -1872,7 +1872,7 @@ fn writeReadBack(cc: codec.Codec) !void {
     try testing.expect((try r.next(a)) == null);
 }
 
-test "nested columns write the spec's groups and levels, and read back as the JSON they were written from" {
+test "nested columns write the spec's groups and levels, and read back as the nested values they were written from" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1910,14 +1910,13 @@ test "nested columns write the spec's groups and levels, and read back as the JS
     const r = try pqdecode.Reader.open(a, path);
     const b = (try r.next(a)).?;
     try testing.expectEqual(@as(usize, 4), b.len);
-    const tags_back = [_]?[]const u8{ "[\"a\",null]", "[]", null, null };
+    const docs_back = [_]?[]const u8{ "{\"id\":1,\"tags\":[\"a\",null]}", "{\"id\":2,\"tags\":[]}", "{\"id\":3,\"tags\":null}", null };
     const maps_back = [_]?[]const u8{ "{\"x\":1,\"y\":null}", "{}", null, "{\"z\":7}" };
     for (0..4) |i| {
         try testing.expectEqual(@as(i64, @intCast(i)), b.columns[0].getValue(i).int);
-        try expectText(tags_back[i], b.columns[2].getValue(i));
-        try expectText(maps_back[i], b.columns[3].getValue(i));
+        try expectText(docs_back[i], b.columns[1].getValue(i));
+        try expectText(maps_back[i], b.columns[2].getValue(i));
     }
-    try testing.expect(b.columns[1].getValue(3).isNull());
 
     const bytes = try tmp.dir.readFileAlloc(a, "nested.parquet", 1 << 20);
     const md = try parquet.parseFile(a, bytes);
@@ -1928,7 +1927,14 @@ test "nested columns write the spec's groups and levels, and read back as the JS
 }
 
 fn expectText(want: ?[]const u8, got: Value) !void {
-    if (want) |x| try testing.expectEqualStrings(x, got.string) else try testing.expect(got.isNull());
+    const x = want orelse return testing.expect(got.isNull());
+    if (got == .nested) {
+        var out = std.Io.Writer.Allocating.init(testing.allocator);
+        defer out.deinit();
+        try @import("../../exec/nested.zig").writeJson(&out.writer, got.nested.node, got.nested.row);
+        return testing.expectEqualStrings(x, out.written());
+    }
+    try testing.expectEqualStrings(x, got.string);
 }
 
 test "a nested struct's typed leaves are read from their JSON text: bools, floats, dates, decimals, base64 bytes and plain strings; one that is not its type is refused as the column is built" {
@@ -1964,7 +1970,8 @@ test "a nested struct's typed leaves are read from their JSON text: bools, float
     try w.close();
 
     const r = try pqdecode.Reader.open(a, path);
-    const b = (try r.next(a)).?;
+    const got = (try r.next(a)).?;
+    const b = .{ .columns = got.columns[0].data.nested.body.fields };
     try testing.expectEqual(true, b.columns[0].getValue(0).bool);
     try testing.expectEqual(false, b.columns[0].getValue(1).bool);
     try testing.expectEqual(@as(f64, -1.5), b.columns[1].getValue(0).float);

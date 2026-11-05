@@ -129,8 +129,7 @@ pub const Layout = struct {
                 continue;
             };
             const got = r.schema.fields[k].ty;
-            const fits = got.kind == want.ty.kind and (got.kind != .decimal or got.scale == want.ty.scale);
-            if (!fits) return eval.explain(Error.LakeFileMismatch, msgfmt.allocPrint(arena, "{s} has file `{s}` whose column `{s}` is {s}, not {s} as in the table's schema", .{
+            if (!fitsType(got, want.ty)) return eval.explain(Error.LakeFileMismatch, msgfmt.allocPrint(arena, "{s} has file `{s}` whose column `{s}` is {s}, not {s} as in the table's schema", .{
                 self.name, below(file.path, self.root), want.name, try got.name(arena), try want.ty.name(arena),
             }) catch self.name);
             o.* = .{ .column = k };
@@ -300,6 +299,72 @@ const Renamer = struct {
     }
 };
 
+/// Whether a file's column of type `got` reads as the table's `want`: the same kind,
+/// a decimal at the same scale (its precision is relabelled), and a struct's
+/// fields fitting by name where both have them, a list's or a map's parts alike.
+/// A struct field only one side has is no mismatch: a table adds and drops them.
+fn fitsType(got: types.Type, want: types.Type) bool {
+    if (got.kind != want.kind) return false;
+    return switch (want.kind) {
+        .decimal => got.scale == want.scale,
+        .array => fitsType(column.childType(got), column.childType(want)),
+        .map, .@"struct" => for (want.fields orelse &.{}) |wf| {
+            const gf = fieldNamed(got, wf.name) orelse continue;
+            if (!fitsType(gf.ty, wf.ty)) break false;
+        } else true,
+        else => true,
+    };
+}
+
+fn fieldNamed(t: types.Type, name: []const u8) ?types.Type.Field {
+    for (t.fields orelse &.{}) |f| if (std.mem.eql(u8, f.name, name)) return f;
+    return null;
+}
+
+/// A file's nested column in the table's type `want` (`fitsType` holds): a struct's
+/// fields taken by name, one the file lacks an all-null column of its type, one the
+/// table lacks left out; a list's or a map's child reshaped alike.
+pub fn reshape(arena: std.mem.Allocator, col: column.Column, want: types.Type) error{OutOfMemory}!column.Column {
+    if (!want.isNested()) {
+        var out = col;
+        out.ty = want;
+        return out;
+    }
+    if (col.ty.eql(want)) {
+        var out = col;
+        out.ty = want;
+        return out;
+    }
+    const nd = col.data.nested;
+    const node = try arena.create(column.Nested);
+    node.* = .{ .ty = want, .body = switch (nd.body) {
+        .list => |l| .{ .list = .{ .offsets = l.offsets, .child = try reshape(arena, l.child, column.childType(want)) } },
+        .fields => |fs| blk: {
+            const wf = want.fields orelse &.{};
+            const kids = try arena.alloc(column.Column, wf.len);
+            for (wf, kids) |f, *k| {
+                const at = for (col.ty.fields orelse &.{}, 0..) |gf, i| {
+                    if (std.mem.eql(u8, gf.name, f.name)) break i;
+                } else null;
+                k.* = if (at) |i| try reshape(arena, fs[i], f.ty) else try nulls(arena, f.ty, col.len);
+            }
+            break :blk .{ .fields = kids };
+        },
+    } };
+    var out = col;
+    out.ty = want;
+    out.data = .{ .nested = node };
+    return out;
+}
+
+fn nulls(arena: std.mem.Allocator, ty: types.Type, n: usize) error{OutOfMemory}!column.Column {
+    var b = column.Builder.init(arena, ty.asNullable());
+    for (0..n) |_| try b.appendNull();
+    var c = try b.finish();
+    c.ty = ty;
+    return c;
+}
+
 fn below(path: []const u8, root: []const u8) []const u8 {
     return if (std.mem.startsWith(u8, path, root)) path[root.len..] else path;
 }
@@ -322,7 +387,7 @@ pub const Fit = struct {
         const cols = try arena.alloc(column.Column, self.outs.len);
         for (cols, self.outs, self.schema.fields) |*c, o, f| switch (o) {
             .column => |k| {
-                c.* = b.columns[k];
+                c.* = if (f.ty.isNested()) try reshape(arena, b.columns[k], f.ty) else b.columns[k];
                 c.ty = f.ty;
             },
             .value => |val| {
@@ -435,4 +500,26 @@ test "a mapping renames a file's columns to the table's, nested ones too, and hi
     try testing.expect(std.mem.indexOf(u8, eval.takeFailure(Error.LakeFileMismatch).?, "carries no Parquet field ids") != null);
     const deep = try Mapping.init(a, .name, &fields);
     try testing.expectError(error.UnsupportedParquetSchema, deep.rename(a, bare[0..6]));
+}
+
+test "a file's struct fits the table's: a field the file lacks reads NULL, one the table dropped is left out, inside lists too" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const int = types.Type.init(.int).asNullable();
+    const str = types.Type.init(.string).asNullable();
+    const old = types.Type{ .kind = .@"struct", .nullable = true, .fields = &.{ .{ .name = "a", .ty = int }, .{ .name = "gone", .ty = str } } };
+    const now = types.Type{ .kind = .@"struct", .nullable = true, .fields = &.{ .{ .name = "a", .ty = int }, .{ .name = "b", .ty = str } } };
+    const old_l = types.Type{ .kind = .array, .nullable = true, .elem = &old };
+    const now_l = types.Type{ .kind = .array, .nullable = true, .elem = &now };
+    try testing.expect(fitsType(old_l, now_l));
+    try testing.expect(!fitsType(old_l, types.Type{ .kind = .array, .elem = &int }));
+
+    var b = column.Builder.init(a, old_l);
+    try b.append(.{ .string = "[{\"a\":1,\"gone\":\"x\"},null]" });
+    try b.append(.null);
+    const got = try reshape(a, try b.finish(), now_l);
+    try testing.expect(got.ty.eql(now_l));
+    try testing.expectEqualStrings("[{\"a\":1,\"b\":null},null]", try @import("../../exec/nested.zig").jsonText(a, got.getValue(0).nested));
+    try testing.expect(got.getValue(1) == .null);
 }

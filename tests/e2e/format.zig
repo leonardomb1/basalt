@@ -382,7 +382,7 @@ test "LogicalType-only parquet timestamps and times read back as wall-clock valu
     );
 }
 
-test "a parquet LIST column unnests through JSON_EACH, one row per element" {
+test "a parquet LIST column unnests through JSON_EACH of its JSON text, one row per element" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -394,7 +394,7 @@ test "a parquet LIST column unnests through JSON_EACH, one row per element" {
 
     const script = try std.fmt.allocPrint(
         alloc,
-        "LOAD INTO '{s}' AS SELECT id, x FROM '{s}/l.parquet' CROSS JOIN UNNEST(JSON_EACH(xs)) AS x ORDER BY id;",
+        "LOAD INTO '{s}' AS SELECT id, x FROM (SELECT id, CAST(xs AS STRING) AS t FROM '{s}/l.parquet') CROSS JOIN UNNEST(JSON_EACH(t)) AS x ORDER BY id;",
         .{ out_path, base },
     );
     defer alloc.free(script);

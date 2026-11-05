@@ -17,19 +17,17 @@
 //! timestamps as 1970. Nanos floor-divide, which is monotone, so statistics-based
 //! pruning stays sound after conversion.
 //!
-//! A struct's fields read as flat dotted columns (`addr.city`). A list of scalars,
-//! any depth, reads as one `string` column of JSON arrays named for the list,
-//! assembled from repetition and definition levels (`ListShape`), which
-//! `JSON_EACH` and `json_get` take apart. A list of structs, a map, and any
-//! nesting of them span several leaves and are rebuilt row by row from all of
-//! their entries into one JSON column (`NNode`, `Assembler`): objects for structs
-//! and maps, arrays for lists. Within a row every leaf's entries are contiguous (a
-//! repetition level of 0 starts the next row); a repeated node at repetition
-//! level R starts an element at every entry whose level is R, and a definition
-//! level below a node's own says it is absent — null if optional, an empty list if
-//! repeated. Every leaf has an entry for every instance of every ancestor, so the
-//! first entry of a node's first leaf answers whether the node is there. Chunks
-//! appear in leaf order including leaves a read skips, hence `Leaf.chunk_idx`.
+//! A file's top-level fields are its columns. A flat field reads as itself; a
+//! struct, a list, a map and any nesting of them read as one nested column of that
+//! type (`nested.zig`), assembled from all of their leaves' repetition and
+//! definition levels into child columns. Within a row every leaf's entries are
+//! contiguous (a repetition level of 0 starts the next row); a repeated node at
+//! repetition level R starts an element at every entry whose level is R, and a
+//! definition level below a node's own says it is absent — null if optional, an
+//! empty list if repeated. Every leaf has an entry for every instance of every
+//! ancestor, so the first entry of a node's first leaf answers whether the node is
+//! there. Chunks appear in leaf order including leaves a read skips, hence
+//! `Leaf.chunk_idx`.
 //!
 //! Row-group pruning (`groupMayMatch`, `groupMayHoldKeys` for a join's keys,
 //! `groupBeatsThreshold`, `fileMinMax`) is conservative in one direction only: a
@@ -90,7 +88,6 @@ pub const decodeByteStreamSplit = @import("encoding.zig").decodeByteStreamSplit;
 pub const temporalTick = @import("logical.zig").temporalTick;
 pub const basaltType = @import("logical.zig").basaltType;
 pub const Leaf = @import("schema.zig").Leaf;
-pub const ListShape = @import("schema.zig").ListShape;
 pub const RootRef = @import("schema.zig").RootRef;
 pub const collectLeaves = @import("schema.zig").collectLeaves;
 pub const readColumnChunk = @import("chunk.zig").readColumnChunk;
@@ -100,8 +97,10 @@ pub const readEntries = @import("chunk.zig").readEntries;
 pub const NNode = @import("nested.zig").NNode;
 pub const Nested = @import("nested.zig").Nested;
 pub const buildNested = @import("nested.zig").buildNested;
-const holdsStruct = @import("nested.zig").holdsStruct;
 const leafIndices = @import("nested.zig").leafIndices;
+const fieldType = @import("nested.zig").fieldType;
+const keepPaths = @import("nested.zig").keepPaths;
+const reaches = @import("nested.zig").reaches;
 pub const assembleNested = @import("nested.zig").assembleNested;
 pub const Bound = @import("stats.zig").Bound;
 pub const KeyBound = @import("stats.zig").KeyBound;
@@ -205,52 +204,46 @@ pub const Reader = struct {
         var keep = std.array_list.Managed(Leaf).init(arena);
         var fields = std.array_list.Managed(types.Schema.Field).init(arena);
         var outputs = std.array_list.Managed(Output).init(arena);
-        var roots_seen = std.array_list.Managed(usize).init(arena);
-        for (all, 0..) |lf, li| {
-            const shared = if (lf.root) |rt| for (all, 0..) |other, oi| {
-                if (oi != li and other.root != null and other.root.?.idx == rt.idx) break true;
-            } else holdsStruct(&try buildNested(arena, md.schema, rt)) else false;
-            if (shared) {
-                const rt = lf.root.?;
-                for (roots_seen.items) |x| {
-                    if (x == rt.idx) break;
-                } else {
-                    try roots_seen.append(rt.idx);
-                    if (!wanted(want, lf.name)) continue;
-                    const tree = try buildNested(arena, md.schema, rt);
-                    var at = std.array_list.Managed(usize).init(arena);
-                    try leafIndices(&tree, &at);
-                    var ix = std.array_list.Managed(usize).init(arena);
-                    for (at.items) |si| {
-                        const o = for (all) |x| {
-                            if (x.schema_idx == si) break x;
-                        } else return Error.UnsupportedParquetSchema;
-                        _ = try basaltType(md.schema[o.schema_idx]);
-                        try keep.append(o);
-                        try ix.append(keep.items.len - 1);
-                    }
-                    if (ix.items.len != tree.nleaves) return Error.UnsupportedParquetSchema;
-                    const n = try arena.create(Nested);
-                    n.* = .{ .name = lf.name, .root = tree, .leaves = ix.items };
-                    try outputs.append(.{ .nested = n });
-                    try fields.append(.{ .name = lf.name, .ty = types.Type.init(.string).asNullable() });
-                }
+        var at: usize = 1;
+        for (0..@as(usize, @intCast(@max(0, md.schema[0].num_children)))) |_| {
+            const idx = at;
+            at = try subtreeEnd(md.schema, idx);
+            const e = md.schema[idx];
+            if (!wanted(want, e.name) and !(want != null and reaches(want.?, e.name))) continue;
+            if (e.isLeaf() and e.repetition != .repeated) {
+                const lf = for (all) |x| {
+                    if (x.schema_idx == idx) break x;
+                } else return Error.UnsupportedParquetSchema;
+                try keep.append(lf);
+                try outputs.append(.{ .leaf = keep.items.len - 1 });
+                try fields.append(.{ .name = e.name, .ty = try leafType(e) });
                 continue;
             }
-            if (!wanted(want, lf.name)) continue;
-            try keep.append(lf);
-            try outputs.append(.{ .leaf = keep.items.len - 1 });
-            try fields.append(.{ .name = lf.name, .ty = try leafType(md.schema[lf.schema_idx], lf) });
+            var tree = try buildNested(arena, md.schema, .{ .idx = idx, .base_def = 0, .base_rep = 0 });
+            if (want) |w| try keepPaths(arena, &tree, e.name, w);
+            var leaf_at = std.array_list.Managed(usize).init(arena);
+            try leafIndices(&tree, &leaf_at);
+            var ix = std.array_list.Managed(usize).init(arena);
+            for (leaf_at.items) |si| {
+                const o = for (all) |x| {
+                    if (x.schema_idx == si) break x;
+                } else return Error.UnsupportedParquetSchema;
+                try keep.append(o);
+                try ix.append(keep.items.len - 1);
+            }
+            if (ix.items.len != tree.nleaves) return Error.UnsupportedParquetSchema;
+            const ty = (try fieldType(arena, md.schema, &tree)).asNullable();
+            const n = try arena.create(Nested);
+            n.* = .{ .name = e.name, .root = tree, .leaves = ix.items, .ty = ty };
+            try outputs.append(.{ .nested = n });
+            try fields.append(.{ .name = e.name, .ty = ty });
         }
         if (fields.items.len == 0 and want != null) {
             for (all) |lf| {
                 if (lf.isRepeated()) continue;
                 try keep.append(lf);
                 try outputs.append(.{ .leaf = keep.items.len - 1 });
-                try fields.append(.{
-                    .name = lf.name,
-                    .ty = (try basaltType(md.schema[lf.schema_idx])).asNullable(),
-                });
+                try fields.append(.{ .name = lf.name, .ty = try leafType(md.schema[lf.schema_idx]) });
                 break;
             }
         }
@@ -338,8 +331,6 @@ pub const Reader = struct {
                         self.md.schema[lf.schema_idx],
                         rows,
                         lf.max_def,
-                        lf.max_rep,
-                        lf.list,
                         chunk.start,
                         self.codesOnly(lf.schema_idx),
                     ) catch |e| return self.named(e);
@@ -351,7 +342,7 @@ pub const Reader = struct {
                         const chunk = try self.chunkOf(arena, g, lf);
                         e.* = readEntries(arena, chunk.bytes, chunk.meta, self.md.schema[lf.schema_idx], lf.max_def, lf.max_rep, chunk.start) catch |err| return self.named(err);
                     }
-                    cols[ci] = try assembleNested(arena, &n.root, entries, rows);
+                    cols[ci] = try assembleNested(arena, self.md.schema, &n.root, entries, rows);
                 },
             };
             if (gone) |bm| if (cols.len > 0) {
@@ -454,6 +445,18 @@ pub const Reader = struct {
 /// they do not (`conform.Policy.parquet_folder`). Nullability is not compared.
 /// `requested` is the projection, so a column one file stands in with (a
 /// projection it holds none of) is not blamed.
+/// The schema index past element `idx`'s subtree: its next sibling's.
+fn subtreeEnd(schema: []const parquet.SchemaElement, idx: usize) Error!usize {
+    var at = idx;
+    var open: usize = 1;
+    while (open > 0) : (open -= 1) {
+        if (at >= schema.len) return Error.UnsupportedParquetSchema;
+        open += @intCast(@max(0, schema[at].num_children));
+        at += 1;
+    }
+    return at;
+}
+
 pub fn schemaMismatch(arena: std.mem.Allocator, want: types.Schema, got: types.Schema, requested: ?[]const []const u8) ?[]const u8 {
     const out = conform.conform(arena, want, got, conform.Policy.parquet_folder, requested) catch return "its columns differ";
     return switch (out) {

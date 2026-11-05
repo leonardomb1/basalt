@@ -27,6 +27,8 @@ const Layout = @import("../parquet/fit.zig").Layout;
 const Mapping = @import("../parquet/fit.zig").Mapping;
 const Reader = @import("../parquet/read.zig").Reader;
 const Value = @import("../../exec/value.zig").Value;
+const column = @import("../../exec/column.zig");
+const nested_json = @import("../../exec/nested.zig");
 const dtypes = @import("delta_types.zig");
 const dvs = @import("delta_dv.zig");
 const eval = @import("../../exec/eval.zig");
@@ -338,68 +340,72 @@ pub const State = struct {
         try self.files.ensureUnusedCapacity(self.arena, @min(rows, 1 << 22));
         while (try r.next(scratch)) |b| {
             defer _ = batch_mem.reset(.retain_capacity);
-            const c_path = b.schema.indexOf("add.path");
-            const c_size = b.schema.indexOf("add.size");
-            const c_parts = b.schema.indexOf("add.partitionValues");
-            const c_dv = b.schema.indexOf("add.deletionVector.storageType");
-            const c_dv_at = b.schema.indexOf("add.deletionVector.pathOrInlineDv");
-            const c_dv_off = b.schema.indexOf("add.deletionVector.offset");
-            const c_dv_size = b.schema.indexOf("add.deletionVector.sizeInBytes");
-            const c_dv_card = b.schema.indexOf("add.deletionVector.cardinality");
-            const c_stats = b.schema.indexOf("add.stats");
-            const c_id = b.schema.indexOf("metaData.id");
-            const c_schema = b.schema.indexOf("metaData.schemaString");
-            const c_pcols = b.schema.indexOf("metaData.partitionColumns");
-            const c_config = b.schema.indexOf("metaData.configuration");
-            const c_rv = b.schema.indexOf("protocol.minReaderVersion");
-            const c_wv = b.schema.indexOf("protocol.minWriterVersion");
-            const c_feat = b.schema.indexOf("protocol.readerFeatures");
-            const c_wfeat = b.schema.indexOf("protocol.writerFeatures");
-            const c_v2 = [_]?usize{ b.schema.indexOf("checkpointMetadata.version"), b.schema.indexOf("sidecar.path") };
+            const c_path = columnAt(b, "add.path");
+            const c_size = columnAt(b, "add.size");
+            const c_parts = columnAt(b, "add.partitionValues");
+            const c_dv = columnAt(b, "add.deletionVector.storageType");
+            const c_dv_at = columnAt(b, "add.deletionVector.pathOrInlineDv");
+            const c_dv_off = columnAt(b, "add.deletionVector.offset");
+            const c_dv_size = columnAt(b, "add.deletionVector.sizeInBytes");
+            const c_dv_card = columnAt(b, "add.deletionVector.cardinality");
+            const c_stats = columnAt(b, "add.stats");
+            const c_id = columnAt(b, "metaData.id");
+            const c_schema = columnAt(b, "metaData.schemaString");
+            const c_pcols = columnAt(b, "metaData.partitionColumns");
+            const c_config = columnAt(b, "metaData.configuration");
+            const c_rv = columnAt(b, "protocol.minReaderVersion");
+            const c_wv = columnAt(b, "protocol.minWriterVersion");
+            const c_feat = columnAt(b, "protocol.readerFeatures");
+            const c_wfeat = columnAt(b, "protocol.writerFeatures");
+            const c_v2 = [_]?column.Column{ columnAt(b, "checkpointMetadata.version"), columnAt(b, "sidecar.path") };
             for (0..b.len) |i| {
-                for (c_v2) |c| if (cell(b, c, i) != .null) {
+                for (c_v2) |c| if (cell(c, i) != .null) {
                     self.v2 = url;
                 };
-                if (cell(b, c_path, i) == .string) {
-                    const size = cell(b, c_size, i);
-                    const storage = cell(b, c_dv, i);
+                if (cell(c_path, i) == .string) {
+                    const size = cell(c_size, i);
+                    const storage = cell(c_dv, i);
                     var dv: ?std.json.Value = null;
                     if (storage == .string) {
                         var o = std.json.ObjectMap.init(scratch);
                         try o.put("storageType", .{ .string = storage.string });
-                        const where = cell(b, c_dv_at, i);
+                        const where = cell(c_dv_at, i);
                         if (where == .string) try o.put("pathOrInlineDv", .{ .string = where.string });
-                        const ints = [_]struct { ?usize, []const u8 }{ .{ c_dv_off, "offset" }, .{ c_dv_size, "sizeInBytes" }, .{ c_dv_card, "cardinality" } };
+                        const ints = [_]struct { ?column.Column, []const u8 }{ .{ c_dv_off, "offset" }, .{ c_dv_size, "sizeInBytes" }, .{ c_dv_card, "cardinality" } };
                         for (ints) |f| {
-                            const v = cell(b, f[0], i);
+                            const v = cell(f[0], i);
                             if (v == .int) try o.put(f[1], .{ .integer = v.int });
                         }
                         dv = .{ .object = o };
                     }
-                    const stats = cell(b, c_stats, i);
+                    const stats = cell(c_stats, i);
                     try self.put(.{
-                        .path = cell(b, c_path, i).string,
+                        .path = cell(c_path, i).string,
                         .size = if (size == .int and size.int >= 0) @intCast(size.int) else null,
-                        .parts = jsonOf(scratch, cell(b, c_parts, i)),
+                        .parts = jsonOf(scratch, cell(c_parts, i)),
                         .dv = dv,
                         .stats = if (stats == .string) stats.string else null,
                     });
                 }
-                if (cell(b, c_schema, i) == .string) {
-                    const id = cell(b, c_id, i);
-                    try self.meta(if (id == .string) id.string else null, cell(b, c_schema, i).string, jsonOf(scratch, cell(b, c_pcols, i)), jsonOf(scratch, cell(b, c_config, i)));
+                if (cell(c_schema, i) == .string) {
+                    const id = cell(c_id, i);
+                    try self.meta(if (id == .string) id.string else null, cell(c_schema, i).string, jsonOf(scratch, cell(c_pcols, i)), jsonOf(scratch, cell(c_config, i)));
                 }
-                if (cell(b, c_rv, i) == .int) {
-                    const wv = cell(b, c_wv, i);
-                    try self.protocol(cell(b, c_rv, i).int, if (wv == .int) wv.int else null, jsonOf(scratch, cell(b, c_feat, i)), jsonOf(scratch, cell(b, c_wfeat, i)));
+                if (cell(c_rv, i) == .int) {
+                    const wv = cell(c_wv, i);
+                    try self.protocol(cell(c_rv, i).int, if (wv == .int) wv.int else null, jsonOf(scratch, cell(c_feat, i)), jsonOf(scratch, cell(c_wfeat, i)));
                 }
             }
         }
     }
 
     fn jsonOf(a: std.mem.Allocator, v: Value) ?std.json.Value {
-        if (v != .string) return null;
-        return std.json.parseFromSliceLeaky(std.json.Value, a, v.string, .{}) catch null;
+        const text = switch (v) {
+            .string => |t| t,
+            .nested => |r| nested_json.jsonText(a, r) catch return null,
+            else => return null,
+        };
+        return std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch null;
     }
 
     /// Refuses a table whose reader version or features basalt does not honour, or
@@ -431,8 +437,24 @@ const checkpoint_columns = [_][]const u8{
     "protocol.writerFeatures",        "checkpointMetadata.version",        "sidecar.path",
 };
 
-fn cell(b: Batch, c: ?usize, row: usize) Value {
-    return if (c) |k| b.columns[k].getValue(row) else .null;
+fn cell(c: ?column.Column, row: usize) Value {
+    return if (c) |k| k.getValue(row) else .null;
+}
+
+/// The column a checkpoint field names by its dotted path: a top-level column,
+/// then each struct's field by name; null when the file has none.
+fn columnAt(b: Batch, path: []const u8) ?column.Column {
+    var it = std.mem.splitScalar(u8, path, '.');
+    var col = b.columns[b.schema.indexOf(it.first()) orelse return null];
+    while (it.next()) |part| {
+        if (col.ty.kind != .@"struct") return null;
+        const fields = col.ty.fields orelse return null;
+        const k = for (fields, 0..) |f, i| {
+            if (std.mem.eql(u8, f.name, part)) break i;
+        } else return null;
+        col = col.data.nested.body.fields[k];
+    }
+    return col;
 }
 
 fn oneOf(s: []const u8, set: []const []const u8) bool {
@@ -478,8 +500,8 @@ fn ownJson(arena: std.mem.Allocator, v: std.json.Value, depth: u8) !std.json.Val
     }
 }
 
-/// `schemaString` as the reader's columns: a struct's fields as dotted columns,
-/// an array or map as one JSON text column, every column nullable.
+/// `schemaString` as the reader's columns: each top-level field one column, a
+/// struct, array or map one nested column of that type, every column nullable.
 fn schemaOf(arena: std.mem.Allocator, name: []const u8, text: []const u8) !types.Schema {
     return (try parseSchema(arena, name, text, null)).schema;
 }
@@ -540,6 +562,12 @@ fn mapType(arena: std.mem.Allocator, name: []const u8, by: Mapping.By, col: []co
 }
 
 fn addFields(arena: std.mem.Allocator, name: []const u8, out: *std.array_list.Managed(types.Schema.Field), prefix: []const u8, v: std.json.Value, depth: usize) !void {
+    for (try structFields(arena, name, prefix, v, depth)) |f| try out.append(.{ .name = f.name, .ty = f.ty.asNullable() });
+}
+
+/// A schemaString struct's fields as basalt's, each nullable as the table's
+/// files may hold nulls anywhere; `col` names the struct in messages.
+fn structFields(arena: std.mem.Allocator, name: []const u8, col: []const u8, v: std.json.Value, depth: usize) anyerror![]const types.Type.Field {
     if (depth >= table.max_depth) return refuse("{s} has a schemaString nested deeper than {d} levels", .{ name, table.max_depth });
     const fields = switch (try dtypes.fields(arena, v, .reading)) {
         .fields => |fs| fs,
@@ -548,21 +576,36 @@ fn addFields(arena: std.mem.Allocator, name: []const u8, out: *std.array_list.Ma
             .not_struct, .not_object => refuse("{s} has a schemaString that is not a struct of fields", .{name}),
         },
     };
-    for (fields) |f| {
-        const full = try std.mem.concat(arena, u8, &.{ prefix, f.name });
-        const t = f.ty;
-        switch (t) {
-            .string => |s| try out.append(.{ .name = full, .ty = (try primitive(name, full, s)).asNullable() }),
-            .object => |o| {
-                const kind = str(o.get("type")) orelse "";
-                if (std.mem.eql(u8, kind, "struct")) {
-                    try addFields(arena, name, out, try std.mem.concat(arena, u8, &.{ full, "." }), t, depth + 1);
-                } else if (std.mem.eql(u8, kind, "array") or std.mem.eql(u8, kind, "map")) {
-                    try out.append(.{ .name = full, .ty = types.Type.init(.string).asNullable() });
-                } else return refuse("{s} has a column `{s}` of type `{s}`, which basalt does not read", .{ name, full, kind });
-            },
-            else => return refuse("{s} has a column `{s}` with no type", .{ name, full }),
-        }
+    const out = try arena.alloc(types.Type.Field, fields.len);
+    for (fields, out) |f, *o| {
+        const full = if (col.len == 0) f.name else try std.mem.concat(arena, u8, &.{ col, ".", f.name });
+        o.* = .{ .name = f.name, .ty = (try typeOf(arena, name, full, f.ty, depth + 1)).asNullable() };
+    }
+    return out;
+}
+
+/// A schemaString type as basalt's: a primitive, a struct of its fields, an array
+/// as a list of its element and a map of its key (never null) and value.
+fn typeOf(arena: std.mem.Allocator, name: []const u8, col: []const u8, t: std.json.Value, depth: usize) anyerror!types.Type {
+    if (depth >= table.max_depth) return refuse("{s} has a schemaString nested deeper than {d} levels", .{ name, table.max_depth });
+    switch (t) {
+        .string => |s| return primitive(name, col, s),
+        .object => |o| {
+            const kind = str(o.get("type")) orelse "";
+            if (std.mem.eql(u8, kind, "struct")) return .{ .kind = .@"struct", .fields = try structFields(arena, name, col, t, depth) };
+            if (std.mem.eql(u8, kind, "array")) {
+                const e = try arena.create(types.Type);
+                e.* = (try typeOf(arena, name, col, o.get("elementType") orelse .null, depth + 1)).asNullable();
+                return .{ .kind = .array, .elem = e };
+            }
+            if (std.mem.eql(u8, kind, "map")) {
+                const k = try typeOf(arena, name, col, o.get("keyType") orelse .null, depth + 1);
+                const v = (try typeOf(arena, name, col, o.get("valueType") orelse .null, depth + 1)).asNullable();
+                return .{ .kind = .map, .fields = try arena.dupe(types.Type.Field, &.{ .{ .name = "key", .ty = k }, .{ .name = "value", .ty = v } }) };
+            }
+            return refuse("{s} has a column `{s}` of type `{s}`, which basalt does not read", .{ name, col, kind });
+        },
+        else => return refuse("{s} has a column `{s}` with no type", .{ name, col }),
     }
 }
 
@@ -828,7 +871,7 @@ test "protocol: reader versions and features, refused only where the table uses 
     try testing.expectError(table.Error.LakeTableRefused, st.checkProtocol());
 }
 
-test "schemaString: primitives, a struct as dotted columns, array and map as JSON text" {
+test "schemaString: primitives, and a struct, an array and a map as nested columns of those types" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -843,14 +886,16 @@ test "schemaString: primitives, a struct as dotted columns, array and map as JSO
         \\{"name":"m","type":{"type":"map","keyType":"string","valueType":"long","valueContainsNull":true},"nullable":true,"metadata":{}},
         \\{"name":"nothing","type":"void","nullable":true,"metadata":{}}]}
     );
-    const want = [_]struct { []const u8, types.TypeKind }{
-        .{ "id", .int },      .{ "amt", .decimal }, .{ "ts", .timestamp },   .{ "addr.city", .string }, .{ "addr.geo.lat", .float },
-        .{ "tags", .string }, .{ "m", .string },    .{ "nothing", .string },
+    const want = [_]struct { []const u8, []const u8 }{
+        .{ "id", "int" },            .{ "amt", "decimal(12,3)" },
+        .{ "ts", "timestamp" },      .{ "addr", "struct(city string, geo struct(lat float))" },
+        .{ "tags", "list(string)" }, .{ "m", "map(string, int)" },
+        .{ "nothing", "string" },
     };
     try testing.expectEqual(want.len, s.fields.len);
     for (want, s.fields) |w, f| {
         try testing.expectEqualStrings(w[0], f.name);
-        try testing.expectEqual(w[1], f.ty.kind);
+        try testing.expectEqualStrings(w[1], try f.ty.name(a));
         try testing.expect(f.ty.nullable);
     }
     try testing.expectEqual(@as(u8, 12), s.fields[1].ty.precision);
