@@ -1,5 +1,6 @@
 //! A nested column's Parquet shape, from its basalt type: the schema elements as
-//! the format's spec lays them out, and the plan the shredder (`shred.zig`) walks.
+//! the format's spec lays them out, and the plan the writer shreds a column by
+//! (`write.zig`'s `LeafWalk`, down each leaf's `chains` entry).
 //!
 //! A struct is a group of its fields. A list is the three-level form the spec
 //! requires of new files, `<name> (LIST) { repeated group list { <elem> element } }`,
@@ -13,9 +14,7 @@
 //! levels once an entry is present, the second the level a further entry repeats
 //! at. Every level comes from `schema.step`, the rule the reader's walk takes its
 //! levels from, so what is written is what is read back; a test holds the plan's
-//! leaves against `schema.collectLeaves` over the elements. A struct also takes
-//! `slot`, where its fields' values sit in the shredder's scratch while a row's
-//! object is walked; `Shape.slots` counts them.
+//! leaves against `schema.collectLeaves` over the elements.
 
 const std = @import("std");
 const types = @import("../../lang/types.zig");
@@ -37,7 +36,6 @@ pub const Node = struct {
     children: []Node = &.{},
     first_leaf: u32 = 0,
     leaves: u32 = 0,
-    slot: u32 = 0,
 };
 
 pub const Shape = struct {
@@ -45,7 +43,7 @@ pub const Shape = struct {
     elements: []const footer.SchemaElement,
     leaves: []const *const Node,
     paths: []const []const []const u8,
-    slots: u32,
+    chains: []const []const *const Node,
 };
 
 pub const Error = error{ OutOfMemory, UnsupportedNestedType };
@@ -56,7 +54,7 @@ pub fn of(arena: std.mem.Allocator, name: []const u8, ty: types.Type) Error!Shap
     const root = try arena.create(Node);
     root.* = try b.node(name, ty, ty.nullable, 0, 0);
     try b.number(root);
-    return .{ .root = root, .elements = b.elements.items, .leaves = b.leaves.items, .paths = b.paths.items, .slots = b.slots };
+    return .{ .root = root, .elements = b.elements.items, .leaves = b.leaves.items, .paths = b.paths.items, .chains = b.chains.items };
 }
 
 const Builder = struct {
@@ -65,7 +63,8 @@ const Builder = struct {
     leaves: std.ArrayList(*const Node),
     paths: std.ArrayList([]const []const u8) = .empty,
     path: std.ArrayList([]const u8) = .empty,
-    slots: u32 = 0,
+    chains: std.ArrayList([]const *const Node) = .empty,
+    chain: std.ArrayList(*const Node) = .empty,
 
     fn add(b: *Builder, e: footer.SchemaElement) Error!void {
         try b.elements.append(b.arena, e);
@@ -113,11 +112,13 @@ const Builder = struct {
     }
 
     /// Each node's first leaf and leaf count, leaves listed in schema order with
-    /// their paths from the column down, and each struct's scratch slots. A list's
+    /// their paths and node chains from the column down. A list's
     /// and a map's repeated group is named on the path as the elements name it.
     fn number(b: *Builder, n: *Node) Error!void {
         try b.path.append(b.arena, n.name);
         defer _ = b.path.pop();
+        try b.chain.append(b.arena, n);
+        defer _ = b.chain.pop();
         if (n.kind == .list) try b.path.append(b.arena, "list");
         if (n.kind == .map) try b.path.append(b.arena, "key_value");
         defer if (n.kind == .list or n.kind == .map) {
@@ -127,12 +128,9 @@ const Builder = struct {
         if (n.kind == .leaf) {
             try b.leaves.append(b.arena, n);
             try b.paths.append(b.arena, try b.arena.dupe([]const u8, b.path.items));
+            try b.chains.append(b.arena, try b.arena.dupe(*const Node, b.chain.items));
             n.leaves = 1;
             return;
-        }
-        if (n.kind == .group) {
-            n.slot = b.slots;
-            b.slots += @intCast(n.children.len);
         }
         for (n.children) |*k| try b.number(k);
         n.leaves = @as(u32, @intCast(b.leaves.items.len)) - n.first_leaf;

@@ -14,11 +14,13 @@
 //! the batch arena, which is recycled long before the group flushes.
 //!
 //! The writer's columns are leaves. A flat field is one, at definition level 1 if
-//! nullable, else 0. A nested field (a list, map or struct, held as JSON text) is
-//! its `shape.zig` groups and leaves, each leaf mapped as a flat column of its type
-//! would be and encoded the same way, plus repetition levels. Each row of the field
-//! is shredded into its leaves (`shred.zig`). A leaf's page is sealed only before
-//! a row starts, so no row spans two pages. `Lay` places each field's leaves among
+//! nullable, else 0. A nested field (a list, map or struct) is its `shape.zig`
+//! groups and leaves, each leaf mapped as a flat column of its type would be and
+//! encoded by the same typed slice encoders, plus repetition levels. It is shredded
+//! from its child columns a leaf at a time (`LeafWalk`), Dremel's record shredding
+//! over offsets and null masks, so each leaf's buffers are read in order and none
+//! is boxed or parsed. A leaf's page is sealed only between rows, so no row spans
+//! two pages. `Lay` places each field's leaves among
 //! the columns. The footer writes the groups' elements and each leaf's full path.
 //! A nested field has no summary statistics (`summarize`). Its leaf chunks keep theirs.
 //!
@@ -79,10 +81,6 @@ const Value = @import("../../exec/value.zig").Value;
 
 const List = std.array_list.Managed;
 const shape = @import("shape.zig");
-const shred = @import("shred.zig");
-const json = @import("../../exec/json.zig");
-const nested = @import("../../exec/nested.zig");
-const celltext = @import("../../exec/celltext.zig");
 
 const Lay = struct { first: u32, n: u32, shape: ?*const shape.Shape = null };
 
@@ -149,7 +147,6 @@ fn newCols(arena: std.mem.Allocator, alloc: std.mem.Allocator, c: Columns) Error
 pub const Error = error{
     UnsupportedParquetWrite,
     UnsupportedParquetNestedType,
-    ParquetNestedValueMismatch,
     AppendNotSupported,
     UnsupportedParquetDecimal,
     ParquetValueOutOfRange,
@@ -258,6 +255,7 @@ const ColBuf = struct {
     present_def: u8 = 1,
     def_width: u8 = 1,
     rep_width: u8 = 0,
+    run_reps: []const u8 = &.{},
     bit_buf: u8 = 0,
     bit_n: u3 = 0,
     nulls: i64 = 0,
@@ -292,6 +290,17 @@ const ColBuf = struct {
             .fixed_raw = List(u8).init(a),
             .dict_idx = List(u32).init(a),
         };
+    }
+
+    /// A definition level, and the repetition level `run_reps` holds for it next when
+    /// a nested leaf's run is being encoded, so the two stay paired as `spill` and
+    /// `rebuildPlain` read them.
+    inline fn pushDef(self: *ColBuf, d: u8) !void {
+        self.defs.appendAssumeCapacity(d);
+        if (self.run_reps.len > 0) {
+            try self.reps.append(self.run_reps[0]);
+            self.run_reps = self.run_reps[1..];
+        }
     }
 
     fn sealPage(self: *ColBuf, arena: std.mem.Allocator) !void {
@@ -676,20 +685,20 @@ pub const Writer = struct {
         }
     }
 
-    /// Rows `lo..hi` of nested column `col` shredded into its leaves, a leaf past
-    /// `page_target_bytes` sealing its page before a row starts, so no row spans
-    /// two pages.
+    /// Rows `lo..hi` of nested column `col` shredded into its leaves, a leaf at a
+    /// time (`LeafWalk`) over slices of `slice_rows`: a leaf past
+    /// `page_target_bytes` seals its page between slices, so no row spans two pages.
     fn shredRows(self: *Writer, sa: std.mem.Allocator, sh: *const shape.Shape, lay: Lay, col: column.Column, lo: usize, hi: usize) !void {
-        const cols = self.cols[lay.first..][0..lay.n];
-        var s = try shred.Shredder(LeafSink).init(sa, sh, .{ .cols = cols, .maps = self.maps[lay.first..][0..lay.n], .sh = sh, .sa = sa });
-        for (lo..hi) |r| {
-            for (cols) |*cb| if (!cb.dict_ok and cb.values.items.len >= page_target_bytes) try cb.sealPage(sa);
-            const text: ?[]const u8 = if (!col.validity.get(r)) null else if (col.data == .nested) try sa.dupe(u8, celltext.nestedText(&col, r)) else col.data.bytes.at(r);
-            s.row(sa, text) catch |e| return switch (e) {
-                error.InvalidJson, error.NotNested, error.CastFailed => Error.ParquetNestedValueMismatch,
-                error.NullInRequired => Error.ParquetNullInRequired,
-                else => e,
-            };
+        for (sh.chains, self.cols[lay.first..][0..lay.n], self.maps[lay.first..][0..lay.n]) |chain, *cb, m| {
+            var w = LeafWalk{ .cb = cb, .sa = sa, .m = m, .chain = chain };
+            var at = lo;
+            while (at < hi) {
+                const end = @min(hi, at + slice_rows);
+                for (at..end) |r| try w.rowAt(0, col, r, 0);
+                try w.flush();
+                if (!cb.dict_ok and cb.values.items.len >= page_target_bytes) try cb.sealPage(sa);
+                at = end;
+            }
         }
     }
 
@@ -1388,18 +1397,14 @@ fn encodeSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: column.Colum
 }
 
 fn encodeValue(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, v: Value) !void {
+    try cb.defs.ensureUnusedCapacity(1);
     if (v == .null) {
-        try cb.defs.append(0);
         if (!m.optional) return Error.ParquetNullInRequired;
+        try cb.pushDef(cb.present_def - 1);
         cb.nulls += 1;
         return;
     }
-    try encodeAt(cb, sa, m, 1, v);
-}
-
-/// Non-null value `v` at definition level `def`, its column's full depth.
-fn encodeAt(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, def: u8, v: Value) !void {
-    try cb.defs.append(def);
+    try cb.pushDef(cb.present_def);
     try cb.observe(sa, v);
     switch (m.phys) {
         .boolean => try cb.pushBit(v == .bool and v.bool),
@@ -1414,38 +1419,75 @@ fn encodeAt(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, def: u8, v: Value) !
     }
 }
 
-/// The shredder's sink for one nested column: each leaf's levels and values into
-/// its column buffer, a leaf's JSON scalar read as its type by `nested.scalarOf`.
-const LeafSink = struct {
-    pub const Error = anyerror;
-    cols: []ColBuf,
-    maps: []const Mapping,
-    sh: *const shape.Shape,
+/// One leaf of a nested column shredded from the column's storage. Rows are
+/// walked down the leaf's node chain: a null or empty ancestor writes its
+/// definition level and no value, and the leaf's own rows reached in order go to
+/// `encodeSlice` a run at a time, as a flat column's rows do, at the leaf's full
+/// depth (`ColBuf.present_def`) or one short of it when null. Repetition levels
+/// follow the walk: 0 at a row, a list's or map's own level for its later entries.
+const LeafWalk = struct {
+    cb: *ColBuf,
     sa: std.mem.Allocator,
+    m: Mapping,
+    chain: []const *const shape.Node,
+    run_col: column.Column = undefined,
+    run_lo: usize = 0,
+    run_hi: usize = 0,
+    run_reps: std.ArrayListUnmanaged(u8) = .empty,
 
-    pub fn level(self: LeafSink, leaf: u32, rep: u32, def: u32, v: ?shred.Leaf) anyerror!void {
-        const cb = &self.cols[leaf];
-        if (cb.rep_width > 0) try cb.reps.append(@intCast(rep));
-        const x = v orelse {
-            try cb.defs.append(@intCast(def));
-            cb.nulls += 1;
-            return;
-        };
-        const val = try leafValue(self.sa, self.sh.leaves[leaf].ty, x);
-        try encodeAt(cb, self.sa, self.maps[leaf], @intCast(def), val);
+    fn rowAt(w: *LeafWalk, depth: usize, col: column.Column, row: usize, rep: u32) anyerror!void {
+        const n = w.chain[depth];
+        if (depth + 1 == w.chain.len) return w.leafRow(col, row, rep);
+        if (!col.validity.get(row)) {
+            if (!n.nullable) return Error.ParquetNullInRequired;
+            return w.structural(rep, n.def - 1);
+        }
+        const next = w.chain[depth + 1];
+        const k = (@intFromPtr(next) - @intFromPtr(n.children.ptr)) / @sizeOf(shape.Node);
+        const body = col.data.nested.body;
+        switch (n.kind) {
+            .group => try w.rowAt(depth + 1, body.fields[k], row, rep),
+            .list, .map => {
+                const l = body.list;
+                const lo: usize = @intCast(l.offsets[row]);
+                const hi: usize = @intCast(l.offsets[row + 1]);
+                if (lo == hi) return w.structural(rep, n.def);
+                const child = if (n.kind == .map) l.child.data.nested.body.fields[k] else l.child;
+                for (lo..hi) |x| try w.rowAt(depth + 1, child, x, if (x == lo) rep else n.entry_rep);
+            },
+            .leaf => unreachable,
+        }
+    }
+
+    fn leafRow(w: *LeafWalk, col: column.Column, row: usize, rep: u32) !void {
+        if (!(w.run_hi > w.run_lo and w.run_hi == row)) {
+            try w.flush();
+            w.run_col = col;
+            w.run_lo = row;
+            w.run_hi = row;
+        }
+        w.run_hi += 1;
+        if (w.cb.rep_width > 0) try w.run_reps.append(w.sa, @intCast(rep));
+    }
+
+    fn structural(w: *LeafWalk, rep: u32, def: u32) !void {
+        try w.flush();
+        if (w.cb.rep_width > 0) try w.cb.reps.append(@intCast(rep));
+        try w.cb.defs.append(@intCast(def));
+        w.cb.nulls += 1;
+    }
+
+    fn flush(w: *LeafWalk) !void {
+        if (w.run_hi > w.run_lo) {
+            w.cb.run_reps = w.run_reps.items;
+            try encodeSlice(w.cb, w.sa, w.m, w.run_col, w.run_lo, w.run_hi);
+            std.debug.assert(w.cb.run_reps.len == 0);
+        }
+        w.run_reps.clearRetainingCapacity();
+        w.run_lo = 0;
+        w.run_hi = 0;
     }
 };
-
-fn leafValue(sa: std.mem.Allocator, ty: types.Type, v: shred.Leaf) !Value {
-    const text = switch (v) {
-        .json => |t| switch (try json.cell(sa, t)) {
-            .null => unreachable,
-            .text => |x| x,
-        },
-        .key => |k| try json.decodeString(sa, k),
-    };
-    return nested.scalarOf(sa, ty, text);
-}
 
 fn typedValue(kind: types.TypeKind, x: anytype) Value {
     return switch (@TypeOf(x)) {
@@ -1470,11 +1512,11 @@ fn encodeFixedSlice(comptime T: type, cb: *ColBuf, sa: std.mem.Allocator, option
     for (lo..hi) |r| {
         if (!col.validity.get(r)) {
             if (!optional) return Error.ParquetNullInRequired;
-            cb.defs.appendAssumeCapacity(0);
+            try cb.pushDef(cb.present_def - 1);
             cb.nulls += 1;
             continue;
         }
-        cb.defs.appendAssumeCapacity(1);
+        try cb.pushDef(cb.present_def);
         const x = data[r];
         var le: [@sizeOf(T)]u8 = undefined;
         std.mem.writeInt(U, &le, @bitCast(x), .little);
@@ -1517,11 +1559,11 @@ fn encodeDecimalSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: colum
     for (lo..hi) |r| {
         if (!col.validity.get(r)) {
             if (!m.optional) return Error.ParquetNullInRequired;
-            cb.defs.appendAssumeCapacity(0);
+            try cb.pushDef(cb.present_def - 1);
             cb.nulls += 1;
             continue;
         }
-        cb.defs.appendAssumeCapacity(1);
+        try cb.pushDef(cb.present_def);
         var buf: [16]u8 = undefined;
         const out = buf[0..width];
         const x: i128 = switch (m.phys) {
@@ -1565,11 +1607,11 @@ fn encodeBytesSlice(cb: *ColBuf, sa: std.mem.Allocator, optional: bool, col: col
     for (lo..hi) |r| {
         if (!col.validity.get(r)) {
             if (!optional) return Error.ParquetNullInRequired;
-            cb.defs.appendAssumeCapacity(0);
+            try cb.pushDef(cb.present_def - 1);
             cb.nulls += 1;
             continue;
         }
-        cb.defs.appendAssumeCapacity(1);
+        try cb.pushDef(cb.present_def);
         const s = b.at(r);
         try cb.putBytes(sa, s);
         if (mn == null or std.mem.order(u8, s, mn.?) == .lt) mn = s;
@@ -1937,6 +1979,41 @@ test "a nested struct's typed leaves are read from their JSON text: bools, float
 
     var bad = try column.Builder.initCapacity(a, rec, 1);
     try testing.expectError(error.CastFailed, bad.append(.{ .string = "{\"d\":\"not a date\"}" }));
+}
+
+test "lists of lists repeat at each depth, an empty and a null inner list apart, and a map's null value stays null" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const path = try std.fs.path.join(a, &.{ dir, "lol.parquet" });
+
+    const int = types.Type.init(.int).asNullable();
+    const inner = types.Type{ .kind = .array, .nullable = true, .elem = &int };
+    const outer = types.Type{ .kind = .array, .nullable = true, .elem = &inner };
+    const m = types.Type{ .kind = .map, .nullable = true, .fields = &.{ .{ .name = "key", .ty = types.Type.init(.string) }, .{ .name = "value", .ty = int } } };
+    const schema = types.Schema{ .fields = &.{ .{ .name = "l", .ty = outer }, .{ .name = "m", .ty = m } } };
+    const ls = [_]?[]const u8{ "[[1,2],[],null]", "[[3]]", "[]", null };
+    const ms = [_]?[]const u8{ "{\"a\":1,\"b\":null}", "{}", null, "{\"c\":3}" };
+    var lb = column.Builder.init(a, outer);
+    var mb = column.Builder.init(a, m);
+    for (ls, ms) |l, x| {
+        try lb.append(if (l) |t| .{ .string = t } else .null);
+        try mb.append(if (x) |t| .{ .string = t } else .null);
+    }
+    var cols = [_]column.Column{ try lb.finish(), try mb.finish() };
+    var w = try Writer.open(a, path, schema, .snappy, .truncate);
+    try w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = ls.len });
+    try w.close();
+
+    const r = try pqdecode.Reader.open(a, path);
+    const b = (try r.next(a)).?;
+    for (ls, ms, 0..) |l, x, i| {
+        try expectText(l, b.columns[0].getValue(i));
+        try expectText(x, b.columns[1].getValue(i));
+    }
 }
 
 test "a nested column over many pages, dictionary and PLAIN leaves alike, reads back row for row, written directly or through a unit encoder" {
