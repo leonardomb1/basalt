@@ -654,6 +654,7 @@ fn pushDict(rows: Rows, cast: Cast, d: Dict, idx: []const u32) Error!void {
             else
                 try rows.put(Decimal, cast, Cast.same, NarrowGather{ .view = view, .idx = idx }, idx.len);
         },
+        .nested => unreachable,
         inline else => |_, tag| {
             const vals = column.fixedOf(tag, d.col.data);
             const T = column.Elem(tag);

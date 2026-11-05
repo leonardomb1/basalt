@@ -241,7 +241,7 @@ fn Read(comptime c: Code) type {
         .f64 => f64,
         .bytes => []const u8,
         .dec => Decimal,
-        .d64 => unreachable,
+        .d64, .nested => unreachable,
     };
 }
 
@@ -294,7 +294,7 @@ fn valueOf(comptime c: Code, kind: types.TypeKind, x: Read(c)) Value {
         .f64 => .{ .float = x },
         .bytes => if (kind == .string) .{ .string = x } else .{ .bytes = x },
         .dec => .{ .decimal = x },
-        .d64 => unreachable,
+        .d64, .nested => unreachable,
     };
 }
 
@@ -508,7 +508,10 @@ pub const Machine = struct {
             error.OutOfMemory => return error.OutOfMemory,
             else => return unsupported("`{s}`: a value of column `{s}` does not fit the first file's {s}", .{ m.source_name, m.table.fields[op.col].name, try ty.name(arena) }),
         };
-        try m.out[op.col].append(cast);
+        m.out[op.col].append(cast) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.CastFailed => unsupported("`{s}`: a value of column `{s}` does not fit the first file's {s}", .{ m.source_name, m.table.fields[op.col].name, try ty.name(arena) }),
+        };
     }
 
     /// The value at the cursor as a `Value`, for JSON text and a cast.

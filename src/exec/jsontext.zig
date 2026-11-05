@@ -119,6 +119,7 @@ pub fn scalar(w: *Writer, v: Value, comptime style: Style) Writer.Error!void {
             try format.writeTimestamp(w, x);
             try w.writeByte('"');
         },
+        .nested => |r| try @import("nested.zig").writeJson(w, r.node, r.row),
     }
 }
 

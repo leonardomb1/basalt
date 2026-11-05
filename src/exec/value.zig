@@ -3,6 +3,9 @@
 //! the boxed, one-at-a-time view used at cold edges and in tests. `Decimal` and
 //! its logic live in `decimal.zig`.
 //!
+//! A nested value (a list, map or struct) is a `NestedRef` into its column, not a
+//! copy, so a `Value` stays as small as its scalars need.
+//!
 //! `Threshold` is the live top-N bound shared between a TopN operator and a source
 //! that can skip blocks (currently parquet). The operator publishes the K-th value;
 //! a source skips regions whose statistics prove they hold nothing better. Until
@@ -30,8 +33,14 @@ pub const Value = union(enum) {
     date: i32,
     time: i64,
     timestamp: i64,
+    nested: NestedRef,
 
     pub fn isNull(self: Value) bool {
         return self == .null;
     }
 };
+
+/// Row `row` of a nested column's storage, borrowed: valid while the batch that
+/// holds `node` is. Whatever keeps a value past its batch copies it
+/// (`Builder.append`, `dupeValue`).
+pub const NestedRef = struct { node: *const @import("column.zig").Nested, row: usize };

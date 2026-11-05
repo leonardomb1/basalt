@@ -558,6 +558,7 @@ pub fn Scalar(comptime F: type) type {
 fn valueKind(v: Value) ?types.TypeKind {
     return switch (v) {
         .null => null,
+        .nested => |r| r.node.ty.kind,
         inline else => |_, tag| @field(types.TypeKind, @tagName(tag)),
     };
 }

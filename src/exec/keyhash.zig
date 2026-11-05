@@ -121,11 +121,23 @@ pub fn hashValue(h: *std.hash.Wyhash, v: Value) void {
         .date => |x| hashTagged(h, .date, std.mem.asBytes(&x)),
         .time => |x| hashTagged(h, .time, std.mem.asBytes(&x)),
         .timestamp => |x| hashTagged(h, .timestamp, std.mem.asBytes(&x)),
+        .nested => |r| hashNested(h, r),
     }
 }
 
-/// `hashValue` of valid row `row` of `col`, read from its storage without boxing. A
-/// nested value, which boxes to null, hashes by its encoded bytes under the bytes tag.
+/// A nested value hashed by its canonical JSON (`nested.writeJson`), streamed into
+/// the hasher, so equal values hash alike with nothing allocated.
+fn hashNested(h: *std.hash.Wyhash, r: @import("value.zig").NestedRef) void {
+    hashTagged(h, .nested, &.{});
+    var buf: [256]u8 = undefined;
+    var hw = std.Io.Writer.Hashing(std.hash.Wyhash).initHasher(h.*, &buf);
+    @import("nested.zig").writeJson(&hw.writer, r.node, r.row) catch unreachable;
+    hw.writer.flush() catch unreachable;
+    h.* = hw.hasher;
+}
+
+/// `hashValue` of valid row `row` of `col`, read from its storage without boxing
+/// where it has a scalar's.
 pub inline fn hashCell(h: *std.hash.Wyhash, col: *const Column, row: usize) void {
     switch (col.ty.kind) {
         .int => hashInt(h, col.data.i64[row]),
@@ -133,8 +145,8 @@ pub inline fn hashCell(h: *std.hash.Wyhash, col: *const Column, row: usize) void
         .time => hashTagged(h, .time, std.mem.asBytes(&col.data.i64[row])),
         .timestamp => hashTagged(h, .timestamp, std.mem.asBytes(&col.data.i64[row])),
         .string => hashTagged(h, .string, col.data.bytes.at(row)),
-        .bytes, .array, .@"struct", .map => hashTagged(h, .bytes, col.data.bytes.at(row)),
-        .bool, .date, .decimal => hashValue(h, col.getValue(row)),
+        .bytes => hashTagged(h, .bytes, col.data.bytes.at(row)),
+        .bool, .date, .decimal, .array, .@"struct", .map => hashValue(h, col.getValue(row)),
     }
 }
 

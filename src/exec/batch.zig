@@ -46,12 +46,7 @@ pub const Batch = struct {
     /// A byte column counts only its rows' span, as it may view a larger buffer.
     pub fn heapBytes(self: Batch) usize {
         var n: usize = 0;
-        for (self.columns) |c| {
-            n += c.validity.bits.len + switch (c.data) {
-                .bytes => |b| b.span(c.len) + b.offsets.len * @sizeOf(i32),
-                inline else => |_, t| std.mem.sliceAsBytes(column_mod.fixedOf(t, c.data)).len,
-            };
-        }
+        for (self.columns) |c| n += column_mod.heapBytes(c);
         return n;
     }
 };

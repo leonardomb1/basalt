@@ -28,8 +28,12 @@ const valueToString = @import("format.zig").valueToString;
 pub fn castValueTyped(arena: std.mem.Allocator, v: Value, ty: types.Type) EvalError!Value {
     if (ty.isNested()) {
         if (v == .null) return .null;
-        if (v != .string) return error.CastFailed;
-        return if (try nested.conform(arena, v.string, ty)) |t| .{ .string = t } else .null;
+        const t = switch (v) {
+            .string => |x| x,
+            .nested => |r| if (r.node.ty.eql(ty)) return v else try nested.jsonText(arena, r),
+            else => return error.CastFailed,
+        };
+        return nested.parse(arena, t, ty);
     }
     if (ty.kind != .decimal) return castValue(arena, v, ty.kind);
     return .{ .decimal = try toDecimal(asDecimalValue(v), ty) };
@@ -183,7 +187,7 @@ pub fn castValue(arena: std.mem.Allocator, v: Value, kind: types.TypeKind) EvalE
     switch (kind) {
         .string => return .{ .string = try valueToString(arena, v) },
         inline .bool, .int, .float, .date, .timestamp, .time => |to| switch (v) {
-            .null, .bytes => return error.CastFailed,
+            .null, .bytes, .nested => return error.CastFailed,
             inline else => |x, tag| {
                 const from = comptime @field(types.TypeKind, @tagName(tag));
                 if (comptime from == to) return v;

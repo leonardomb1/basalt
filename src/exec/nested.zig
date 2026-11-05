@@ -1,11 +1,13 @@
-//! Nested values against their type. A list, map or struct is held as JSON text,
-//! and `CAST` to one conforms the text to it: a struct's fields in the type's
+//! Nested values and JSON text. A list, map or struct column holds `column.Nested`
+//! storage. JSON text is how one is read in (`appendJson`, behind `CAST` and
+//! `Builder.append`) and how it is shown and written as text (`writeJson`).
+//! `CAST` to a nested type reads the text as it: a struct's fields in the type's
 //! order, a field the text lacks as null and one it has beyond the type dropped,
 //! a list's elements and a map's entries in the order written, and every scalar
-//! read as its type and written back as basalt writes JSON (`jsontext.scalar`), so
-//! equal values conform to equal text. A container of the wrong JSON kind, a value
-//! that does not read as its type, or a null where the type is NOT NULL fails the
-//! cast. A map's key is its text as an object key (`jsontext.keyText`).
+//! read as its type, so equal values write back (`writeJson`) as equal text. A
+//! container of the wrong JSON kind, a value that does not read as its type, or a
+//! null where the type is NOT NULL fails the cast. A map's key is read as the key
+//! type from its text.
 //!
 //! `scalarOf` is the one rule for a JSON scalar as a typed value, which the
 //! Parquet writer reads nested leaves by too: text as itself, BYTES from the base64
@@ -18,6 +20,8 @@ const types = @import("../lang/types.zig");
 const Value = @import("value.zig").Value;
 const castValueTyped = @import("eval/cast.zig").castValueTyped;
 const EvalError = @import("eval.zig").EvalError;
+const column = @import("column.zig");
+const Builder = column.Builder;
 
 const Writer = std.Io.Writer;
 
@@ -30,76 +34,122 @@ pub fn scalarOf(arena: std.mem.Allocator, ty: types.Type, text: []const u8) Eval
     };
 }
 
-/// JSON text `text` conformed to nested type `ty`, or null when it is JSON `null`.
-pub fn conform(arena: std.mem.Allocator, text: []const u8, ty: types.Type) EvalError!?[]const u8 {
-    json.validate(arena, text) catch |e| return if (e == error.OutOfMemory) e else error.CastFailed;
-    const t = std.mem.trim(u8, text, " \t\r\n");
-    if (t[0] == 'n') return null;
-    var out = try Writer.Allocating.initCapacity(arena, t.len + t.len / 4);
-    value(arena, &out.writer, t, ty) catch |e| return switch (e) {
-        error.WriteFailed => error.OutOfMemory,
-        else => |x| x,
-    };
-    return out.written();
+/// JSON text `text` read as nested type `ty`, by `appendJson`'s rules: a nested
+/// value in a one-row column of its own, or null when the text is JSON `null`.
+pub fn parse(arena: std.mem.Allocator, text: []const u8, ty: types.Type) EvalError!Value {
+    var b = Builder.init(arena, ty.asNullable());
+    try appendJson(&b, text);
+    const col = try b.finish();
+    if (!col.validity.get(0)) return .null;
+    return .{ .nested = .{ .node = col.data.nested, .row = 0 } };
 }
 
-const Error = EvalError || Writer.Error;
+/// JSON text `text` appended to nested builder `b` as one row, read by `conform`'s
+/// rules; JSON `null` is a null row.
+pub fn appendJson(b: *Builder, text: []const u8) Builder.AppendError!void {
+    json.validate(b.arena, text) catch |e| return failed(e);
+    const t = std.mem.trim(u8, text, " \t\r\n");
+    if (t[0] == 'n') return b.append(.null);
+    return into(b, t);
+}
 
-fn value(arena: std.mem.Allocator, w: *Writer, t: []const u8, ty: types.Type) Error!void {
+fn failed(e: anyerror) Builder.AppendError {
+    return if (e == error.OutOfMemory) error.OutOfMemory else error.CastFailed;
+}
+
+fn into(b: *Builder, t: []const u8) Builder.AppendError!void {
     if (t[0] == 'n') {
-        if (!ty.nullable) return error.CastFailed;
-        return w.writeAll("null");
+        if (!b.ty.nullable) return error.CastFailed;
+        return b.append(.null);
     }
-    switch (ty.kind) {
+    switch (b.ty.kind) {
         .@"struct" => {
             if (t[0] != '{') return error.CastFailed;
-            const fields = ty.fields orelse return error.CastFailed;
+            const fields = b.ty.fields orelse return error.CastFailed;
             var buf: [16]?[]const u8 = undefined;
-            const got = if (fields.len <= buf.len) buf[0..fields.len] else try arena.alloc(?[]const u8, fields.len);
-            try json.pick(arena, t, fields, got);
-            try w.writeByte('{');
-            for (fields, got, 0..) |f, v, i| {
-                if (i > 0) try w.writeByte(',');
-                try jsontext.key(w, f.name);
-                try value(arena, w, v orelse "null", f.ty);
-            }
-            try w.writeByte('}');
+            const got = if (fields.len <= buf.len) buf[0..fields.len] else try b.arena.alloc(?[]const u8, fields.len);
+            json.pick(b.arena, t, fields, got) catch |e| return failed(e);
+            const nb = try b.openNested();
+            for (nb.fields, got) |*k, v| try into(k, v orelse "null");
         },
         .array => {
             if (t[0] != '[') return error.CastFailed;
-            const elem = ty.elem orelse return error.CastFailed;
-            try w.writeByte('[');
+            const nb = try b.openNested();
             var it = json.Elements.root(t);
-            var first = true;
-            while (it.next()) |e| : (first = false) {
-                if (!first) try w.writeByte(',');
-                try value(arena, w, e, elem.*);
-            }
-            try w.writeByte(']');
+            while (it.next()) |e| try into(&nb.list.child, e);
+            try Builder.endEntries(nb);
         },
         .map => {
             if (t[0] != '{') return error.CastFailed;
-            const kv = ty.fields orelse return error.CastFailed;
-            if (kv.len != 2) return error.CastFailed;
-            try w.writeByte('{');
+            const nb = try b.openNested();
             var it = json.Members.root(t);
-            var first = true;
-            while (it.next()) |m| : (first = false) {
-                if (!first) try w.writeByte(',');
-                const k = try scalarOf(arena, kv[0].ty, try json.decodeString(arena, m.key));
-                try jsontext.key(w, try jsontext.keyText(arena, k));
-                try value(arena, w, m.value, kv[1].ty);
+            while (it.next()) |m| {
+                const kv = try nb.list.child.openNested();
+                const k = &kv.fields[0];
+                const key = json.decodeString(b.arena, m.key) catch |e| return failed(e);
+                try k.append(scalarOf(b.arena, k.ty, key) catch |e| return failed(e));
+                try into(&kv.fields[1], m.value);
+            }
+            try Builder.endEntries(nb);
+        },
+        else => {
+            const cell = json.cell(b.arena, t) catch |e| return failed(e);
+            try b.append(scalarOf(b.arena, b.ty, cell.text) catch |e| return failed(e));
+        },
+    }
+}
+
+/// Row `row` of nested storage `n` as basalt writes it as JSON: a struct an object
+/// in its type's field order, a list an array, a map an object keyed by each key's
+/// text, every scalar as `jsontext.scalar` writes one nested.
+pub fn writeJson(w: *Writer, n: *const column.Nested, row: usize) Writer.Error!void {
+    switch (n.body) {
+        .fields => |fs| {
+            try w.writeByte('{');
+            for (fs, n.ty.fields orelse &.{}, 0..) |c, f, i| {
+                if (i > 0) try w.writeByte(',');
+                try jsontext.key(w, f.name);
+                try jsontext.scalar(w, c.getValue(row), jsontext.nested);
             }
             try w.writeByte('}');
         },
-        else => {
-            const text = switch (try json.cell(arena, t)) {
-                .null => unreachable,
-                .text => |x| x,
-            };
-            try jsontext.scalar(w, try scalarOf(arena, ty, text), jsontext.nested);
+        .list => |l| {
+            const map = n.ty.kind == .map;
+            try w.writeByte(if (map) '{' else '[');
+            for (@as(usize, @intCast(l.offsets[row]))..@as(usize, @intCast(l.offsets[row + 1])), 0..) |x, i| {
+                if (i > 0) try w.writeByte(',');
+                if (!map) {
+                    try jsontext.scalar(w, l.child.getValue(x), jsontext.nested);
+                    continue;
+                }
+                const kv = l.child.data.nested.body.fields;
+                try writeKey(w, kv[0].getValue(x));
+                try w.writeByte(':');
+                try jsontext.scalar(w, kv[1].getValue(x), jsontext.nested);
+            }
+            try w.writeByte(if (map) '}' else ']');
         },
     }
+}
+
+/// A map key as an object key: text and BYTES (base64) as the strings they are,
+/// temporal values in their quoted ISO text, a number or bool quoted.
+fn writeKey(w: *Writer, k: Value) Writer.Error!void {
+    switch (k) {
+        .int, .float, .decimal, .bool => {
+            try w.writeByte('"');
+            try jsontext.scalar(w, k, jsontext.nested);
+            try w.writeByte('"');
+        },
+        else => try jsontext.scalar(w, k, jsontext.nested),
+    }
+}
+
+/// A nested value's JSON text in `arena`.
+pub fn jsonText(arena: std.mem.Allocator, r: @import("value.zig").NestedRef) error{OutOfMemory}![]const u8 {
+    var out = Writer.Allocating.init(arena);
+    writeJson(&out.writer, r.node, r.row) catch return error.OutOfMemory;
+    return out.written();
 }
 
 const testing = std.testing;
@@ -109,8 +159,8 @@ fn scalar(kind: types.TypeKind, nullable: bool) types.Type {
 }
 
 fn expectConform(a: std.mem.Allocator, ty: types.Type, in: []const u8, want: ?[]const u8) !void {
-    const got = try conform(a, in, ty);
-    if (want) |x| try testing.expectEqualStrings(x, got.?) else try testing.expect(got == null);
+    const got = try parse(a, in, ty);
+    if (want) |x| try testing.expectEqualStrings(x, try jsonText(a, got.nested)) else try testing.expect(got == .null);
 }
 
 test "nested: a struct takes its type's field order, nulls what is missing, drops the rest and reads each scalar as its type" {
@@ -127,11 +177,11 @@ test "nested: a struct takes its type's field order, nulls what is missing, drop
     try expectConform(a, rec, " {\"tags\":[\"1\",2,null],\"x\":true,\"amt\":\"1.5\",\"id\":\"7\"} ", "{\"id\":7,\"amt\":1.50,\"d\":null,\"tags\":[1,2,null]}");
     try expectConform(a, rec, "{\"id\":1,\"d\":\"2024-02-29\",\"tags\":[]}", "{\"id\":1,\"amt\":null,\"d\":\"2024-02-29\",\"tags\":[]}");
     try expectConform(a, rec, "null", null);
-    try testing.expectError(error.CastFailed, conform(a, "{\"amt\":1}", rec));
-    try testing.expectError(error.CastFailed, conform(a, "{\"id\":\"x\"}", rec));
-    try testing.expectError(error.CastFailed, conform(a, "[1]", rec));
-    try testing.expectError(error.CastFailed, conform(a, "{\"id\":1,\"tags\":{}}", rec));
-    try testing.expectError(error.CastFailed, conform(a, "{\"id\":", rec));
+    try testing.expectError(error.CastFailed, parse(a, "{\"amt\":1}", rec));
+    try testing.expectError(error.CastFailed, parse(a, "{\"id\":\"x\"}", rec));
+    try testing.expectError(error.CastFailed, parse(a, "[1]", rec));
+    try testing.expectError(error.CastFailed, parse(a, "{\"id\":1,\"tags\":{}}", rec));
+    try testing.expectError(error.CastFailed, parse(a, "{\"id\":", rec));
 }
 
 test "nested: a map reads its keys as the key type and keeps the order written; a NOT NULL element refuses a null" {
@@ -140,8 +190,8 @@ test "nested: a map reads its keys as the key type and keeps the order written; 
     const a = ar.allocator();
     const m = types.Type{ .kind = .map, .fields = &.{ .{ .name = "key", .ty = scalar(.int, false) }, .{ .name = "value", .ty = scalar(.bool, true) } } };
     try expectConform(a, m, "{\"10\":true,\"2\":\"false\",\"03\":null}", "{\"10\":true,\"2\":false,\"3\":null}");
-    try testing.expectError(error.CastFailed, conform(a, "{\"k\":true}", m));
+    try testing.expectError(error.CastFailed, parse(a, "{\"k\":true}", m));
     const strict = types.Type{ .kind = .array, .elem = &scalar(.string, false) };
     try expectConform(a, strict, "[\"a\",\"b\\n\"]", "[\"a\",\"b\\n\"]");
-    try testing.expectError(error.CastFailed, conform(a, "[\"a\",null]", strict));
+    try testing.expectError(error.CastFailed, parse(a, "[\"a\",null]", strict));
 }

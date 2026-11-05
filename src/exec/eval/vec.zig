@@ -13,6 +13,7 @@ const ast = @import("../../lang/ast.zig");
 const cast = @import("cast.zig");
 const cmpResult = @import("row.zig").cmpResult;
 const column = @import("../column.zig");
+const nested_json = @import("../nested.zig");
 const decimalArithType = @import("../decimal.zig").decimalArithType;
 const decimalOp = @import("../decimal.zig").decimalOp;
 const evalRow = @import("row.zig").evalRow;
@@ -159,6 +160,7 @@ fn rowwiseVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) Vec
             .time => Type.init(.time),
             .timestamp => Type.init(.timestamp),
             .decimal => |d| Type.decimal(0, d.scale),
+            .nested => |r| r.node.ty,
         };
         if (last) |l| if (l.kind == vt.kind and l.scale == vt.scale) continue;
         last = vt;
@@ -651,6 +653,7 @@ const vec_casts = blk: {
 
 fn castColVec(arena: std.mem.Allocator, col: Column, ty: Type, n: usize) VecError!Vec {
     if (col.ty.kind == ty.kind and ty.kind != .decimal and !ty.isNested()) return .{ .col = col };
+    if (ty.isNested()) return nestedCast(arena, col, ty);
     inline for (vec_casts) |p| if (col.ty.kind == p[0] and ty.kind == p[1]) return switch (p[0]) {
         .string => castColWith(p[0], p[1], arena, col.data.bytes, col, ty, n),
         .decimal => switch (column.decimals(col)) {
@@ -659,6 +662,27 @@ fn castColVec(arena: std.mem.Allocator, col: Column, ty: Type, n: usize) VecErro
         else => castColWith(p[0], p[1], arena, column.fixedOf(comptime column.storageOf(p[0]), col.data), col, ty, n),
     };
     return error.Unsupported;
+}
+
+/// A column cast to nested type `ty`: JSON text parsed into one builder for the
+/// batch, the same nested type kept as it is, another one read again from its
+/// JSON. A value that does not fit goes to the row path, which names it.
+fn nestedCast(arena: std.mem.Allocator, col: Column, ty: Type) VecError!Vec {
+    if (col.ty.isNested() and col.ty.eql(ty)) return .{ .col = col };
+    if (col.ty.kind != .string and !col.ty.isNested()) return error.Unsupported;
+    var b = try column.Builder.initCapacity(arena, ty.asNullable(), col.len);
+    for (0..col.len) |r| {
+        const v = col.getValue(r);
+        const text: Value = switch (v) {
+            .nested => |x| .{ .string = try nested_json.jsonText(arena, x) },
+            else => v,
+        };
+        b.append(text) catch |e| return switch (e) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.CastFailed => error.Unsupported,
+        };
+    }
+    return .{ .col = try b.finish() };
 }
 
 /// The one loop of a column cast: `castElem` per row over `xs`, the column's values.
@@ -714,6 +738,15 @@ fn mergeCols(arena: std.mem.Allocator, take: []const bool, t_in: Column, e_in: C
         }
         pub fn bytes(o: @This()) !column.Bytes {
             return mergeBytes(o.arena, o.bm, o.take, o.t.data.bytes, o.e.data.bytes, o.t.validity, o.e.validity);
+        }
+        pub fn nested(o: @This()) error{OutOfMemory}!*const column.Nested {
+            const Ref = struct { chunk: usize, row: usize };
+            const refs = try o.arena.alloc(Ref, o.take.len);
+            for (refs, o.take, 0..) |*r, k, i| {
+                r.* = .{ .chunk = if (k) 0 else 1, .row = i };
+                if (!(if (k) o.t.validity.get(i) else o.e.validity.get(i))) o.bm.setValid(i, false);
+            }
+            return (try column.takeAcross(o.arena, &.{ o.t, o.e }, refs)).data.nested;
         }
     };
     const data = try column.mapTag(column.Shape.of(t.data), Op{ .arena = arena, .take = take, .t = t, .e = e, .bm = &bm });
@@ -1380,6 +1413,11 @@ fn broadcastScalar(arena: std.mem.Allocator, s: Value, out_ty: Type, n: usize) E
             }
             return .{ .offsets = offsets, .values = values };
         }
+        pub fn nested(o: @This()) error{OutOfMemory}!*const column.Nested {
+            const idx = try o.arena.alloc(usize, o.n);
+            @memset(idx, 0);
+            return (try column.permute(o.arena, o.one, idx)).data.nested;
+        }
     };
     const data = try column.mapTag(column.Shape.of(one.data), Op{ .arena = arena, .one = one, .n = n });
     return Column.derived(one.ty, n, bm, data);
@@ -1414,6 +1452,7 @@ fn scalarType(v: Value) Type {
         .date => Type.init(.date),
         .time => Type.init(.time),
         .timestamp => Type.init(.timestamp),
+        .nested => |r| r.node.ty,
     };
 }
 

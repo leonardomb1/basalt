@@ -6,10 +6,10 @@
 //! `cast`. Nulls follow SQL three-valued logic, tracked as a per-type `nullable`
 //! flag; a bare `null` literal is `unknown` and unifies with anything.
 //!
-//! Nested kinds describe their shape and are held as JSON text: an `array`'s
+//! Nested kinds describe their shape, held as `column.Nested` storage: an `array`'s
 //! `elem` is its element type, a `struct`'s `fields` its fields, and a `map`'s
-//! `fields` the pair `key` then `value`, as Parquet's MAP group holds them, its
-//! value an object keyed by each key's text.
+//! `fields` the pair `key` then `value`, as Parquet's MAP group holds them, each
+//! row a list of those pairs (`column.entryType`).
 //!
 //! A `Field`'s `rel`/`base` are set on columns a join's right side contributed:
 //! the side's alias and the column's original name, which `name` no longer is

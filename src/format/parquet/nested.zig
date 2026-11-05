@@ -389,10 +389,10 @@ pub fn assembleLists(
 
 fn finishRow(out: *column.Builder, buf: *std.array_list.Managed(u8), open: *usize, row_null: bool) Error!void {
     if (row_null) {
-        try out.append(.null);
+        out.append(.null) catch return error.OutOfMemory;
     } else {
         while (open.* > 0) : (open.* -= 1) try buf.append(']');
-        try out.append(.{ .string = buf.items });
+        out.append(.{ .string = buf.items }) catch return error.OutOfMemory;
     }
     buf.clearRetainingCapacity();
 }

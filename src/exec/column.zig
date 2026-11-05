@@ -12,6 +12,17 @@
 //! `i` is `values[codes[i]]`, a null row's code is 0) so filters and GROUP BY can
 //! work on the entries; anything that makes a new column leaves it behind.
 //!
+//! A list, map or struct column holds `Nested` storage, Arrow's layout. A struct
+//! has one child column per field, each with the parent's rows (under a null
+//! parent, a null placeholder). A list has `len + 1` offsets into one child column,
+//! row `i` being the child's rows `offsets[i]..offsets[i+1]`. Its first offset is
+//! not 0 when the column is a slice of a larger one, so a slice copies nothing. A
+//! map is a list whose child is the struct of its `key` and `value` (`entryType`),
+//! as Parquet's `key_value` group holds it. Every copy, gather and merge recurses
+//! into the children, so it moves typed child buffers as it moves flat ones.
+//! A gather of list rows gathers the child rows they span. `Value.nested` reads
+//! one row by reference.
+//!
 //! `Builder` writes validity directly in its final bit-packed form, appended
 //! pre-set to all-valid, so a null-free column never touches it beyond growing it
 //! (it was once a `[]bool` shadow array folded down in `finish`). The bulk and
@@ -311,7 +322,7 @@ fn takeRows(b: Bytes, idx: []const u32, values: []u8, ends: []i32, off: usize) u
 }
 
 /// The rows `sel` keeps of `c`, its dictionary view carried along (`carryDict`).
-pub fn select(arena: std.mem.Allocator, c: Column, sel: Selection) !Column {
+pub fn select(arena: std.mem.Allocator, c: Column, sel: Selection) error{OutOfMemory}!Column {
     if (c.codes_only) return codesOf(arena, c, try selectSlice(u32, arena, c.dict.?.codes, sel), try selectValidity(arena, c.validity, c.len, sel));
     const bm = try selectValidity(arena, c.validity, c.len, sel);
     const Op = struct {
@@ -324,11 +335,27 @@ pub fn select(arena: std.mem.Allocator, c: Column, sel: Selection) !Column {
         fn bytes(o: @This()) !Bytes {
             return selectBytes(o.arena, o.c.data.bytes, o.sel);
         }
+        fn nested(o: @This()) error{OutOfMemory}!*const Nested {
+            return permuteNested(o.arena, o.c.data.nested, try selRows(o.arena, o.sel));
+        }
     };
     var out = Column.derived(c.ty, sel.kept, bm, try mapTag(Shape.of(c.data), Op{ .arena = arena, .c = c, .sel = sel }));
     if (c.dict) |d| if (d.values.len <= dict_carry_max) {
         out.dict = try carryDict(arena, d, try selectSlice(u32, arena, d.codes, sel));
     };
+    return out;
+}
+
+/// The source row of each row `sel` keeps, for storage gathered row by row.
+fn selRows(arena: std.mem.Allocator, sel: Selection) error{OutOfMemory}![]usize {
+    const out = try arena.alloc(usize, sel.kept);
+    var w: usize = 0;
+    for (sel.runs) |r| {
+        for (sel.idx[w..r.at], out[w..r.at]) |i, *o| o.* = i;
+        for (out[r.at..][0..r.len], r.src..) |*o, i| o.* = i;
+        w = r.at + r.len;
+    }
+    for (sel.idx[w..], out[w..]) |i, *o| o.* = i;
     return out;
 }
 
@@ -415,7 +442,7 @@ fn concatValidity(arena: std.mem.Allocator, chunks: []const Column, total: usize
     return bm;
 }
 
-pub fn concat(arena: std.mem.Allocator, chunks_raw: []const Column, total: usize) !Column {
+pub fn concat(arena: std.mem.Allocator, chunks_raw: []const Column, total: usize) error{OutOfMemory}!Column {
     const chunks_in = try spellAll(arena, chunks_raw);
     std.debug.assert(chunks_in.len > 0);
     const chunks = try sameLayout(arena, chunks_in);
@@ -436,6 +463,9 @@ pub fn concat(arena: std.mem.Allocator, chunks_raw: []const Column, total: usize
         fn bytes(o: @This()) !Bytes {
             return concatBytes(o.arena, o.chunks, o.total);
         }
+        fn nested(o: @This()) error{OutOfMemory}!*const Nested {
+            return concatNested(o.arena, o.chunks, o.total);
+        }
     };
     return Column.derived(chunks[0].ty, total, bm, try mapTag(Shape.of(chunks[0].data), Op{ .arena = arena, .chunks = chunks, .total = total }));
 }
@@ -444,7 +474,7 @@ pub fn concat(arena: std.mem.Allocator, chunks_raw: []const Column, total: usize
 /// the validity, a chunk's bits landing mid-byte, is copied first on this thread.
 pub fn concatThreads(arena: std.mem.Allocator, chunks_raw: []const Column, total: usize, threads: usize) !Column {
     const chunks_in = try spellAll(arena, chunks_raw);
-    if (threads < 2 or chunks_in.len < 2 or total < 1 << 17) return concat(arena, chunks_in, total);
+    if (threads < 2 or chunks_in.len < 2 or total < 1 << 17 or chunks_in[0].data == .nested) return concat(arena, chunks_in, total);
     const chunks = try sameLayout(arena, chunks_in);
     const bm = try concatValidity(arena, chunks, total);
     const rows = try arena.alloc(usize, chunks.len);
@@ -475,6 +505,7 @@ pub fn concatThreads(arena: std.mem.Allocator, chunks_raw: []const Column, total
                     @memcpy(o.values[base..][0 .. hi - lo], b.values[lo..hi]);
                     for (b.offsets[1 .. c.len + 1], o.offsets[at + 1 ..][0..c.len]) |src, *dst| dst.* = @intCast(base + @as(usize, @intCast(src)) - lo);
                 },
+                .nested => unreachable,
                 inline else => |_, tag| @memcpy(fixedOf(tag, x.out)[at..][0..c.len], fixedOf(tag, c.data)[0..c.len]),
             }
         }
@@ -507,7 +538,7 @@ fn concatBytes(arena: std.mem.Allocator, chunks: []const Column, total: usize) !
     return .{ .offsets = offsets, .values = values };
 }
 
-pub fn permute(arena: std.mem.Allocator, c_in: Column, idx: []const usize) !Column {
+pub fn permute(arena: std.mem.Allocator, c_in: Column, idx: []const usize) error{OutOfMemory}!Column {
     const c = try spell(arena, c_in);
     const bm = try permuteValidity(arena, c.validity, c.len, idx);
     const Op = struct {
@@ -522,6 +553,9 @@ pub fn permute(arena: std.mem.Allocator, c_in: Column, idx: []const usize) !Colu
         }
         fn bytes(o: @This()) !Bytes {
             return o.c.data.bytes.take(o.arena, o.idx);
+        }
+        fn nested(o: @This()) error{OutOfMemory}!*const Nested {
+            return permuteNested(o.arena, o.c.data.nested, o.idx);
         }
     };
     var out = Column.derived(c.ty, idx.len, bm, try mapTag(Shape.of(c.data), Op{ .arena = arena, .c = c, .idx = idx }));
@@ -538,7 +572,7 @@ pub fn permute(arena: std.mem.Allocator, c_in: Column, idx: []const usize) !Colu
 /// emits its chunks or a merge interleaves its sources. Rows taken from sources not
 /// much longer than they are skip the per-row validity when no source holds a null,
 /// as `permuteValidity` does. Dictionary views are dropped, as each chunk's differs.
-pub fn takeAcross(a: std.mem.Allocator, srcs_raw: []const Column, refs: anytype) !Column {
+pub fn takeAcross(a: std.mem.Allocator, srcs_raw: []const Column, refs: anytype) error{OutOfMemory}!Column {
     const srcs_in = try spellAll(a, srcs_raw);
     const srcs = try sameLayout(a, srcs_in);
     var bm = try Bitmap.initFull(a, refs.len);
@@ -591,6 +625,9 @@ pub fn takeAcross(a: std.mem.Allocator, srcs_raw: []const Column, refs: anytype)
             }
             return .{ .offsets = offsets, .values = values };
         }
+        pub fn nested(o: @This()) error{OutOfMemory}!*const Nested {
+            return takeAcrossNested(o.a, o.srcs, o.refs);
+        }
     };
     const data = try mapTag(Shape.of(srcs[0].data), Op{ .a = a, .srcs = srcs, .refs = refs });
     return Column.derived(srcs[0].ty, refs.len, bm, data);
@@ -599,13 +636,14 @@ pub fn takeAcross(a: std.mem.Allocator, srcs_raw: []const Column, refs: anytype)
 /// Rows `start..start + n` of `c` as a view on its buffers, nothing copied: `start` is
 /// a multiple of 8 so the validity stays byte-aligned, byte offsets keep indexing the
 /// same values buffer, and a dictionary keeps its entries over a run of its codes.
-pub fn slice(arena: std.mem.Allocator, c: Column, start: usize, n: usize) !Column {
+pub fn slice(arena: std.mem.Allocator, c: Column, start: usize, n: usize) error{OutOfMemory}!Column {
     std.debug.assert(start % 8 == 0 and start + n <= c.len);
     var out = c;
     out.len = n;
     out.validity = .{ .bits = c.validity.bits[start / 8 ..][0 .. (n + 7) / 8], .len = n };
     out.data = switch (c.data) {
         .bytes => |b| .{ .bytes = .{ .offsets = b.offsets[start..][0 .. n + 1], .values = b.values } },
+        .nested => |nd| .{ .nested = try sliceNested(arena, nd, start, n) },
         inline else => |_, tag| dataLike(tag, Shape.of(c.data), fixedOf(tag, c.data)[start..][0..n]),
     };
     if (c.dict) |d| {
@@ -631,7 +669,7 @@ fn permuteValidity(arena: std.mem.Allocator, v: Bitmap, n: usize, idx: []const u
 /// `c`'s rows copied into `arena`, one memcpy per buffer: the gather of every row in
 /// order, without the gather. Only the rows' own span is copied, as `c` may view a
 /// larger buffer; a small dictionary view comes along (`carryDict`).
-pub fn copy(arena: std.mem.Allocator, c: Column) !Column {
+pub fn copy(arena: std.mem.Allocator, c: Column) error{OutOfMemory}!Column {
     if (c.codes_only) {
         const bm = try Bitmap.initFull(arena, c.len);
         @memcpy(bm.bits, c.validity.bits[0..bm.bits.len]);
@@ -650,6 +688,7 @@ pub fn copy(arena: std.mem.Allocator, c: Column) !Column {
             for (offs, b.offsets[0 .. c.len + 1]) |*o, x| o.* = x - b.offsets[0];
             break :blk .{ .bytes = .{ .offsets = offs, .values = try arena.dupe(u8, b.values[lo..hi]) } };
         },
+        .nested => |nd| .{ .nested = try copyNested(arena, nd, c.len) },
         inline else => |_, tag| dataLike(tag, Shape.of(c.data), try arena.dupe(Elem(tag), fixedOf(tag, c.data)[0..c.len])),
     };
     return out;
@@ -662,7 +701,7 @@ pub fn permuteThreads(arena: std.mem.Allocator, c_in: Column, idx: []const usize
     const c = try spell(arena, c_in);
     const n = idx.len;
     const nc = par.chunks(n, 1 << 16);
-    if (threads < 2 or nc < 2) return permute(arena, c, idx);
+    if (threads < 2 or nc < 2 or c.data == .nested) return permute(arena, c, idx);
     var bm = try Bitmap.initFull(arena, n);
     const starts = try arena.alloc(usize, nc);
     var span: usize = 0;
@@ -708,6 +747,7 @@ pub fn permuteThreads(arena: std.mem.Allocator, c_in: Column, idx: []const usize
                         o.offsets[w + 1] = @intCast(off);
                     }
                 },
+                .nested => unreachable,
                 inline else => |_, tag| {
                     const o = fixedOf(tag, x.out);
                     const s = fixedOf(tag, x.c.data);
@@ -721,6 +761,24 @@ pub fn permuteThreads(arena: std.mem.Allocator, c_in: Column, idx: []const usize
     return Column.derived(c.ty, n, bm, out);
 }
 
+/// A column's heap, typed stores plus validity: what holding it costs. A byte
+/// column counts only its rows' span, as it may view a larger buffer; a nested one
+/// adds its children's.
+pub fn heapBytes(c: Column) usize {
+    return c.validity.bits.len + switch (c.data) {
+        .bytes => |b| b.span(c.len) + b.offsets.len * @sizeOf(i32),
+        .nested => |nd| switch (nd.body) {
+            .fields => |fs| blk: {
+                var n: usize = 0;
+                for (fs) |f| n += heapBytes(f);
+                break :blk n;
+            },
+            .list => |l| l.offsets.len * @sizeOf(i32) + heapBytes(l.child),
+        },
+        inline else => |_, t| std.mem.sliceAsBytes(fixedOf(t, c.data)).len,
+    };
+}
+
 pub const Tag = std.meta.Tag(Column.Data);
 
 /// The storage a column of `kind` holds: the one kind-to-storage mapping, which
@@ -732,8 +790,185 @@ pub fn storageOf(kind: types.TypeKind) Tag {
         .int, .time, .timestamp => .i64,
         .float => .f64,
         .decimal => .dec,
-        .string, .bytes, .array, .@"struct", .map => .bytes,
+        .string, .bytes => .bytes,
+        .array, .@"struct", .map => .nested,
     };
+}
+
+pub const Nested = struct {
+    ty: types.Type,
+    body: Body,
+
+    pub const Body = union(enum) { list: List, fields: []const Column };
+    pub const List = struct { offsets: []const i32, child: Column };
+};
+
+/// A map's entries as the struct its list holds: `key`, then `value`.
+pub fn entryType(map: types.Type) types.Type {
+    return .{ .kind = .@"struct", .fields = map.fields orelse &.{} };
+}
+
+/// The type of a list's or map's child column.
+pub fn childType(ty: types.Type) types.Type {
+    if (ty.kind == .map) return entryType(ty);
+    return if (ty.elem) |e| e.* else types.Type.init(.string).asNullable();
+}
+
+/// The child rows list rows `rows` span, end to end, and the offsets that index
+/// them from 0.
+fn listTake(arena: std.mem.Allocator, l: Nested.List, rows: []const usize) error{OutOfMemory}!struct { offsets: []i32, idx: []usize } {
+    var total: usize = 0;
+    for (rows) |r| total += @intCast(l.offsets[r + 1] - l.offsets[r]);
+    const offsets = try arena.alloc(i32, rows.len + 1);
+    const idx = try arena.alloc(usize, try checkSpan(total));
+    offsets[0] = 0;
+    var w: usize = 0;
+    for (rows, offsets[1..]) |r, *end| {
+        for (@as(usize, @intCast(l.offsets[r]))..@as(usize, @intCast(l.offsets[r + 1]))) |x| {
+            idx[w] = x;
+            w += 1;
+        }
+        end.* = @intCast(w);
+    }
+    return .{ .offsets = offsets, .idx = idx };
+}
+
+/// A list's first `n` rows' child rows as a column of their own, the child itself
+/// when they are all of it.
+fn listChild(arena: std.mem.Allocator, l: Nested.List, n: usize) error{OutOfMemory}!Column {
+    const lo: usize = @intCast(l.offsets[0]);
+    const hi: usize = @intCast(l.offsets[n]);
+    if (lo == 0 and hi == l.child.len) return l.child;
+    const idx = try arena.alloc(usize, hi - lo);
+    for (idx, lo..) |*x, r| x.* = r;
+    return permute(arena, l.child, idx);
+}
+
+fn newNested(arena: std.mem.Allocator, ty: types.Type, body: Nested.Body) error{OutOfMemory}!*const Nested {
+    const out = try arena.create(Nested);
+    out.* = .{ .ty = ty, .body = body };
+    return out;
+}
+
+/// Rows `rows` of nested storage `n`, its children gathered by them.
+fn permuteNested(arena: std.mem.Allocator, n: *const Nested, rows: []const usize) error{OutOfMemory}!*const Nested {
+    return newNested(arena, n.ty, switch (n.body) {
+        .fields => |fs| blk: {
+            const kids = try arena.alloc(Column, fs.len);
+            for (fs, kids) |f, *k| k.* = try permute(arena, f, rows);
+            break :blk .{ .fields = kids };
+        },
+        .list => |l| blk: {
+            const t = try listTake(arena, l, rows);
+            break :blk .{ .list = .{ .offsets = t.offsets, .child = try permute(arena, l.child, t.idx) } };
+        },
+    });
+}
+
+const ChildRef = struct { chunk: usize, row: usize };
+
+/// `takeAcross` for nested storage: a struct's children gathered by the same rows
+/// across the sources, a list's child by the rows each picked row spans in its own
+/// source.
+fn takeAcrossNested(a: std.mem.Allocator, srcs: []const Column, refs: anytype) error{OutOfMemory}!*const Nested {
+    const n0 = srcs[0].data.nested;
+    const kids_of = try a.alloc(Column, srcs.len);
+    switch (n0.body) {
+        .fields => |fs0| {
+            const kids = try a.alloc(Column, fs0.len);
+            for (kids, 0..) |*k, i| {
+                for (srcs, kids_of) |src, *x| x.* = src.data.nested.body.fields[i];
+                k.* = try takeAcross(a, kids_of, refs);
+            }
+            return newNested(a, n0.ty, .{ .fields = kids });
+        },
+        .list => {
+            var total: usize = 0;
+            for (refs) |e| {
+                const l = srcs[e.chunk].data.nested.body.list;
+                total += @intCast(l.offsets[e.row + 1] - l.offsets[e.row]);
+            }
+            const offsets = try a.alloc(i32, refs.len + 1);
+            const crefs = try a.alloc(ChildRef, try checkSpan(total));
+            offsets[0] = 0;
+            var w: usize = 0;
+            for (refs, offsets[1..]) |e, *end| {
+                const l = srcs[e.chunk].data.nested.body.list;
+                for (@as(usize, @intCast(l.offsets[e.row]))..@as(usize, @intCast(l.offsets[e.row + 1]))) |x| {
+                    crefs[w] = .{ .chunk = e.chunk, .row = x };
+                    w += 1;
+                }
+                end.* = @intCast(w);
+            }
+            for (srcs, kids_of) |src, *x| x.* = src.data.nested.body.list.child;
+            return newNested(a, n0.ty, .{ .list = .{ .offsets = offsets, .child = try takeAcross(a, kids_of, crefs) } });
+        },
+    }
+}
+
+/// `concat` for nested storage: a struct's children laid end to end, a list's
+/// offsets rebased onto its children laid end to end.
+fn concatNested(arena: std.mem.Allocator, chunks: []const Column, total: usize) error{OutOfMemory}!*const Nested {
+    const n0 = chunks[0].data.nested;
+    const parts = try arena.alloc(Column, chunks.len);
+    switch (n0.body) {
+        .fields => |fs0| {
+            const kids = try arena.alloc(Column, fs0.len);
+            for (kids, 0..) |*k, i| {
+                for (chunks, parts) |c, *x| x.* = c.data.nested.body.fields[i];
+                k.* = try concat(arena, parts, total);
+            }
+            return newNested(arena, n0.ty, .{ .fields = kids });
+        },
+        .list => {
+            const offsets = try arena.alloc(i32, total + 1);
+            offsets[0] = 0;
+            var w: usize = 0;
+            var base: usize = 0;
+            for (chunks, parts) |c, *x| {
+                const l = c.data.nested.body.list;
+                x.* = try listChild(arena, l, c.len);
+                const lo = l.offsets[0];
+                for (l.offsets[1 .. c.len + 1]) |o| {
+                    w += 1;
+                    offsets[w] = @intCast(base + @as(usize, @intCast(o - lo)));
+                }
+                base += x.len;
+            }
+            return newNested(arena, n0.ty, .{ .list = .{ .offsets = offsets, .child = try concat(arena, parts, base) } });
+        },
+    }
+}
+
+/// Rows `start..start + n` of nested storage as a view: a struct's children
+/// sliced alike, a list's offsets narrowed over the same child.
+fn sliceNested(arena: std.mem.Allocator, nd: *const Nested, start: usize, n: usize) error{OutOfMemory}!*const Nested {
+    return newNested(arena, nd.ty, switch (nd.body) {
+        .fields => |fs| blk: {
+            const kids = try arena.alloc(Column, fs.len);
+            for (fs, kids) |f, *k| k.* = try slice(arena, f, start, n);
+            break :blk .{ .fields = kids };
+        },
+        .list => |l| .{ .list = .{ .offsets = l.offsets[start..][0 .. n + 1], .child = l.child } },
+    });
+}
+
+/// The first `n` rows of nested storage copied into `arena`, a list's child cut to
+/// the rows they span.
+fn copyNested(arena: std.mem.Allocator, nd: *const Nested, n: usize) error{OutOfMemory}!*const Nested {
+    return newNested(arena, nd.ty, switch (nd.body) {
+        .fields => |fs| blk: {
+            const kids = try arena.alloc(Column, fs.len);
+            for (fs, kids) |f, *k| k.* = try copy(arena, f);
+            break :blk .{ .fields = kids };
+        },
+        .list => |l| blk: {
+            const offsets = try arena.alloc(i32, n + 1);
+            for (offsets, l.offsets[0 .. n + 1]) |*o, x| o.* = x - l.offsets[0];
+            const whole = l.offsets[0] == 0 and l.offsets[n] == l.child.len;
+            break :blk .{ .list = .{ .offsets = offsets, .child = if (whole) try copy(arena, l.child) else try listChild(arena, l, n) } };
+        },
+    });
 }
 
 /// The element type of a fixed-width storage.
@@ -799,12 +1034,13 @@ pub const Shape = struct {
     }
 };
 
-/// A `Data` of `shape`, from `op.fixed(t)` for a fixed-width storage and
-/// `op.bytes()` for bytes: the per-storage dispatch every column copy, merge and
+/// A `Data` of `shape`, from `op.fixed(t)` for a fixed-width storage,
+/// `op.bytes()` for bytes and `op.nested()` for nested storage: the per-storage dispatch every column copy, merge and
 /// spill read goes through, so none can miss a storage.
 pub fn mapTag(shape: Shape, op: anytype) !Column.Data {
     return switch (shape.tag) {
         .bytes => .{ .bytes = try op.bytes() },
+        .nested => .{ .nested = try op.nested() },
         inline else => |t| dataLike(t, shape, try op.fixed(t)),
     };
 }
@@ -823,6 +1059,9 @@ pub fn allocData(arena: std.mem.Allocator, shape: Shape, n: usize, span: usize) 
             const offsets = try o.arena.alloc(i32, o.n + 1);
             offsets[0] = 0;
             return .{ .offsets = offsets, .values = try o.arena.alloc(u8, try checkSpan(o.span)) };
+        }
+        fn nested(_: @This()) !*const Nested {
+            unreachable;
         }
     };
     return mapTag(shape, Op{ .arena = arena, .n = n, .span = span });
@@ -851,6 +1090,7 @@ pub const Column = struct {
         dec: DecStore,
         d64: D64Store,
         bytes: Bytes,
+        nested: *const Nested,
     };
 
     pub fn getValue(self: Column, i: usize) Value {
@@ -860,7 +1100,7 @@ pub const Column = struct {
             return if (self.ty.kind == .bytes) .{ .bytes = v } else .{ .string = v };
         }
         return switch (self.ty.kind) {
-            .array, .@"struct", .map => .{ .string = self.data.bytes.at(i) },
+            .array, .@"struct", .map => .{ .nested = .{ .node = self.data.nested, .row = i } },
             .decimal => .{ .decimal = decimals(self).at(i) },
             inline else => |k| blk: {
                 const t = comptime storageOf(k);
@@ -984,7 +1224,15 @@ pub const Builder = struct {
         dec: std.array_list.Managed(value.Decimal),
         d64: std.array_list.Managed(Dec64),
         bytes: BytesStore,
+        nested: ?*NestedBuilder,
     };
+
+    pub const NestedBuilder = union(enum) {
+        list: struct { ends: std.array_list.Managed(i32), child: Builder },
+        fields: []Builder,
+    };
+
+    pub const AppendError = error{ OutOfMemory, CastFailed };
 
     pub fn init(arena: std.mem.Allocator, ty: types.Type) Builder {
         const bytes_store: Store = .{ .bytes = .{
@@ -994,6 +1242,7 @@ pub const Builder = struct {
         const narrow = ty.kind == .decimal and ty.precision >= 1;
         const store: Store = if (narrow) .{ .d64 = std.array_list.Managed(Dec64).init(arena) } else switch (storageOf(ty.kind)) {
             .bytes => bytes_store,
+            .nested => .{ .nested = null },
             inline else => |t| @unionInit(Store, @tagName(t), std.array_list.Managed(Elem(t)).init(arena)),
         };
         return .{ .arena = arena, .ty = ty, .bits = std.array_list.Managed(u8).init(arena), .store = store, .nscale = ty.scale };
@@ -1065,6 +1314,7 @@ pub const Builder = struct {
                 try l.ends.ensureTotalCapacity(rows);
                 try l.values.ensureTotalCapacity(rows * BYTES_PER_ROW_HINT);
             },
+            .nested => {},
             inline else => |*l| try l.ensureTotalCapacity(rows),
         }
         return b;
@@ -1077,7 +1327,7 @@ pub const Builder = struct {
                 if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
                 try l.appendSlice(vals);
             },
-            .bytes => return error.BulkTypeMismatch,
+            .bytes, .nested => return error.BulkTypeMismatch,
         }
         try self.pushValidRun(vals.len);
     }
@@ -1092,7 +1342,7 @@ pub const Builder = struct {
                 try l.ensureUnusedCapacity(n);
                 return l.unusedCapacitySlice()[0..n];
             },
-            .bytes => return error.BulkTypeMismatch,
+            .bytes, .nested => return error.BulkTypeMismatch,
         }
     }
 
@@ -1103,7 +1353,7 @@ pub const Builder = struct {
                 if (@TypeOf(l.items) != []T) return error.BulkTypeMismatch;
                 l.items.len += n;
             },
-            .bytes => return error.BulkTypeMismatch,
+            .bytes, .nested => return error.BulkTypeMismatch,
         }
         try self.pushValidRun(n);
     }
@@ -1223,7 +1473,7 @@ pub const Builder = struct {
                     try self.pushValid(present);
                 }
             },
-            .bytes => return error.BulkTypeMismatch,
+            .bytes, .nested => return error.BulkTypeMismatch,
         }
     }
 
@@ -1274,8 +1524,11 @@ pub const Builder = struct {
         }
         self.store.dec.appendAssumeCapacity(d);
     }
-    pub fn appendNull(self: *Builder) !void {
-        try self.append(.null);
+    pub fn appendNull(self: *Builder) error{OutOfMemory}!void {
+        self.append(.null) catch |e| return switch (e) {
+            error.CastFailed => unreachable,
+            error.OutOfMemory => error.OutOfMemory,
+        };
     }
 
     /// Room for `n` more bytes of a bytes column's next value, which a producer
@@ -1293,7 +1546,8 @@ pub const Builder = struct {
         try l.ends.append(@intCast(try checkSpan(l.values.items.len)));
     }
 
-    pub fn append(self: *Builder, v: Value) !void {
+    pub fn append(self: *Builder, v: Value) AppendError!void {
+        if (self.store == .nested) return self.appendNested(v);
         const int: ?i64 = if (self.store == .i64 and !v.isNull()) self.asI64(v) else null;
         const ok = !v.isNull() and (self.store != .i64 or int != null);
         try self.pushValid(ok);
@@ -1314,6 +1568,70 @@ pub const Builder = struct {
                 if (ok) try l.values.appendSlice(self.asBytes(v));
                 try l.ends.append(@intCast(try checkSpan(l.values.items.len)));
             },
+            .nested => unreachable,
+        }
+    }
+
+    /// The child builders of a nested builder, made at its first row.
+    pub fn nestedStore(self: *Builder) error{OutOfMemory}!*NestedBuilder {
+        if (self.store.nested) |nb| return nb;
+        const nb = try self.arena.create(NestedBuilder);
+        nb.* = switch (self.ty.kind) {
+            .@"struct" => blk: {
+                const fs = self.ty.fields orelse &.{};
+                const kids = try self.arena.alloc(Builder, fs.len);
+                for (fs, kids) |f, *k| k.* = Builder.init(self.arena, f.ty);
+                break :blk .{ .fields = kids };
+            },
+            else => .{ .list = .{ .ends = std.array_list.Managed(i32).init(self.arena), .child = Builder.init(self.arena, childType(self.ty)) } },
+        };
+        self.store.nested = nb;
+        return nb;
+    }
+
+    /// A present nested row begun: its validity set, its children for the caller to
+    /// fill (a list's entries closed by `endEntries`).
+    pub fn openNested(self: *Builder) error{OutOfMemory}!*NestedBuilder {
+        const nb = try self.nestedStore();
+        try self.pushValid(true);
+        return nb;
+    }
+
+    pub fn endEntries(nb: *NestedBuilder) error{OutOfMemory}!void {
+        const l = &nb.list;
+        try l.ends.append(@intCast(try checkSpan(l.child.rows)));
+    }
+
+    /// A nested row from `v`: a null (a struct's children each a null placeholder),
+    /// a row of another nested column copied, or JSON text read as `nested.zig`
+    /// conforms it.
+    fn appendNested(self: *Builder, v: Value) AppendError!void {
+        switch (v) {
+            .null => {
+                const nb = try self.nestedStore();
+                try self.pushValid(false);
+                switch (nb.*) {
+                    .fields => |kids| for (kids) |*k| try k.append(.null),
+                    .list => try endEntries(nb),
+                }
+            },
+            .nested => |r| {
+                const nb = try self.openNested();
+                switch (nb.*) {
+                    .fields => |kids| {
+                        if (r.node.body != .fields or r.node.body.fields.len != kids.len) return error.CastFailed;
+                        for (kids, r.node.body.fields) |*k, c| try k.append(c.getValue(r.row));
+                    },
+                    .list => |*l| {
+                        if (r.node.body != .list) return error.CastFailed;
+                        const src = r.node.body.list;
+                        for (@as(usize, @intCast(src.offsets[r.row]))..@as(usize, @intCast(src.offsets[r.row + 1]))) |x| try l.child.append(src.child.getValue(x));
+                        try endEntries(nb);
+                    },
+                }
+            },
+            .string => |t| try @import("nested.zig").appendJson(self, t),
+            else => return error.CastFailed,
         }
     }
 
@@ -1321,6 +1639,10 @@ pub const Builder = struct {
     /// it in bulk, a byte value into one block reserved for all of them.
     pub fn appendRepeated(self: *Builder, v: Value, n: usize) !void {
         if (n == 0) return;
+        if (self.store == .nested) {
+            for (0..n) |_| try self.append(v);
+            return;
+        }
         try self.append(v);
         const k = n - 1;
         if (k == 0) return;
@@ -1339,6 +1661,7 @@ pub const Builder = struct {
                     l.ends.appendAssumeCapacity(@intCast(l.values.items.len));
                 }
             },
+            .nested => unreachable,
             inline else => |*l| try l.appendNTimes(l.items[l.items.len - 1], k),
         }
         if (ok) try self.pushValidRun(k) else try self.pushNullRun(k);
@@ -1417,7 +1740,7 @@ pub const Builder = struct {
         }
     }
 
-    pub fn finish(self: *Builder) !Column {
+    pub fn finish(self: *Builder) error{OutOfMemory}!Column {
         const n = self.rows;
         if (self.codes_only) if (self.dict_vals == null or self.dict_vals.?.len == 0 or self.dict_codes.items.len != n) try self.spellSoFar();
         const bm = Bitmap{ .bits = try self.bits.toOwnedSlice(), .len = n };
@@ -1430,6 +1753,7 @@ pub const Builder = struct {
             },
             .dec => |*l| try packDecimals(self.arena, bm, try l.toOwnedSlice()),
             .d64 => |*l| .{ .d64 = .{ .narrow_cells = try l.toOwnedSlice(), .scale = self.nscale } },
+            .nested => .{ .nested = try self.finishNested() },
             inline else => |*l, t| dataOf(t, try l.toOwnedSlice()),
         };
         var dict: ?*const Column.Dict = null;
@@ -1439,6 +1763,23 @@ pub const Builder = struct {
             dict = d;
         };
         return .{ .ty = self.ty, .len = n, .validity = bm, .data = data, .dict = dict, .codes_only = self.codes_only and n > 0 };
+    }
+
+    fn finishNested(self: *Builder) error{OutOfMemory}!*const Nested {
+        const nb = try self.nestedStore();
+        return newNested(self.arena, self.ty, switch (nb.*) {
+            .fields => |kids| blk: {
+                const cols = try self.arena.alloc(Column, kids.len);
+                for (kids, cols) |*k, *c| c.* = try k.finish();
+                break :blk .{ .fields = cols };
+            },
+            .list => |*l| blk: {
+                const offsets = try self.arena.alloc(i32, self.rows + 1);
+                offsets[0] = 0;
+                @memcpy(offsets[1..], l.ends.items);
+                break :blk .{ .list = .{ .offsets = offsets, .child = try l.child.finish() } };
+            },
+        });
     }
 
     /// Records the dictionary the rows just appended came from (`src`, its process-wide
@@ -2016,4 +2357,85 @@ test "a codes-only builder writes its rows out when a value arrives otherwise, t
     try std.testing.expect(!c.codes_only);
     const want = [_][]const u8{ "b", "aa", "aa", "b", "plain" };
     for (want, 0..) |s, r| try std.testing.expectEqualStrings(s, c.data.bytes.at(r));
+}
+
+const nested_json = @import("nested.zig");
+
+fn nestedOf(a: std.mem.Allocator, ty: types.Type, rows: []const ?[]const u8) !Column {
+    var b = Builder.init(a, ty);
+    for (rows) |r| try b.append(if (r) |t| .{ .string = t } else .null);
+    return b.finish();
+}
+
+fn expectNested(a: std.mem.Allocator, c: Column, want: []const ?[]const u8) !void {
+    try std.testing.expectEqual(want.len, c.len);
+    for (want, 0..) |w, r| {
+        const v = c.getValue(r);
+        if (w) |x| try std.testing.expectEqualStrings(x, try nested_json.jsonText(a, v.nested)) else try std.testing.expect(v == .null);
+    }
+}
+
+test "nested columns gather, permute, take across chunks, concatenate, slice and copy into their children" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const str = types.Type.init(.string).asNullable();
+    const tags = types.Type{ .kind = .array, .nullable = true, .elem = &str };
+    const item = types.Type{ .kind = .@"struct", .nullable = true, .fields = &.{ .{ .name = "a", .ty = types.Type.init(.int).asNullable() }, .{ .name = "b", .ty = tags } } };
+    const ty = types.Type{ .kind = .array, .nullable = true, .elem = &item };
+    var rows: [20]?[]const u8 = undefined;
+    for (&rows, 0..) |*r, i| r.* = switch (i % 4) {
+        0 => try std.fmt.allocPrint(a, "[{{\"a\":{d},\"b\":[\"x{d}\",null]}},null]", .{ i, i }),
+        1 => "[]",
+        2 => null,
+        else => try std.fmt.allocPrint(a, "[{{\"a\":null,\"b\":null}},{{\"a\":{d},\"b\":[]}}]", .{i}),
+    };
+    const c = try nestedOf(a, ty, &rows);
+    try expectNested(a, c, &rows);
+
+    var keep: [20]bool = undefined;
+    for (&keep, 0..) |*k, i| k.* = i % 3 != 1;
+    const g = try gather(a, c, &keep, 13);
+    var gw: [13]?[]const u8 = undefined;
+    var w: usize = 0;
+    for (rows, keep) |r, k| if (k) {
+        gw[w] = r;
+        w += 1;
+    };
+    try expectNested(a, g, &gw);
+
+    const idx = [_]usize{ 19, 0, 0, 6, 2 };
+    try expectNested(a, try permute(a, c, &idx), &.{ rows[19], rows[0], rows[0], rows[6], rows[2] });
+
+    const s = try slice(a, c, 8, 12);
+    try expectNested(a, s, rows[8..]);
+    try expectNested(a, try copy(a, s), rows[8..]);
+    const both = [_]Column{ s, c };
+    const cat = try concat(a, &both, 32);
+    try expectNested(a, try slice(a, cat, 0, 12), rows[8..]);
+    try expectNested(a, try slice(a, cat, 16, 16), rows[4..]);
+
+    const Ref = struct { chunk: usize, row: usize };
+    const refs = [_]Ref{ .{ .chunk = 1, .row = 3 }, .{ .chunk = 0, .row = 0 }, .{ .chunk = 1, .row = 2 } };
+    try expectNested(a, try takeAcross(a, &both, &refs), &.{ rows[3], rows[8], rows[2] });
+
+    var b = Builder.init(a, ty);
+    try b.append(c.getValue(3));
+    try b.append(.null);
+    try expectNested(a, try b.finish(), &.{ rows[3], null });
+}
+
+test "a nested builder reads JSON by the type, a map keyed by its key type, and refuses what does not fit" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const m = types.Type{ .kind = .map, .nullable = true, .fields = &.{ .{ .name = "key", .ty = types.Type.init(.int) }, .{ .name = "value", .ty = types.Type.init(.bool).asNullable() } } };
+    const c = try nestedOf(a, m, &.{ "{\"10\":true,\"02\":null}", "{}", null });
+    try expectNested(a, c, &.{ "{\"10\":true,\"2\":null}", "{}", null });
+    const kv = c.data.nested.body.list.child;
+    try std.testing.expectEqual(@as(i64, 2), kv.data.nested.body.fields[0].getValue(1).int);
+    var b = Builder.init(a, m);
+    try std.testing.expectError(error.CastFailed, b.append(.{ .string = "{\"x\":true}" }));
+    try std.testing.expectError(error.CastFailed, b.append(.{ .string = "[1]" }));
+    try std.testing.expectError(error.CastFailed, b.append(.{ .int = 1 }));
 }

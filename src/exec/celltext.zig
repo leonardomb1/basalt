@@ -20,6 +20,7 @@ const format = @import("eval/format.zig");
 const decimal = @import("decimal.zig");
 const civil = @import("civil.zig");
 const Batch = @import("batch.zig").Batch;
+const nestedJson = @import("nested.zig");
 const Value = @import("value.zig").Value;
 
 const Column = column.Column;
@@ -76,7 +77,10 @@ pub inline fn write(w: anytype, c: *const Column, r: usize, p: anytype) !void {
     switch (c.ty.kind) {
         .string => return p.string(w, c.data.bytes.at(r)),
         .bytes => return if (@hasDecl(P, "bytes")) p.bytes(w, c.data.bytes.at(r)) else p.string(w, c.data.bytes.at(r)),
-        .array, .@"struct", .map => return if (@hasDecl(P, "nested")) p.nested(w, c.data.bytes.at(r)) else p.string(w, c.data.bytes.at(r)),
+        .array, .@"struct", .map => {
+            const t = nestedText(c, r);
+            return if (@hasDecl(P, "nested")) p.nested(w, t) else p.string(w, t);
+        },
         else => {},
     }
     if (escapes(P)) {
@@ -92,7 +96,8 @@ pub inline fn write(w: anytype, c: *const Column, r: usize, p: anytype) !void {
 /// into `buf`.
 pub fn text(c: *const Column, r: usize, buf: *[scalar_bound]u8, p: anytype) []const u8 {
     switch (c.ty.kind) {
-        .string, .bytes, .array, .@"struct", .map => return c.data.bytes.at(r),
+        .string, .bytes => return c.data.bytes.at(r),
+        .array, .@"struct", .map => return nestedText(c, r),
         else => {},
     }
     var fw = std.Io.Writer.fixed(buf);
@@ -161,6 +166,19 @@ fn shortDecimal(x: f64) ?ShortDecimal {
     return null;
 }
 
+threadlocal var nested_out: std.ArrayListUnmanaged(u8) = .empty;
+
+/// A nested cell's JSON text (`nested.writeJson`), valid until the next one on this
+/// thread: it is rendered into one buffer the thread keeps, so a cell writer still
+/// allocates nothing per cell once the buffer has grown to the widest cell.
+pub fn nestedText(c: *const Column, r: usize) []const u8 {
+    nested_out.clearRetainingCapacity();
+    var out = std.Io.Writer.Allocating.fromArrayList(std.heap.smp_allocator, &nested_out);
+    nestedJson.writeJson(&out.writer, c.data.nested, r) catch {};
+    nested_out = out.toArrayList();
+    return nested_out.items;
+}
+
 fn escapes(comptime P: type) bool {
     return @hasDecl(P, "escape_scalars") and P.escape_scalars;
 }
@@ -203,9 +221,14 @@ pub fn writeTemporal(w: anytype, kind: types.TypeKind, x: i64, comptime P: type)
 /// Tests' fixture: a one-column batch of `kind` over the values sinks spell
 /// differently, its last row null; decimals carry scales other than the column's.
 pub fn goldenColumn(arena: std.mem.Allocator, kind: types.TypeKind) !Batch {
-    const nested = kind == .array or kind == .@"struct" or kind == .map;
-    const ty = if (kind == .decimal) types.Type.decimal(14, 2).asNullable() else types.Type.init(kind).asNullable();
-    var b = column.Builder.init(arena, if (nested) types.Type.init(.string).asNullable() else ty);
+    const elem = try arena.create(types.Type);
+    elem.* = types.Type.init(.string).asNullable();
+    const ty = switch (kind) {
+        .decimal => types.Type.decimal(14, 2).asNullable(),
+        .array, .@"struct", .map => types.Type{ .kind = .array, .nullable = true, .elem = elem },
+        else => types.Type.init(kind).asNullable(),
+    };
+    var b = column.Builder.init(arena, ty);
     switch (kind) {
         .bool => for ([_]bool{ true, false }) |x| try b.append(.{ .bool = x }),
         .int => for ([_]i64{ 0, -1, std.math.minInt(i64), std.math.maxInt(i64) }) |x| try b.append(.{ .int = x }),
@@ -216,12 +239,11 @@ pub fn goldenColumn(arena: std.mem.Allocator, kind: types.TypeKind) !Batch {
         .date => for ([_]i32{ 0, 19723, -719528, std.math.minInt(i32) + 1 }) |x| try b.append(.{ .date = x }),
         .time => for ([_]i64{ 0, 3_723_000_001, 86_399_999_999 }) |x| try b.append(.{ .time = x }),
         .timestamp => for ([_]i64{ 0, 1_704_067_200_123_456, -1, -62_135_596_800_000_000 }) |x| try b.append(.{ .timestamp = x }),
-        .array, .@"struct", .map => try b.append(.{ .string = "[1,\"a b\",null]" }),
+        .array, .@"struct", .map => try b.append(.{ .string = "[\"a b\",null]" }),
     }
     try b.append(.null);
     const cols = try arena.alloc(Column, 1);
     cols[0] = try b.finish();
-    if (nested) cols[0].ty = ty;
     const schema = try arena.create(types.Schema);
     schema.* = .{ .fields = try arena.dupe(types.Schema.Field, &.{.{ .name = "c", .ty = ty }}) };
     return .{ .schema = schema, .columns = cols, .len = cols[0].len };

@@ -82,6 +82,7 @@ const shape = @import("shape.zig");
 const shred = @import("shred.zig");
 const json = @import("../../exec/json.zig");
 const nested = @import("../../exec/nested.zig");
+const celltext = @import("../../exec/celltext.zig");
 
 const Lay = struct { first: u32, n: u32, shape: ?*const shape.Shape = null };
 
@@ -683,7 +684,7 @@ pub const Writer = struct {
         var s = try shred.Shredder(LeafSink).init(sa, sh, .{ .cols = cols, .maps = self.maps[lay.first..][0..lay.n], .sh = sh, .sa = sa });
         for (lo..hi) |r| {
             for (cols) |*cb| if (!cb.dict_ok and cb.values.items.len >= page_target_bytes) try cb.sealPage(sa);
-            const text: ?[]const u8 = if (!col.validity.get(r)) null else if (col.codes_only) col.dict.?.values[col.dict.?.codes[r]] else col.data.bytes.at(r);
+            const text: ?[]const u8 = if (!col.validity.get(r)) null else if (col.data == .nested) try sa.dupe(u8, celltext.nestedText(&col, r)) else col.data.bytes.at(r);
             s.row(sa, text) catch |e| return switch (e) {
                 error.InvalidJson, error.NotNested, error.CastFailed => Error.ParquetNestedValueMismatch,
                 error.NullInRequired => Error.ParquetNullInRequired,
@@ -1888,7 +1889,7 @@ fn expectText(want: ?[]const u8, got: Value) !void {
     if (want) |x| try testing.expectEqualStrings(x, got.string) else try testing.expect(got.isNull());
 }
 
-test "a nested struct's typed leaves are read from their JSON text: bools, floats, dates, decimals, base64 bytes and plain strings" {
+test "a nested struct's typed leaves are read from their JSON text: bools, floats, dates, decimals, base64 bytes and plain strings; one that is not its type is refused as the column is built" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1935,10 +1936,7 @@ test "a nested struct's typed leaves are read from their JSON text: bools, float
     try testing.expectEqualStrings("x\ny", b.columns[5].getValue(0).string);
 
     var bad = try column.Builder.initCapacity(a, rec, 1);
-    try bad.append(.{ .string = "{\"d\":\"not a date\"}" });
-    var bad_cols = [_]column.Column{ try bad.finish(), try fs.finish() };
-    var w2 = try Writer.open(a, try std.fs.path.join(a, &.{ dir, "bad.parquet" }), schema, .snappy, .truncate);
-    try testing.expectError(Error.ParquetNestedValueMismatch, w2.writeBatch(a, .{ .schema = &schema, .columns = &bad_cols, .len = 1 }));
+    try testing.expectError(error.CastFailed, bad.append(.{ .string = "{\"d\":\"not a date\"}" }));
 }
 
 test "a nested column over many pages, dictionary and PLAIN leaves alike, reads back row for row, written directly or through a unit encoder" {

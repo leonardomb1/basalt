@@ -804,6 +804,7 @@ pub fn mkLit(arena: std.mem.Allocator, v: Value) anyerror!*ast.Expr {
         .time => typedLit(arena, v, types.Type.init(.time)),
         .timestamp => typedLit(arena, v, types.Type.init(.timestamp)),
         .decimal => |d| typedLit(arena, v, types.Type.decimal(38, d.scale)),
+        .nested => |r| typedLit(arena, v, r.node.ty),
         .bytes => |b| blk: {
             const hex = try arena.alloc(u8, b.len * 2);
             for (b, 0..) |c, i| _ = std.fmt.bufPrint(hex[i * 2 ..][0..2], "{X:0>2}", .{c}) catch unreachable;

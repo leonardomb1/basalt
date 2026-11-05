@@ -49,6 +49,7 @@ pub fn valueToString(arena: std.mem.Allocator, v: Value) ![]const u8 {
         .date => |x| try formatDate(arena, x),
         .time => |x| try formatTime(arena, x),
         .timestamp => |x| try formatTimestamp(arena, x),
+        .nested => |r| try @import("../nested.zig").jsonText(arena, r),
     };
 }
 

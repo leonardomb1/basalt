@@ -162,7 +162,7 @@ const Outs = struct {
                     sa.* = try column.BytesAppender.init(arena, n);
                     d.* = .{ .bytes = undefined };
                 },
-                .d64 => unreachable,
+                .d64, .nested => unreachable,
                 inline else => |t| d.* = column.dataOf(t, try arena.alloc(column.Elem(t), n)),
             }
         }
@@ -181,6 +181,7 @@ const Outs = struct {
                         try sa.pushNull();
                     } else try sa.push(o.strs.?.at(@intCast(k[j])));
                 },
+                .nested => unreachable,
                 inline else => |_, tag| {
                     const arr = column.fixedOf(tag, d.*);
                     const T = column.Elem(tag);

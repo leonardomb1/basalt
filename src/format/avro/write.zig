@@ -191,6 +191,7 @@ fn encoderFor(data: Column.Data) Encoder {
                     .f64 => try out.appendSlice(&std.mem.toBytes(std.mem.nativeToLittle(u64, @bitCast(col.data.f64[row])))),
                     .bytes => try bytesOf(out, col.data.bytes.at(row)),
                     .dec, .d64 => try decimalBytes(out, decimals(col.*).at(row), fld),
+                    .nested => unreachable,
                 }
             }
         }.f,

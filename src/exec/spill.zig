@@ -23,6 +23,7 @@ const std = @import("std");
 const types = @import("../lang/types.zig");
 const value = @import("value.zig");
 const column = @import("column.zig");
+const celltext = @import("celltext.zig");
 const civil = @import("civil.zig");
 const space_mod = @import("space.zig");
 
@@ -48,13 +49,13 @@ fn pad(n: u64) u64 {
 
 fn elemSize(tag: Tag) u64 {
     return switch (tag) {
-        .bytes => @sizeOf(i32),
+        .bytes, .nested => @sizeOf(i32),
         inline else => |t| @sizeOf(column.Elem(t)),
     };
 }
 
 fn dataLen(tag: Tag, rows: u64) u64 {
-    return elemSize(tag) * (if (tag == .bytes) rows + 1 else rows);
+    return elemSize(tag) * (if (tag == .bytes or tag == .nested) rows + 1 else rows);
 }
 
 fn headerLen(ncols: usize) u64 {
@@ -123,6 +124,13 @@ pub const Writer = struct {
     }
 
     fn valuesLen(c: Column, rows: usize) u64 {
+        if (c.data == .nested) {
+            var n: u64 = 0;
+            for (0..rows) |r| if (c.validity.get(r)) {
+                n += celltext.nestedText(&c, r).len;
+            };
+            return n;
+        }
         if (c.data != .bytes) return 0;
         if (c.codes_only) {
             var n: u64 = 0;
@@ -161,6 +169,7 @@ pub const Writer = struct {
             try self.putPadded(c.validity.bits[0 .. (rows + 7) / 8]);
             switch (c.data) {
                 .bytes => |by| if (c.codes_only) try self.putCodes(c, rows) else try self.putBytes(by, rows),
+                .nested => try self.putNested(c, rows),
                 inline else => |_, t| try self.putPadded(std.mem.sliceAsBytes(column.fixedOf(t, c.data)[0..rows])),
             }
         }
@@ -186,6 +195,21 @@ pub const Writer = struct {
             total += d.values[k].len;
         };
         try self.zeros(pad(total) - total);
+    }
+
+    /// A nested column as each row's JSON text (`celltext.nestedText`), laid out as
+    /// `putBytes` lays strings, which the reader builds back into the column.
+    fn putNested(self: *Writer, c: Column, rows: usize) !void {
+        var w: i32 = 0;
+        try self.put(std.mem.asBytes(&w));
+        for (0..rows) |r| {
+            if (c.validity.get(r)) w += @intCast(celltext.nestedText(&c, r).len);
+            try self.put(std.mem.asBytes(&w));
+        }
+        const n = (rows + 1) * @sizeOf(i32);
+        try self.zeros(pad(n) - n);
+        for (0..rows) |r| if (c.validity.get(r)) try self.put(celltext.nestedText(&c, r));
+        try self.zeros(pad(@intCast(w)) - @as(u64, @intCast(w)));
     }
 
     fn putBytes(self: *Writer, by: column.Bytes, rows: usize) !void {
@@ -235,6 +259,11 @@ pub const Reader = struct {
     released: usize = 0,
     /// Where the batch last handed out starts.
     last: usize = 0,
+    /// Nested columns are rebuilt from their JSON, not mapped: each batch's into an
+    /// arena of its own (`live`), handed back to `spare` by `releaseRead` for every
+    /// batch but the last, which is when a caller is done with the earlier ones.
+    live: std.ArrayListUnmanaged(*std.heap.ArenaAllocator) = .empty,
+    spare: std.ArrayListUnmanaged(*std.heap.ArenaAllocator) = .empty,
 
     /// Small, as a merge reads up to its fan-in of runs at once, each holding what it
     /// has read since its last release.
@@ -271,6 +300,15 @@ pub const Reader = struct {
     /// Drops from the process the pages of the batches before the last handed out,
     /// for a caller done reading them; read again, they fault back in from the file.
     pub fn releaseRead(self: *Reader) void {
+        if (self.live.items.len > 1) {
+            const keep = self.live.items[self.live.items.len - 1];
+            for (self.live.items[0 .. self.live.items.len - 1]) |a| {
+                _ = a.reset(.retain_capacity);
+                self.spare.append(std.heap.smp_allocator, a) catch freeArena(a);
+            }
+            self.live.items[0] = keep;
+            self.live.items.len = 1;
+        }
         if (self.last - self.released < release_every) return;
         release(self.map[self.released..self.last]);
         self.released = self.last;
@@ -292,12 +330,16 @@ pub const Reader = struct {
             v.* = try self.takeU64();
         }
         const cols = try arena.alloc(Column, fields.len);
+        const nest_arena = if (std.mem.indexOfScalar(Tag, tags, .nested) != null) try self.nestArena() else arena;
         for (cols, fields, tags, vlens) |*c, f, t, vlen| {
             const bits = try self.take((rows + 7) / 8);
             const Op = struct {
                 r: *Reader,
                 rows: u64,
                 vlen: u64,
+                arena: std.mem.Allocator,
+                ty: types.Type,
+                bits: []const u8,
                 pub fn fixed(o: @This(), comptime tag: Tag) ![]column.Elem(tag) {
                     return o.r.takeSlice(column.Elem(tag), o.rows);
                 }
@@ -305,9 +347,22 @@ pub const Reader = struct {
                     const offsets = try o.r.takeSlice(i32, o.rows + 1);
                     return .{ .offsets = offsets, .values = try o.r.take(o.vlen) };
                 }
+                pub fn nested(o: @This()) !*const column.Nested {
+                    const text = try o.bytes();
+                    var b = column.Builder.init(o.arena, o.ty);
+                    const valid = column.Bitmap{ .bits = @constCast(o.bits), .len = @intCast(o.rows) };
+                    for (0..@intCast(o.rows)) |row| {
+                        if (!valid.get(row)) {
+                            try b.appendNull();
+                            continue;
+                        }
+                        b.append(.{ .string = text.at(row) }) catch return error.CorruptSpill;
+                    }
+                    return (try b.finish()).data.nested;
+                }
             };
             const shape: column.Shape = .{ .tag = t, .scale = if (t == .d64) std.math.cast(u8, vlen) orelse return error.CorruptSpill else 0 };
-            const data = try column.mapTag(shape, Op{ .r = self, .rows = rows, .vlen = vlen });
+            const data = try column.mapTag(shape, Op{ .r = self, .rows = rows, .vlen = vlen, .arena = nest_arena, .ty = f.ty, .bits = bits });
             c.* = .{
                 .ty = f.ty,
                 .len = @intCast(rows),
@@ -318,7 +373,31 @@ pub const Reader = struct {
         return .{ .schema = self.schema, .columns = cols, .len = @intCast(rows) };
     }
 
+    fn nestArena(self: *Reader) !std.mem.Allocator {
+        const a = self.spare.pop() orelse blk: {
+            const x = try std.heap.smp_allocator.create(std.heap.ArenaAllocator);
+            x.* = .init(std.heap.smp_allocator);
+            break :blk x;
+        };
+        self.live.append(std.heap.smp_allocator, a) catch |e| {
+            freeArena(a);
+            return e;
+        };
+        return a.allocator();
+    }
+
+    fn freeArena(a: *std.heap.ArenaAllocator) void {
+        a.deinit();
+        std.heap.smp_allocator.destroy(a);
+    }
+
     pub fn close(self: *Reader) void {
+        for (self.live.items) |a| freeArena(a);
+        for (self.spare.items) |a| freeArena(a);
+        self.live.deinit(std.heap.smp_allocator);
+        self.spare.deinit(std.heap.smp_allocator);
+        self.live = .empty;
+        self.spare = .empty;
         if (self.map.len > 0) std.posix.munmap(self.map);
         self.map = self.map[0..0];
         self.c = .{ .p = self.map };
@@ -607,4 +686,37 @@ test "spill reader rejects a file without the magic" {
     try f.file.writeAll("not a spill file");
     f.file.close();
     try testing.expectError(error.CorruptSpill, Reader.open(.{ .path = f.path, .schema = &all_schema, .rows = 0, .bytes = 16 }));
+}
+
+test "spill writes a nested column as JSON and reads it back as nested storage, across batches the reader releases" {
+    var td = try TestDir.init(1 << 20);
+    defer td.deinit();
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const int = types.Type.init(.int).asNullable();
+    const ty = types.Type{ .kind = .array, .nullable = true, .elem = &int };
+    const schema = types.Schema{ .fields = &.{.{ .name = "l", .ty = ty }} };
+    var w = try Writer.init(td.ds.space(), a, &schema, "nested");
+    errdefer w.abort();
+    const texts = [_]?[]const u8{ "[1,2]", null, "[]", "[null,3]" };
+    for (0..3) |_| {
+        var b = column.Builder.init(a, ty);
+        for (texts) |t| try b.append(if (t) |x| .{ .string = x } else .null);
+        var cols = [_]Column{try b.finish()};
+        try w.write(.{ .schema = &schema, .columns = &cols, .len = texts.len });
+    }
+    const run = try w.finish();
+    var r = try Reader.open(run);
+    defer r.close();
+    var n: usize = 0;
+    while (try r.next(a)) |got| : (n += 1) {
+        try testing.expectEqual(Tag.nested, @as(Tag, got.columns[0].data));
+        for (texts, 0..) |t, row| {
+            const v = got.columns[0].getValue(row);
+            if (t) |x| try testing.expectEqualStrings(x, celltext.nestedText(&got.columns[0], row)) else try testing.expect(v == .null);
+        }
+        r.releaseRead();
+    }
+    try testing.expectEqual(@as(usize, 3), n);
 }
