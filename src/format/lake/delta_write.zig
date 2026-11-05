@@ -39,6 +39,14 @@
 //! matched row (`delta_merge.zig`); under PARTIAL COLS the rows may leave out
 //! table columns other than the key and the listed ones.
 //!
+//! Under `USING changes` the UPSERT applies a change feed (`delta_merge.zig`):
+//! `Plan.change` says where the hidden change columns are among the incoming ones,
+//! the application the position is kept under, the position the table holds for
+//! it (null: none yet) and the position column's kind; the columns the feed's
+//! arguments read that the table lacks are not written, and the commit carries
+//! the batch's largest position as a `txn` action, a batch of no rows committing
+//! nothing.
+//!
 //! A commit landing at a version the table checkpoints at (every tenth, or
 //! `delta.checkpointInterval`) is followed by a checkpoint (`delta_checkpoint.zig`);
 //! one that cannot be written is a warning, as the commit stands.
@@ -94,6 +102,7 @@ pub const Mode = union(enum) {
 pub const Upsert = struct {
     keys: []const []const u8,
     partial: ?[]const []const u8 = null,
+    changes: ?ast.Changes = null,
 };
 
 /// The disposition a LOAD names, as a Delta write takes it.
@@ -104,6 +113,34 @@ pub fn modeOf(m: ast.WriteMode) Mode {
         .upsert => |u| .{ .upsert = .{ .keys = u.keys, .partial = u.partial } },
     };
 }
+
+/// `modeOf` for a whole write: an UPSERT under `USING changes` carries them.
+pub fn writeModeOf(w: ast.Write) Mode {
+    var m = modeOf(w.mode);
+    if (m == .upsert) m.upsert.changes = w.changes;
+    return m;
+}
+
+/// Whether incoming column `name` is one a change feed reads but the table does
+/// not take: a hidden change column, or one the `USING changes` arguments read.
+fn changeOnly(ch: ?ast.Changes, name: []const u8) bool {
+    const c = ch orelse return false;
+    if (name.len > 0 and name[0] == 0) return true;
+    return ast.nameIn(c.drop, name);
+}
+
+fn changesOf(mode: Mode) ?ast.Changes {
+    return if (mode == .upsert) mode.upsert.changes else null;
+}
+
+pub const Change = struct {
+    seq: usize,
+    del: usize,
+    pos: usize,
+    app: []const u8,
+    since: ?i64,
+    kind: types.TypeKind,
+};
 
 /// A table column the rows leave out (`Col.src`), as PARTIAL COLS allows.
 pub const absent = std.math.maxInt(usize);
@@ -148,6 +185,7 @@ pub const Plan = struct {
     partial: ?[]const usize = null,
     /// The incoming rows' columns.
     in_fields: []const types.Schema.Field = &.{},
+    change: ?Change = null,
 
     /// What EXPLAIN and `check` add after the root.
     pub fn label(self: *const Plan, arena: std.mem.Allocator) ![]const u8 {
@@ -184,7 +222,10 @@ pub fn plan(arena: std.mem.Allocator, root: []const u8, mode: Mode, create: bool
     if (!delta.hasVersions(listed, log_path)) {
         if (!create) return refuse("folder `{s}` holds no _delta_log/, so it is no Delta table; `WITH (format = 'delta')` creates one there", .{root});
         p.* = .{ .name = name, .root = root, .mode = mode, .codec = codec, .snap = null, .cols = &.{}, .parts = &.{}, .data = &.{}, .schema_string = "" };
-        if (schema_in) |schema| p.* = try planCreate(arena, name, root, mode, partition_by, codec, schema);
+        if (schema_in) |schema| {
+            p.* = try planCreate(arena, name, root, mode, partition_by, codec, schema);
+            p.change = try changeOf(arena, p, null);
+        }
         return p;
     }
     const st = try delta.snapshot(arena, root, .{}, listed);
@@ -209,11 +250,12 @@ pub fn plan(arena: std.mem.Allocator, root: []const u8, mode: Mode, create: bool
         };
         c.* = try tableCol(arena, name, f, schema.fields[src].ty, src);
     }
-    for (schema.fields) |f| if (indexOfField(fields, f.name) == null)
+    for (schema.fields) |f| if (indexOfField(fields, f.name) == null and !changeOnly(changesOf(mode), f.name))
         return refuse("the rows have column `{s}`, which {s} lacks; basalt does not add columns to a Delta table", .{ f.name, name });
     p.* = .{ .name = name, .root = root, .mode = mode, .codec = codec, .snap = st, .cols = cols, .parts = &.{}, .data = &.{}, .schema_string = st.schema_string.?, .in_fields = schema.fields };
     try split(p, arena, st.part_cols);
     try upsertCols(p, arena);
+    p.change = try changeOf(arena, p, st);
     return p;
 }
 
@@ -290,13 +332,20 @@ fn split(self: *Plan, arena: std.mem.Allocator, part_cols: []const []const u8) !
 }
 
 fn planCreate(arena: std.mem.Allocator, name: []const u8, root: []const u8, mode: Mode, partition_by: ?[]const []const u8, codec: codecs.Codec, schema: types.Schema) !Plan {
-    if (schema.fields.len == 0) return refuse("{s} would have no columns", .{name});
-    const cols = try arena.alloc(Col, schema.fields.len);
+    var kept: usize = 0;
+    for (schema.fields) |f| kept += @intFromBool(!changeOnly(changesOf(mode), f.name));
+    if (kept == 0) return refuse("{s} would have no columns", .{name});
+    const cols = try arena.alloc(Col, kept);
     var aw = std.Io.Writer.Allocating.init(arena);
     const w = &aw.writer;
     try w.writeAll("{\"type\":\"struct\",\"fields\":[");
-    for (schema.fields, cols, 0..) |f, *c, i| {
-        c.* = try createCol(arena, name, f, i);
+    var n: usize = 0;
+    for (schema.fields, 0..) |f, src| {
+        if (changeOnly(changesOf(mode), f.name)) continue;
+        const i = n;
+        n += 1;
+        const c = &cols[i];
+        c.* = try createCol(arena, name, f, src);
         if (i > 0) try w.writeByte(',');
         try w.writeAll("{\"name\":");
         try jsontext.string(w, f.name);
@@ -310,6 +359,41 @@ fn planCreate(arena: std.mem.Allocator, name: []const u8, root: []const u8, mode
     try split(&p, arena, partition_by orelse &.{});
     try upsertCols(&p, arena);
     return p;
+}
+
+/// Under `USING changes`, the hidden change columns among the incoming ones and
+/// the position the table holds for the feed's application; a position of a kind
+/// `txn.version` cannot hold, a non-boolean `delete_when` and a position the
+/// rows' type cannot be compared with are refused.
+fn changeOf(arena: std.mem.Allocator, p: *const Plan, st: ?*delta.State) !?Change {
+    const ch = changesOf(p.mode) orelse return null;
+    const at = struct {
+        fn of(fields: []const types.Schema.Field, n: []const u8) usize {
+            for (fields, 0..) |f, i| if (std.mem.eql(u8, f.name, n)) return i;
+            unreachable;
+        }
+    };
+    const fields = p.in_fields;
+    const c = Change{
+        .seq = at.of(fields, ast.Changes.seq_col),
+        .del = at.of(fields, ast.Changes.del_col),
+        .pos = at.of(fields, ast.Changes.pos_col),
+        .app = ch.name orelse p.root,
+        .since = null,
+        .kind = undefined,
+    };
+    var out = c;
+    const pt = fields[c.pos].ty;
+    if (!pt.unknown and pt.kind != .int and pt.kind != .date and pt.kind != .timestamp)
+        return refuse("`position` in `USING changes` is {s}; {s} keeps a feed's position as Delta's `txn` version, a number, so it takes an INT, DATE or TIMESTAMP", .{ try pt.name(arena), p.name });
+    out.kind = if (pt.unknown) .int else pt.kind;
+    const dt = fields[c.del].ty;
+    if (!dt.unknown and dt.kind != .bool)
+        return refuse("`delete_when` in `USING changes` is {s}, not a condition; write it as one, e.g. `delete_when = op = 'd'`", .{try dt.name(arena)});
+    const seq_ty = fields[c.seq].ty;
+    if (seq_ty.isNested()) return refuse("`sequence_by` in `USING changes` is {s}; it orders a key's changes, so it takes a number, date, timestamp or text", .{try seq_ty.name(arena)});
+    if (st) |s| out.since = s.txns.get(out.app);
+    return out;
 }
 
 /// A basalt column as a new table's column. A column a whole input held only NULLs
@@ -925,9 +1009,15 @@ pub const Sink = struct {
             read_set = rs;
         };
         while (self.files.count() > 0) try self.finishFile(self.files.keys()[0]);
-        if (p.snap != null and self.n_added == 0 and (p.mode == .append or removes.len == 0)) return;
+        const moved: ?i64 = if (p.change != null) (if (self.merging) |m| m.top else null) else null;
+        if (p.snap != null and self.n_added == 0 and (p.mode == .append or removes.len == 0) and moved == null) return;
         const now = std.time.milliTimestamp();
         const w = &self.adds.writer;
+        if (moved) |v| {
+            try w.writeAll("{\"txn\":{\"appId\":");
+            try jsontext.string(w, p.change.?.app);
+            try w.print(",\"version\":{d},\"lastUpdated\":{d}}}}}\n", .{ v, now });
+        }
         for (removes) |f| {
             try w.writeAll("{\"remove\":{\"path\":");
             try jsontext.string(w, f.raw);
@@ -955,6 +1045,7 @@ pub const Sink = struct {
             .read_set = read_set,
             .key_root = if (p.snap) |st| st.key_root else "",
             .hold = if (self.merging) |m| m.hold() else null,
+            .app = if (p.change) |ch| ch.app else null,
         }) catch |e| {
             if (e == dlog.Error.DeltaCommitUnknown or e == dlog.Error.DeltaCommitUnsynced or e == dlog.Error.DeltaStoreUnsafe) self.begun.clearRetainingCapacity();
             return e;

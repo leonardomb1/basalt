@@ -69,11 +69,14 @@ pub fn parseLoadInto(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Erro
         write = .{ .connector = conn, .form = null, .target = target, .mode = .default };
     }
 
-    if (self.eatKw("using")) write.form = try self.expectIdent();
+    var change_items: ?[]const ast.SelectItem = null;
+    if (self.eatKw("using")) try self.parseLoadUsing(&write, &change_items);
 
     var whints = std.array_list.Managed(ast.Hint).init(self.arena);
     while (true) {
-        if (self.eatKw("append")) {
+        if (write.form == null and self.eatKw("using")) {
+            try self.parseLoadUsing(&write, &change_items);
+        } else if (self.eatKw("append")) {
             write.mode = .append;
         } else if (self.eatKw("replace")) {
             write.mode = .overwrite;
@@ -120,9 +123,62 @@ pub fn parseLoadInto(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Erro
     var stages = std.array_list.Managed(ast.Stage).init(self.arena);
     self.top_names = .load;
     try self.parseQuery(out, &stages);
+    if (change_items) |items| try stages.append(.{ .node = .{ .select = items }, .hints = &.{}, .pos = pos });
     try stages.append(.{ .node = .{ .write = write }, .hints = try whints.toOwnedSlice(), .pos = pos });
     _ = try self.expect(.semi);
     try out.append(.{ .output = .{ .stages = try stages.toOwnedSlice(), .pos = pos } });
+}
+
+/// `USING <name> [ ( key = expr, ... ) ]`, after `USING`. A load path takes no
+/// arguments; `changes` takes `sequence_by`, `position` (both required),
+/// `delete_when` and `name` (a string), which become the select stage `items`
+/// that computes the hidden change columns ahead of the write.
+pub fn parseLoadUsing(self: *Parser, write: *ast.Write, items: *?[]const ast.SelectItem) Error!void {
+    const pos = self.curPos();
+    const name = try self.expectIdent();
+    write.form = name;
+    if (!self.at(.lparen)) {
+        if (std.mem.eql(u8, name, "changes")) return self.fail(pos, "`USING changes` takes its arguments: `USING changes (sequence_by = <col>, position = <col>[, delete_when = <condition>][, name = '<app>'])`", .{});
+        return;
+    }
+    if (!std.mem.eql(u8, name, "changes")) return self.fail(pos, "`USING {s}` takes no arguments; only `USING changes (...)` does", .{name});
+    _ = self.advance();
+    var seq: ?*ast.Expr = null;
+    var del: ?*ast.Expr = null;
+    var at: ?*ast.Expr = null;
+    var ch = ast.Changes{ .pos = pos };
+    var reads = std.array_list.Managed(ast.QualName).init(self.arena);
+    while (!self.at(.rparen)) {
+        const kpos = self.curPos();
+        const key = try self.expectIdent();
+        _ = try self.expect(.assign);
+        if (std.mem.eql(u8, key, "name")) {
+            if (!self.at(.string)) return self.fail(self.curPos(), "`name` in `USING changes` is a string, the application its position is kept under", .{});
+            if (ch.name != null) return self.fail(kpos, "`USING changes` names `name` twice", .{});
+            ch.name = self.advance().text;
+        } else {
+            const slot: *?*ast.Expr = if (std.mem.eql(u8, key, "sequence_by")) &seq else if (std.mem.eql(u8, key, "delete_when")) &del else if (std.mem.eql(u8, key, "position")) &at else return self.fail(kpos, "unknown `USING changes` argument `{s}` (it takes sequence_by, position, delete_when and name)", .{key});
+            if (slot.* != null) return self.fail(kpos, "`USING changes` names `{s}` twice", .{key});
+            slot.* = try self.parseExpr();
+            try self.collectFields(slot.*.?, &reads);
+        }
+        if (!self.eat(.comma)) break;
+    }
+    _ = try self.expect(.rparen);
+    const s = seq orelse return self.fail(pos, "`USING changes` needs `sequence_by`, which orders a key's changes", .{});
+    const p = at orelse return self.fail(pos, "`USING changes` needs `position`, whose largest value the table keeps as the feed's position", .{});
+    var drop = std.array_list.Managed([]const u8).init(self.arena);
+    for (reads.items) |q| if (!q.dollar and q.parts.len == 1) if (!ast.nameIn(drop.items, q.parts[0])) try drop.append(q.parts[0]);
+    ch.drop = try drop.toOwnedSlice();
+    ch.deletes = del != null;
+    write.changes = ch;
+    const false_lit = try self.mk(.{ .bool_lit = false });
+    items.* = try self.arena.dupe(ast.SelectItem, &.{
+        .star,
+        .{ .computed = .{ .name = ast.Changes.seq_col, .expr = s } },
+        .{ .computed = .{ .name = ast.Changes.del_col, .expr = del orelse false_lit } },
+        .{ .computed = .{ .name = ast.Changes.pos_col, .expr = p } },
+    });
 }
 
 pub fn parseTerminalQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {

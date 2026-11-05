@@ -13,6 +13,12 @@
 //! collecting a query's columns takes `t` in `t -> t > 1` for one; lambdas are
 //! values only as arguments of the JSON array functions.
 //!
+//! `Write.changes` is `USING changes (...)`, the change feed a Delta UPSERT
+//! applies: the arguments' values are the hidden columns `Changes.seq_col`,
+//! `del_col` and `pos_col` a select stage computes before the write; `drop` names
+//! the output columns they read, which the table need not have and which are not
+//! written; `name` keys the position the table keeps (null: the target's path).
+//!
 //! Expressions. `LetIn` is inlined by `expand.zig`, so the type-checker and
 //! evaluator never see it. `TRY_CAST` is `Cast` with `safe`: a failed conversion
 //! is null, so it is always nullable. `is empty` is true for null or an empty
@@ -459,6 +465,18 @@ pub const Write = struct {
     target: []const u8,
     mode: WriteMode,
     split: ?SplitBy = null,
+    changes: ?Changes = null,
+};
+
+pub const Changes = struct {
+    name: ?[]const u8 = null,
+    drop: []const []const u8 = &.{},
+    deletes: bool = false,
+    pos: Pos,
+
+    pub const seq_col = "\x00change_seq";
+    pub const del_col = "\x00change_del";
+    pub const pos_col = "\x00change_pos";
 };
 
 /// `SPLIT BY (col) [JOBS n]`: a clause of its own, so a `WITH` key cannot spell it.

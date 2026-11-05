@@ -18,6 +18,11 @@ AS
   `LOAD INTO 's3://bucket/bronze/x.parquet'`.
 - `USING stream_load` names the one load path StarRocks and Doris have, and
   may be left out; on any other target, or with another name, it is an error.
+- `UPSERT ON (k) USING changes (sequence_by = s, position = p[, delete_when =
+  <condition>][, name = 'app'])` on a Delta table applies a change feed: the
+  latest change per key upserts or deletes it, and the table keeps the largest
+  `position` applied, which the query reads as `$since`
+  ([Writing Delta](formats.md#writing-delta)).
 - A per-row dynamic target uses `IDENTIFIER(<string-expr>)` over loop vars
   ([FOR EACH](for-each.md)): `LOAD INTO sr.IDENTIFIER('crm_' || lower($name)) ...`. A file target
   built this way must end in a literal extension, which picks the writer.

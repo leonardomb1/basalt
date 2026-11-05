@@ -84,6 +84,10 @@ const synthReconcile = @import("../plan.zig").synthReconcile;
 const targetLabel = @import("../run.zig").targetLabel;
 const topNStages = @import("../lanes.zig").topNStages;
 const types = @import("../../lang/types.zig");
+const lake = @import("../../format/lake/table.zig");
+const delta = @import("../../format/lake/delta.zig");
+const mkLit = @import("../env.zig").mkLit;
+const Value = @import("../../exec/value.zig").Value;
 const unionCanon = @import("../plan.zig").unionCanon;
 const unionExceptNames = @import("../plan.zig").unionExceptNames;
 const unionSpecs = @import("../plan.zig").unionSpecs;
@@ -91,6 +95,37 @@ const wholeAggStages = @import("../lanes.zig").wholeAggStages;
 
 /// Run one output pipeline: split it into key-range lanes or stream it serially. A
 /// fanned-out union reports per branch, so this outer call then counts nothing.
+/// `$since` for a `USING changes` statement: the position the target table keeps
+/// for the feed's application, as a value of the statement's `position` type;
+/// NULL when the table keeps none or is yet to be made. The type comes from
+/// analysing the statement as `check` does, `$since` NULL meanwhile.
+fn bindSince(env: *Env, out: ast.Pipeline) !void {
+    const w = out.stages[out.stages.len - 1].node.write;
+    const ch = w.changes.?;
+    const nul = try analyze.mk(env.arena, .null_lit);
+    try env.params.put(analyze.since_name, .null);
+    try env.params_expr.put(analyze.since_name, nul);
+    const found = (try lake.detect(env.arena, w.target)) orelse return;
+    if (found.kind != .delta) return;
+    const st = try delta.snapshot(env.arena, w.target, .{}, found.listed);
+    const v = st.txns.get(ch.name orelse w.target) orelse return;
+    _ = env.params.remove(analyze.since_name);
+    _ = env.params_expr.remove(analyze.since_name);
+    var adiag = analyze.Diag{};
+    const plan = try analyze.analyzeOne(env.arena, out, env.bindings, env.connections, env.params_expr, &adiag, env.tables, 1);
+    var kind: types.TypeKind = .int;
+    for (plan.outputs[0].stages) |sg| if (sg.out_schema) |sc| if (sc.indexOf(ast.Changes.pos_col)) |i| {
+        kind = sc.fields[i].ty.kind;
+    };
+    const val: Value = switch (kind) {
+        .date => .{ .date = std.math.cast(i32, v) orelse return planErr(env.diag, "the position the Delta table keeps for this feed is not a date") },
+        .timestamp => .{ .timestamp = v },
+        else => .{ .int = v },
+    };
+    try env.params.put(analyze.since_name, val);
+    try env.params_expr.put(analyze.since_name, try mkLit(env.arena, val));
+}
+
 pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     errdefer env.diag.stamp(out.pos);
     const arena = env.arena;
@@ -103,6 +138,11 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     const is_load = !env.explain and !std.mem.eql(u8, last.write.connector, "stdout");
     if (is_load) env.last_target = try targetLabel(arena, last.write);
     defer env.endStatement(is_load);
+    if (last.write.changes != null) try bindSince(env, out);
+    defer if (last.write.changes != null) {
+        _ = env.params.remove(analyze.since_name);
+        _ = env.params_expr.remove(analyze.since_name);
+    };
     const moving = env.progress != null and (is_load or env.progress.?.mode == .hook);
     if (moving) env.progress.?.begin(try moveLabel(arena, stages[0], last.write));
     const load_t0 = std.time.milliTimestamp();
@@ -828,7 +868,7 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
         try bstages.append(.{ .node = .{ .select = items }, .hints = &.{}, .pos = u.pos });
         try bstages.appendSlice(downstream);
         const bmode: ast.WriteMode = if (i == 0 or w.mode != .overwrite) w.mode else .append;
-        const bw = ast.Write{ .connector = w.connector, .form = w.form, .target = w.target, .mode = bmode };
+        const bw = ast.Write{ .connector = w.connector, .form = w.form, .target = w.target, .mode = bmode, .changes = w.changes };
         try bstages.append(.{ .node = .{ .write = bw }, .hints = write_stage.hints, .pos = write_stage.pos });
         try runOutput(env, .{ .stages = try bstages.toOwnedSlice(), .pos = u.pos }, opts, stats, lanes_used, batch_arena);
     }

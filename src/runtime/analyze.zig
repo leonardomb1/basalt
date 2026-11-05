@@ -335,6 +335,9 @@ pub const WriteOptions = @import("analyze/targets.zig").WriteOptions;
 pub const writeOptions = @import("analyze/targets.zig").writeOptions;
 pub const writeFormat = @import("analyze/targets.zig").writeFormat;
 pub const deltaTarget = @import("analyze/targets.zig").deltaTarget;
+
+/// The `$param` a `USING changes` statement's query reads the table's position as.
+pub const since_name = "since";
 pub const partitionBy = @import("analyze/targets.zig").partitionBy;
 const delta_write = @import("../format/lake/delta_write.zig");
 const lake = @import("../format/lake/table.zig");
@@ -1371,6 +1374,21 @@ const Ctx = struct {
     fn analyzeOutput(self: *Ctx, pipe: ast.Pipeline) !Output {
         errdefer self.diag.stamp(pipe.pos);
         if (pipe.stages.len == 0) return fail(self.diag, "empty pipeline", .{});
+        const last = pipe.stages[pipe.stages.len - 1].node;
+        if (last == .write) if (last.write.changes != null) {
+            if (self.params.get(since_name) != null)
+                return fail(self.diag, "`$since` is bound by `USING changes` to the position the table holds; rename the PARAM or LET named `since`", .{});
+            var local = try self.params.cloneWithAllocator(self.arena);
+            try local.put(since_name, try mk(self.arena, .null_lit));
+            const saved = self.params;
+            self.params = &local;
+            defer self.params = saved;
+            return self.analyzeOutputIn(pipe);
+        };
+        return self.analyzeOutputIn(pipe);
+    }
+
+    fn analyzeOutputIn(self: *Ctx, pipe: ast.Pipeline) !Output {
         const raw = try bindLimits(self.arena, pipe.stages, self.params, self.diag);
         const head = try self.inlineHead(raw);
         const via = head.via;
@@ -1537,7 +1555,7 @@ const Ctx = struct {
         if (!deltaTarget(w, hints) or std.mem.indexOf(u8, w.target, "://") != null or std.mem.indexOf(u8, w.target, "${") != null) return null;
         const opts = try writeOptions(self.arena, w, hints, self.diag);
         const create = (formatFromHints(hints, self.diag) catch null) == .delta;
-        const p = delta_write.plan(self.arena, w.target, delta_write.modeOf(w.mode), create, opts.delta.partition_by, opts.delta.codec, schema) catch |e| {
+        const p = delta_write.plan(self.arena, w.target, delta_write.writeModeOf(w), create, opts.delta.partition_by, opts.delta.codec, schema) catch |e| {
             if (e == lake.Error.LakeTableRefused) return fail(self.diag, "{s}", .{eval.takeFailure(e) orelse @errorName(e)});
             _ = eval.takeFailure(e);
             return null;
@@ -1660,7 +1678,7 @@ const Ctx = struct {
             try checkFileSink(w, hints, self.diag);
             try checkSinkForm(w, hints, w.connector, self.diag);
             if (deltaTarget(w, hints))
-                return .{ .connector = w.connector, .target = w.target, .mode = try delta_write.modeOf(w.mode).label(self.arena), .format = "delta" };
+                return .{ .connector = w.connector, .target = w.target, .mode = try delta_write.writeModeOf(w).label(self.arena), .format = "delta" };
             return .{ .connector = w.connector, .target = w.target, .mode = @tagName(w.mode) };
         }
         const conn = self.connections.get(w.connector) orelse
@@ -1978,6 +1996,11 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
     _ = try writeOptions(scratch.allocator(), w, hints, diag);
     _ = try cutoverProblem(w, hints, diag);
     const form = w.form orelse return;
+    if (std.mem.eql(u8, form, "changes")) {
+        if (!deltaTarget(w, hints)) return fail(diag, "`USING changes` applies a change feed to a Delta table; `{s}` is not one (a folder ending in `/`, or `WITH (format = 'delta')`)", .{w.target});
+        if (w.mode != .upsert) return fail(diag, "`USING changes` applies changes by key: write it with `UPSERT ON (<key>)`", .{});
+        return;
+    }
     if (stream and std.mem.eql(u8, form, "stream_load")) return;
     if (stream) return fail(diag, "unknown load path `USING {s}`; a {s} target loads by `stream_load`", .{ form, connector });
     return fail(diag, "`USING {s}` does not apply here: only a starrocks or doris target takes `USING stream_load`", .{form});

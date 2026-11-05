@@ -232,6 +232,7 @@ pub const State = struct {
     mapping: ?[]const u8 = null,
     v2: ?[]const u8 = null,
     files: std.StringArrayHashMapUnmanaged(Add) = .empty,
+    txns: std.StringHashMapUnmanaged(i64) = .empty,
     whole: ?*Whole = null,
 
     pub const Whole = struct {
@@ -272,6 +273,18 @@ pub const State = struct {
         const k = try self.key(scratch, try table.percentDecode(scratch, path), dv);
         _ = self.files.swapRemove(k);
         return k;
+    }
+
+    /// Application `app`'s transaction version, the last one seen winning.
+    fn txn(self: *State, app: []const u8, v: std.json.Value) !void {
+        const n: i64 = switch (v) {
+            .integer => |x| x,
+            .number_string => |t| std.fmt.parseInt(i64, t, 10) catch return,
+            else => return,
+        };
+        const g = try self.txns.getOrPut(self.arena, app);
+        if (!g.found_existing) g.key_ptr.* = try self.arena.dupe(u8, app);
+        g.value_ptr.* = n;
     }
 
     /// Keeps action `kind`'s body `o` whole, when the state is kept so; `file` is
@@ -370,7 +383,10 @@ pub const State = struct {
                 const wv: ?i64 = if (o.get("minWriterVersion")) |w| (if (w == .integer) w.integer else null) else null;
                 try self.protocol(rv.integer, wv, o.get("readerFeatures"), o.get("writerFeatures"));
                 try self.keep(k, o, null);
-            } else if (std.mem.eql(u8, k, "txn") or std.mem.eql(u8, k, "domainMetadata")) {
+            } else if (std.mem.eql(u8, k, "txn")) {
+                try self.txn(str(o.get("appId")) orelse continue, o.get("version") orelse continue);
+                try self.keep(k, o, null);
+            } else if (std.mem.eql(u8, k, "domainMetadata")) {
                 try self.keep(k, o, null);
             }
         }
@@ -412,7 +428,10 @@ pub const State = struct {
             const c_feat = columnAt(b, "protocol.readerFeatures");
             const c_wfeat = columnAt(b, "protocol.writerFeatures");
             const c_v2 = [_]?column.Column{ columnAt(b, "checkpointMetadata.version"), columnAt(b, "sidecar.path") };
+            const c_app = columnAt(b, "txn.appId");
+            const c_txv = columnAt(b, "txn.version");
             for (0..b.len) |i| {
+                if (cell(c_app, i) == .string and cell(c_txv, i) == .int) try self.txn(cell(c_app, i).string, .{ .integer = cell(c_txv, i).int });
                 for (c_v2) |c| if (cell(c, i) != .null) {
                     self.v2 = url;
                 };
@@ -521,7 +540,8 @@ const checkpoint_columns = [_][]const u8{
     "add.stats",                      "add.deletionVector.pathOrInlineDv", "add.deletionVector.offset", "add.deletionVector.sizeInBytes",
     "add.deletionVector.cardinality", "metaData.id",                       "metaData.schemaString",     "metaData.partitionColumns",
     "metaData.configuration",         "protocol.minReaderVersion",         "protocol.minWriterVersion", "protocol.readerFeatures",
-    "protocol.writerFeatures",        "checkpointMetadata.version",        "sidecar.path",
+    "protocol.writerFeatures",        "checkpointMetadata.version",        "sidecar.path",              "txn.appId",
+    "txn.version",
 };
 
 fn cell(c: ?column.Column, row: usize) Value {

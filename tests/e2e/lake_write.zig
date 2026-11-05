@@ -299,6 +299,64 @@ test "Delta file skipping: a filter on a column or a struct's field leaves out t
     try runRefuses(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT id FROM '$B/t/' WHERE id >= 20;", "could not read its file");
 }
 
+test "Delta USING changes: each run applies the changes past the table's position, the latest per key, deletes too, once" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const apply =
+        \\LOAD INTO '$B/t/' WITH (format = 'delta', partition_by = 'region') UPSERT ON (id)
+        \\  USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn, name = 'orders_cdc')
+        \\AS SELECT * FROM '$B/c.csv' WHERE lsn > coalesce($since, 0);
+    ;
+    const view = "SELECT * FROM '$B/t/' ORDER BY id";
+    const batches = [_][]const u8{
+        "id,name,region,op,seq,lsn\n1,a,eu,i,1,10\n2,b,us,i,2,11\n1,a2,eu,u,3,12\n",
+        "2,b,us,d,4,13\n3,c,eu,i,5,14\n9,z,us,d,6,15\n",
+        "1,a3,us,u,8,16\n3,c,eu,d,7,16\n4,d,eu,i,9,17\n",
+    };
+    const want = [_][]const u8{
+        "id,name,region\n1,a2,eu\n2,b,us\n",
+        "id,name,region\n1,a2,eu\n3,c,eu\n",
+        "id,name,region\n1,a3,us\n4,d,eu\n",
+    };
+    var text = std.array_list.Managed(u8).init(a);
+    for (batches, want, 0..) |b, w, i| {
+        try text.appendSlice(b);
+        try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = text.items });
+        try load(&tmp, apply, if (i == 1) 4 else 1);
+        try testing.expectEqualStrings(w, try rows(a, &tmp, view));
+        try load(&tmp, apply, 4);
+        try testing.expectEqualStrings(w, try rows(a, &tmp, view));
+        try testing.expect(!exists(&tmp, try std.fmt.allocPrint(a, "t/_delta_log/{d:0>20}.json", .{i + 1})));
+    }
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 2), "{\"txn\":{\"appId\":\"orders_cdc\",\"version\":17,") != null);
+    try testing.expectEqual(@as(usize, 2), try actions(a, &tmp, "t", 2, "remove"));
+
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,region,op,seq,lsn\n4,d2,eu,u,10,18\n" });
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) PARTIAL COLS (name) USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn, name = 'orders_cdc') AS SELECT * FROM '$B/c.csv' WHERE lsn > $since;", 1);
+    try testing.expectEqualStrings("id,name,region\n1,a3,us\n4,d2,eu\n", try rows(a, &tmp, view));
+
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,region,op,seq,lsn\n5,e,eu,i,1,30\n5,f,eu,i,1,31\n" });
+    try runRefuses(a, &tmp, apply, "twice at sequence 1");
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,region,op,seq,lsn\n5,e,eu,i,1,7\n" });
+    try runRefuses(a, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn, name = 'orders_cdc') AS SELECT * FROM '$B/c.csv';", "behind the 18 it holds for `orders_cdc`");
+    try testing.expect(!exists(&tmp, "t/_delta_log/00000000000000000005.json"));
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' APPEND USING changes (sequence_by = seq, position = lsn) AS SELECT * FROM '$B/c.csv';", "write it with `UPSERT ON (<key>)`");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/x.csv' USING changes (sequence_by = seq, position = lsn) AS SELECT * FROM '$B/c.csv';", "applies a change feed to a Delta table");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, delete_when = op = 'd', position = name) AS SELECT id, name, region, op, seq FROM '$B/c.csv';", "takes an INT, DATE or TIMESTAMP");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, delete_when = seq, position = lsn) AS SELECT id, name, region, seq, lsn FROM '$B/c.csv';", "not a condition");
+
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,region,op,seq,lsn\n6,g,eu,i,1,40\n" });
+    for (5..11) |_| try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn, name = 'other') AS SELECT * FROM '$B/c.csv' WHERE lsn > coalesce($since, 0) OR TRUE;", 1);
+    try load(&tmp, "LOAD INTO '$B/t/' APPEND AS SELECT 7 AS id, 'h' AS name, 'eu' AS region;", 1);
+    try testing.expect(exists(&tmp, "t/_delta_log/00000000000000000010.checkpoint.parquet"));
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,region,op,seq,lsn\n8,i,eu,i,1,18\n8,j,eu,i,2,19\n" });
+    try load(&tmp, apply, 1);
+    try testing.expectEqualStrings("id,name\n8,j\n", try rows(a, &tmp, "SELECT id, name FROM '$B/t/' WHERE id = 8"));
+}
+
 test "Delta write: what is refused, at check where it can be seen" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();

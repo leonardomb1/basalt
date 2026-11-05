@@ -90,6 +90,8 @@ pub const Commit = struct {
     key_root: []const u8 = "",
     /// An UPSERT's test of a winner's added file.
     hold: ?Hold = null,
+    /// The application whose position (`txn`) the commit moves, under `USING changes`.
+    app: ?[]const u8 = null,
 };
 
 /// The log at `root` (a folder path ending in `/`), local or in an object store.
@@ -195,6 +197,7 @@ const Winner = struct {
     adds: std.ArrayListUnmanaged(std.json.ObjectMap) = .empty,
     removed: std.ArrayListUnmanaged([]const u8) = .empty,
     txn: ?[]const u8 = null,
+    apps: std.ArrayListUnmanaged([]const u8) = .empty,
 };
 
 fn readWinner(arena: std.mem.Allocator, text: []const u8) !Winner {
@@ -218,6 +221,8 @@ fn readWinner(arena: std.mem.Allocator, text: []const u8) !Winner {
             if (std.mem.eql(u8, k, "commitInfo")) if (body.object.get("txnId")) |x| if (x == .string) {
                 w.txn = x.string;
             };
+            if (std.mem.eql(u8, k, "txn")) if (body.object.get("appId")) |x| if (x == .string)
+                try w.apps.append(arena, x.string);
         }
     }
     return w;
@@ -229,6 +234,8 @@ fn conflict(arena: std.mem.Allocator, c: Commit, w: Winner, version: u64) !?[]co
         return try msgfmt.allocPrint(arena, "another writer created the table first (version {d})", .{version});
     if (w.meta or w.protocol)
         return try msgfmt.allocPrint(arena, "version {d}, committed concurrently, changed the table's {s}", .{ version, if (w.meta) "metadata (schema, partitioning or properties)" else "protocol" });
+    if (c.app) |app| for (w.apps.items) |x| if (std.mem.eql(u8, x, app))
+        return try msgfmt.allocPrint(arena, "version {d}, committed concurrently, applied changes for `{s}` too, so this batch may already be in the table; run again to apply from where it left off", .{ version, app });
     if (w.removed.items.len > 0 and c.read_set.len > 0) {
         var mine: std.StringHashMapUnmanaged(void) = .empty;
         for (c.read_set) |f| try mine.put(arena, try keyOf(arena, c.key_root, try table.percentDecode(arena, f)), {});
@@ -396,6 +403,21 @@ test "commit: an append moves past winners that only added files; REPLACE and a 
     var s5 = FakeStore{ .arena = a, .race = &.{appended} };
     try testing.expectError(Error.DeltaCommitConflict, commit(a, s5.store(), "T", testCommit(.create, null, "T")));
     try testing.expect(std.mem.indexOf(u8, eval.takeFailure(Error.DeltaCommitConflict).?, "created the table first") != null);
+}
+
+test "commit: a change feed's commit fails on a winner that moved the same application's position, not another's" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const same = "{\"commitInfo\":{\"txnId\":\"W\"}}\n{\"txn\":{\"appId\":\"cdc\",\"version\":9}}\n";
+    const other = "{\"commitInfo\":{\"txnId\":\"W\"}}\n{\"txn\":{\"appId\":\"etl\",\"version\":9}}\n";
+    var c = testCommit(.upsert, 3, "T");
+    c.app = "cdc";
+    var s1 = FakeStore{ .arena = a, .race = &.{same} };
+    try testing.expectError(Error.DeltaCommitConflict, commit(a, s1.store(), "T", c));
+    try testing.expect(std.mem.indexOf(u8, eval.takeFailure(Error.DeltaCommitConflict).?, "applied changes for `cdc` too") != null);
+    var s2 = FakeStore{ .arena = a, .race = &.{other} };
+    try testing.expectEqual(@as(u64, 5), try commit(a, s2.store(), "T", c));
 }
 
 test "commit: a create failing outright names the table, the version and the files; an unreadable outcome is unknown" {

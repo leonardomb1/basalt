@@ -265,6 +265,37 @@ row whose key is NULL matches nothing and stays. A row may move partition: a
 matched row is written where its new values put it. An UPSERT into a folder with
 `format = 'delta'` and no table creates it with the rows.
 
+`USING changes (...)` makes an UPSERT apply a change feed, the position it has
+read to kept in the table itself, so each run applies exactly what is new:
+
+```sql ignore
+LOAD INTO 's3://lake/silver/orders/' UPSERT ON (order_id)
+  USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn, name = 'orders_cdc')
+AS SELECT * FROM 'landing/orders_changes/' WHERE lsn > coalesce($since, 0);
+```
+
+Each argument is an expression over the query's columns. Of a key's rows, the
+one of the highest `sequence_by` is the one applied, as the latest change; two
+of a key at one sequence fail the run, as which applies would otherwise depend
+on the run. The winner upserts its key, or, when `delete_when` holds for it,
+deletes the key's live row (a delete of a key the table lacks does nothing).
+The commit records the rows' largest `position` as the table's position for
+`name` (the target's path when unset) — Delta's `txn` action, which Spark and
+delta-rs keep for idempotent writes — in the same commit as the rows, so the
+rows and the position land together or not at all. `$since` is that position
+for the statement's query, NULL until a run records one, so `WHERE lsn > $since`
+reads only what is new and pushes down to the source like any `$param`; a run
+with nothing new commits nothing. A position behind the one the table holds
+fails the run, as the query then read changes already applied, and a writer
+committing a position for the same `name` concurrently fails it as a conflict,
+so a rerun after either applies from where the table stands. The position is a
+number Delta keeps, so `position` takes an INT, DATE or TIMESTAMP. The columns
+the arguments read are not written to a table that lacks them, so a feed's
+`op`, `seq` and `lsn` stay out of a table the write creates; a column wanted in
+the table as well is given twice (`SELECT *, at AS changed_at` with `position =
+changed_at`). `PARTIAL COLS` applies to the updates; a delete removes the whole
+row. A checkpoint carries the positions, as Delta's checkpoints keep `txn`.
+
 Only the live files that may hold an incoming key are read: those whose
 partition value (for a key column that partitions the table) or statistics
 (`nullCount`, `minValues`, `maxValues`; a string maximum of 32 bytes or more, as
