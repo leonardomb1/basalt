@@ -79,6 +79,7 @@ const types = @import("../../lang/types.zig");
 const testing = std.testing;
 
 const refuse = table.refuse;
+const variant = @import("variant.zig");
 
 pub const Mode = union(enum) {
     append,
@@ -211,7 +212,7 @@ fn applyMapping(arena: std.mem.Allocator, p: *Plan, st: *const delta.State) !voi
         const md = fv.object.get("metadata").?.object;
         c.phys_name = md.get("delta.columnMapping.physicalName").?.string;
         try ids.put(arena, c.phys_name.?, @intCast(md.get("delta.columnMapping.id").?.integer));
-        c.file_ty = try fileType(arena, fv.object.get("type").?, c.ty, ids);
+        if (!c.variant) c.file_ty = try fileType(arena, fv.object.get("type").?, c.ty, ids);
     }
     p.field_ids = ids;
 }
@@ -356,6 +357,7 @@ pub const Col = struct {
     src: usize,
     phys_name: ?[]const u8 = null,
     file_ty: ?types.Type = null,
+    variant: bool = false,
 
     /// The name the table's files and log give it: its physical name under
     /// column mapping, else its own.
@@ -755,6 +757,36 @@ pub fn tableFields(arena: std.mem.Allocator, name: []const u8, text: []const u8)
     };
 }
 
+const variant_file_ty = types.Type{ .kind = .@"struct", .fields = &.{
+    .{ .name = "value", .ty = .{ .kind = .bytes, .nullable = true } },
+    .{ .name = "metadata", .ty = .{ .kind = .bytes, .nullable = true } },
+} };
+
+/// The rows' JSON text column `col` as table `name`'s variant column `c` holds
+/// it, each value encoded; a value that is not JSON is refused.
+fn variantColumn(arena: std.mem.Allocator, col: column.Column, c: Col, name: []const u8) !column.Column {
+    var vb = try column.Builder.initCapacity(arena, types.Type.init(.bytes).asNullable(), col.len);
+    var mb = try column.Builder.initCapacity(arena, types.Type.init(.bytes).asNullable(), col.len);
+    for (0..col.len) |r| {
+        const v = col.getValue(r);
+        if (v == .null) {
+            try vb.appendNull();
+            try mb.appendNull();
+            continue;
+        }
+        const e = try variant.encode(arena, v.string) orelse
+            return refuse("column `{s}` is a variant in {s}, but a row holds {s}, which is not JSON", .{ c.name, name, v.string[0..@min(v.string.len, 60)] });
+        try vb.append(.{ .bytes = e.value });
+        try mb.append(.{ .bytes = e.metadata });
+    }
+    const kids = try arena.alloc(column.Column, 2);
+    kids[0] = try vb.finish();
+    kids[1] = try mb.finish();
+    const node = try arena.create(column.Nested);
+    node.* = .{ .ty = variant_file_ty, .body = .{ .fields = kids } };
+    return .{ .ty = variant_file_ty, .len = col.len, .validity = col.validity, .data = .{ .nested = node } };
+}
+
 /// A table column `f` as the rows' column of type `in` is written to it.
 fn tableCol(arena: std.mem.Allocator, name: []const u8, f: Field, in: types.Type, src: usize) !Col {
     return tableColLoose(arena, name, f, in, src, false);
@@ -765,6 +797,11 @@ fn tableCol(arena: std.mem.Allocator, name: []const u8, f: Field, in: types.Type
 fn tableColLoose(arena: std.mem.Allocator, name: []const u8, f: Field, in: types.Type, src: usize, loose: bool) !Col {
     if (f.ty != .string) return nestedCol(arena, name, f, in, src, loose);
     const t = f.ty.string;
+    if (std.mem.eql(u8, t, "variant")) {
+        if (!in.unknown and in.kind != .string)
+            return refuse("column `{s}` is {s} in the rows but `variant` in {s}; give it as JSON text (a string)", .{ f.name, @tagName(in.kind), name });
+        return .{ .name = f.name, .delta_type = t, .ty = types.Type.init(.string), .file_ty = variant_file_ty, .phys = .{ .leaves = &.{ .{}, .{} } }, .nullable = f.nullable, .src = src, .variant = true };
+    }
     const c = Col{ .name = f.name, .delta_type = t, .ty = dtypes.scalarType(t, .write) orelse
         return refuse("{s} has column `{s}` of type `{s}`, which basalt does not write", .{ name, f.name, t }), .phys = dtypes.physical(t), .nullable = f.nullable, .src = src };
     if (in.unknown) return c;
@@ -830,10 +867,10 @@ fn fitsNested(in: types.Type, t: types.Type, loose: bool) bool {
 /// that adds and removes whole files, and the ones whose demands `writable`
 /// checks the table does not make.
 const honoured = [_][]const u8{
-    "appendOnly",          "invariants",          "checkConstraints",  "changeDataFeed", "generatedColumns",
-    "columnMapping",       "identityColumns",     "deletionVectors",   "timestampNtz",   "domainMetadata",
-    "vacuumProtocolCheck", "allowColumnDefaults", "inCommitTimestamp", "clustering",     "v2Checkpoint",
-    "rowTracking",
+    "appendOnly",          "invariants",          "checkConstraints",     "changeDataFeed", "generatedColumns",
+    "columnMapping",       "identityColumns",     "deletionVectors",      "timestampNtz",   "domainMetadata",
+    "vacuumProtocolCheck", "allowColumnDefaults", "inCommitTimestamp",    "clustering",     "v2Checkpoint",
+    "rowTracking",         "typeWidening",        "typeWidening-preview", "variantType",    "variantType-preview",
 };
 
 /// Refuses a table that asks a writer for what basalt does not do.
@@ -909,6 +946,7 @@ fn statsJson(arena: std.mem.Allocator, p: *const Plan, sum: pqwrite.Writer.Summa
         for (p.data, sum.columns[0..p.data.len]) |k, cs| {
             const c = p.cols[k];
             items.clearRetainingCapacity();
+            if (c.variant) continue;
             if (c.ty.isNested()) {
                 for (cs.leaves) |l| {
                     const ph = if (l.leaf < c.phys.leaves.len) c.phys.leaves[l.leaf] else pqwrite.Physical{};
@@ -1226,6 +1264,7 @@ pub const Sink = struct {
                 continue;
             }
             var src = b.columns[pc.src];
+            if (pc.variant) src = try variantColumn(arena, src, pc, p.name);
             if (pc.ty.isNested() and !src.ty.eql(pc.ty)) src = try fit.reshape(arena, src, pc.ty);
             c.* = if (rows) |x| try column.permute(arena, src, x) else src;
         }
@@ -1611,8 +1650,10 @@ test "a table's column types: narrower integers and floats, decimals that hold e
     try testing.expect(std.mem.indexOf(u8, eval.takeFailure(table.Error.LakeTableRefused).?, "cannot hold every value") != null);
     try testing.expectError(table.Error.LakeTableRefused, tableCol(testing.failing_allocator, "T", F.of("date"), types.Type.init(.string), 0));
     try testing.expectEqualStrings("column `c` is string in the rows but `date` in T; cast it", eval.takeFailure(table.Error.LakeTableRefused).?);
-    try testing.expectError(table.Error.LakeTableRefused, tableCol(testing.failing_allocator, "T", F.of("variant"), types.Type.init(.string), 0));
-    try testing.expect(std.mem.indexOf(u8, eval.takeFailure(table.Error.LakeTableRefused).?, "`variant`, which basalt does not write") != null);
+    const v = try tableCol(testing.failing_allocator, "T", F.of("variant"), types.Type.init(.string), 0);
+    try testing.expect(v.variant and v.ty.kind == .string and v.file_ty.?.kind == .@"struct");
+    try testing.expectError(table.Error.LakeTableRefused, tableCol(testing.failing_allocator, "T", F.of("variant"), types.Type.init(.int), 0));
+    try testing.expect(std.mem.indexOf(u8, eval.takeFailure(table.Error.LakeTableRefused).?, "give it as JSON text") != null);
 }
 
 test "writable: writer features by name, enforced column metadata, constraints, append-only" {

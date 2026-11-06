@@ -673,7 +673,8 @@ pub const State = struct {
             if (oneOf(f, &.{ "columnMapping", "deletionVectors", "timestampNtz", "vacuumProtocolCheck", "v2Checkpoint" })) continue;
             if (oneOf(f, &.{ "catalogManaged", "catalogOwned-preview" }))
                 return refuse("{s} is catalog-managed (reader feature `{s}`): its newest commits are held by a catalog, not in _delta_log/", .{ self.name, f });
-            if (oneOf(f, &.{ "typeWidening", "typeWidening-preview", "variantType", "variantType-preview", "variantShredding", "variantShredding-preview" }))
+            if (oneOf(f, &.{ "typeWidening", "typeWidening-preview", "variantType", "variantType-preview" })) continue;
+            if (oneOf(f, &.{ "variantShredding", "variantShredding-preview" }))
                 return refuse("{s} uses reader feature `{s}`, which basalt does not read", .{ self.name, f });
             return refuse("{s} needs reader feature `{s}`, which basalt does not know; reading without it could return wrong rows", .{ self.name, f });
         }
@@ -769,7 +770,7 @@ fn schemaOf(arena: std.mem.Allocator, name: []const u8, text: []const u8) !types
     return (try parseSchema(arena, name, text, null)).schema;
 }
 
-const Parsed = struct { schema: types.Schema, mapping: ?*const Mapping = null };
+const Parsed = struct { schema: types.Schema, mapping: ?*const Mapping = null, variants: []const usize = &.{} };
 
 /// `schemaOf`, with how the files name each column when the table maps them `by`.
 fn parseSchema(arena: std.mem.Allocator, name: []const u8, text: []const u8, by: ?Mapping.By) !Parsed {
@@ -777,10 +778,11 @@ fn parseSchema(arena: std.mem.Allocator, name: []const u8, text: []const u8, by:
         return refuse("{s} has a schemaString that is not JSON", .{name});
     var out = std.array_list.Managed(types.Schema.Field).init(arena);
     try addFields(arena, name, &out, "", v, 0);
-    const b = by orelse return .{ .schema = .{ .fields = out.items } };
+    const variants = try variantFields(arena, v);
+    const b = by orelse return .{ .schema = .{ .fields = out.items }, .variants = variants };
     const m = try arena.create(Mapping);
     m.* = try Mapping.init(arena, b, (try mapType(arena, name, b, "", v, 0)).children);
-    return .{ .schema = .{ .fields = out.items }, .mapping = m };
+    return .{ .schema = .{ .fields = out.items }, .mapping = m, .variants = variants };
 }
 
 /// A type of `schemaString` as the mapping of what it nests: a struct's fields,
@@ -842,9 +844,26 @@ fn structFields(arena: std.mem.Allocator, name: []const u8, col: []const u8, v: 
     const out = try arena.alloc(types.Type.Field, fields.len);
     for (fields, out) |f, *o| {
         const full = if (col.len == 0) f.name else try std.mem.concat(arena, u8, &.{ col, ".", f.name });
-        o.* = .{ .name = f.name, .ty = (try typeOf(arena, name, full, f.ty, depth + 1)).asNullable() };
+        const top_variant = col.len == 0 and isVariant(f.ty);
+        o.* = .{ .name = f.name, .ty = (if (top_variant) types.Type.init(.string) else try typeOf(arena, name, full, f.ty, depth + 1)).asNullable() };
     }
     return out;
+}
+
+fn isVariant(t: std.json.Value) bool {
+    return t == .string and std.mem.eql(u8, t.string, "variant");
+}
+
+/// The top-level columns of `schemaString` value `v` whose type is `variant`, as
+/// indices of its fields.
+fn variantFields(arena: std.mem.Allocator, v: std.json.Value) ![]const usize {
+    const fields = switch (try dtypes.fields(arena, v, .lenient)) {
+        .fields => |fs| fs,
+        .problem => return &.{},
+    };
+    var out = std.ArrayList(usize).empty;
+    for (fields, 0..) |f, i| if (isVariant(f.ty)) try out.append(arena, i);
+    return out.items;
 }
 
 /// Column `col`'s `schemaString` type `t` as basalt's, as the reader types it.
@@ -857,7 +876,7 @@ pub fn tableType(arena: std.mem.Allocator, name: []const u8, col: []const u8, t:
 fn typeOf(arena: std.mem.Allocator, name: []const u8, col: []const u8, t: std.json.Value, depth: usize) anyerror!types.Type {
     if (depth >= table.max_depth) return refuse("{s} has a schemaString nested deeper than {d} levels", .{ name, table.max_depth });
     switch (t) {
-        .string => |s| return primitive(name, col, s),
+        .string => |s| return if (depth == 0 and std.mem.eql(u8, s, "variant")) types.Type.init(.string) else primitive(name, col, s),
         .object => |o| {
             const kind = str(o.get("type")) orelse "";
             if (std.mem.eql(u8, kind, "struct")) return .{ .kind = .@"struct", .fields = try structFields(arena, name, col, t, depth) };
@@ -878,6 +897,8 @@ fn typeOf(arena: std.mem.Allocator, name: []const u8, col: []const u8, t: std.js
 }
 
 fn primitive(name: []const u8, col: []const u8, t: []const u8) !types.Type {
+    if (std.mem.eql(u8, t, "variant"))
+        return refuse("{s} has a variant `{s}` inside a struct, list or map; basalt reads a variant only as a top-level column", .{ name, col });
     return dtypes.scalarType(t, .read) orelse
         refuse("{s} has a column `{s}` of type `{s}`, which basalt does not read", .{ name, col, t });
 }
@@ -973,7 +994,7 @@ pub fn layoutOf(arena: std.mem.Allocator, st: *const State, root: []const u8, ad
         }
     }
     const out = try arena.create(FileLayout);
-    out.* = .{ .layout = .{ .name = name, .root = root, .schema = schema, .part_fields = part_fields, .files = files, .mapping = parsed.mapping }, .files = files };
+    out.* = .{ .layout = .{ .name = name, .root = root, .schema = schema, .part_fields = part_fields, .files = files, .mapping = parsed.mapping, .variants = parsed.variants }, .files = files };
     return out;
 }
 
@@ -1177,8 +1198,7 @@ test "protocol: reader versions and features, refused only where the table uses 
     try st.checkProtocol();
     for ([_][2][]const u8{
         .{ "catalogManaged", "catalog-managed" },
-        .{ "typeWidening", "reader feature `typeWidening`, which basalt does not read" },
-        .{ "variantType", "reader feature `variantType`, which basalt does not read" },
+        .{ "variantShredding", "reader feature `variantShredding`, which basalt does not read" },
         .{ "fancyNew", "reader feature `fancyNew`, which basalt does not know" },
     }) |c| {
         st.features = &.{c[0]};
@@ -1220,9 +1240,13 @@ test "schemaString: primitives, and a struct, an array and a map as nested colum
     try testing.expectEqual(@as(u8, 12), s.fields[1].ty.precision);
     try testing.expectEqual(@as(u8, 3), s.fields[1].ty.scale);
     try testing.expectError(table.Error.LakeTableRefused, schemaOf(a, "T",
-        \\{"type":"struct","fields":[{"name":"v","type":"variant","nullable":true,"metadata":{}}]}
+        \\{"type":"struct","fields":[{"name":"s","type":{"type":"struct","fields":[{"name":"v","type":"variant","nullable":true,"metadata":{}}]},"nullable":true,"metadata":{}}]}
     ));
-    try testing.expectEqualStrings("T has a column `v` of type `variant`, which basalt does not read", eval.takeFailure(table.Error.LakeTableRefused).?);
+    try testing.expectEqualStrings("T has a variant `s.v` inside a struct, list or map; basalt reads a variant only as a top-level column", eval.takeFailure(table.Error.LakeTableRefused).?);
+    const top = try schemaOf(a, "T",
+        \\{"type":"struct","fields":[{"name":"v","type":"variant","nullable":true,"metadata":{}}]}
+    );
+    try testing.expectEqualStrings("string", try top.fields[0].ty.name(a));
 
     var deep = std.array_list.Managed(u8).init(a);
     for (0..100_000) |_| try deep.appendSlice("{\"type\":\"struct\",\"fields\":[{\"name\":\"a\",\"type\":");

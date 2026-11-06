@@ -28,9 +28,11 @@ const Value = @import("../../exec/value.zig").Value;
 const cmp = @import("stats.zig").cmp;
 const column = @import("../../exec/column.zig");
 const eval = @import("../../exec/eval.zig");
+const cast = @import("../../exec/eval/cast.zig");
 const parseFooterOf = @import("folder.zig").parseFooterOf;
 const roaring = @import("../lake/roaring.zig");
 const dtypes = @import("../lake/delta_types.zig");
+const variant = @import("../lake/variant.zig");
 const types = @import("../../lang/types.zig");
 const testing = std.testing;
 
@@ -46,6 +48,7 @@ pub const Layout = struct {
     files: []const File,
     mapping: ?*const Mapping = null,
     rows: ?Rows = null,
+    variants: []const usize = &.{},
 
     pub const Rows = struct { id: usize, version: usize, mat_id: []const u8, mat_version: []const u8 };
 
@@ -225,6 +228,13 @@ pub const Layout = struct {
                 continue;
             };
             const got = r.schema.fields[k].ty;
+            if (std.mem.indexOfScalar(usize, self.variants, fi) != null) {
+                if (!isVariantFile(got)) return eval.explain(Error.LakeFileMismatch, msgfmt.allocPrint(arena, "{s} has file `{s}` whose variant column `{s}` is {s}, not a struct of binary `value` and `metadata`", .{
+                    self.name, below(file.path, self.root), want.name, try got.name(arena),
+                }) catch self.name);
+                o.* = .{ .variant = k };
+                continue;
+            }
             if (!fitsType(got, want.ty)) return eval.explain(Error.LakeFileMismatch, msgfmt.allocPrint(arena, "{s} has file `{s}` whose column `{s}` is {s}, not {s} as in the table's schema", .{
                 self.name, below(file.path, self.root), want.name, try got.name(arena), try want.ty.name(arena),
             }) catch self.name);
@@ -395,11 +405,45 @@ const Renamer = struct {
     }
 };
 
+fn isVariantFile(got: types.Type) bool {
+    if (got.kind != .@"struct") return false;
+    for ([_][]const u8{ "value", "metadata" }) |n| {
+        const f = fieldNamed(got, n) orelse return false;
+        if (f.ty.kind != .bytes) return false;
+    }
+    return true;
+}
+
+/// A file's variant column (a struct of `value` and `metadata`) as its values'
+/// JSON text; a corrupt value fails naming the column.
+fn variantText(arena: std.mem.Allocator, col: column.Column, want: types.Schema.Field) !column.Column {
+    const fs = col.data.nested.body.fields;
+    var vi: usize = 0;
+    var mi: usize = 0;
+    for (col.ty.fields.?, 0..) |f, i| {
+        if (std.mem.eql(u8, f.name, "value")) vi = i;
+        if (std.mem.eql(u8, f.name, "metadata")) mi = i;
+    }
+    var bd = try column.Builder.initCapacity(arena, want.ty, col.len);
+    for (0..col.len) |r| {
+        const v = if (col.validity.get(r)) fs[vi].getValue(r) else Value.null;
+        const m = if (col.validity.get(r)) fs[mi].getValue(r) else Value.null;
+        if (v == .null or m == .null) {
+            try bd.appendNull();
+            continue;
+        }
+        const text = variant.decode(arena, v.bytes, m.bytes) catch |e| return if (e == error.OutOfMemory) e else eval.explain(e, msgfmt.allocPrint(arena, "its variant column `{s}` has a value that is not valid Variant binary", .{want.name}) catch "a variant value is not valid Variant binary");
+        try bd.append(.{ .string = text });
+    }
+    return bd.finish();
+}
+
 /// Whether a file's column of type `got` reads as the table's `want`: the same kind,
 /// a decimal at the same scale (its precision is relabelled), and a struct's
 /// fields fitting by name where both have them, a list's or a map's parts alike.
 /// A struct field only one side has is no mismatch: a table adds and drops them.
 fn fitsType(got: types.Type, want: types.Type) bool {
+    if (widens(got, want)) return true;
     if (got.kind != want.kind) return false;
     return switch (want.kind) {
         .decimal => got.scale == want.scale,
@@ -412,6 +456,30 @@ fn fitsType(got: types.Type, want: types.Type) bool {
     };
 }
 
+/// Whether a file's `got` is a narrower type the table has widened to `want`, as
+/// Delta's type widening allows: an integer to a decimal or a double, a decimal to
+/// a larger scale, a date to a timestamp (integers and floats of every width are
+/// basalt's one INT and FLOAT already).
+fn widens(got: types.Type, want: types.Type) bool {
+    return switch (got.kind) {
+        .int => want.kind == .decimal or want.kind == .float,
+        .decimal => want.kind == .decimal and want.scale > got.scale,
+        .date => want.kind == .timestamp,
+        else => false,
+    };
+}
+
+/// Column `col` of a type that `widens` to `want`, its values cast to it.
+fn widened(arena: std.mem.Allocator, col: column.Column, want: types.Type) error{OutOfMemory}!column.Column {
+    var bd = try column.Builder.initCapacity(arena, want, col.len);
+    for (0..col.len) |r| {
+        const v = col.getValue(r);
+        const w = if (v == .null) Value.null else cast.castValueTyped(arena, v, want) catch Value.null;
+        bd.append(w) catch return error.OutOfMemory;
+    }
+    return bd.finish();
+}
+
 fn fieldNamed(t: types.Type, name: []const u8) ?types.Type.Field {
     for (t.fields orelse &.{}) |f| if (std.mem.eql(u8, f.name, name)) return f;
     return null;
@@ -422,6 +490,7 @@ fn fieldNamed(t: types.Type, name: []const u8) ?types.Type.Field {
 /// table lacks left out; a list's or a map's child reshaped alike.
 pub fn reshape(arena: std.mem.Allocator, col: column.Column, want: types.Type) error{OutOfMemory}!column.Column {
     if (!want.isNested()) {
+        if (widens(col.ty, want)) return widened(arena, col, want);
         var out = col;
         out.ty = want;
         return out;
@@ -483,15 +552,17 @@ pub const Fit = struct {
         value: Value,
         row_id: struct { mat: ?usize, pos: usize, base: ?i64 },
         row_version: struct { mat: ?usize, default: ?i64 },
+        variant: usize,
     };
 
     pub fn apply(self: *const Fit, arena: std.mem.Allocator, b: Batch) !Batch {
         const cols = try arena.alloc(column.Column, self.outs.len);
         for (cols, self.outs, self.schema.fields) |*c, o, f| switch (o) {
             .column => |k| {
-                c.* = if (f.ty.isNested()) try reshape(arena, b.columns[k], f.ty) else b.columns[k];
+                c.* = if (f.ty.isNested() or widens(b.columns[k].ty, f.ty)) try reshape(arena, b.columns[k], f.ty) else b.columns[k];
                 c.ty = f.ty;
             },
+            .variant => |k| c.* = try variantText(arena, b.columns[k], f),
             .value => |val| {
                 var bd = try column.Builder.initCapacity(arena, f.ty, b.len);
                 try bd.appendRepeated(val, b.len);

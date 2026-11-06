@@ -311,7 +311,7 @@ test "Delta refusals name the feature, version or file a read cannot honour" {
 
     for ([_][2][]const u8{
         .{ "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"catalogManaged\"]}}", "is catalog-managed (reader feature `catalogManaged`)" },
-        .{ "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"typeWidening\"]}}", "uses reader feature `typeWidening`, which basalt does not read" },
+        .{ "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"variantShredding\"]}}", "uses reader feature `variantShredding`, which basalt does not read" },
         .{ "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"timestampNtz\",\"futureThing\"]}}", "needs reader feature `futureThing`, which basalt does not know" },
         .{ "{\"protocol\":{\"minReaderVersion\":4,\"minWriterVersion\":7}}", "needs Delta reader version 4; basalt reads reader versions 1 to 3" },
     }) |c| {
@@ -322,8 +322,8 @@ test "Delta refusals name the feature, version or file a read cannot honour" {
     const fields = try std.mem.join(a, ",", &.{ try field(a, "id", "long"), try field(a, "name", "string") });
     try commit(a, &tmp, "t", 2, &.{ "{\"protocol\":{\"minReaderVersion\":2,\"minWriterVersion\":5}}", try meta(a, fields, "[]", "{\"delta.columnMapping.mode\":\"name\"}") });
     try refused(a, &tmp, "SELECT * FROM '$B/t/'", "uses column mapping (mode `name`) but its column `id` has no physical name", false);
-    try commit(a, &tmp, "t", 2, &.{try meta(a, try field(a, "v", "variant"), "[]", "{}")});
-    try refused(a, &tmp, "SELECT * FROM '$B/t/'", "has a column `v` of type `variant`, which basalt does not read", false);
+    try commit(a, &tmp, "t", 2, &.{try meta(a, try std.mem.join(a, ",", &.{ try field(a, "id", "variant"), try field(a, "name", "string") }), "[]", "{}")});
+    try refused(a, &tmp, "SELECT * FROM '$B/t/'", "has file `b.parquet` whose variant column `id` is int, not a struct of binary `value` and `metadata`", true);
     try commit(a, &tmp, "t", 2, &.{try meta(a, try std.mem.join(a, ",", &.{ try field(a, "id", "string"), try field(a, "name", "string") }), "[]", "{}")});
     try refused(a, &tmp, "SELECT * FROM '$B/t/'", "has file `b.parquet` whose column `id` is int, not string as in the table's schema", true);
     try tmp.dir.deleteFile("t/_delta_log/00000000000000000002.json");

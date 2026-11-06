@@ -141,11 +141,22 @@ name reads NULL from files written before, as their data is the old column's.
 In `id` mode a file without field ids fails the read naming it, rather than read
 as all NULLs.
 
+Under type widening (`typeWidening`) a file written before a column widened
+reads in the table's wider type: an integer as a decimal or a double, a decimal
+at a larger scale, a date as a timestamp, struct fields and list and map parts
+alike. A `variant` column (`variantType`) reads as its JSON text, a STRING:
+objects with their keys in order, a decimal as its exact digits, dates,
+timestamps, times and UUIDs as quoted text, binary as quoted base64, a NaN or
+infinite float as `null`, each as basalt's JSON writes its own values;
+nanosecond timestamps keep their microseconds. A variant nested inside a struct, list or map, a shredded one
+(`variantShredding`) and a file whose variant column is not the struct of binary
+`value` and `metadata` the protocol defines are refused.
+
 A table using a reader feature basalt does not honour is refused, naming it,
-rather than read into wrong rows: a catalog-managed table, `typeWidening`,
-`variantType`, a reader version past 3, and any feature basalt does not know.
-`deletionVectors`, `columnMapping`, `timestampNtz`, `vacuumProtocolCheck` and
-`v2Checkpoint` read as described; a V2 checkpoint, named by a UUID and written
+rather than read into wrong rows: a catalog-managed table,
+`variantShredding`, a reader version past 3, and any feature basalt does not
+know. `deletionVectors`, `columnMapping`, `timestampNtz`, `vacuumProtocolCheck`,
+`typeWidening`, `variantType` and `v2Checkpoint` read as described; a V2 checkpoint, named by a UUID and written
 as JSON or Parquet, is read like a classic one, its `add`s and `remove`s
 inline or in the sidecar files under `_delta_log/_sidecars/` it names, of
 which only those two kinds of action are taken. A live file missing from storage (a
@@ -430,13 +441,18 @@ Databricks' writer features are honoured as the protocol asks:
   materialized columns (an updated row keeps its id and takes the new version,
   an inserted one is numbered afresh); a table that enables it without naming
   those columns refuses such a rewrite.
+- A widened column (`typeWidening`) takes rows of its wider type; a `variant`
+  column takes JSON text, each value written as Variant binary (integers in the
+  narrowest width, a number with a fraction as a decimal when its digits fit,
+  else a double) with no statistics, and a row whose text is not JSON fails the
+  write. basalt does not create variant columns: a STRING creates a `string`.
 
 A table that asks a writer for what basalt does not do is refused, naming it: a
 writer version past 7, a writer feature other than `appendOnly`, `invariants`,
 `checkConstraints`, `changeDataFeed`, `generatedColumns`, `columnMapping`,
 `identityColumns`, `deletionVectors`, `timestampNtz`, `domainMetadata`,
 `vacuumProtocolCheck`, `allowColumnDefaults`, `inCommitTimestamp`, `clustering`,
-`v2Checkpoint` and `rowTracking`, and among those any the
+`v2Checkpoint`, `rowTracking`, `typeWidening` and `variantType`, and among those any the
 table actually uses — a column invariant, a CHECK constraint, a generated or
 identity column, a column default an UPSERT's `PARTIAL COLS` leaves to it — as
 well as a `REPLACE` or `UPSERT` of a

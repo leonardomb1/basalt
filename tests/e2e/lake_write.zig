@@ -644,6 +644,64 @@ test "Delta row tracking: new files are numbered on from the high-water mark, an
     try testing.expectEqualStrings("n\n5\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/t/'"));
 }
 
+test "Delta type widening: a file written before a column widened reads in the wider type, and the table takes rows of it" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT id, CAST('2026-01-0' || id AS DATE) AS d, CAST(amt AS DECIMAL(5,2)) AS x FROM '$B/a.csv';", 1);
+    const v0 = try logFile(a, &tmp, "t", 0);
+    var meta: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, v0, '\n');
+    while (lines.next()) |l| if (std.mem.startsWith(u8, l, "{\"metaData\":")) {
+        meta = l;
+    };
+    var m = try std.mem.replaceOwned(u8, a, meta, "\\\"name\\\":\\\"id\\\",\\\"type\\\":\\\"long\\\",\\\"nullable\\\":true,\\\"metadata\\\":{}", "\\\"name\\\":\\\"id\\\",\\\"type\\\":\\\"decimal(20,0)\\\",\\\"nullable\\\":true,\\\"metadata\\\":{\\\"delta.typeChanges\\\":[{\\\"fromType\\\":\\\"long\\\",\\\"toType\\\":\\\"decimal(20,0)\\\"}]}");
+    m = try std.mem.replaceOwned(u8, a, m, "\\\"name\\\":\\\"d\\\",\\\"type\\\":\\\"date\\\"", "\\\"name\\\":\\\"d\\\",\\\"type\\\":\\\"timestamp_ntz\\\"");
+    m = try std.mem.replaceOwned(u8, a, m, "\\\"type\\\":\\\"decimal(5,2)\\\"", "\\\"type\\\":\\\"decimal(10,4)\\\"");
+    try testing.expect(!std.mem.eql(u8, m, meta));
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000001.json", .data = try std.mem.concat(a, u8, &.{
+        "{\"commitInfo\":{\"timestamp\":1}}\n",
+        "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"typeWidening\",\"timestampNtz\"],\"writerFeatures\":[\"typeWidening\",\"timestampNtz\"]}}\n",
+        m,
+        "\n",
+    }) });
+    try testing.expectEqualStrings("id,d,x\n1,2026-01-01 00:00:00,10.0000\n2,2026-01-02 00:00:00,20.0000\n3,2026-01-03 00:00:00,5.0000\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT CAST(99999999999999999999 AS DECIMAL(20,0)) AS id, CAST('2026-02-01 12:30:00' AS TIMESTAMP) AS d, CAST('12345.6789' AS DECIMAL(10,4)) AS x;", 1);
+    try testing.expectEqualStrings("n,big\n4,99999999999999999999\n", try rows(a, &tmp, "SELECT COUNT(*) AS n, MAX(id) AS big FROM '$B/t/'"));
+    try testing.expectEqualStrings("id,x\n2,20.0000\n", try rows(a, &tmp, "SELECT id, x FROM '$B/t/' WHERE d = '2026-01-02 00:00:00'"));
+}
+
+test "Delta variant: a variant column takes JSON text, is written as Variant binary and reads back as JSON" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT id, CAST(grp AS VARCHAR) AS v FROM '$B/a.csv' WHERE id < 0;", 0);
+    const v0 = try logFile(a, &tmp, "t", 0);
+    var meta: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, v0, '\n');
+    while (lines.next()) |l| if (std.mem.startsWith(u8, l, "{\"metaData\":")) {
+        meta = l;
+    };
+    const m = try std.mem.replaceOwned(u8, a, meta, "\\\"name\\\":\\\"v\\\",\\\"type\\\":\\\"string\\\"", "\\\"name\\\":\\\"v\\\",\\\"type\\\":\\\"variant\\\"");
+    try testing.expect(!std.mem.eql(u8, m, meta));
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000001.json", .data = try std.mem.concat(a, u8, &.{
+        "{\"commitInfo\":{\"timestamp\":1}}\n",
+        "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"variantType\"],\"writerFeatures\":[\"variantType\"]}}\n",
+        m,
+        "\n",
+    }) });
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT 1 AS id, '{\"b\":[1,2.5,\"" ++ "y" ** 70 ++ "\"],\"a\":{\"k\":null,\"t\":true}}' AS v UNION ALL SELECT 2, '-12.5' UNION ALL SELECT 3, NULL;", 3);
+    try testing.expectEqualStrings("id,v\n1,\"{\"\"a\"\":{\"\"k\"\":null,\"\"t\"\":true},\"\"b\"\":[1,2.5,\"\"" ++ "y" ** 70 ++ "\"\"]}\"\n2,-12.5\n3,\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT 2 AS id, '[\"x\"]' AS v;", 1);
+    try testing.expectEqualStrings("id,v\n2,\"[\"\"x\"\"]\"\n3,\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' WHERE id > 1 ORDER BY id"));
+    try harness.expectRunRefuses(gpa, &tmp, "LOAD INTO '$B/t/' AS SELECT 9 AS id, '{nope' AS v;", 1, "is a variant in");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' AS SELECT 9 AS id, 5 AS v;", "give it as JSON text");
+}
+
 test "Delta write: what is refused, at check where it can be seen" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
@@ -668,10 +726,10 @@ test "Delta write: what is refused, at check where it can be seen" {
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT AS SELECT * FROM '$B/a.csv';", "infers the primary key from the source");
 
     const v0 = try logFile(a, &tmp, "t", 0);
-    const featured = try std.mem.replaceOwned(u8, a, v0, "{\"minReaderVersion\":1,\"minWriterVersion\":2}", "{\"minReaderVersion\":1,\"minWriterVersion\":7,\"writerFeatures\":[\"appendOnly\",\"typeWidening\"]}");
+    const featured = try std.mem.replaceOwned(u8, a, v0, "{\"minReaderVersion\":1,\"minWriterVersion\":2}", "{\"minReaderVersion\":1,\"minWriterVersion\":7,\"writerFeatures\":[\"appendOnly\",\"icebergCompatV2\"]}");
     try tmp.dir.makePath("f/_delta_log");
     try tmp.dir.writeFile(.{ .sub_path = "f/_delta_log/00000000000000000000.json", .data = featured });
-    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/f/' AS SELECT * FROM '$B/a.csv';", "uses writer feature `typeWidening`, which basalt does not honour");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/f/' AS SELECT * FROM '$B/a.csv';", "uses writer feature `icebergCompatV2`, which basalt does not honour");
 
     const append_only = try std.mem.replaceOwned(u8, a, v0, "\"configuration\":{}", "\"configuration\":{\"delta.appendOnly\":\"true\"}");
     try tmp.dir.makePath("ao/_delta_log");

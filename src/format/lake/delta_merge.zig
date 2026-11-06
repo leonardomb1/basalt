@@ -372,7 +372,7 @@ pub const Merge = struct {
             f.* = .{ .path = src.path, .size = src.size, .parts = parts, .deletes = src.deletes, .row_base = src.row_base, .row_version = src.row_version };
         }
         const out = try a.create(fit.Layout);
-        out.* = .{ .name = base.name, .root = base.root, .schema = .{ .fields = fields }, .part_fields = part_fields, .files = files, .mapping = base.mapping };
+        out.* = .{ .name = base.name, .root = base.root, .schema = .{ .fields = fields }, .part_fields = part_fields, .files = files, .mapping = base.mapping, .variants = base.variants };
         if (self.rowCols() == 2) {
             const st = self.plan.snap.?;
             out.rows = .{
