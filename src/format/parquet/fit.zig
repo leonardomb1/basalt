@@ -38,6 +38,8 @@ const testing = std.testing;
 
 pub const Error = error{ LakeFileMismatch, LakeEmptySchema };
 
+pub const change_type_name = "_change_type";
+
 pub const Layout = struct {
     /// How messages name the table: "Delta table `s3://b/t/`".
     name: []const u8,
@@ -49,6 +51,7 @@ pub const Layout = struct {
     mapping: ?*const Mapping = null,
     rows: ?Rows = null,
     variants: []const usize = &.{},
+    change_type: ?usize = null,
 
     pub const Rows = struct { id: usize, version: usize, mat_id: []const u8, mat_version: []const u8 };
 
@@ -60,6 +63,7 @@ pub const Layout = struct {
         stats: ?[]const u8 = null,
         row_base: ?i64 = null,
         row_version: ?i64 = null,
+        change_type: ?[]const u8 = null,
     };
 
     pub fn paths(self: *const Layout, arena: std.mem.Allocator) ![]const []const u8 {
@@ -179,6 +183,10 @@ pub const Layout = struct {
         var names = std.array_list.Managed([]const u8).init(arena);
         var wants_rows = false;
         for (v.fields) |fi| if (self.partOf(fi) == null) {
+            if (self.change_type == fi) {
+                if (file.change_type == null) try names.append(try self.fileColumn(arena, change_type_name));
+                continue;
+            }
             if (self.rowField(fi) != null) {
                 wants_rows = true;
                 continue;
@@ -221,6 +229,18 @@ pub const Layout = struct {
             }
             if (self.partOf(fi)) |p| {
                 o.* = .{ .value = if (p < file.parts.len) file.parts[p] else .null };
+                continue;
+            }
+            if (self.change_type == fi) {
+                if (file.change_type) |t| {
+                    o.* = .{ .value = .{ .string = t } };
+                    continue;
+                }
+                const k = r.schema.indexOf(try self.fileColumn(arena, change_type_name)) orelse
+                    return eval.explain(Error.LakeFileMismatch, msgfmt.allocPrint(arena, "{s} has change data file `{s}` with no `_change_type` column", .{ self.name, below(file.path, self.root) }) catch self.name);
+                if (r.schema.fields[k].ty.kind != .string)
+                    return eval.explain(Error.LakeFileMismatch, msgfmt.allocPrint(arena, "{s} has change data file `{s}` whose `_change_type` is not a string", .{ self.name, below(file.path, self.root) }) catch self.name);
+                o.* = .{ .column = k };
                 continue;
             }
             const k = r.schema.indexOf(want.name) orelse {

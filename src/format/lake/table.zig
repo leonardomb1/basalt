@@ -42,16 +42,22 @@ pub const Kind = enum {
     }
 };
 
+pub const pin_keys = [_][]const u8{ "version", "timestamp", "changes_from", "changes_to" };
+
 pub const At = struct {
     version: ?u64 = null,
     timestamp_us: ?i64 = null,
+    changes: ?Changes = null,
+
+    pub const Point = union(enum) { version: u64, us: i64 };
+    pub const Changes = struct { from: Point, to: ?Point = null };
 
     pub fn eql(a: At, b: At) bool {
-        return a.version == b.version and a.timestamp_us == b.timestamp_us;
+        return a.version == b.version and a.timestamp_us == b.timestamp_us and std.meta.eql(a.changes, b.changes);
     }
 
     pub fn pinned(self: At) bool {
-        return self.version != null or self.timestamp_us != null;
+        return self.version != null or self.timestamp_us != null or self.changes != null;
     }
 };
 
@@ -366,6 +372,7 @@ test {
     _ = @import("delta.zig");
     _ = @import("delta_maint.zig");
     _ = @import("variant.zig");
+    _ = @import("delta_changes.zig");
     _ = @import("delta_checkpoint.zig");
     _ = @import("delta_dv.zig");
     _ = @import("delta_log.zig");

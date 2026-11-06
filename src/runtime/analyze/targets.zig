@@ -86,9 +86,18 @@ pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
 
 /// What a lake table read is pinned to: `version = N`, a Delta commit number, or
 /// `timestamp = '2026-11-01 08:00:00'`, the table as it stood then (UTC); not both.
+/// `changes_from` (and `changes_to`), each a version or a time, read the changes
+/// over that range instead, and pin nothing else.
 pub fn lakeAt(hints: []const ast.Hint, diag: *Diag) Error!lake.At {
     var at = lake.At{};
+    var to: ?lake.At.Point = null;
     for (hints) |h| {
+        const which: ?[]const u8 = if (std.mem.eql(u8, h.key, "changes_from")) "changes_from" else if (std.mem.eql(u8, h.key, "changes_to")) "changes_to" else null;
+        if (which) |k| {
+            const p = try changePoint(h.value, k, diag);
+            if (std.mem.eql(u8, k, "changes_from")) at.changes = .{ .from = p } else to = p;
+            continue;
+        }
         if (std.mem.eql(u8, h.key, "timestamp")) {
             const t = switch (h.value) {
                 .str, .ident => |s| s,
@@ -111,7 +120,27 @@ pub fn lakeAt(hints: []const ast.Hint, diag: *Diag) Error!lake.At {
     }
     if (at.version != null and at.timestamp_us != null)
         return fail(diag, "`version` and `timestamp` both pin the Delta table read; give one", .{});
+    if (to) |p| {
+        if (at.changes == null) return fail(diag, "`changes_to` ends a range of changes that `changes_from` starts; give `changes_from` too", .{});
+        at.changes.?.to = p;
+    }
+    if (at.changes != null and (at.version != null or at.timestamp_us != null))
+        return fail(diag, "`changes_from` reads the changes over a range of versions, which `version` and `timestamp` do not pin; give one or the other", .{});
     return at;
+}
+
+/// A `changes_from` or `changes_to` value `v`: a whole number is a commit
+/// version, text that is not one a time (UTC).
+fn changePoint(v: ast.HintVal, key: []const u8, diag: *Diag) Error!lake.At.Point {
+    const text = switch (v) {
+        .int => |i| return if (i >= 0) .{ .version = @intCast(i) } else fail(diag, "`{s}` is a commit version from 0, or a time as text", .{key}),
+        .str, .ident => |s| s,
+        .flag => return fail(diag, "`{s}` is a commit version (`{s} = 3`) or a time (`{s} = '2026-11-01 08:00:00'`)", .{ key, key, key }),
+    };
+    if (std.fmt.parseInt(u64, text, 10)) |n| return .{ .version = n } else |_| {}
+    const us = @import("../../exec/eval.zig").parseTimestampText(text) orelse
+        return fail(diag, "`{s} = '{s}'` is neither a commit version nor a date or timestamp (`2026-11-01` or `2026-11-01 08:00:00`, UTC)", .{ key, text });
+    return .{ .us = us };
 }
 
 /// How a JSON read cuts its input into rows: `format = 'ndjson'` (or `'jsonl'`)
@@ -450,7 +479,7 @@ pub fn laneHints(st: ast.Stage) bool {
             if (!in_folder and f != readFormat(p, null)) return false;
             continue;
         }
-        if ((std.mem.eql(u8, h.key, "version") or std.mem.eql(u8, h.key, "timestamp")) and st.node == .read and st.node.read.form == .path and lake.isTablePath(st.node.read.form.path)) continue;
+        if (ast.nameIn(&lake.pin_keys, h.key) and st.node == .read and st.node.read.form == .path and lake.isTablePath(st.node.read.form.path)) continue;
         return false;
     }
     return true;

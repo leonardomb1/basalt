@@ -105,6 +105,28 @@ pub const Bitmap = struct {
     }
 };
 
+/// The rows `rows` marks true as a bitmap, each 65536-row bucket holding any a
+/// bitset container.
+pub fn ofRows(arena: std.mem.Allocator, rows: []const bool) Error!Bitmap {
+    var out = std.ArrayList(Container).empty;
+    var n: u64 = 0;
+    var end: u64 = 0;
+    var at: usize = 0;
+    while (at < rows.len) : (at += 1 << 16) {
+        const chunk = rows[at..@min(rows.len, at + (1 << 16))];
+        if (std.mem.indexOfScalar(bool, chunk, true) == null) continue;
+        const data = try arena.alloc(u8, bitset_len);
+        @memset(data, 0);
+        for (chunk, 0..) |on, i| if (on) {
+            data[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+            n += 1;
+            end = at + i + 1;
+        };
+        try out.append(arena, .{ .high = at >> 16, .kind = .bitset, .data = data });
+    }
+    return .{ .containers = out.items, .cardinality = n, .end = end };
+}
+
 const Cursor = @import("../cursor.zig").Reader(.little, error.DeletionVectorCorrupt);
 
 /// The bitmap `bytes` (the portable format, its magic already taken off) holds,
@@ -361,4 +383,23 @@ test "a malformed bitmap is refused, never read past its end" {
             _ = b.clear(0, &keep);
         } else |_| {}
     }
+}
+
+test "a bitmap built from a row mask holds those rows, across buckets" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const rows = try a.alloc(bool, 70_000);
+    @memset(rows, false);
+    for ([_]usize{ 0, 63, 64, 65_535, 65_536, 69_999 }) |i| rows[i] = true;
+    const bm = try ofRows(a, rows);
+    try std.testing.expectEqual(@as(u64, 6), bm.cardinality);
+    try std.testing.expectEqual(@as(u64, 70_000), bm.end);
+    try std.testing.expectEqual(@as(usize, 2), bm.containers.len);
+    const keep = try a.alloc(bool, 70_000);
+    @memset(keep, true);
+    try std.testing.expectEqual(@as(usize, 6), bm.clear(0, keep));
+    for (rows, keep) |r, k| try std.testing.expectEqual(!r, k);
+    try std.testing.expectEqual(@as(usize, 2), bm.count(65_000, 1_000));
+    try std.testing.expectEqual(@as(u64, 0), (try ofRows(a, &.{ false, false })).cardinality);
 }

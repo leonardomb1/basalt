@@ -193,7 +193,8 @@ fn usage(w: anytype) !void {
         \\             STRING or BYTES column a row verbatim (fixed-width files)
         \\  delta      a folder holding _delta_log/ reads as the Delta table: its live
         \\             files, typed by its schema; WITH (version = N) an older one,
-        \\             WITH (timestamp = '2026-11-02 06:00:00') the one of that time.
+        \\             WITH (timestamp = '2026-11-02 06:00:00') the one of that time,
+        \\             WITH (changes_from = N[, changes_to = M]) its change feed.
         \\             LOAD INTO 'folder/' appends to it, REPLACEs it, or
         \\             UPSERT ON (k) [PARTIAL COLS (c)] merges rows into it; WITH
         \\             (format = 'delta', partition_by = 'c') creates one

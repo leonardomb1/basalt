@@ -78,6 +78,7 @@ GROUP BY region;
 
 SELECT count(*) AS n_then FROM 's3://lake/sales/' WITH (version = 12);
 SELECT count(*) AS n_monday FROM 's3://lake/sales/' WITH (timestamp = '2026-11-02 06:00:00');
+SELECT id, amt, _change_type, _commit_version FROM 's3://lake/sales/' WITH (changes_from = 41);
 ```
 
 The log is replayed as the protocol says: the newest complete checkpoint at or
@@ -96,6 +97,27 @@ commits. A time before the oldest readable commit or after the newest is
 refused naming that commit's version and time, as Spark refuses it, and
 `version` and `timestamp` together are refused. `_last_checkpoint` is not
 needed, since the log's listing is read.
+
+`WITH (changes_from = 41)` reads the table's change data feed instead: the rows
+each commit from version 41 on changed, `changes_to = 45` ending the range (it
+defaults to the newest version), either a version or a time, a range by time
+starting at the first commit at or after its start and ending at the last at or
+before its end. Each row has the table's columns, then `_change_type`
+(`insert`, `delete`, `update_preimage` or `update_postimage`), `_commit_version`
+and `_commit_timestamp` (the commit's time as `timestamp` reads it); a filter on
+the last two or on a partition column skips whole files. A commit that wrote
+change data files (`cdc` actions, under `_change_data/`) is read from those
+alone; any other commit's added files read as inserts and its removed files as
+deletes, every row each held less what its deletion vector already deleted, and
+a file it removes and adds again with a new deletion vector as the rows that
+vector newly deletes (or no longer deletes, as inserts). Files added or removed
+without changing data (`dataChange` false, as OPTIMIZE writes) hold no change.
+The rows are read in the table's schema at the range's end, older files fitted to
+it by name. A range is refused where `delta.enableChangeDataFeed` is not `true`
+at its start or a `metaData` inside it turns it off, where a commit in it is no
+longer in `_delta_log/`, where it starts after it ends or past the newest
+version, and where the table has a column of one of the three names;
+`changes_from` goes with neither `version` nor `timestamp`.
 
 The schema is the table's (`metaData.schemaString`): a column a file lacks reads
 as NULL, as one added after the file was written does, and a file whose column

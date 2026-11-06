@@ -143,7 +143,7 @@ pub const table = [_]Format{
         .compressed_read_refused = "a Delta table is a folder of Parquet files and its log, read from its root folder",
         .archive_refused = "a Delta table is a folder of Parquet files and its log, read from its root folder; extract it first",
         .lanes = .row_groups,
-        .read_keys = &.{ "format", "version", "timestamp" },
+        .read_keys = &.{ "format", "version", "timestamp", "changes_from", "changes_to" },
         .write = .{},
         .write_keys = &.{ "format", "partition_by", "compression", "merge_schema", "overwrite_schema" },
     },

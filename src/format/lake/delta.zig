@@ -122,14 +122,14 @@ fn commitIct(arena: std.mem.Allocator, url: []const u8) ?i64 {
 }
 
 /// Milliseconds since the epoch as `2026-11-01 08:00:00.000` (UTC), for messages.
-fn msText(arena: std.mem.Allocator, ms: i64) ![]const u8 {
+pub fn msText(arena: std.mem.Allocator, ms: i64) ![]const u8 {
     const days = @divFloor(ms, 86_400_000);
     const rem: u64 = @intCast(ms - days * 86_400_000);
     const c = @import("../../exec/civil.zig").civilFromDays(days);
     return msgfmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3} UTC", .{ @as(u64, @intCast(@max(c.y, 0))), c.m, c.d, rem / 3_600_000, rem / 60_000 % 60, rem / 1000 % 60, rem % 1000 });
 }
 
-const Log = struct {
+pub const Log = struct {
     name: []const u8,
     commits: std.AutoHashMapUnmanaged(u64, []const u8) = .empty,
     checkpoints: std.AutoArrayHashMapUnmanaged(Checkpoint, Parts) = .empty,
@@ -165,7 +165,7 @@ const Log = struct {
     /// The newest version committed at or before `t_us`, by commit times
     /// (`commitInfo`), searched by halves among the readable commits; a time before
     /// the oldest readable commit or after the newest is refused, as Spark refuses it.
-    fn asOf(self: *const Log, arena: std.mem.Allocator, newest: u64, t_us: i64) !u64 {
+    pub fn asOf(self: *const Log, arena: std.mem.Allocator, newest: u64, t_us: i64) !u64 {
         const t = @divFloor(t_us, 1000);
         var lo = self.oldest(newest);
         var hi = newest;
@@ -182,7 +182,7 @@ const Log = struct {
 
     /// When commit `v` was made: its `commitInfo`'s `inCommitTimestamp`, else
     /// `timestamp`, in milliseconds.
-    fn commitMs(self: *const Log, arena: std.mem.Allocator, v: u64) !i64 {
+    pub fn commitMs(self: *const Log, arena: std.mem.Allocator, v: u64) !i64 {
         const url = self.commits.get(v) orelse return refuse("{s} has no commit file for version {d}, so it cannot tell when that version was made", .{ self.name, v });
         const text = try table.readWhole(arena, url);
         var lines = std.mem.splitScalar(u8, text, '\n');
@@ -198,7 +198,7 @@ const Log = struct {
         return refuse("{s}'s commit {d} records no time (`commitInfo.timestamp`), so a read as of a time cannot place it", .{ self.name, v });
     }
 
-    fn oldest(self: *const Log, newest: u64) u64 {
+    pub fn oldest(self: *const Log, newest: u64) u64 {
         var lo: u64 = if (self.commits.contains(0)) 0 else newest;
         for (self.checkpoints.keys(), self.checkpoints.values()) |c, p| {
             if (p.count() == c.parts and c.version < lo) lo = c.version;
@@ -714,12 +714,12 @@ fn oneOf(s: []const u8, set: []const []const u8) bool {
     return false;
 }
 
-fn int(v: ?std.json.Value) ?i64 {
+pub fn int(v: ?std.json.Value) ?i64 {
     const x = v orelse return null;
     return if (x == .integer) x.integer else null;
 }
 
-fn str(v: ?std.json.Value) ?[]const u8 {
+pub fn str(v: ?std.json.Value) ?[]const u8 {
     const x = v orelse return null;
     return if (x == .string) x.string else null;
 }
@@ -901,6 +901,7 @@ fn primitive(name: []const u8, col: []const u8, t: []const u8) !types.Type {
 /// `root`'s table at `at`; `listed` is `_delta_log/`'s listing when detection
 /// already made it.
 pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?[]const []const u8) !*const table.Resolved {
+    if (at.changes != null) return @import("delta_changes.zig").resolve(arena, root, at, listed_in);
     const st = try snapshot(arena, root, at, listed_in);
     try st.checkProtocol();
     const layout = try layoutOf(arena, st, root, st.files.values());
@@ -1012,8 +1013,11 @@ pub fn snapshotWholeAt(arena: std.mem.Allocator, root: []const u8, at: table.At)
     return replay(arena, root, at, null, w);
 }
 
-fn replay(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?[]const []const u8, whole: ?*State.Whole) !*State {
-    _ = replays.fetchAdd(1, .monotonic);
+pub const Listing = struct { name: []const u8, log_path: []const u8, log: Log, newest: u64 };
+
+/// `root`'s `_delta_log/` as listed (`listed_in` when a listing was made),
+/// refusing a folder with no log or no commit in it.
+pub fn listLog(arena: std.mem.Allocator, root: []const u8, listed_in: ?[]const []const u8) !Listing {
     const name = try msgfmt.allocPrint(arena, "Delta table `{s}`", .{root});
     if (table.isHttp(root))
         return refuse("{s} cannot be read over http(s): a Delta table is found by listing _delta_log/, which a URL cannot do; read it from a local path, s3://, az://, sftp:// or smb://", .{name});
@@ -1029,6 +1033,16 @@ fn replay(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?
         try log.add(arena, u, rel);
     }
     const newest = log.latest() orelse return refuse("{s} has no commit in _delta_log/", .{name});
+    return .{ .name = name, .log_path = log_path, .log = log, .newest = newest };
+}
+
+fn replay(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?[]const []const u8, whole: ?*State.Whole) !*State {
+    _ = replays.fetchAdd(1, .monotonic);
+    const ls = try listLog(arena, root, listed_in);
+    const name = ls.name;
+    const log_path = ls.log_path;
+    const log = ls.log;
+    const newest = ls.newest;
     const target = if (at.timestamp_us) |t| try log.asOf(arena, newest, t) else at.version orelse newest;
     if (target > newest)
         return refuse("{s} has no version {d} (versions {d} to {d} can be read)", .{ name, target, log.oldest(newest), newest });

@@ -52,7 +52,8 @@ A folder holding a `_delta_log/` is read as the Delta table it is — its live
 files, typed by its schema, without the rows its deletion vectors delete and
 under the names its column mapping gives, `WITH (version = N)` (or `timestamp =
 '2026-11-02 06:00:00'`) for an earlier
-version — not as its files ([Delta Lake](formats.md#delta-lake)). One holding
+version, `WITH (changes_from = N)` (and `changes_to`) for the rows each commit
+since changed — not as its files ([Delta Lake](formats.md#delta-lake)). One holding
 `metadata/*.metadata.json` is an Iceberg table, which basalt does not read yet; it
 is refused rather than read plain, and `WITH (format = 'parquet')` reads its files.
 

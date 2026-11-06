@@ -702,6 +702,60 @@ test "Delta variant: a variant column takes JSON text, is written as Variant bin
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' AS SELECT 9 AS id, 5 AS v;", "give it as JSON text");
 }
 
+test "Delta changes: changes_from and changes_to read each commit's inserts, deletes and change data files" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT * FROM '$B/a.csv';", 1);
+    const v0 = try logFile(a, &tmp, "t", 0);
+    var meta: []const u8 = "";
+    var adds0: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, v0, '\n');
+    while (lines.next()) |l| {
+        if (std.mem.startsWith(u8, l, "{\"metaData\":")) meta = l;
+        if (std.mem.startsWith(u8, l, "{\"add\":")) adds0 = l;
+    }
+    const fed = try std.mem.replaceOwned(u8, a, meta, "\"configuration\":{}", "\"configuration\":{\"delta.enableChangeDataFeed\":\"true\"}");
+    try testing.expect(!std.mem.eql(u8, fed, meta));
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000001.json", .data = try std.mem.concat(a, u8, &.{ "{\"commitInfo\":{\"timestamp\":1}}\n", fed, "\n" }) });
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT * FROM '$B/b.csv';", 1);
+    const v2 = try logFile(a, &tmp, "t", 2);
+    const at = std.mem.indexOf(u8, v2, "{\"add\":{\"path\":\"").? + "{\"add\":{\"path\":\"".len;
+    const path2 = v2[at .. at + std.mem.indexOfScalar(u8, v2[at..], '"').?];
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000003.json", .data = try std.fmt.allocPrint(a,
+        \\{{"commitInfo":{{"timestamp":4102444800000}}}}
+        \\{{"remove":{{"path":"{s}","deletionTimestamp":4102444800000,"dataChange":true}}}}
+        \\{{"add":{{"path":"{s}","partitionValues":{{}},"size":1,"modificationTime":0,"dataChange":false}}}}
+        \\
+    , .{ path2, path2 }) });
+    try tmp.dir.makePath("t/_change_data");
+    try load(&tmp, "LOAD INTO '$B/t/_change_data/c.parquet' AS SELECT 1 AS id, 'a' AS grp, 10 AS amt, 'update_preimage' AS _change_type UNION ALL SELECT 1, 'a', 99, 'update_postimage';", 1);
+    const size = (try tmp.dir.statFile("t/_change_data/c.parquet")).size;
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000004.json", .data = try std.fmt.allocPrint(a,
+        \\{{"commitInfo":{{"timestamp":4102444801000}}}}
+        \\{{"cdc":{{"path":"_change_data/c.parquet","partitionValues":{{}},"size":{d},"dataChange":false}}}}
+        \\{s}
+        \\
+    , .{ size, adds0 }) });
+
+    const all = "id,amt,_change_type,_commit_version\n7,1,insert,2\n8,2,insert,2\n7,1,delete,3\n8,2,delete,3\n1,10,update_preimage,4\n1,99,update_postimage,4\n";
+    try testing.expectEqualStrings(all, try rows(a, &tmp, "SELECT id, amt, _change_type, _commit_version FROM '$B/t/' WITH (changes_from = 2) ORDER BY _commit_version, id, amt"));
+    try testing.expectEqualStrings("id,_change_type\n7,insert\n8,insert\n7,delete\n8,delete\n", try rows(a, &tmp, "SELECT id, _change_type FROM '$B/t/' WITH (changes_from = 2, changes_to = '3') ORDER BY _commit_version, id"));
+    try testing.expectEqualStrings("n,first,last\n4,3,2100-01-01 00:00:01\n", try rows(a, &tmp, "SELECT COUNT(*) AS n, MIN(_commit_version) AS first, MAX(_commit_timestamp) AS last FROM '$B/t/' WITH (changes_from = '2099-12-31')"));
+    try testing.expectEqualStrings("n\n2\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/t/' WITH (changes_from = 1) WHERE _commit_version = 4"));
+    try testing.expectEqualStrings("n\n5\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/t/'"));
+
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/t/' WITH (changes_from = 0);", "does not record its changes at version 0");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/t/' WITH (changes_from = 5);", "has no version 5 to read changes from");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/t/' WITH (changes_from = 3, changes_to = 2);", "would start at version 3, after they end at version 2");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/t/' WITH (changes_from = '2200-01-01');", "has no commit at or after that time");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/t/' WITH (changes_to = 3);", "give `changes_from` too");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/t/' WITH (changes_from = 1, version = 2);", "give one or the other");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/t/' WITH (changes_from = 'soon');", "neither a commit version nor a date");
+}
+
 test "Delta write: what is refused, at check where it can be seen" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
