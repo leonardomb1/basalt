@@ -92,6 +92,9 @@ pub const Commit = struct {
     hold: ?Hold = null,
     /// The application whose position (`txn`) the commit moves, under `USING changes`.
     app: ?[]const u8 = null,
+    /// The commit's in-commit timestamp, written into `body` as
+    /// `"inCommitTimestamp":<ict>`; a retry past a winner raises it above the winner's.
+    ict: ?i64 = null,
 };
 
 /// The log at `root` (a folder path ending in `/`), local or in an object store.
@@ -198,6 +201,7 @@ const Winner = struct {
     removed: std.ArrayListUnmanaged([]const u8) = .empty,
     txn: ?[]const u8 = null,
     apps: std.ArrayListUnmanaged([]const u8) = .empty,
+    ict: ?i64 = null,
 };
 
 fn readWinner(arena: std.mem.Allocator, text: []const u8) !Winner {
@@ -220,6 +224,9 @@ fn readWinner(arena: std.mem.Allocator, text: []const u8) !Winner {
                 try w.removed.append(arena, try table.percentDecode(arena, p.string));
             if (std.mem.eql(u8, k, "commitInfo")) if (body.object.get("txnId")) |x| if (x == .string) {
                 w.txn = x.string;
+            };
+            if (std.mem.eql(u8, k, "commitInfo")) if (body.object.get("inCommitTimestamp")) |x| if (x == .integer) {
+                w.ict = x.integer;
             };
             if (std.mem.eql(u8, k, "txn")) if (body.object.get("appId")) |x| if (x == .string)
                 try w.apps.append(arena, x.string);
@@ -257,7 +264,8 @@ fn keyOf(arena: std.mem.Allocator, key_root: []const u8, decoded: []const u8) ![
 }
 
 /// Commits `c`, returning the version it became.
-pub fn commit(arena: std.mem.Allocator, store: Store, name: []const u8, c: Commit) !u64 {
+pub fn commit(arena: std.mem.Allocator, store: Store, name: []const u8, c_in: Commit) !u64 {
+    var c = c_in;
     var version: u64 = if (c.read_version) |r| r + 1 else 0;
     var attempts: usize = 0;
     while (true) : (attempts += 1) {
@@ -277,6 +285,12 @@ pub fn commit(arena: std.mem.Allocator, store: Store, name: []const u8, c: Commi
         const w = try readWinner(arena, text);
         if (w.txn) |t| if (std.mem.eql(u8, t, c.txn_id)) return version;
         if (try conflict(arena, c, w, version)) |why| return fail(arena, name, c, why);
+        if (c.ict) |mine| if (w.ict) |theirs| if (theirs >= mine) {
+            const was = try msgfmt.allocPrint(arena, "\"inCommitTimestamp\":{d}", .{mine});
+            const now = try msgfmt.allocPrint(arena, "\"inCommitTimestamp\":{d}", .{theirs + 1});
+            c.body = try std.mem.replaceOwned(u8, arena, c.body, was, now);
+            c.ict = theirs + 1;
+        };
         version += 1;
     }
 }
@@ -418,6 +432,19 @@ test "commit: a change feed's commit fails on a winner that moved the same appli
     try testing.expect(std.mem.indexOf(u8, eval.takeFailure(Error.DeltaCommitConflict).?, "applied changes for `cdc` too") != null);
     var s2 = FakeStore{ .arena = a, .race = &.{other} };
     try testing.expectEqual(@as(u64, 5), try commit(a, s2.store(), "T", c));
+}
+
+test "commit: an in-commit timestamp a winner reached is raised past it on the retry" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const winner = "{\"commitInfo\":{\"inCommitTimestamp\":5000,\"txnId\":\"W\"}}\n{\"add\":{\"path\":\"w.parquet\"}}\n";
+    var c = testCommit(.append, 3, "T");
+    c.body = "{\"commitInfo\":{\"inCommitTimestamp\":4000,\"txnId\":\"T\"}}\n{\"add\":{\"path\":\"new.parquet\"}}\n";
+    c.ict = 4000;
+    var s = FakeStore{ .arena = a, .race = &.{winner} };
+    try testing.expectEqual(@as(u64, 5), try commit(a, s.store(), "T", c));
+    try testing.expect(std.mem.indexOf(u8, s.commits.get(5).?, "\"inCommitTimestamp\":5001,") != null);
 }
 
 test "commit: a create failing outright names the table, the version and the files; an unreadable outcome is unknown" {

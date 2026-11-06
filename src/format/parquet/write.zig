@@ -569,6 +569,7 @@ pub const Writer = struct {
     group_rows: usize = row_group_rows,
     group_bytes: usize = row_group_bytes,
     part: Part = .{},
+    field_ids: ?*const std.StringHashMapUnmanaged(i32) = null,
 
     const Backend = union(enum) {
         file: std.fs.File,
@@ -854,6 +855,13 @@ pub const Writer = struct {
 
     /// `close`, returning the file's row count, size and per-column statistics,
     /// copied into `out`.
+    /// The Parquet field id a schema element named `name` takes (`field_ids`, a
+    /// column-mapped Delta table's), null for none.
+    fn fieldId(self: *const Writer, name: []const u8) ?i32 {
+        const m = self.field_ids orelse return null;
+        return m.get(name);
+    }
+
     pub fn closeSummary(self: *Writer, out: std.mem.Allocator) !Summary {
         return (try self.finish(out)).?;
     }
@@ -980,16 +988,16 @@ pub const Writer = struct {
         try writeSchemaRoot(&w, self.schema.fields.len);
         for (self.schema.fields, self.lays) |f, lay| {
             const sh = lay.shape orelse {
-                try writeSchemaLeaf(&w, f.name, self.maps[lay.first]);
+                try writeSchemaLeaf(&w, f.name, self.maps[lay.first], self.fieldId(f.name));
                 continue;
             };
             var leaf = lay.first;
             for (sh.elements) |e| {
                 if (e.num_children > 0) {
-                    try writeSchemaGroup(&w, e);
+                    try writeSchemaGroup(&w, e, self.fieldId(e.name));
                     continue;
                 }
-                try writeSchemaLeaf(&w, e.name, self.maps[leaf]);
+                try writeSchemaLeaf(&w, e.name, self.maps[leaf], self.fieldId(e.name));
                 leaf += 1;
             }
         }
@@ -1224,13 +1232,14 @@ fn writeSchemaRoot(w: *thrift.Writer, children: usize) !void {
 
 /// A nested column's group element: its repetition, children, and for a list or a
 /// map the converted and logical type that name it so.
-fn writeSchemaGroup(w: *thrift.Writer, e: parquet.SchemaElement) !void {
+fn writeSchemaGroup(w: *thrift.Writer, e: parquet.SchemaElement, id: ?i32) !void {
     try w.structBegin();
     try w.writeI32(3, @intFromEnum(e.repetition orelse .required));
     try w.writeBinary(4, e.name);
     try w.writeI32(5, e.num_children);
+    if (e.converted_type) |c| try w.writeI32(6, c);
+    if (id) |x| try w.writeI32(9, x);
     if (e.converted_type) |c| {
-        try w.writeI32(6, c);
         try w.fieldBegin(.@"struct", 10);
         try w.structBegin();
         try emptyVariant(w, if (c == logical.conv_list) 3 else 2);
@@ -1239,7 +1248,7 @@ fn writeSchemaGroup(w: *thrift.Writer, e: parquet.SchemaElement) !void {
     try w.structEnd();
 }
 
-fn writeSchemaLeaf(w: *thrift.Writer, name: []const u8, m: Mapping) !void {
+fn writeSchemaLeaf(w: *thrift.Writer, name: []const u8, m: Mapping, id: ?i32) !void {
     try w.structBegin();
     try w.writeI32(1, @intFromEnum(m.phys));
     if (m.type_length) |n| try w.writeI32(2, n);
@@ -1248,6 +1257,7 @@ fn writeSchemaLeaf(w: *thrift.Writer, name: []const u8, m: Mapping) !void {
     if (m.converted) |c| try w.writeI32(6, c);
     if (m.scale) |s| try w.writeI32(7, s);
     if (m.precision) |p| try w.writeI32(8, p);
+    if (id) |x| try w.writeI32(9, x);
     try writeLogicalType(w, m);
     try w.structEnd();
 }

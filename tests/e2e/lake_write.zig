@@ -516,6 +516,82 @@ test "Delta time travel by timestamp: the newest commit at or before the time, b
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/out.csv' AS SELECT id FROM '$B/t/' WITH (timestamp = '1970-01-01', version = 1);", "give one");
 }
 
+test "Delta in-commit timestamps: a table that enables them gets one past the newest in each commit, which time travel reads" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT 1 AS id;", 1);
+    const v0 = try logFile(a, &tmp, "t", 0);
+    var meta: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, v0, '\n');
+    while (lines.next()) |l| if (std.mem.startsWith(u8, l, "{\"metaData\":")) {
+        meta = l;
+    };
+    const future: i64 = 9_000_000_000_000;
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000001.json", .data = try std.mem.concat(a, u8, &.{
+        try std.fmt.allocPrint(a, "{{\"commitInfo\":{{\"timestamp\":1,\"inCommitTimestamp\":{d}}}}}\n", .{future}),
+        "{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":7,\"writerFeatures\":[\"inCommitTimestamp\"]}}\n",
+        try std.mem.replaceOwned(u8, a, meta, "\"configuration\":{}", "\"configuration\":{\"delta.enableInCommitTimestamps\":\"true\"}"),
+        "\n",
+    }) });
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT 2 AS id;", 1);
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT 3 AS id;", 1);
+    try testing.expect(std.mem.startsWith(u8, try logFile(a, &tmp, "t", 2), "{\"commitInfo\":"));
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 2), try std.fmt.allocPrint(a, "\"inCommitTimestamp\":{d},", .{future + 1})) != null);
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 3), try std.fmt.allocPrint(a, "\"inCommitTimestamp\":{d},", .{future + 2})) != null);
+    try testing.expectEqualStrings("n\n2\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/t/' WITH (timestamp = '2255-03-14 16:00:00.001')"));
+    try testing.expectEqualStrings("n\n3\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/t/' WITH (timestamp = '2255-03-14 16:00:00.002')"));
+}
+
+test "Delta liquid clustering: a clustered table takes appends and upserts, its clustering domain kept; delta_optimize leaves it to Databricks" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT id, grp FROM '$B/a.csv';", 1);
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000001.json", .data = "{\"commitInfo\":{\"timestamp\":1}}\n" ++
+        "{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":7,\"writerFeatures\":[\"domainMetadata\",\"clustering\"]}}\n" ++
+        "{\"domainMetadata\":{\"domain\":\"delta.clustering\",\"configuration\":\"{\\\"clusteringColumns\\\":[[\\\"grp\\\"]]}\",\"removed\":false}}\n" });
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT id + 10 AS id, grp FROM '$B/a.csv';", 1);
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT 1 AS id, 'z' AS grp;", 1);
+    try testing.expectEqualStrings("n,z\n6,1\n", try rows(a, &tmp, "SELECT COUNT(*) AS n, COUNT_IF(grp = 'z') AS z FROM '$B/t/'"));
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 2), "clusteringProvider") == null);
+    try runRefuses(a, &tmp, "CALL delta_optimize('$B/t/');", "liquid-clustered");
+}
+
+test "Delta V2 checkpoints: a JSON one with its adds in a sidecar is read; a table using them is written, its checkpoints marked V2" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT 0 AS id;", 1);
+    for (1..11) |i| try load(&tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/t/' AS SELECT {d} AS id;", .{i}), 1);
+    var meta: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, try logFile(a, &tmp, "t", 0), '\n');
+    while (lines.next()) |l| if (std.mem.startsWith(u8, l, "{\"metaData\":")) {
+        meta = l;
+    };
+    try tmp.dir.makePath("t/_delta_log/_sidecars");
+    try tmp.dir.rename("t/_delta_log/00000000000000000010.checkpoint.parquet", "t/_delta_log/_sidecars/7e5c-side.parquet");
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json", .data = try std.mem.concat(a, u8, &.{
+        "{\"checkpointMetadata\":{\"version\":10}}\n",
+        "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"v2Checkpoint\"],\"writerFeatures\":[\"v2Checkpoint\"]}}\n",
+        meta,
+        "\n{\"sidecar\":{\"path\":\"7e5c-side.parquet\",\"sizeInBytes\":1,\"modificationTime\":0}}\n",
+    }) });
+    for (0..11) |v| try tmp.dir.deleteFile(try std.fmt.allocPrint(a, "t/_delta_log/{d:0>20}.json", .{v}));
+    try tmp.dir.deleteFile("t/_delta_log/_last_checkpoint");
+    try testing.expectEqualStrings("n,s\n11,55\n", try rows(a, &tmp, "SELECT COUNT(*) AS n, SUM(id) AS s FROM '$B/t/'"));
+    for (11..21) |i| try load(&tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/t/' AS SELECT {d} AS id;", .{i}), 1);
+    try testing.expectEqualStrings("n,s\n21,210\n", try rows(a, &tmp, "SELECT COUNT(*) AS n, SUM(id) AS s FROM '$B/t/'"));
+    const cp = "'$B/t/_delta_log/00000000000000000020.checkpoint.parquet'";
+    try testing.expectEqualStrings("v,adds\n20,21\n", try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT MAX(checkpointMetadata.version) AS v, COUNT(add.path) AS adds FROM {s}", .{cp})));
+}
+
 test "Delta write: what is refused, at check where it can be seen" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();

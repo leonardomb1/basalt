@@ -28,6 +28,19 @@ pub const Batch = struct {
 
     /// Every column copied into `a`, for a batch that must outlive the per-batch
     /// arena it was produced in.
+    /// The batch with its nested columns' types copied into `a`, where its storage
+    /// is: a batch an operator built in `a` may still name the types of memory the
+    /// operator frees on its next call, which a writer thread rendering the batch
+    /// meanwhile must not read.
+    pub fn ownTypes(self: Batch, a: std.mem.Allocator) !Batch {
+        var nested = false;
+        for (self.columns) |c| nested = nested or c.ty.isNested();
+        if (!nested) return self;
+        const cols = try a.alloc(Column, self.columns.len);
+        for (cols, self.columns) |*o, c| o.* = try column_mod.ownTypes(a, c);
+        return .{ .schema = self.schema, .columns = cols, .len = self.len };
+    }
+
     pub fn deepCopy(self: Batch, a: std.mem.Allocator) !Batch {
         const cols = try a.alloc(Column, self.columns.len);
         for (cols, self.columns) |*o, c| o.* = try column_mod.copy(a, c);

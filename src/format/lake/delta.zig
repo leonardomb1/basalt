@@ -15,9 +15,11 @@
 //! `id`, honoured where the protocol enables the feature) each column is found in
 //! the files by its physical name or field id (`fit.Mapping`), and partition values
 //! are keyed by physical name. A table using a reader feature basalt does not
-//! honour is refused naming it, where reading on would return wrong rows: V2
-//! checkpoints, catalog-managed commits, type widening, variants, and any feature
-//! basalt does not know.
+//! honour is refused naming it, where reading on would return wrong rows:
+//! catalog-managed commits, type widening, variants, and any feature basalt does
+//! not know. A V2 checkpoint (named by a UUID, JSON or Parquet) is a base like a
+//! classic one; the sidecar files it names are read for their `add`s and
+//! `remove`s alone (`files_only`).
 //!
 //! A read keeps only what it reads by. A replay for a checkpoint
 //! (`snapshotWhole`) also keeps every action whole in `State.whole`: the last
@@ -105,6 +107,23 @@ const Checkpoint = struct { version: u64, parts: u32 };
 const Parts = std.AutoArrayHashMapUnmanaged(u32, []const u8);
 
 /// What `_delta_log/` lists, and which of it a version is read from.
+/// Commit `url`'s `commitInfo.inCommitTimestamp`, null when it records none.
+fn commitIct(arena: std.mem.Allocator, url: []const u8) ?i64 {
+    const text = table.readWhole(arena, url) catch return null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const l = std.mem.trim(u8, line, " \r\t");
+        if (l.len == 0) continue;
+        const j = std.json.parseFromSliceLeaky(std.json.Value, arena, l, .{}) catch continue;
+        if (j != .object) continue;
+        const ci = j.object.get("commitInfo") orelse continue;
+        if (ci != .object) continue;
+        const t = ci.object.get("inCommitTimestamp") orelse return null;
+        return if (t == .integer) t.integer else null;
+    }
+    return null;
+}
+
 /// Milliseconds since the epoch as `2026-11-01 08:00:00.000` (UTC), for messages.
 fn msText(arena: std.mem.Allocator, ms: i64) ![]const u8 {
     const days = @divFloor(ms, 86_400_000);
@@ -117,9 +136,6 @@ const Log = struct {
     name: []const u8,
     commits: std.AutoHashMapUnmanaged(u64, []const u8) = .empty,
     checkpoints: std.AutoArrayHashMapUnmanaged(Checkpoint, Parts) = .empty,
-    /// The newest V2 checkpoint's version, which explains a log a reader of
-    /// classic checkpoints cannot reach a version through.
-    v2: ?u64 = null,
 
     fn add(self: *Log, arena: std.mem.Allocator, url: []const u8, rel: []const u8) !void {
         switch (parseName(rel)) {
@@ -129,7 +145,11 @@ const Log = struct {
                 if (!gop.found_existing) gop.value_ptr.* = .empty;
                 try gop.value_ptr.put(arena, c.part, url);
             },
-            .v2 => |v| self.v2 = @max(self.v2 orelse v, v),
+            .v2 => |v| {
+                const gop = try self.checkpoints.getOrPut(arena, .{ .version = v, .parts = 1 });
+                if (!gop.found_existing) gop.value_ptr.* = .empty;
+                try gop.value_ptr.put(arena, 1, url);
+            },
             .other => {},
         }
     }
@@ -204,8 +224,6 @@ const Log = struct {
         var v = from;
         while (v <= target) : (v += 1) {
             if (self.commits.contains(v)) continue;
-            if (self.v2) |x| if (x <= target and (best == null or x > best.?.version))
-                return refuse("{s} uses V2 checkpoints (reader feature `v2Checkpoint`, checkpoint {d}), which basalt does not read", .{ self.name, x });
             if (partial) |p| if (best == null or p.version > best.?.version) {
                 return refuse("{s}'s checkpoint {d} lists {d} parts but only {d} are in _delta_log/", .{ self.name, p.version, p.parts, self.checkpoints.get(p).?.count() });
             };
@@ -274,9 +292,11 @@ pub const State = struct {
     part_cols: []const []const u8 = &.{},
     config: ?std.json.Value = null,
     mapping: ?[]const u8 = null,
-    v2: ?[]const u8 = null,
+    sidecars: std.ArrayListUnmanaged([]const u8) = .empty,
+    files_only: bool = false,
     files: std.StringArrayHashMapUnmanaged(Add) = .empty,
     txns: std.StringHashMapUnmanaged(i64) = .empty,
+    last_ict: ?i64 = null,
     meta_raw: ?std.json.Value = null,
     whole: ?*Whole = null,
 
@@ -406,6 +426,7 @@ pub const State = struct {
             if (body != .object) continue;
             const o = body.object;
             const k = kv.key_ptr.*;
+            if (self.files_only and !std.mem.eql(u8, k, "add") and !std.mem.eql(u8, k, "remove")) continue;
             if (std.mem.eql(u8, k, "add")) {
                 const p = str(o.get("path")) orelse continue;
                 const file = try self.put(.{
@@ -434,6 +455,10 @@ pub const State = struct {
                 try self.keep(k, o, null);
             } else if (std.mem.eql(u8, k, "domainMetadata")) {
                 try self.keep(k, o, null);
+            } else if (std.mem.eql(u8, k, "commitInfo")) {
+                if (o.get("inCommitTimestamp")) |t| if (t == .integer) {
+                    self.last_ict = t.integer;
+                };
             }
         }
     }
@@ -443,6 +468,7 @@ pub const State = struct {
     /// Each row group is decoded into memory freed once its rows are kept, and the
     /// file map is sized for the rows up front, as an arena keeps every outgrown table.
     fn checkpoint(self: *State, url: []const u8) !void {
+        if (std.mem.endsWith(u8, url, ".json")) return self.checkpointJson(url);
         if (self.whole != null) return self.checkpointWhole(url);
         var reader_mem = std.heap.ArenaAllocator.init(pagecache.process);
         defer reader_mem.deinit();
@@ -473,14 +499,12 @@ pub const State = struct {
             const c_wv = columnAt(b, "protocol.minWriterVersion");
             const c_feat = columnAt(b, "protocol.readerFeatures");
             const c_wfeat = columnAt(b, "protocol.writerFeatures");
-            const c_v2 = [_]?column.Column{ columnAt(b, "checkpointMetadata.version"), columnAt(b, "sidecar.path") };
+            const c_side = columnAt(b, "sidecar.path");
             const c_app = columnAt(b, "txn.appId");
             const c_txv = columnAt(b, "txn.version");
             for (0..b.len) |i| {
-                if (cell(c_app, i) == .string and cell(c_txv, i) == .int) try self.txn(cell(c_app, i).string, .{ .integer = cell(c_txv, i).int });
-                for (c_v2) |c| if (cell(c, i) != .null) {
-                    self.v2 = url;
-                };
+                if (!self.files_only and cell(c_app, i) == .string and cell(c_txv, i) == .int) try self.txn(cell(c_app, i).string, .{ .integer = cell(c_txv, i).int });
+                if (cell(c_side, i) == .string) try self.sidecars.append(self.arena, try self.arena.dupe(u8, cell(c_side, i).string));
                 if (cell(c_path, i) == .string) {
                     const size = cell(c_size, i);
                     const storage = cell(c_dv, i);
@@ -506,7 +530,7 @@ pub const State = struct {
                         .stats = if (stats == .string) stats.string else null,
                     });
                 }
-                if (cell(c_schema, i) == .string) {
+                if (!self.files_only and cell(c_schema, i) == .string) {
                     const id = cell(c_id, i);
                     try self.meta(if (id == .string) id.string else null, cell(c_schema, i).string, jsonOf(scratch, cell(c_pcols, i)), jsonOf(scratch, cell(c_config, i)));
                     var o = std.json.ObjectMap.init(scratch);
@@ -527,11 +551,35 @@ pub const State = struct {
                     if (made == .int) try o.put("createdTime", .{ .integer = made.int });
                     self.meta_raw = try ownJson(self.arena, .{ .object = o }, whole_depth);
                 }
-                if (cell(c_rv, i) == .int) {
+                if (!self.files_only and cell(c_rv, i) == .int) {
                     const wv = cell(c_wv, i);
                     try self.protocol(cell(c_rv, i).int, if (wv == .int) wv.int else null, jsonOf(scratch, cell(c_feat, i)), jsonOf(scratch, cell(c_wfeat, i)));
                 }
             }
+        }
+    }
+
+    /// A V2 checkpoint written as JSON: a commit's lines, a `sidecar` action naming
+    /// a file of more `add`s and `remove`s, its `checkpointMetadata` passed over.
+    fn checkpointJson(self: *State, url: []const u8) !void {
+        var mem = std.heap.ArenaAllocator.init(pagecache.process);
+        defer mem.deinit();
+        const text = try table.readWhole(mem.allocator(), url);
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        var line_mem = std.heap.ArenaAllocator.init(pagecache.process);
+        defer line_mem.deinit();
+        while (lines.next()) |line| {
+            const t = std.mem.trim(u8, line, " \r\t");
+            if (t.len == 0) continue;
+            _ = line_mem.reset(.retain_capacity);
+            const a = line_mem.allocator();
+            const v = std.json.parseFromSliceLeaky(std.json.Value, a, t, .{}) catch
+                return refuse("{s} has a checkpoint holding a line that is not JSON", .{self.name});
+            if (v == .object) if (v.object.get("sidecar")) |sc| {
+                if (sc == .object) if (str(sc.object.get("path"))) |sp| try self.sidecars.append(self.arena, try self.arena.dupe(u8, sp));
+                continue;
+            };
+            try self.action(a, t);
         }
     }
 
@@ -554,8 +602,10 @@ pub const State = struct {
             for (0..b.len) |i| for (cols, names) |c, n| {
                 const v = cell(c, i);
                 if (v == .null) continue;
-                if (std.mem.eql(u8, n, "checkpointMetadata") or std.mem.eql(u8, n, "sidecar")) {
-                    self.v2 = url;
+                if (std.mem.eql(u8, n, "checkpointMetadata")) continue;
+                if (std.mem.eql(u8, n, "sidecar")) {
+                    const sp = cell(columnAt(b, "sidecar.path"), i);
+                    if (sp == .string) try self.sidecars.append(self.arena, try self.arena.dupe(u8, sp.string));
                     continue;
                 }
                 if (v != .nested) continue;
@@ -586,9 +636,7 @@ pub const State = struct {
             return refuse("{s} uses column mapping mode `{s}`, which the Delta protocol does not define (`none`, `name` or `id`); basalt cannot tell how its files name their columns", .{ self.name, m });
         if (self.reader_version < 3) return;
         for (self.features) |f| {
-            if (oneOf(f, &.{ "columnMapping", "deletionVectors", "timestampNtz", "vacuumProtocolCheck" })) continue;
-            if (std.mem.eql(u8, f, "v2Checkpoint"))
-                return refuse("{s} uses V2 checkpoints (reader feature `v2Checkpoint`), which basalt does not read", .{self.name});
+            if (oneOf(f, &.{ "columnMapping", "deletionVectors", "timestampNtz", "vacuumProtocolCheck", "v2Checkpoint" })) continue;
             if (oneOf(f, &.{ "catalogManaged", "catalogOwned-preview" }))
                 return refuse("{s} is catalog-managed (reader feature `{s}`): its newest commits are held by a catalog, not in _delta_log/", .{ self.name, f });
             if (oneOf(f, &.{ "typeWidening", "typeWidening-preview", "variantType", "variantType-preview", "variantShredding", "variantShredding-preview" }))
@@ -910,13 +958,21 @@ fn replay(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?
         const files = log.checkpoints.get(c).?;
         var k: u32 = 1;
         while (k <= c.parts) : (k += 1) try st.checkpoint(files.get(k).?);
-        if (st.v2) |f| return refuse("{s} uses V2 checkpoints (reader feature `v2Checkpoint`, checkpoint `{s}`), which basalt does not read", .{ name, folder.below(f, log_path) });
+        const sidecar_dir = try std.mem.concat(arena, u8, &.{ log_path, "_sidecars/" });
+        const sides = st.sidecars.items;
+        st.sidecars = .empty;
+        st.files_only = true;
+        for (sides) |sp| try st.checkpoint(try table.mapPath(arena, sidecar_dir, try table.percentDecode(arena, sp)));
+        st.files_only = false;
     }
     var text_mem = std.heap.ArenaAllocator.init(pagecache.process);
     defer text_mem.deinit();
     var line_mem = std.heap.ArenaAllocator.init(pagecache.process);
     defer line_mem.deinit();
     var v: u64 = if (from) |f| f.version + 1 else 0;
+    if (from) |f| if (f.version == target) if (log.commits.get(target)) |url| {
+        st.last_ict = commitIct(arena, url);
+    };
     while (v <= target) : (v += 1) {
         _ = text_mem.reset(.retain_capacity);
         const text = try table.readWhole(text_mem.allocator(), log.commits.get(v).?);
@@ -996,8 +1052,9 @@ test "the base checkpoint: newest complete one at or below the version, commits 
 
     var v2 = Log{ .name = "T" };
     for ([_][]const u8{ "00000000000000000010.checkpoint.80a083e8-7026-4e79-81be-64bd76c43a11.json", "00000000000000000011.json" }) |n| try v2.add(a, n, n);
-    try testing.expectError(table.Error.LakeTableRefused, v2.base(11));
-    try testing.expectEqualStrings("T uses V2 checkpoints (reader feature `v2Checkpoint`, checkpoint 10), which basalt does not read", eval.takeFailure(table.Error.LakeTableRefused).?);
+    const c2 = (try v2.base(11)).?;
+    try testing.expectEqual(@as(u64, 10), c2.version);
+    try testing.expect(std.mem.endsWith(u8, v2.checkpoints.get(c2).?.get(1).?, ".json"));
 }
 
 test "a file is keyed by its resolved path and deletion vector, so line order in a commit does not matter" {
@@ -1050,10 +1107,9 @@ test "protocol: reader versions and features, refused only where the table uses 
     try testing.expectEqualStrings("id", st.mappingMode().?);
     st.mapping = null;
     st.reader_version = 3;
-    st.features = &.{ "deletionVectors", "timestampNtz", "vacuumProtocolCheck", "columnMapping" };
+    st.features = &.{ "deletionVectors", "timestampNtz", "vacuumProtocolCheck", "columnMapping", "v2Checkpoint" };
     try st.checkProtocol();
     for ([_][2][]const u8{
-        .{ "v2Checkpoint", "V2 checkpoints" },
         .{ "catalogManaged", "catalog-managed" },
         .{ "typeWidening", "reader feature `typeWidening`, which basalt does not read" },
         .{ "variantType", "reader feature `variantType`, which basalt does not read" },

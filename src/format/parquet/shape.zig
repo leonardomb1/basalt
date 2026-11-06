@@ -101,7 +101,6 @@ const Builder = struct {
                 const kids = try b.arena.alloc(Node, 2);
                 kids[0] = try b.node("key", kv[0].ty, false, ed, er);
                 kids[1] = try b.node("value", kv[1].ty, kv[1].ty.nullable, ed, er);
-                if (kids[0].kind != .leaf) return Error.UnsupportedNestedType;
                 return .{ .name = name, .kind = .map, .ty = ty, .nullable = nullable, .def = d, .rep = rep, .entry_def = ed, .entry_rep = er, .children = kids };
             },
             else => {
@@ -192,12 +191,14 @@ test "shape: structs, three-level lists and maps take the spec's layout, and the
     try testing.expectEqual(@as(u32, 2), s.root.children[1].leaves);
 }
 
-test "shape: a struct without fields, a list without an element type and a nested map key are refused" {
+test "shape: a struct without fields and a list without an element type are refused; a nested map key is a required group" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     try testing.expectError(Error.UnsupportedNestedType, of(a, "s", .{ .kind = .@"struct", .fields = &.{} }));
     try testing.expectError(Error.UnsupportedNestedType, of(a, "l", .{ .kind = .array }));
     const inner = types.Type{ .kind = .@"struct", .fields = &.{.{ .name = "x", .ty = scalar(.int, true) }} };
-    try testing.expectError(Error.UnsupportedNestedType, of(a, "m", .{ .kind = .map, .fields = &.{ .{ .name = "key", .ty = inner }, .{ .name = "value", .ty = scalar(.int, true) } } }));
+    const sh = try of(a, "m", .{ .kind = .map, .fields = &.{ .{ .name = "key", .ty = inner }, .{ .name = "value", .ty = scalar(.int, true) } } });
+    try testing.expectEqual(@as(usize, 2), sh.leaves.len);
+    try testing.expectEqual(footer.Repetition.required, sh.elements[2].repetition.?);
 }

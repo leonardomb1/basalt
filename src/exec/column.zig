@@ -695,6 +695,24 @@ pub fn copy(arena: std.mem.Allocator, c: Column) error{OutOfMemory}!Column {
     return out;
 }
 
+/// Column `c`, its storage already its own (a permute's), with every nested type
+/// in it copied into `arena` too, as `copy` owns them.
+pub fn ownTypes(arena: std.mem.Allocator, c: Column) error{OutOfMemory}!Column {
+    if (!c.ty.isNested() or c.data != .nested) return c;
+    var out = c;
+    out.ty = try ownType(arena, c.ty);
+    const nd = c.data.nested;
+    out.data = .{ .nested = try newNested(arena, try ownType(arena, nd.ty), switch (nd.body) {
+        .fields => |fs| blk: {
+            const kids = try arena.alloc(Column, fs.len);
+            for (fs, kids) |f, *k| k.* = try ownTypes(arena, f);
+            break :blk .{ .fields = kids };
+        },
+        .list => |l| .{ .list = .{ .offsets = l.offsets, .child = try ownTypes(arena, l.child) } },
+    }) };
+    return out;
+}
+
 /// Nested type `t` copied into `arena`, its field names and parts with it: a copy
 /// of a nested column outlives the reader whose schema its type came from, as a
 /// parallel sort's runs outlive their lanes' files.
@@ -986,7 +1004,7 @@ fn copyNested(arena: std.mem.Allocator, nd: *const Nested, n: usize) error{OutOf
             const offsets = try arena.alloc(i32, n + 1);
             for (offsets, l.offsets[0 .. n + 1]) |*o, x| o.* = x - l.offsets[0];
             const whole = l.offsets[0] == 0 and l.offsets[n] == l.child.len;
-            break :blk .{ .list = .{ .offsets = offsets, .child = if (whole) try copy(arena, l.child) else try listChild(arena, l, n) } };
+            break :blk .{ .list = .{ .offsets = offsets, .child = if (whole) try copy(arena, l.child) else try ownTypes(arena, try listChild(arena, l, n)) } };
         },
     });
 }

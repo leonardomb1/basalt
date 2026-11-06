@@ -198,7 +198,7 @@ pub const Merge = struct {
         const f32s = try a.alloc(bool, nk);
         for (p.keys, names, tys, part, lo, hi, f32s) |k, *n, *t, *is_part, *l, *h, *f| {
             f.* = p.cols[k].phys.float32;
-            n.* = p.cols[k].name;
+            n.* = p.cols[k].fileName();
             t.* = p.cols[k].ty;
             is_part.* = std.mem.indexOfScalar(usize, p.parts, k) != null;
             l.* = .null;

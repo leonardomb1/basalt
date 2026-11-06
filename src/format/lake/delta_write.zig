@@ -145,6 +145,95 @@ pub const Change = struct {
 
 pub const Evolve = enum { keep, merge, overwrite };
 
+/// A column-mapped table's plan given its files' names: every field of its schema
+/// lacking a physical name and id (one `merge_schema` adds, every one under
+/// `overwrite_schema`) gets `col-<uuid>` and the next id past
+/// `delta.columnMapping.maxColumnId`, raised in the commit's metadata; then each
+/// column takes its physical name and its type with struct fields so renamed, and
+/// every id is kept for the writer to set on its Parquet field.
+fn applyMapping(arena: std.mem.Allocator, p: *Plan, st: *const delta.State) !void {
+    var tree = try std.json.parseFromSliceLeaky(std.json.Value, arena, p.schema_string, .{});
+    const was: i64 = std.fmt.parseInt(i64, std.mem.trim(u8, st.property("delta.columnMapping.maxColumnId") orelse "0", " "), 10) catch 0;
+    var next = was;
+    const list = tree.object.getPtr("fields").?;
+    for (list.array.items) |*fv| try assignField(arena, fv, &next);
+    if (next != was) {
+        var aw = std.Io.Writer.Allocating.init(arena);
+        try std.json.Stringify.value(tree, .{}, &aw.writer);
+        p.schema_string = aw.written();
+        p.new_meta = true;
+        p.max_column_id = next;
+    }
+    const ids = try arena.create(std.StringHashMapUnmanaged(i32));
+    ids.* = .empty;
+    const cols = @constCast(p.cols);
+    for (list.array.items, cols) |fv, *c| {
+        const md = fv.object.get("metadata").?.object;
+        c.phys_name = md.get("delta.columnMapping.physicalName").?.string;
+        try ids.put(arena, c.phys_name.?, @intCast(md.get("delta.columnMapping.id").?.integer));
+        c.file_ty = try fileType(arena, fv.object.get("type").?, c.ty, ids);
+    }
+    p.field_ids = ids;
+}
+
+/// Gives schema field `fv` (and the struct fields its type nests) a physical name
+/// and id where it has none, ids counting up from `next`.
+fn assignField(arena: std.mem.Allocator, fv: *std.json.Value, next: *i64) !void {
+    if (fv.* != .object) return;
+    const md_ptr = fv.object.getPtr("metadata");
+    var md = if (md_ptr) |m| (if (m.* == .object) m.object else std.json.ObjectMap.init(arena)) else std.json.ObjectMap.init(arena);
+    if (md.get("delta.columnMapping.id") == null) {
+        next.* += 1;
+        try md.put("delta.columnMapping.id", .{ .integer = next.* });
+    }
+    if (md.get("delta.columnMapping.physicalName") == null)
+        try md.put("delta.columnMapping.physicalName", .{ .string = try msgfmt.allocPrint(arena, "col-{s}", .{&dlog.uuid()}) });
+    try fv.object.put("metadata", .{ .object = md });
+    if (fv.object.getPtr("type")) |t| try assignType(arena, t, next);
+}
+
+fn assignType(arena: std.mem.Allocator, t: *std.json.Value, next: *i64) anyerror!void {
+    if (t.* != .object) return;
+    if (t.object.getPtr("fields")) |fs| if (fs.* == .array) for (fs.array.items) |*fv| try assignField(arena, fv, next);
+    if (t.object.getPtr("elementType")) |e| try assignType(arena, e, next);
+    if (t.object.getPtr("keyType")) |k| try assignType(arena, k, next);
+    if (t.object.getPtr("valueType")) |v| try assignType(arena, v, next);
+}
+
+/// Type `t` (of `schemaString` type `jt`) as the files hold it: each struct field
+/// named by its physical name, whose id goes into `ids`.
+fn fileType(arena: std.mem.Allocator, jt: std.json.Value, t: types.Type, ids: *std.StringHashMapUnmanaged(i32)) !types.Type {
+    if (!t.isNested() or jt != .object) return t;
+    var out = t;
+    switch (t.kind) {
+        .@"struct" => {
+            const jfs = (jt.object.get("fields") orelse return t).array.items;
+            const fs = try arena.alloc(types.Type.Field, t.fields.?.len);
+            for (fs, t.fields.?, jfs) |*o, f, jf| {
+                const md = jf.object.get("metadata").?.object;
+                const pn = md.get("delta.columnMapping.physicalName").?.string;
+                try ids.put(arena, pn, @intCast(md.get("delta.columnMapping.id").?.integer));
+                o.* = .{ .name = pn, .ty = try fileType(arena, jf.object.get("type").?, f.ty, ids) };
+            }
+            out.fields = fs;
+        },
+        .array => {
+            const e = try arena.create(types.Type);
+            e.* = try fileType(arena, jt.object.get("elementType").?, t.elem.?.*, ids);
+            out.elem = e;
+        },
+        .map => {
+            const kv = t.fields.?;
+            const fs = try arena.alloc(types.Type.Field, 2);
+            fs[0] = .{ .name = kv[0].name, .ty = try fileType(arena, jt.object.get("keyType").?, kv[0].ty, ids) };
+            fs[1] = .{ .name = kv[1].name, .ty = try fileType(arena, jt.object.get("valueType").?, kv[1].ty, ids) };
+            out.fields = fs;
+        },
+        else => {},
+    }
+    return out;
+}
+
 /// A table's nested column type `t` (`schemaString`'s JSON) grown by the struct
 /// fields `in` has that it lacks, at any depth, each added nullable at the end of
 /// its struct; null when `in` adds none or is of another shape, which the write
@@ -225,6 +314,14 @@ pub const Col = struct {
     nullable: bool = true,
     /// Its position in the incoming rows, `absent` when they leave it out.
     src: usize,
+    phys_name: ?[]const u8 = null,
+    file_ty: ?types.Type = null,
+
+    /// The name the table's files and log give it: its physical name under
+    /// column mapping, else its own.
+    pub fn fileName(self: Col) []const u8 {
+        return self.phys_name orelse self.name;
+    }
 };
 
 /// A write planned against the table as it stands.
@@ -251,6 +348,8 @@ pub const Plan = struct {
     change: ?Change = null,
     new_meta: bool = false,
     optimize: bool = false,
+    field_ids: ?*const std.StringHashMapUnmanaged(i32) = null,
+    max_column_id: ?i64 = null,
 
     /// What EXPLAIN and `check` add after the root.
     pub fn label(self: *const Plan, arena: std.mem.Allocator) ![]const u8 {
@@ -320,6 +419,7 @@ pub fn planEvolving(arena: std.mem.Allocator, root: []const u8, mode: Mode, crea
         p.* = try planCreate(arena, name, root, mode, parts, codec, schema);
         p.snap = st;
         p.new_meta = true;
+        if (st.mappingMode() != null) try applyMapping(arena, p, st);
         return p;
     }
     if (partition_by) |want| if (!sameNames(want, st.part_cols))
@@ -385,6 +485,7 @@ pub fn planEvolving(arena: std.mem.Allocator, root: []const u8, mode: Mode, crea
         return refuse("{s} is partitioned by `{s}`, which the rows lack; a row's partition column says where it is written", .{ name, p.cols[k].name });
     try upsertCols(p, arena);
     p.change = try changeOf(arena, p, st);
+    if (st.mappingMode() != null) try applyMapping(arena, p, st);
     return p;
 }
 
@@ -686,9 +787,9 @@ fn fitsNested(in: types.Type, t: types.Type, loose: bool) bool {
 /// that adds and removes whole files, and the ones whose demands `writable`
 /// checks the table does not make.
 const honoured = [_][]const u8{
-    "appendOnly",          "invariants",          "checkConstraints", "changeDataFeed", "generatedColumns",
-    "columnMapping",       "identityColumns",     "deletionVectors",  "timestampNtz",   "domainMetadata",
-    "vacuumProtocolCheck", "allowColumnDefaults",
+    "appendOnly",          "invariants",          "checkConstraints",  "changeDataFeed", "generatedColumns",
+    "columnMapping",       "identityColumns",     "deletionVectors",   "timestampNtz",   "domainMetadata",
+    "vacuumProtocolCheck", "allowColumnDefaults", "inCommitTimestamp", "clustering",     "v2Checkpoint",
 };
 
 /// Refuses a table that asks a writer for what basalt does not do.
@@ -699,8 +800,6 @@ pub fn writable(st: *const delta.State, fields: []const Field, mode: Mode) !void
         if (oneOf(f, &honoured)) continue;
         return refuse("{s} uses writer feature `{s}`, which basalt does not honour, so it does not write the table", .{ st.name, f });
     };
-    if (st.mappingMode()) |m|
-        return refuse("{s} uses column mapping (mode `{s}`): its files name columns by physical name or field id, which basalt reads but does not write, so it does not write the table", .{ st.name, m });
     for (fields) |f| {
         const md = f.metadata orelse continue;
         var it = md.iterator();
@@ -777,7 +876,7 @@ fn statsJson(arena: std.mem.Allocator, p: *const Plan, sum: pqwrite.Writer.Summa
             } else continue;
             if (!first) try w.writeByte(',');
             first = false;
-            try jsontext.string(w, c.name);
+            try jsontext.string(w, c.fileName());
             try w.writeByte(':');
             if (c.ty.isNested()) {
                 try w.writeByte('{');
@@ -859,6 +958,7 @@ pub const Sink = struct {
     spilled: bool = false,
     /// The version the commit became, once it is made.
     committed: ?u64 = null,
+    ict: ?i64 = null,
     compacting: ?[]const delta.Add = null,
     warn: ?merge.Warn = null,
     /// Set once `close` or `abort` has freed everything, so an `abort` after a
@@ -892,8 +992,9 @@ pub const Sink = struct {
         const fields = try a.alloc(types.Schema.Field, p.data.len);
         const phys = try a.alloc(pqwrite.Physical, p.data.len);
         for (p.data, fields, phys) |k, *f, *ph| {
-            f.* = .{ .name = p.cols[k].name, .ty = p.cols[k].ty.asNullable() };
-            ph.* = p.cols[k].phys;
+            const c = p.cols[k];
+            f.* = .{ .name = c.fileName(), .ty = (c.file_ty orelse c.ty).asNullable() };
+            ph.* = c.phys;
         }
         self.file_schema = .{ .fields = fields };
         self.phys = phys;
@@ -931,7 +1032,13 @@ pub const Sink = struct {
                 try jsontext.string(w, pb.written());
             },
         }
-        try w.print("}},\"isBlindAppend\":{s},\"engineInfo\":\"basalt/{s}\",\"txnId\":\"{s}\"}}}}\n", .{ if (p.mode == .append and p.snap != null and !p.optimize) "true" else "false", @import("build_options").version, &self.txn });
+        try w.writeByte('}');
+        if (p.snap) |st| if (st.property("delta.enableInCommitTimestamps")) |on| if (textconv.boolText(.delta_property, on) orelse false) {
+            const ict = @max(now, (st.last_ict orelse 0) + 1);
+            self.ict = ict;
+            try w.print(",\"inCommitTimestamp\":{d}", .{ict});
+        };
+        try w.print(",\"isBlindAppend\":{s},\"engineInfo\":\"basalt/{s}\",\"txnId\":\"{s}\"}}}}\n", .{ if (p.mode == .append and p.snap != null and !p.optimize) "true" else "false", @import("build_options").version, &self.txn });
         if (p.snap == null) {
             try w.writeAll("{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":2}}\n");
             try w.print("{{\"metaData\":{{\"id\":\"{s}\",\"format\":{{\"provider\":\"parquet\",\"options\":{{}}}},\"schemaString\":", .{&dlog.uuid()});
@@ -943,6 +1050,11 @@ pub const Sink = struct {
             const st = p.snap.?;
             var o = if (st.meta_raw) |m| (if (m == .object) try m.object.clone() else std.json.ObjectMap.init(a)) else std.json.ObjectMap.init(a);
             try o.put("schemaString", .{ .string = p.schema_string });
+            if (p.max_column_id) |m| {
+                var conf = if (o.get("configuration")) |c| (if (c == .object) try c.object.clone() else std.json.ObjectMap.init(a)) else if (st.config) |c| try c.object.clone() else std.json.ObjectMap.init(a);
+                try conf.put("delta.columnMapping.maxColumnId", .{ .string = try msgfmt.allocPrint(a, "{d}", .{m}) });
+                try o.put("configuration", .{ .object = conf });
+            }
             var parts = std.json.Array.init(a);
             for (p.parts) |k| try parts.append(.{ .string = p.cols[k].name });
             try o.put("partitionColumns", .{ .array = parts });
@@ -1089,7 +1201,7 @@ pub const Sink = struct {
         var aw = std.Io.Writer.Allocating.init(a);
         const w = &aw.writer;
         for (self.plan.parts, values) |k, v| {
-            try escapePath(w, self.plan.cols[k].name);
+            try escapePath(w, self.plan.cols[k].fileName());
             try w.writeByte('=');
             if (v) |t| try escapePath(w, t) else try w.writeAll("__HIVE_DEFAULT_PARTITION__");
             try w.writeByte('/');
@@ -1103,6 +1215,7 @@ pub const Sink = struct {
         const full = try std.mem.concat(a, u8, &.{ self.plan.root, rel });
         if (!objstore.isUrl(full)) if (std.fs.path.dirname(full)) |d| try std.fs.cwd().makePath(d);
         const writer = try pqwrite.Writer.openPhysical(a, full, self.file_schema, self.plan.codec, .truncate, self.phys);
+        writer.field_ids = self.plan.field_ids;
         try self.begun.append(self.mem.allocator(), try self.mem.allocator().dupe(u8, full));
         const o = try a.create(Open);
         const kept = try a.alloc(?[]const u8, values.len);
@@ -1146,7 +1259,7 @@ pub const Sink = struct {
         try w.writeAll(",\"partitionValues\":{");
         for (p.parts, o.values, 0..) |k, v, i| {
             if (i > 0) try w.writeByte(',');
-            try jsontext.string(w, p.cols[k].name);
+            try jsontext.string(w, p.cols[k].fileName());
             try w.writeByte(':');
             if (v) |t| try jsontext.string(w, t) else try w.writeAll("null");
         }
@@ -1220,6 +1333,7 @@ pub const Sink = struct {
             .key_root = if (p.snap) |st| st.key_root else "",
             .hold = if (self.merging) |m| m.hold() else null,
             .app = if (p.change) |ch| ch.app else null,
+            .ict = self.ict,
         }) catch |e| {
             if (e == dlog.Error.DeltaCommitUnknown or e == dlog.Error.DeltaCommitUnsynced or e == dlog.Error.DeltaStoreUnsafe) self.begun.clearRetainingCapacity();
             return e;
@@ -1440,7 +1554,7 @@ test "writable: writer features by name, enforced column metadata, constraints, 
     st.writer_version = 7;
     st.writer_features = &.{ "appendOnly", "deletionVectors", "timestampNtz" };
     try writable(&st, &.{}, .append);
-    for ([_][]const u8{ "rowTracking", "inCommitTimestamp", "clustering", "fancyNew" }) |f| {
+    for ([_][]const u8{ "rowTracking", "fancyNew" }) |f| {
         st.writer_features = &.{f};
         try testing.expectError(table.Error.LakeTableRefused, writable(&st, &.{}, .append));
         try testing.expect(std.mem.indexOf(u8, eval.takeFailure(table.Error.LakeTableRefused).?, f) != null);

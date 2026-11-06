@@ -310,7 +310,6 @@ test "Delta refusals name the feature, version or file a read cannot honour" {
     try testing.expectEqualStrings("n\n3\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/t/' WITH (version = 1)", 1));
 
     for ([_][2][]const u8{
-        .{ "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"v2Checkpoint\"]}}", "uses V2 checkpoints (reader feature `v2Checkpoint`)" },
         .{ "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"catalogManaged\"]}}", "is catalog-managed (reader feature `catalogManaged`)" },
         .{ "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"typeWidening\"]}}", "uses reader feature `typeWidening`, which basalt does not read" },
         .{ "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"timestampNtz\",\"futureThing\"]}}", "needs reader feature `futureThing`, which basalt does not know" },
@@ -513,6 +512,53 @@ test "delta_optimize on Spark's table with a deletion vector rewrites its file w
     const again = try runIn(a, &tmp, "CALL delta_optimize('$B/table-with-dv-small/');", 1);
     try testing.expect(again.err == null);
     if (tmp.dir.access("table-with-dv-small/_delta_log/00000000000000000003.json", .{})) |_| return error.TestUnexpectedResult else |_| {}
+}
+
+test "Delta column mapping writes: Spark's tables by name and by id take appends, upserts and new columns, written under physical names" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try golden(&tmp, "dat-column_mapping");
+    try golden(&tmp, "table-with-columnmapping-mode-id");
+    try golden(&tmp, "dv-with-columnmapping");
+    const ok = struct {
+        fn run(al: std.mem.Allocator, t: *std.testing.TmpDir, script: []const u8) !void {
+            const r = try runIn(al, t, script, 1);
+            if (r.check_msg) |m| std.debug.print("check: {s}\n", .{m});
+            if (r.err) |e| {
+                std.debug.print("run: {s}\n", .{r.msg});
+                return e;
+            }
+        }
+    };
+
+    try ok.run(a, &tmp, "LOAD INTO '$B/dat-column_mapping/' AS SELECT 'z' AS letter, 999 AS new_int, CAST('2026-01-01' AS DATE) AS date;");
+    try ok.run(a, &tmp, "LOAD INTO '$B/dat-column_mapping/' UPSERT ON (new_int) AS SELECT 'y' AS letter, 999 AS new_int, CAST('2026-01-02' AS DATE) AS date;");
+    try ok.run(a, &tmp, "LOAD INTO '$B/dat-column_mapping/' WITH (merge_schema = true) AS SELECT 'w' AS letter, 7 AS new_int, CAST('2026-01-03' AS DATE) AS date, 1.5 AS extra;");
+    try testing.expectEqualStrings("letter,new_int,date,extra\nw,7,2026-01-03,1.5\ny,999,2026-01-02,\n", try lanesAgree(a, &tmp, "SELECT * FROM '$B/dat-column_mapping/' WHERE new_int > 900 OR extra IS NOT NULL ORDER BY letter"));
+    try testing.expectEqualStrings("n\n12\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/dat-column_mapping/'", 1));
+    const v3 = try tmp.dir.readFileAlloc(a, "dat-column_mapping/_delta_log/00000000000000000006.json", 1 << 16);
+    try testing.expect(std.mem.indexOf(u8, v3, "\"delta.columnMapping.maxColumnId\":\"4\"") != null);
+    try testing.expect(std.mem.indexOf(u8, v3, "\\\"name\\\":\\\"extra\\\",\\\"type\\\":\\\"decimal(2,1)\\\",\\\"nullable\\\":true,\\\"metadata\\\":{\\\"delta.columnMapping.id\\\":4,\\\"delta.columnMapping.physicalName\\\":\\\"col-") != null);
+    try testing.expect(std.mem.indexOf(u8, v3, "\\\"minValues\\\":{\\\"col-4ef4d1f5-5d3c-4aad-b4db-405ac3f186e6\\\":\\\"w\\\"") != null);
+
+    try ok.run(a, &tmp, "LOAD INTO '$B/table-with-columnmapping-mode-id/' AS SELECT * FROM '$B/table-with-columnmapping-mode-id/' WHERE ByteType = 4;");
+    try ok.run(a, &tmp, "LOAD INTO '$B/table-with-columnmapping-mode-id/' WITH (merge_schema = true) AS SELECT *, 'new' AS extra FROM '$B/table-with-columnmapping-mode-id/' WHERE ByteType = 1;");
+    try testing.expectEqualStrings(
+        "ByteType,s,m,extra\n1,\"{\"\"aa\"\":[1,2],\"\"ab\"\":{\"\"[1,2]\"\":{\"\"aca\"\":3}}}\",\"{\"\"2\"\":{\"\"ab\"\":20}}\",\n1,\"{\"\"aa\"\":[1,2],\"\"ab\"\":{\"\"[1,2]\"\":{\"\"aca\"\":3}}}\",\"{\"\"2\"\":{\"\"ab\"\":20}}\",new\n4,\"{\"\"aa\"\":[4,5],\"\"ab\"\":{\"\"[4,5]\"\":{\"\"aca\"\":6}}}\",\"{\"\"5\"\":{\"\"ab\"\":80}}\",\n4,\"{\"\"aa\"\":[4,5],\"\"ab\"\":{\"\"[4,5]\"\":{\"\"aca\"\":6}}}\",\"{\"\"5\"\":{\"\"ab\"\":80}}\",\n",
+        try lanesAgree(a, &tmp, "SELECT ByteType, struct_of_arrays_maps_of_structs AS s, map_of_rows AS m, extra FROM '$B/table-with-columnmapping-mode-id/' WHERE ByteType IN (1, 4) ORDER BY ByteType, extra NULLS FIRST"),
+    );
+    try testing.expect(std.mem.indexOf(u8, try tmp.dir.readFileAlloc(a, "table-with-columnmapping-mode-id/_delta_log/00000000000000000002.json", 1 << 20), "\"delta.columnMapping.maxColumnId\":\"31\"") != null);
+
+    try ok.run(a, &tmp, "LOAD INTO '$B/dv-with-columnmapping/' AS SELECT 9 AS part, 900 AS col1, 'x' AS col2;");
+    try ok.run(a, &tmp, "LOAD INTO '$B/dv-with-columnmapping/' UPSERT ON (col1) AS SELECT part, col1, 'up' AS col2 FROM '$B/dv-with-columnmapping/' WHERE col1 = 36;");
+    try testing.expectEqualStrings("n,u,p9\n36,1,6\n", try lanesAgree(a, &tmp, "SELECT COUNT(*) AS n, COUNT_IF(col2 = 'up') AS u, COUNT_IF(part = 9) AS p9 FROM '$B/dv-with-columnmapping/'"));
+    var dir = try tmp.dir.openDir("dv-with-columnmapping", .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |e| if (e.kind == .directory and !std.mem.startsWith(u8, e.name, "_")) try testing.expect(std.mem.startsWith(u8, e.name, "col-"));
 }
 
 test "Delta deletion vectors with column mapping, partitions and a Spark checkpoint" {
@@ -734,8 +780,8 @@ test "Delta column mapping by name: a rename keeps its data, a dropped column re
     try commit(a, &tmp, "cm", 2, &.{try meta(a, mapped, "[]", "{\"delta.columnMapping.mode\":\"name\"}")});
 
     const w = try runIn(a, &tmp, "LOAD INTO '$B/cm/' APPEND AS SELECT 3 AS x, 'w' AS b, 'z' AS z;", 1);
-    try testing.expect(w.err != null);
-    try testing.expect(std.mem.indexOf(u8, w.msg, "uses column mapping (mode `name`): its files name columns by physical name or field id, which basalt reads but does not write") != null);
+    try testing.expect(w.err == null);
+    try testing.expectEqualStrings("x,b,z\n1,,\n2,new,\n3,w,z\n", try lanesAgree(a, &tmp, "SELECT * FROM '$B/cm/' ORDER BY x"));
 }
 
 test "an UPSERT into a table with deletion vectors rewrites a file without its deleted rows" {

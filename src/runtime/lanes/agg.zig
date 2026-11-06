@@ -329,7 +329,7 @@ pub fn writeTailOver(env: *Env, snk: driver.Sink, start: op.Op, tail: []const an
     defer pw.shutdown();
     var at: usize = 0;
     while (try cur.next(ping_pong[at].allocator())) |outb| {
-        try pw.submit(outb);
+        try pw.submit(try outb.ownTypes(ping_pong[at].allocator()));
         stats.rows_out += outb.len;
         at ^= 1;
         _ = ping_pong[at].reset(.retain_capacity);

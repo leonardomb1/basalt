@@ -116,9 +116,12 @@ pub const Sort = struct {
     }
 
     /// The next sorted rows of `h`, gathered into `arena`; `h` is freed with the last.
+    /// The held rows' next batch, in `arena`; the last one frees the held rows, so
+    /// its nested types, which name theirs, are first copied into `arena` too.
     fn emit(self: *Sort, arena: std.mem.Allocator, h: *Held) !?Batch {
-        const b = try h.take(arena, self.in_schema, @max(self.batch_rows, 1));
+        var b = try h.take(arena, self.in_schema, @max(self.batch_rows, 1));
         if (h.pos == h.refs.len) {
+            if (b) |x| b = try x.ownTypes(arena);
             h.destroy();
             self.held = null;
         }
@@ -512,7 +515,7 @@ pub const Held = struct {
     /// its own rows (a materialized binding's), still counted towards `bytes`.
     pub fn adopt(self: *Held, b: Batch) !void {
         if (b.len == 0) return;
-        try self.chunks.append(self.ar.allocator(), b);
+        try self.chunks.append(self.ar.allocator(), try b.ownTypes(self.ar.allocator()));
         self.rows += b.len;
         self.bytes += b.heapBytes();
     }

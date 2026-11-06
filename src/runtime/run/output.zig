@@ -785,7 +785,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     while (true) {
         if (aborting()) return error.Aborted;
         const b = (try res.op.next(ping_pong[cur].allocator())) orelse break;
-        try pw.submit(b);
+        try pw.submit(try b.ownTypes(ping_pong[cur].allocator()));
         stats.rows_out += b.len;
         cur ^= 1;
         _ = ping_pong[cur].reset(.retain_capacity);

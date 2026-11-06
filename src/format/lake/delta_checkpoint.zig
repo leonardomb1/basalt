@@ -82,9 +82,10 @@ const columns = [_]struct { []const u8, []const u8 }{
         f("readerFeatures", "{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true}") ++ "," ++
         f("writerFeatures", "{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true}")) },
     .{ "domainMetadata", st(f("domain", "\"string\"") ++ "," ++ f("configuration", "\"string\"") ++ "," ++ f("removed", "\"boolean\"")) },
+    .{ "checkpointMetadata", st(f("version", "\"long\"") ++ "," ++ f("tags", map_ss)) },
 };
 
-const Col = enum { txn, add, remove, metaData, protocol, domainMetadata };
+const Col = enum { txn, add, remove, metaData, protocol, domainMetadata, checkpointMetadata };
 
 /// The checkpoint interval `st` asks for: `delta.checkpointInterval` when it is a
 /// positive number, else `default_interval`.
@@ -158,7 +159,12 @@ pub fn cleanLog(arena: std.mem.Allocator, root: []const u8, version: u64, keep_m
                 try whole.put(arena, c.version, c.parts);
                 try all.append(.{ .v = c.version, .url = u });
             },
-            .v2, .other => if (versionOf(rel, ".crc")) |v| try all.append(.{ .v = v, .url = u }),
+            .v2 => |v| {
+                try parts.put(arena, v, 1);
+                try whole.put(arena, v, 1);
+                try all.append(.{ .v = v, .url = u });
+            },
+            .other => if (versionOf(rel, ".crc")) |v| try all.append(.{ .v = v, .url = u }),
         }
     }
     var cands = std.array_list.Managed(u64).init(arena);
@@ -220,7 +226,8 @@ pub const Written = struct { version: u64, rows: u64, bytes: u64, adds: u64, kee
 pub fn write(arena: std.mem.Allocator, root: []const u8, version: u64, now_ms: i64) !Written {
     const s = try delta.snapshotWhole(arena, root, version);
     const whole = s.whole.?;
-    const schema = try checkpointSchema(arena, s.name);
+    const v2 = usesV2(s);
+    const schema = try checkpointSchema(arena, s.name, v2);
     const final = try msgfmt.allocPrint(arena, "{s}{s}{d:0>20}.checkpoint.parquet", .{ root, delta.log_dir, version });
     const local = !objstore.isRemote(final);
     const path = if (local) try msgfmt.allocPrint(arena, "{s}{s}.{d:0>20}.checkpoint.parquet.{s}.tmp", .{ root, delta.log_dir, version, &dlog.uuid() }) else final;
@@ -232,6 +239,7 @@ pub fn write(arena: std.mem.Allocator, root: []const u8, version: u64, now_ms: i
     };
     var rows = Rows{ .arena = arena, .w = w, .schema = schema.schema };
     try rows.init();
+    if (v2) try rows.put(.checkpointMetadata, try std.json.parseFromSliceLeaky(std.json.Value, arena, try msgfmt.allocPrint(arena, "{{\"version\":{d}}}", .{version}), .{}));
     if (whole.protocol) |v| try rows.put(.protocol, v);
     if (whole.meta) |v| try rows.put(.metaData, v);
     for (whole.txns.values()) |v| try rows.put(.txn, v);
@@ -262,10 +270,18 @@ pub fn write(arena: std.mem.Allocator, root: []const u8, version: u64, now_ms: i
 
 const Schema = struct { schema: types.Schema, phys: []const pqwrite.Physical };
 
-fn checkpointSchema(arena: std.mem.Allocator, name: []const u8) !Schema {
-    const fields = try arena.alloc(types.Schema.Field, columns.len);
-    const phys = try arena.alloc(pqwrite.Physical, columns.len);
-    for (columns, fields, phys) |c, *fd, *ph| {
+/// Whether the table's checkpoints are V2 (feature `v2Checkpoint`): they then carry
+/// a `checkpointMetadata` row, under the classic name the protocol allows them.
+fn usesV2(s: *const delta.State) bool {
+    for ([_][]const []const u8{ s.features, s.writer_features }) |fs| for (fs) |feat| if (std.mem.eql(u8, feat, "v2Checkpoint")) return true;
+    return false;
+}
+
+fn checkpointSchema(arena: std.mem.Allocator, name: []const u8, v2: bool) !Schema {
+    const n = if (v2) columns.len else columns.len - 1;
+    const fields = try arena.alloc(types.Schema.Field, n);
+    const phys = try arena.alloc(pqwrite.Physical, n);
+    for (columns[0..n], fields, phys) |c, *fd, *ph| {
         const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, c[1], .{});
         fd.* = .{ .name = c[0], .ty = try delta.tableType(arena, name, c[0], v) };
         ph.* = .{ .leaves = try dtypes.leafPhysicals(arena, v) };
@@ -290,14 +306,14 @@ const Rows = struct {
     text: std.Io.Writer.Allocating = undefined,
 
     fn init(self: *Rows) !void {
-        for (&self.builders, self.schema.fields) |*b, fd| b.* = column.Builder.init(self.arena, fd.ty);
+        for (self.builders[0..self.schema.fields.len], self.schema.fields) |*b, fd| b.* = column.Builder.init(self.arena, fd.ty);
         self.text = std.Io.Writer.Allocating.init(self.arena);
     }
 
     fn put(self: *Rows, which: Col, v: std.json.Value) !void {
         self.text.clearRetainingCapacity();
         try std.json.Stringify.value(v, .{}, &self.text.writer);
-        for (&self.builders, 0..) |*b, i| {
+        for (self.builders[0..self.schema.fields.len], 0..) |*b, i| {
             if (i == @intFromEnum(which)) try b.append(.{ .string = self.text.written() }) else try b.append(.null);
         }
         self.n += 1;
@@ -307,8 +323,8 @@ const Rows = struct {
 
     fn flush(self: *Rows) !void {
         if (self.n == 0) return;
-        const cols = try self.arena.alloc(column.Column, columns.len);
-        for (&self.builders, cols, self.schema.fields) |*b, *c, fd| {
+        const cols = try self.arena.alloc(column.Column, self.schema.fields.len);
+        for (self.builders[0..self.schema.fields.len], cols, self.schema.fields) |*b, *c, fd| {
             c.* = try b.finish();
             b.* = column.Builder.init(self.arena, fd.ty);
         }

@@ -105,6 +105,8 @@ pub fn optimize(gpa: std.mem.Allocator, arena: std.mem.Allocator, root: []const 
     try st.checkProtocol();
     const fields = try write.tableFields(arena, st.name, st.schema_string orelse return refuse("{s} has no metaData action in its log", .{st.name}));
     try write.writable(st, fields, .append);
+    for (st.writer_features) |f| if (std.mem.eql(u8, f, "clustering"))
+        return refuse("{s} is liquid-clustered (writer feature `clustering`); its OPTIMIZE clusters as it compacts, which basalt does not, and compacting its clustered files into unclustered ones would undo that, so run OPTIMIZE there", .{st.name});
     const all = st.files.values();
     if (all.len == 0) return .{ .removed = 0, .added = 0, .partitions = 0 };
     const fl = try delta.layoutOf(arena, st, root, all);

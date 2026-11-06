@@ -142,10 +142,13 @@ In `id` mode a file without field ids fails the read naming it, rather than read
 as all NULLs.
 
 A table using a reader feature basalt does not honour is refused, naming it,
-rather than read into wrong rows: V2 checkpoints, a catalog-managed table,
-`typeWidening`, `variantType`, a reader version past 3, and any feature basalt
-does not know. `deletionVectors`, `columnMapping`, `timestampNtz` and
-`vacuumProtocolCheck` read as described. A live file missing from storage (a
+rather than read into wrong rows: a catalog-managed table, `typeWidening`,
+`variantType`, a reader version past 3, and any feature basalt does not know.
+`deletionVectors`, `columnMapping`, `timestampNtz`, `vacuumProtocolCheck` and
+`v2Checkpoint` read as described; a V2 checkpoint, named by a UUID and written
+as JSON or Parquet, is read like a classic one, its `add`s and `remove`s
+inline or in the sidecar files under `_delta_log/_sidecars/` it names, of
+which only those two kinds of action are taken. A live file missing from storage (a
 `version` older than a `VACUUM` kept, say) fails the read naming it.
 
 A Delta table is found by listing its log, which an `https://` URL cannot do; it
@@ -400,15 +403,34 @@ references them and `VACUUM` removes them. A failed commit names the table and
 the version it tried; one whose outcome cannot be read back keeps its files and
 says so.
 
+Databricks' writer features are honoured as the protocol asks:
+
+- **Column mapping** (`name` or `id`): files are written under each column's
+  physical name, nested struct fields too, with its id as the Parquet field id;
+  statistics, partition values and partition folders use physical names; a
+  column or struct field `merge_schema` adds, and every one under
+  `overwrite_schema`, gets a `col-<uuid>` name and the next id, the commit
+  raising `delta.columnMapping.maxColumnId`.
+- **In-commit timestamps** (`delta.enableInCommitTimestamps`): each commit's
+  `commitInfo`, its first action, carries one past the newest commit's, raised
+  past a concurrent writer's when the commit moves to a later version; time
+  travel by timestamp reads them.
+- **Liquid clustering** (`clustering`): rows are written unclustered, as the
+  protocol lets a writer that does not cluster, its `delta.clustering` domain
+  kept; `delta_optimize` leaves a clustered table to an engine that clusters.
+- **V2 checkpoints** (`v2Checkpoint`): basalt's checkpoint of such a table
+  carries the `checkpointMetadata` row, under the classic name the protocol
+  allows.
+
 A table that asks a writer for what basalt does not do is refused, naming it: a
 writer version past 7, a writer feature other than `appendOnly`, `invariants`,
 `checkConstraints`, `changeDataFeed`, `generatedColumns`, `columnMapping`,
 `identityColumns`, `deletionVectors`, `timestampNtz`, `domainMetadata`,
-`vacuumProtocolCheck` and `allowColumnDefaults`, and among those any the table
-actually uses — a column invariant, a CHECK constraint, a generated or identity
-column, column mapping by name or id (read, but not written: its files name
-columns by physical name or field id), a column default an UPSERT's `PARTIAL
-COLS` leaves to it — as well as a `REPLACE` or `UPSERT` of a
+`vacuumProtocolCheck`, `allowColumnDefaults`, `inCommitTimestamp`, `clustering`
+and `v2Checkpoint` (`rowTracking` among those refused), and among those any the
+table actually uses — a column invariant, a CHECK constraint, a generated or
+identity column, a column default an UPSERT's `PARTIAL COLS` leaves to it — as
+well as a `REPLACE` or `UPSERT` of a
 `delta.appendOnly` table and every reader feature a read refuses. EXPLAIN and
 `check` name the table's version and file count, or that the write creates it,
 and `check` refuses what it can see of a local table: its features, its columns
