@@ -197,7 +197,7 @@ fn expandCallStmt(cx: *Ctx, c: ast.CallStmt) Error!ast.Stmt {
         if (std.mem.startsWith(u8, c.name, "delta_")) {
             const args = try cx.arena.alloc(*ast.Expr, c.args.len);
             for (c.args, 0..) |a, i| args[i] = try expandExpr(cx, a, null, 0);
-            return .{ .call = .{ .name = c.name, .args = args, .pos = c.pos } };
+            return .{ .call = .{ .name = c.name, .args = args, .pos = c.pos, .explain = c.explain } };
         }
         cx.msg.* = msgfmt.allocPrint(cx.arena, "CALL: no function named `{s}`", .{c.name}) catch "CALL: unknown function";
         return error.ExpandFailed;
@@ -216,7 +216,7 @@ fn expandCallStmt(cx: *Ctx, c: ast.CallStmt) Error!ast.Stmt {
     const args = try cx.arena.alloc(*ast.Expr, c.args.len);
     for (c.args, 0..) |a, i| args[i] = try expandExpr(cx, a, null, 0);
     const full = try checkArgTypes(cx, fd, try fillDefaults(cx, fd, args));
-    return .{ .call = .{ .name = c.name, .args = full, .pos = c.pos } };
+    return .{ .call = .{ .name = c.name, .args = full, .pos = c.pos, .explain = c.explain } };
 }
 
 fn expandAttrs(cx: *Ctx, attrs: []const ast.Attr) Error![]const ast.Attr {

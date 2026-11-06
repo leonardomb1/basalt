@@ -223,6 +223,39 @@ test "EXPLAIN mid-script explains that query without running it" {
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("never.csv", .{}));
 }
 
+test "EXPLAIN ANALYZE CALL runs the function's statements moving no data, and the next CALL writes again" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n2\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc,
+        \\CREATE FUNCTION copy_to(name) AS
+        \\  LOAD INTO IDENTIFIER('{s}/' || $name || '.csv') AS SELECT * FROM '{s}/in.csv';
+        \\END;
+        \\EXPLAIN ANALYZE CALL copy_to('never');
+        \\CALL copy_to('kept');
+    , .{ base, base });
+    defer alloc.free(script);
+    var rdiag: Diag = .{};
+    var cap = try StderrCapture.begin(tmp.dir);
+    const res = exec(alloc, script, .{ .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+    const prof = try cap.end(alloc);
+    defer alloc.free(prof);
+    _ = try res;
+    errdefer std.debug.print("{s}\n", .{prof});
+    try std.testing.expect(std.mem.indexOf(u8, prof, "not written: EXPLAIN ANALYZE moves no data") != null);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access("never.csv", .{}));
+    try tmp.dir.access("kept.csv", .{});
+
+    var ar = std.heap.ArenaAllocator.init(alloc);
+    defer ar.deinit();
+    var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try std.testing.expectError(error.ParseFailed, parser.parseSource(ar.allocator(), "PRINT 1;\nEXPLAIN CALL f();", &pd));
+    try std.testing.expect(std.mem.indexOf(u8, pd.msg, "EXPLAIN CALL needs ANALYZE") != null);
+}
+
 test "EXPLAIN ANALYZE on lanes names the path, the in-memory or build-side scan, and the load's sink" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

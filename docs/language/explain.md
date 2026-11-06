@@ -121,6 +121,12 @@ $ basalt run -c "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'db', databa
                  EXPLAIN SELECT SUM(v) AS v FROM pg.public.t;"
 ```
 
+`EXPLAIN ANALYZE CALL f(...)` does the same for a statement function: each
+statement its body runs is explained with actuals and moves no data, and the
+statements after the `CALL` run normally again. A `CALL` takes `ANALYZE` only, as
+its statements are rendered as it runs; `basalt run --explain` treats every
+statement of the run so.
+
 `EXPLAIN ANALYZE` moves no data. The pipeline runs — that is where the numbers
 come from — but every sink is discarded: a terminal `SELECT` prints its plan
 instead of its rows, and a `LOAD` writes nothing, creates no table and commits

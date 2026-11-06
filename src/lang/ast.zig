@@ -715,6 +715,7 @@ pub const CallStmt = struct {
     name: []const u8,
     args: []const *Expr,
     pos: Pos,
+    explain: bool = false,
 };
 
 pub const Throw = struct {

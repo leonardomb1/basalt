@@ -592,7 +592,14 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
     env.log.log(.info, "call {s}: {d} argument(s) [depth {d}]", .{ c.name, cells.len, env.call_depth + 1 });
     env.call_depth += 1;
     defer env.call_depth -= 1;
-    try run_body(env, body, .{ .names = pnames, .types = ptypes, .cells = cells, .outer = &env.script_scope }, opts, stats, lanes_used, batch_arena);
+    const was_explain = env.explain;
+    var body_opts = opts;
+    if (c.explain) {
+        env.explain = true;
+        body_opts.explain = true;
+    }
+    defer env.explain = was_explain;
+    try run_body(env, body, .{ .names = pnames, .types = ptypes, .cells = cells, .outer = &env.script_scope }, body_opts, stats, lanes_used, batch_arena);
 }
 
 /// Render a `PRINT` argument with the helper that formats any cell, so a

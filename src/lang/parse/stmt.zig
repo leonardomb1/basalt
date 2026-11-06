@@ -193,6 +193,13 @@ pub fn parseExplainStmt(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) E
     const mode = try explainMode(self);
 
     const base = out.items.len;
+    if (self.isKw("call")) {
+        if (mode != .analyze)
+            return self.fail(self.curPos(), "EXPLAIN CALL needs ANALYZE: a CALL's statements are rendered as it runs, so `EXPLAIN ANALYZE CALL ...` runs each one, moving no data, and shows its plan with actuals", .{});
+        var c = try self.parseCallStmt();
+        c.explain = true;
+        return out.append(.{ .call = c });
+    }
     if (self.isKw("load")) {
         try self.parseLoadInto(out);
     } else if (self.isKw("with") or self.isKw("select")) {
