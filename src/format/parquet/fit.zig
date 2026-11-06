@@ -45,6 +45,9 @@ pub const Layout = struct {
     part_fields: []const usize = &.{},
     files: []const File,
     mapping: ?*const Mapping = null,
+    rows: ?Rows = null,
+
+    pub const Rows = struct { id: usize, version: usize, mat_id: []const u8, mat_version: []const u8 };
 
     pub const File = struct {
         path: []const u8,
@@ -52,6 +55,8 @@ pub const Layout = struct {
         parts: []const Value = &.{},
         deletes: ?Deletes = null,
         stats: ?[]const u8 = null,
+        row_base: ?i64 = null,
+        row_version: ?i64 = null,
     };
 
     pub fn paths(self: *const Layout, arena: std.mem.Allocator) ![]const []const u8 {
@@ -116,6 +121,22 @@ pub const Layout = struct {
         return false;
     }
 
+    /// Which hidden row-tracking output schema field `fi` is, if either.
+    fn rowField(self: *const Layout, fi: usize) ?enum { id, version } {
+        const rf = self.rows orelse return null;
+        if (fi == rf.id) return .id;
+        if (fi == rf.version) return .version;
+        return null;
+    }
+
+    /// A column the table's schema does not name (a materialized row-tracking
+    /// column) as the reader names it: under column mapping, renamed out of reach
+    /// of the table's names (`Mapping.rename`).
+    fn fileColumn(self: *const Layout, arena: std.mem.Allocator, name: []const u8) ![]const u8 {
+        if (self.mapping == null) return name;
+        return std.mem.concat(arena, u8, &.{ "\x00", name });
+    }
+
     /// Column `name` (a top-level column, or a struct's field as `s.city`) as a
     /// file's statistics key it, by physical names under column mapping, with its
     /// type; null for a list, map or struct, or a path through a list or map.
@@ -153,7 +174,12 @@ pub const Layout = struct {
         if (self.pruned(i, bounds)) return null;
         const file = self.files[i];
         var names = std.array_list.Managed([]const u8).init(arena);
+        var wants_rows = false;
         for (v.fields) |fi| if (self.partOf(fi) == null) {
+            if (self.rowField(fi) != null) {
+                wants_rows = true;
+                continue;
+            }
             const name = self.schema.fields[fi].name;
             const w = v.want orelse {
                 try names.append(name);
@@ -169,6 +195,10 @@ pub const Layout = struct {
             } else if (!whole) continue;
             try names.append(name);
         };
+        if (wants_rows) {
+            const rf = self.rows.?;
+            for ([_][]const u8{ rf.mat_id, rf.mat_version }) |m| if (m.len > 0) try names.append(try self.fileColumn(arena, m));
+        }
         const r = self.openFile(arena, file, names.items) catch |e| {
             if (e == error.OutOfMemory) return e;
             const why = eval.peekFailure(e) orelse @errorName(e);
@@ -179,6 +209,13 @@ pub const Layout = struct {
         const outs = try arena.alloc(Fit.Out, v.fields.len);
         for (outs, v.fields) |*o, fi| {
             const want = self.schema.fields[fi];
+            if (self.rowField(fi)) |which| {
+                const rf = self.rows.?;
+                const mat_name = if (which == .id) rf.mat_id else rf.mat_version;
+                const m = if (mat_name.len > 0) r.schema.indexOf(try self.fileColumn(arena, mat_name)) else null;
+                o.* = if (which == .id) .{ .row_id = .{ .mat = m, .pos = try r.wantPositions(), .base = file.row_base } } else .{ .row_version = .{ .mat = m, .default = file.row_version } };
+                continue;
+            }
             if (self.partOf(fi)) |p| {
                 o.* = .{ .value = if (p < file.parts.len) file.parts[p] else .null };
                 continue;
@@ -441,7 +478,12 @@ pub const Fit = struct {
     schema: *const types.Schema,
     outs: []const Out,
 
-    pub const Out = union(enum) { column: usize, value: Value };
+    pub const Out = union(enum) {
+        column: usize,
+        value: Value,
+        row_id: struct { mat: ?usize, pos: usize, base: ?i64 },
+        row_version: struct { mat: ?usize, default: ?i64 },
+    };
 
     pub fn apply(self: *const Fit, arena: std.mem.Allocator, b: Batch) !Batch {
         const cols = try arena.alloc(column.Column, self.outs.len);
@@ -453,6 +495,30 @@ pub const Fit = struct {
             .value => |val| {
                 var bd = try column.Builder.initCapacity(arena, f.ty, b.len);
                 try bd.appendRepeated(val, b.len);
+                c.* = try bd.finish();
+            },
+            .row_id => |x| {
+                var bd = try column.Builder.initCapacity(arena, f.ty, b.len);
+                const mat = if (x.mat) |k| b.columns[k] else null;
+                for (0..b.len) |r| {
+                    if (mat) |m| if (m.validity.get(r)) {
+                        try bd.append(m.getValue(r));
+                        continue;
+                    };
+                    try bd.append(if (x.base) |base| .{ .int = base + b.columns[x.pos].data.i64[r] } else .null);
+                }
+                c.* = try bd.finish();
+            },
+            .row_version => |x| {
+                var bd = try column.Builder.initCapacity(arena, f.ty, b.len);
+                const mat = if (x.mat) |k| b.columns[k] else null;
+                for (0..b.len) |r| {
+                    if (mat) |m| if (m.validity.get(r)) {
+                        try bd.append(m.getValue(r));
+                        continue;
+                    };
+                    try bd.append(if (x.default) |d| .{ .int = d } else .null);
+                }
                 c.* = try bd.finish();
             },
         };

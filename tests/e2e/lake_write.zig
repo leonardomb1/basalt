@@ -592,6 +592,58 @@ test "Delta V2 checkpoints: a JSON one with its adds in a sidecar is read; a tab
     try testing.expectEqualStrings("v,adds\n20,21\n", try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT MAX(checkpointMetadata.version) AS v, COUNT(add.path) AS adds FROM {s}", .{cp})));
 }
 
+test "Delta row tracking: new files are numbered on from the high-water mark, and UPSERT and OPTIMIZE keep each copied row's id and commit version" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT id, grp, amt FROM '$B/a.csv';", 1);
+    const v0 = try logFile(a, &tmp, "t", 0);
+    var meta: []const u8 = "";
+    var add0: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, v0, '\n');
+    while (lines.next()) |l| {
+        if (std.mem.startsWith(u8, l, "{\"metaData\":")) meta = l;
+        if (std.mem.startsWith(u8, l, "{\"add\":")) add0 = l;
+    }
+    const conf = "\"configuration\":{\"delta.enableRowTracking\":\"true\",\"delta.rowTracking.materializedRowIdColumnName\":\"_row-id-col-t\",\"delta.rowTracking.materializedRowCommitVersionColumnName\":\"_row-commit-version-col-t\"}";
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000001.json", .data = try std.mem.concat(a, u8, &.{
+        "{\"commitInfo\":{\"timestamp\":1}}\n",
+        "{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":7,\"writerFeatures\":[\"domainMetadata\",\"rowTracking\"]}}\n",
+        try std.mem.replaceOwned(u8, a, meta, "\"configuration\":{}", conf),
+        "\n",
+        try std.mem.replaceOwned(u8, a, add0, "\"dataChange\":true,", "\"dataChange\":false,\"baseRowId\":0,\"defaultRowCommitVersion\":0,"),
+        "\n{\"domainMetadata\":{\"domain\":\"delta.rowTracking\",\"configuration\":\"{\\\"rowIdHighWaterMark\\\":2}\",\"removed\":false}}\n",
+    }) });
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT id + 10 AS id, grp, amt FROM '$B/a.csv' WHERE id < 3;", 1);
+    const v2 = try logFile(a, &tmp, "t", 2);
+    try testing.expect(std.mem.indexOf(u8, v2, "\"baseRowId\":3,\"defaultRowCommitVersion\":2,") != null);
+    try testing.expect(std.mem.indexOf(u8, v2, "rowIdHighWaterMark\\\":4}") != null);
+    try testing.expect(std.mem.indexOf(u8, v2, "@@") == null);
+
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT 1 AS id, 'z' AS grp, 99 AS amt;", 1);
+    const v3 = try logFile(a, &tmp, "t", 3);
+    const at = std.mem.indexOf(u8, v3, "{\"add\":{\"path\":\"").? + 16;
+    const rewritten = v3[at .. at + std.mem.indexOfScalar(u8, v3[at..], '"').?];
+    try testing.expect(std.mem.indexOf(u8, v3, "\"baseRowId\":5,\"defaultRowCommitVersion\":3,") != null);
+    try testing.expectEqualStrings(
+        "id,rid,ver\n1,0,\n2,1,0\n3,2,0\n",
+        try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT id, \"_row-id-col-t\" AS rid, \"_row-commit-version-col-t\" AS ver FROM '$B/t/{s}' ORDER BY id", .{rewritten})),
+    );
+    try testing.expectEqualStrings("id,grp,amt\n1,z,99\n2,a,20\n3,b,5\n11,a,10\n12,a,20\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+
+    try load(&tmp, "CALL delta_optimize('$B/t/');", 1);
+    const v4 = try logFile(a, &tmp, "t", 4);
+    const at4 = std.mem.indexOf(u8, v4, "{\"add\":{\"path\":\"").? + 16;
+    const compacted = v4[at4 .. at4 + std.mem.indexOfScalar(u8, v4[at4..], '"').?];
+    try testing.expectEqualStrings(
+        "id,rid,ver\n1,0,3\n2,1,0\n3,2,0\n11,3,2\n12,4,2\n",
+        try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT id, \"_row-id-col-t\" AS rid, \"_row-commit-version-col-t\" AS ver FROM '$B/t/{s}' ORDER BY id", .{compacted})),
+    );
+    try testing.expectEqualStrings("n\n5\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/t/'"));
+}
+
 test "Delta write: what is refused, at check where it can be seen" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
@@ -616,10 +668,10 @@ test "Delta write: what is refused, at check where it can be seen" {
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT AS SELECT * FROM '$B/a.csv';", "infers the primary key from the source");
 
     const v0 = try logFile(a, &tmp, "t", 0);
-    const featured = try std.mem.replaceOwned(u8, a, v0, "{\"minReaderVersion\":1,\"minWriterVersion\":2}", "{\"minReaderVersion\":1,\"minWriterVersion\":7,\"writerFeatures\":[\"appendOnly\",\"rowTracking\"]}");
+    const featured = try std.mem.replaceOwned(u8, a, v0, "{\"minReaderVersion\":1,\"minWriterVersion\":2}", "{\"minReaderVersion\":1,\"minWriterVersion\":7,\"writerFeatures\":[\"appendOnly\",\"typeWidening\"]}");
     try tmp.dir.makePath("f/_delta_log");
     try tmp.dir.writeFile(.{ .sub_path = "f/_delta_log/00000000000000000000.json", .data = featured });
-    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/f/' AS SELECT * FROM '$B/a.csv';", "uses writer feature `rowTracking`, which basalt does not honour");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/f/' AS SELECT * FROM '$B/a.csv';", "uses writer feature `typeWidening`, which basalt does not honour");
 
     const append_only = try std.mem.replaceOwned(u8, a, v0, "\"configuration\":{}", "\"configuration\":{\"delta.appendOnly\":\"true\"}");
     try tmp.dir.makePath("ao/_delta_log");

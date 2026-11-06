@@ -348,9 +348,14 @@ pub const Merge = struct {
     fn tagged(self: *Merge, a: std.mem.Allocator, adds: []const delta.Add) !*const fit.Layout {
         const fl = try delta.layoutOf(a, self.plan.snap.?, self.plan.root, adds);
         const base = fl.layout;
-        const nf = self.plan.cols.len;
+        const nc = self.plan.cols.len;
+        const nf = nc + self.rowCols();
         const fields = try a.alloc(types.Schema.Field, nf + 1);
-        for (fields[0..nf], self.plan.cols) |*f, c| f.* = .{ .name = c.name, .ty = c.ty.asNullable() };
+        for (fields[0..nc], self.plan.cols) |*f, c| f.* = .{ .name = c.name, .ty = c.ty.asNullable() };
+        if (self.rowCols() == 2) {
+            fields[nc] = .{ .name = delta.row_id_name, .ty = types.Type.init(.int).asNullable() };
+            fields[nc + 1] = .{ .name = delta.row_version_name, .ty = types.Type.init(.int).asNullable() };
+        }
         fields[nf] = .{ .name = tag_name, .ty = types.Type.init(.int).asNullable() };
         const part_fields = try a.alloc(usize, base.part_fields.len + 1);
         @memcpy(part_fields[0..base.part_fields.len], base.part_fields);
@@ -364,11 +369,27 @@ pub const Merge = struct {
                 if (c.phys.float32 and v.* == .float) v.* = .{ .float = @as(f32, @floatCast(v.float)) };
             }
             parts[src.parts.len] = .{ .int = @intCast(i) };
-            f.* = .{ .path = src.path, .size = src.size, .parts = parts, .deletes = src.deletes };
+            f.* = .{ .path = src.path, .size = src.size, .parts = parts, .deletes = src.deletes, .row_base = src.row_base, .row_version = src.row_version };
         }
         const out = try a.create(fit.Layout);
         out.* = .{ .name = base.name, .root = base.root, .schema = .{ .fields = fields }, .part_fields = part_fields, .files = files, .mapping = base.mapping };
+        if (self.rowCols() == 2) {
+            const st = self.plan.snap.?;
+            out.rows = .{
+                .id = nc,
+                .version = nc + 1,
+                .mat_id = st.property("delta.rowTracking.materializedRowIdColumnName") orelse "",
+                .mat_version = st.property("delta.rowTracking.materializedRowCommitVersionColumnName") orelse "",
+            };
+        }
         return out;
+    }
+
+    /// The hidden row-tracking columns the rewrite carries: 2 where the table keeps
+    /// row ids, else 0.
+    fn rowCols(self: *const Merge) usize {
+        const r = self.plan.row orelse return 0;
+        return if (r.keep) 2 else 0;
     }
 
     /// The spool replayed, each batch fitted by `f` when given.
@@ -508,8 +529,12 @@ pub const Merge = struct {
         var bm = std.heap.ArenaAllocator.init(self.gpa);
         defer bm.deinit();
         const shape = try a.create(types.Schema);
-        const tf = try a.alloc(types.Schema.Field, p.cols.len);
-        for (tf, p.cols) |*f, c| f.* = .{ .name = c.name, .ty = c.ty.asNullable() };
+        const tf = try a.alloc(types.Schema.Field, p.cols.len + self.rowCols());
+        for (tf[0..p.cols.len], p.cols) |*f, c| f.* = .{ .name = c.name, .ty = c.ty.asNullable() };
+        if (self.rowCols() == 2) {
+            tf[p.cols.len] = .{ .name = delta.row_id_name, .ty = types.Type.init(.int).asNullable() };
+            tf[p.cols.len + 1] = .{ .name = delta.row_version_name, .ty = types.Type.init(.int).asNullable() };
+        }
         shape.* = .{ .fields = tf };
 
         const build = try self.replay(a, null);
@@ -558,13 +583,15 @@ pub const Merge = struct {
     fn combine(self: *Merge, t: std.mem.Allocator, shape: *const types.Schema, b: Batch) !Batch {
         const p = self.plan;
         const nc = p.cols.len;
-        const nt = nc + 1;
+        const nr = self.rowCols();
+        const tag_at = nc + nr;
+        const nt = tag_at + 1;
         const rn = nt + p.in_fields.len;
         const masks = [3][]bool{ try t.alloc(bool, b.len), try t.alloc(bool, b.len), try t.alloc(bool, b.len) };
         var counts = [3]usize{ 0, 0, 0 };
         const del: ?column.Column = if (p.change) |ch| b.columns[nt + ch.del] else null;
         for (0..b.len) |r| {
-            const exists = b.columns[nc].validity.get(r);
+            const exists = b.columns[tag_at].validity.get(r);
             var class: usize = if (!exists) 2 else if (b.columns[rn].validity.get(r)) 1 else 0;
             if (class != 0) if (del) |d| if (deletes(d, r)) {
                 class = 3;
@@ -573,9 +600,25 @@ pub const Merge = struct {
             if (class < 3) counts[class] += 1;
         }
         const kept = counts[0] + counts[1] + counts[2];
-        const cols = try t.alloc(column.Column, nc);
+        const cols = try t.alloc(column.Column, nc + nr);
         var chunks: [3]column.Column = undefined;
-        for (cols, p.cols, 0..) |*c, pc, k| {
+        if (nr == 2) {
+            const int_ty = types.Type.init(.int).asNullable();
+            const none = try join.nullColumn(t, int_ty, b.len);
+            const sources = [2][3]column.Column{
+                .{ b.columns[nc], b.columns[nc], none },
+                .{ b.columns[nc + 1], none, none },
+            };
+            for (sources, cols[nc..]) |from, *c| {
+                var n: usize = 0;
+                for (from, masks, counts) |src, m, cnt| if (cnt > 0) {
+                    chunks[n] = try column.gather(t, src, m, cnt);
+                    n += 1;
+                };
+                c.* = if (n == 0) try join.nullColumn(t, int_ty, 0) else if (n == 1) chunks[0] else try column.concat(t, chunks[0..n], kept);
+            }
+        }
+        for (cols[0..nc], p.cols, 0..) |*c, pc, k| {
             const fresh = if (p.partial) |pl| std.mem.indexOfScalar(usize, pl, k) != null else true;
             const incoming = if (pc.src == write.absent) try join.nullColumn(t, pc.ty, b.len) else b.columns[nt + pc.src];
             const from = [3]column.Column{ b.columns[k], if (fresh) incoming else b.columns[k], incoming };
@@ -607,8 +650,10 @@ pub const Merge = struct {
                 b = .{ .schema = b.schema, .columns = cols, .len = n };
             }
         }
-        const cols = try t.alloc(column.Column, self.plan.cols.len);
-        for (cols, self.plan.cols) |*c, pc| c.* = if (pc.src == write.absent) try join.nullColumn(t, pc.ty, b.len) else b.columns[pc.src];
+        const nc = self.plan.cols.len;
+        const cols = try t.alloc(column.Column, nc + self.rowCols());
+        for (cols[0..nc], self.plan.cols) |*c, pc| c.* = if (pc.src == write.absent) try join.nullColumn(t, pc.ty, b.len) else b.columns[pc.src];
+        for (cols[nc..]) |*c| c.* = try join.nullColumn(t, types.Type.init(.int).asNullable(), b.len);
         return .{ .schema = shape, .columns = cols, .len = b.len };
     }
 

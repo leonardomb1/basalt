@@ -125,6 +125,7 @@ pub fn writeModeOf(w: ast.Write) Mode {
 /// Whether incoming column `name` is one a change feed reads but the table does
 /// not take: a hidden change column, or one the `USING changes` arguments read.
 fn changeOnly(ch: ?ast.Changes, name: []const u8) bool {
+    if (std.mem.eql(u8, name, delta.row_id_name) or std.mem.eql(u8, name, delta.row_version_name)) return true;
     const c = ch orelse return false;
     if (name.len > 0 and name[0] == 0) return true;
     return ast.nameIn(c.drop, name);
@@ -144,6 +145,45 @@ pub const Change = struct {
 };
 
 pub const Evolve = enum { keep, merge, overwrite };
+
+pub const RowPlan = struct {
+    hwm: i64,
+    mat_id: []const u8,
+    mat_version: []const u8,
+    keep: bool,
+    src: ?[2]usize = null,
+};
+
+/// Row tracking as `st`'s table asks it of a writer (writer feature
+/// `rowTracking`): each new file numbered on from the high-water mark, and, where
+/// `delta.enableRowTracking` holds, a copied row's id and commit version kept in
+/// the materialized columns, which the table must then name; `in` locates the
+/// hidden row columns a rewrite's rows carry.
+fn rowPlan(st: *const delta.State, name: []const u8, in: []const types.Schema.Field) !?RowPlan {
+    const on = for (st.writer_features) |f| {
+        if (std.mem.eql(u8, f, "rowTracking")) break true;
+    } else false;
+    if (!on) return null;
+    const keep = if (st.property("delta.enableRowTracking")) |t| textconv.boolText(.delta_property, t) orelse false else false;
+    var r = RowPlan{
+        .hwm = st.row_hwm orelse -1,
+        .mat_id = st.property("delta.rowTracking.materializedRowIdColumnName") orelse "",
+        .mat_version = st.property("delta.rowTracking.materializedRowCommitVersionColumnName") orelse "",
+        .keep = keep,
+    };
+    var id_at: ?usize = null;
+    var ver_at: ?usize = null;
+    for (in, 0..) |f, i| {
+        if (std.mem.eql(u8, f.name, delta.row_id_name)) id_at = i;
+        if (std.mem.eql(u8, f.name, delta.row_version_name)) ver_at = i;
+    }
+    if (id_at != null and ver_at != null and keep) {
+        if (r.mat_id.len == 0 or r.mat_version.len == 0)
+            return refuse("{s} tracks row ids (`delta.enableRowTracking`) but names no materialized row-id and row-commit-version columns, where a rewrite must keep them", .{name});
+        r.src = .{ id_at.?, ver_at.? };
+    }
+    return r;
+}
 
 /// A column-mapped table's plan given its files' names: every field of its schema
 /// lacking a physical name and id (one `merge_schema` adds, every one under
@@ -350,6 +390,7 @@ pub const Plan = struct {
     optimize: bool = false,
     field_ids: ?*const std.StringHashMapUnmanaged(i32) = null,
     max_column_id: ?i64 = null,
+    row: ?RowPlan = null,
 
     /// What EXPLAIN and `check` add after the root.
     pub fn label(self: *const Plan, arena: std.mem.Allocator) ![]const u8 {
@@ -420,6 +461,7 @@ pub fn planEvolving(arena: std.mem.Allocator, root: []const u8, mode: Mode, crea
         p.snap = st;
         p.new_meta = true;
         if (st.mappingMode() != null) try applyMapping(arena, p, st);
+        p.row = try rowPlan(st, name, schema.fields);
         return p;
     }
     if (partition_by) |want| if (!sameNames(want, st.part_cols))
@@ -486,6 +528,7 @@ pub fn planEvolving(arena: std.mem.Allocator, root: []const u8, mode: Mode, crea
     try upsertCols(p, arena);
     p.change = try changeOf(arena, p, st);
     if (st.mappingMode() != null) try applyMapping(arena, p, st);
+    p.row = try rowPlan(st, name, schema.fields);
     return p;
 }
 
@@ -790,6 +833,7 @@ const honoured = [_][]const u8{
     "appendOnly",          "invariants",          "checkConstraints",  "changeDataFeed", "generatedColumns",
     "columnMapping",       "identityColumns",     "deletionVectors",   "timestampNtz",   "domainMetadata",
     "vacuumProtocolCheck", "allowColumnDefaults", "inCommitTimestamp", "clustering",     "v2Checkpoint",
+    "rowTracking",
 };
 
 /// Refuses a table that asks a writer for what basalt does not do.
@@ -862,7 +906,7 @@ fn statsJson(arena: std.mem.Allocator, p: *const Plan, sum: pqwrite.Writer.Summa
     for ([_]?dtypes.Bound{ .min, .max, null }) |which| {
         try w.print(",\"{s}\":{{", .{if (which) |b| b.key() else "nullCount"});
         var first = true;
-        for (p.data, sum.columns) |k, cs| {
+        for (p.data, sum.columns[0..p.data.len]) |k, cs| {
             const c = p.cols[k];
             items.clearRetainingCapacity();
             if (c.ty.isNested()) {
@@ -958,6 +1002,7 @@ pub const Sink = struct {
     spilled: bool = false,
     /// The version the commit became, once it is made.
     committed: ?u64 = null,
+    row_counts: std.ArrayListUnmanaged(u64) = .empty,
     ict: ?i64 = null,
     compacting: ?[]const delta.Add = null,
     warn: ?merge.Warn = null,
@@ -986,15 +1031,28 @@ pub const Sink = struct {
             const cols = try plan_arena.dupe(Col, p.cols);
             for (cols, 0..) |*c, k| c.src = k;
             out.cols = cols;
+            if (out.row) |*r| if (r.keep) {
+                if (r.mat_id.len == 0 or r.mat_version.len == 0)
+                    return refuse("{s} tracks row ids (`delta.enableRowTracking`) but names no materialized row-id and row-commit-version columns, where an UPSERT's rewrite must keep them", .{p.name});
+                r.src = .{ cols.len, cols.len + 1 };
+            };
             self.plan = out;
             self.merging = try merge.Merge.init(gpa, p, opts);
         }
-        const fields = try a.alloc(types.Schema.Field, p.data.len);
-        const phys = try a.alloc(pqwrite.Physical, p.data.len);
-        for (p.data, fields, phys) |k, *f, *ph| {
+        const extra: usize = if (self.plan.row) |r| (if (r.src != null) 2 else 0) else 0;
+        const fields = try a.alloc(types.Schema.Field, p.data.len + extra);
+        const phys = try a.alloc(pqwrite.Physical, p.data.len + extra);
+        for (p.data, fields[0..p.data.len], phys[0..p.data.len]) |k, *f, *ph| {
             const c = p.cols[k];
             f.* = .{ .name = c.fileName(), .ty = (c.file_ty orelse c.ty).asNullable() };
             ph.* = c.phys;
+        }
+        if (extra == 2) {
+            const r = self.plan.row.?;
+            fields[p.data.len] = .{ .name = r.mat_id, .ty = types.Type.init(.int).asNullable() };
+            fields[p.data.len + 1] = .{ .name = r.mat_version, .ty = types.Type.init(.int).asNullable() };
+            phys[p.data.len] = .{};
+            phys[p.data.len + 1] = .{};
         }
         self.file_schema = .{ .fields = fields };
         self.phys = phys;
@@ -1155,9 +1213,13 @@ pub const Sink = struct {
     /// partition `key` names.
     fn writeRows(self: *Sink, arena: std.mem.Allocator, b: Batch, rows: ?[]const usize, values: []const ?[]const u8, key: []const u8) !void {
         const p = self.plan;
-        const cols = try arena.alloc(column.Column, p.data.len);
+        const row_src: ?[2]usize = if (p.row) |r| r.src else null;
+        const cols = try arena.alloc(column.Column, p.data.len + @as(usize, if (row_src != null) 2 else 0));
         const n = if (rows) |x| x.len else b.len;
-        for (p.data, cols) |k, *c| {
+        if (row_src) |rs| for (rs, cols[p.data.len..]) |k, *c| {
+            c.* = if (rows) |x| try column.permute(arena, b.columns[k], x) else b.columns[k];
+        };
+        for (p.data, cols[0..p.data.len]) |k, *c| {
             const pc = p.cols[k];
             if (pc.src == absent) {
                 c.* = try @import("../../exec/op/join.zig").nullColumn(arena, pc.ty, n);
@@ -1263,7 +1325,12 @@ pub const Sink = struct {
             try w.writeByte(':');
             if (v) |t| try jsontext.string(w, t) else try w.writeAll("null");
         }
-        try w.print("}},\"size\":{d},\"modificationTime\":{d},\"dataChange\":{s},\"stats\":", .{ sum.bytes, std.time.milliTimestamp(), if (self.compacting == null) "true" else "false" });
+        try w.print("}},\"size\":{d},\"modificationTime\":{d},\"dataChange\":{s},", .{ sum.bytes, std.time.milliTimestamp(), if (self.compacting == null) "true" else "false" });
+        if (p.row != null) {
+            try w.print("\"baseRowId\":\"@@B{d}@@\",\"defaultRowCommitVersion\":\"@@V@@\",", .{self.row_counts.items.len});
+            try self.row_counts.append(self.mem.allocator(), @intCast(sum.rows));
+        }
+        try w.writeAll("\"stats\":");
         try jsontext.string(w, try statsJson(a, p, sum));
         try w.writeAll("}}\n");
         self.n_added += 1;
@@ -1317,6 +1384,8 @@ pub const Sink = struct {
             }
             try w.writeAll("}}\n");
         }
+        if (p.row != null and self.row_counts.items.len > 0)
+            try w.writeAll("{\"domainMetadata\":{\"domain\":\"delta.rowTracking\",\"configuration\":\"{\\\"rowIdHighWaterMark\\\":@@H@@}\",\"removed\":false}}\n");
         for (self.dirs.keys()) |d| try dlog.syncDir(d);
         var ts = dlog.TableStore{ .root = p.root };
         self.committed = dlog.commit(a, ts.store(), p.name, .{
@@ -1334,6 +1403,7 @@ pub const Sink = struct {
             .hold = if (self.merging) |m| m.hold() else null,
             .app = if (p.change) |ch| ch.app else null,
             .ict = self.ict,
+            .rows = if (p.row) |r| (if (self.row_counts.items.len > 0) dlog.RowIds{ .hwm = r.hwm, .counts = self.row_counts.items } else null) else null,
         }) catch |e| {
             if (e == dlog.Error.DeltaCommitUnknown or e == dlog.Error.DeltaCommitUnsynced or e == dlog.Error.DeltaStoreUnsafe) self.begun.clearRetainingCapacity();
             return e;
@@ -1554,7 +1624,7 @@ test "writable: writer features by name, enforced column metadata, constraints, 
     st.writer_version = 7;
     st.writer_features = &.{ "appendOnly", "deletionVectors", "timestampNtz" };
     try writable(&st, &.{}, .append);
-    for ([_][]const u8{ "rowTracking", "fancyNew" }) |f| {
+    for ([_][]const u8{"fancyNew"}) |f| {
         st.writer_features = &.{f};
         try testing.expectError(table.Error.LakeTableRefused, writable(&st, &.{}, .append));
         try testing.expect(std.mem.indexOf(u8, eval.takeFailure(table.Error.LakeTableRefused).?, f) != null);

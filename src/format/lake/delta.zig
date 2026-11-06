@@ -247,6 +247,8 @@ pub const Add = struct {
     parts: ?std.json.Value = null,
     dv: ?std.json.Value = null,
     stats: ?[]const u8 = null,
+    base_row_id: ?i64 = null,
+    row_version: ?i64 = null,
 };
 
 /// A file's path, decoded from the log, as the protocol identifies it: resolved
@@ -297,6 +299,7 @@ pub const State = struct {
     files: std.StringArrayHashMapUnmanaged(Add) = .empty,
     txns: std.StringHashMapUnmanaged(i64) = .empty,
     last_ict: ?i64 = null,
+    row_hwm: ?i64 = null,
     meta_raw: ?std.json.Value = null,
     whole: ?*Whole = null,
 
@@ -328,6 +331,8 @@ pub const State = struct {
             .parts = if (a.parts) |v| try ownJson(self.arena, v, 2) else null,
             .dv = if (a.dv) |v| try ownJson(self.arena, v, 2) else null,
             .stats = if (a.stats) |t| try self.arena.dupe(u8, t) else null,
+            .base_row_id = a.base_row_id,
+            .row_version = a.row_version,
         };
         const k = try self.key(self.arena, x.path, try jsonDv(self.arena, x.dv));
         try self.files.put(self.arena, k, x);
@@ -338,6 +343,20 @@ pub const State = struct {
         const k = try self.key(scratch, try table.percentDecode(scratch, path), dv);
         _ = self.files.swapRemove(k);
         return k;
+    }
+
+    /// A `domainMetadata` action: the row-id high-water mark (domain
+    /// `delta.rowTracking`, `{"rowIdHighWaterMark": N}`) is kept.
+    fn domain(self: *State, scratch: std.mem.Allocator, name: []const u8, conf: ?[]const u8, removed: bool) !void {
+        if (!std.mem.eql(u8, name, "delta.rowTracking")) return;
+        if (removed) {
+            self.row_hwm = null;
+            return;
+        }
+        const t = conf orelse return;
+        const v = std.json.parseFromSliceLeaky(std.json.Value, scratch, t, .{}) catch return;
+        if (v != .object) return;
+        self.row_hwm = int(v.object.get("rowIdHighWaterMark"));
     }
 
     /// Application `app`'s transaction version, the last one seen winning.
@@ -435,6 +454,8 @@ pub const State = struct {
                     .parts = o.get("partitionValues"),
                     .dv = if (o.get("deletionVector")) |d| (if (d == .object) d else null) else null,
                     .stats = str(o.get("stats")),
+                    .base_row_id = int(o.get("baseRowId")),
+                    .row_version = int(o.get("defaultRowCommitVersion")),
                 });
                 try self.keep(k, o, file);
             } else if (std.mem.eql(u8, k, "remove")) {
@@ -454,6 +475,7 @@ pub const State = struct {
                 try self.txn(str(o.get("appId")) orelse continue, o.get("version") orelse continue);
                 try self.keep(k, o, null);
             } else if (std.mem.eql(u8, k, "domainMetadata")) {
+                try self.domain(scratch, str(o.get("domain")) orelse continue, str(o.get("configuration")), if (o.get("removed")) |r| r == .bool and r.bool else false);
                 try self.keep(k, o, null);
             } else if (std.mem.eql(u8, k, "commitInfo")) {
                 if (o.get("inCommitTimestamp")) |t| if (t == .integer) {
@@ -502,8 +524,18 @@ pub const State = struct {
             const c_side = columnAt(b, "sidecar.path");
             const c_app = columnAt(b, "txn.appId");
             const c_txv = columnAt(b, "txn.version");
+            const c_base = columnAt(b, "add.baseRowId");
+            const c_rver = columnAt(b, "add.defaultRowCommitVersion");
+            const c_dom = columnAt(b, "domainMetadata.domain");
+            const c_dconf = columnAt(b, "domainMetadata.configuration");
+            const c_drem = columnAt(b, "domainMetadata.removed");
             for (0..b.len) |i| {
                 if (!self.files_only and cell(c_app, i) == .string and cell(c_txv, i) == .int) try self.txn(cell(c_app, i).string, .{ .integer = cell(c_txv, i).int });
+                if (!self.files_only and cell(c_dom, i) == .string) {
+                    const conf = cell(c_dconf, i);
+                    const rem = cell(c_drem, i);
+                    try self.domain(scratch, cell(c_dom, i).string, if (conf == .string) conf.string else null, rem == .bool and rem.bool);
+                }
                 if (cell(c_side, i) == .string) try self.sidecars.append(self.arena, try self.arena.dupe(u8, cell(c_side, i).string));
                 if (cell(c_path, i) == .string) {
                     const size = cell(c_size, i);
@@ -528,6 +560,8 @@ pub const State = struct {
                         .parts = jsonOf(scratch, cell(c_parts, i)),
                         .dv = dv,
                         .stats = if (stats == .string) stats.string else null,
+                        .base_row_id = if (cell(c_base, i) == .int) cell(c_base, i).int else null,
+                        .row_version = if (cell(c_rver, i) == .int) cell(c_rver, i).int else null,
                     });
                 }
                 if (!self.files_only and cell(c_schema, i) == .string) {
@@ -653,7 +687,8 @@ const checkpoint_columns = [_][]const u8{
     "metaData.configuration",         "protocol.minReaderVersion",         "protocol.minWriterVersion", "protocol.readerFeatures",
     "protocol.writerFeatures",        "checkpointMetadata.version",        "sidecar.path",              "txn.appId",
     "txn.version",                    "metaData.name",                     "metaData.description",      "metaData.format.provider",
-    "metaData.format.options",        "metaData.createdTime",
+    "metaData.format.options",        "metaData.createdTime",              "add.baseRowId",             "add.defaultRowCommitVersion",
+    "domainMetadata.domain",          "domainMetadata.configuration",      "domainMetadata.removed",
 };
 
 fn cell(c: ?column.Column, row: usize) Value {
@@ -679,6 +714,11 @@ fn columnAt(b: Batch, path: []const u8) ?column.Column {
 fn oneOf(s: []const u8, set: []const []const u8) bool {
     for (set) |x| if (std.mem.eql(u8, s, x)) return true;
     return false;
+}
+
+fn int(v: ?std.json.Value) ?i64 {
+    const x = v orelse return null;
+    return if (x == .integer) x.integer else null;
 }
 
 fn str(v: ?std.json.Value) ?[]const u8 {
@@ -866,6 +906,32 @@ pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_
 /// A layout over some of a table's live files, `files` aligned with `adds`.
 pub const FileLayout = struct { layout: Layout, files: []Layout.File };
 
+/// The names a layout's hidden row-tracking fields go by (`withRows`).
+pub const row_id_name = "\x00row_id";
+pub const row_version_name = "\x00row_version";
+
+/// Layout `l` of `st`'s files with two hidden fields after its own: each row's
+/// row id and row commit version, as Delta's row tracking defines them (the
+/// materialized column's value, else the file's `baseRowId` plus the row's
+/// position, and `defaultRowCommitVersion`), for a write that copies rows to keep.
+pub fn withRows(arena: std.mem.Allocator, st: *const State, l: Layout) !Layout {
+    var out = l;
+    const n = l.schema.fields.len;
+    const fields = try arena.alloc(types.Schema.Field, n + 2);
+    @memcpy(fields[0..n], l.schema.fields);
+    const int_ty = types.Type.init(.int).asNullable();
+    fields[n] = .{ .name = row_id_name, .ty = int_ty };
+    fields[n + 1] = .{ .name = row_version_name, .ty = int_ty };
+    out.schema = .{ .fields = fields };
+    out.rows = .{
+        .id = n,
+        .version = n + 1,
+        .mat_id = st.property("delta.rowTracking.materializedRowIdColumnName") orelse "",
+        .mat_version = st.property("delta.rowTracking.materializedRowCommitVersionColumnName") orelse "",
+    };
+    return out;
+}
+
 /// `adds` (live files of `st`) as a Parquet layout of the table's schema, in the
 /// order given, each file with its deletion vector's descriptor checked (read
 /// only when the file is) and, under column mapping, how its columns are named.
@@ -899,7 +965,7 @@ pub fn layoutOf(arena: std.mem.Allocator, st: *const State, root: []const u8, ad
             p.* = (try table.partitionValue(arena, text, schema.fields[fi].ty)) orelse
                 return refuse("{s} has file `{s}` with partition value `{s}` for column `{s}`, which is not a {s}", .{ name, decoded, text.?, c, try schema.fields[fi].ty.name(arena) });
         }
-        f.* = .{ .path = try table.mapPath(arena, root, decoded), .size = a.size, .parts = parts, .stats = a.stats };
+        f.* = .{ .path = try table.mapPath(arena, root, decoded), .size = a.size, .parts = parts, .stats = a.stats, .row_base = a.base_row_id, .row_version = a.row_version };
         if (a.dv) |dv| {
             const ref = try arena.create(dvs.Ref);
             ref.* = .{ .name = name, .root = root, .file = decoded, .d = try dvs.descriptor(name, decoded, dv) };

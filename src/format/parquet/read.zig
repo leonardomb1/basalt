@@ -155,6 +155,7 @@ pub const Reader = struct {
     /// The rows the table deletes from this file, loaded into `deleted` when the
     /// first row group is read; `firsts` holds each row group's first row.
     deletes: ?Deletes = null,
+    positions: bool = false,
     deleted: ?roaring.Bitmap = null,
     firsts: []const u64 = &.{},
     /// Top-level string columns read as dictionary codes only, by name: a pipeline
@@ -319,7 +320,12 @@ pub const Reader = struct {
                 kept = rows - n;
             }
             if (self.src.coalesces()) self.held = try self.fetchGroup(arena, g);
-            const cols = try arena.alloc(column.Column, self.outputs.len);
+            const cols = try arena.alloc(column.Column, self.outputs.len + @intFromBool(self.positions));
+            if (self.positions) {
+                const ps = try arena.alloc(i64, rows);
+                for (ps, 0..) |*x, r| x.* = @intCast(self.firsts[gi] + r);
+                cols[self.outputs.len] = column.Column.derived(types.Type.init(.int), rows, try column.Bitmap.initFull(arena, rows), .{ .i64 = ps });
+            }
             for (self.outputs, 0..) |o, ci| switch (o) {
                 .leaf => |li| {
                     const lf = self.leaves[li];
@@ -362,17 +368,43 @@ pub const Reader = struct {
     /// its position in the whole file, whichever row groups a read skips.
     fn deletedRows(self: *Reader, d: Deletes) !*const roaring.Bitmap {
         if (self.deleted == null) {
-            const firsts = try self.arena.alloc(u64, self.md.row_groups.len);
-            var total: u64 = 0;
-            for (self.md.row_groups, firsts) |g, *f| {
-                f.* = total;
-                total += std.math.cast(u64, g.num_rows) orelse return Error.CorruptParquetPage;
-            }
-            self.firsts = firsts;
+            const total = try self.rowFirsts();
             self.deleted = try d.load(d.ctx, self.arena, total);
         }
         return &self.deleted.?;
     }
+
+    /// Each row group's first row in the whole file (`firsts`), computed once;
+    /// returns the file's row count.
+    fn rowFirsts(self: *Reader) !u64 {
+        var total: u64 = 0;
+        if (self.firsts.len == self.md.row_groups.len and self.firsts.len > 0) {
+            const last = self.md.row_groups[self.md.row_groups.len - 1];
+            return self.firsts[self.firsts.len - 1] + (std.math.cast(u64, last.num_rows) orelse return Error.CorruptParquetPage);
+        }
+        const firsts = try self.arena.alloc(u64, self.md.row_groups.len);
+        for (self.md.row_groups, firsts) |g, *f| {
+            f.* = total;
+            total += std.math.cast(u64, g.num_rows) orelse return Error.CorruptParquetPage;
+        }
+        self.firsts = firsts;
+        return total;
+    }
+
+    /// Makes each batch end in a column `pos_name` of every row's position in the
+    /// whole file, counted before deleted rows drop out, as a Delta row id is.
+    pub fn wantPositions(self: *Reader) !usize {
+        if (self.positions) return self.schema.fields.len - 1;
+        const fields = try self.arena.alloc(types.Schema.Field, self.schema.fields.len + 1);
+        @memcpy(fields[0..self.schema.fields.len], self.schema.fields);
+        fields[self.schema.fields.len] = .{ .name = pos_name, .ty = types.Type.init(.int) };
+        self.schema = .{ .fields = fields };
+        self.positions = true;
+        _ = try self.rowFirsts();
+        return fields.len - 1;
+    }
+
+    pub const pos_name = "\x00pos";
 
     const Chunk = struct { bytes: []const u8, meta: parquet.ColumnMetaData, start: u64 };
 

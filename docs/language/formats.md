@@ -421,13 +421,22 @@ Databricks' writer features are honoured as the protocol asks:
 - **V2 checkpoints** (`v2Checkpoint`): basalt's checkpoint of such a table
   carries the `checkpointMetadata` row, under the classic name the protocol
   allows.
+- **Row tracking** (`rowTracking`): each new file is numbered on from the
+  table's row-id high-water mark (`baseRowId`, its `defaultRowCommitVersion` the
+  commit's version), the mark raised in the `delta.rowTracking` domain and
+  renumbered past a concurrent writer's when the commit moves to a later
+  version. Where `delta.enableRowTracking` holds, a row an UPSERT or
+  `delta_optimize` copies keeps its row id and commit version in the table's
+  materialized columns (an updated row keeps its id and takes the new version,
+  an inserted one is numbered afresh); a table that enables it without naming
+  those columns refuses such a rewrite.
 
 A table that asks a writer for what basalt does not do is refused, naming it: a
 writer version past 7, a writer feature other than `appendOnly`, `invariants`,
 `checkConstraints`, `changeDataFeed`, `generatedColumns`, `columnMapping`,
 `identityColumns`, `deletionVectors`, `timestampNtz`, `domainMetadata`,
-`vacuumProtocolCheck`, `allowColumnDefaults`, `inCommitTimestamp`, `clustering`
-and `v2Checkpoint` (`rowTracking` among those refused), and among those any the
+`vacuumProtocolCheck`, `allowColumnDefaults`, `inCommitTimestamp`, `clustering`,
+`v2Checkpoint` and `rowTracking`, and among those any the
 table actually uses — a column invariant, a CHECK constraint, a generated or
 identity column, a column default an UPSERT's `PARTIAL COLS` leaves to it — as
 well as a `REPLACE` or `UPSERT` of a

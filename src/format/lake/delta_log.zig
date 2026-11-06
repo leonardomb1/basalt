@@ -10,6 +10,12 @@
 //! written before the commit, so a reader never meets a commit naming a file that
 //! is not there yet.
 //!
+//! Under row tracking a commit's `body` spells each new file's `baseRowId`
+//! `"@@B<k>@@"`, its `defaultRowCommitVersion` `"@@V@@"` and the new high-water
+//! mark `@@H@@` (`RowIds`), rendered at each version tried (`render`): file `k`'s
+//! rows numbered on from the mark after those of the files before it, the mark
+//! raised past a winner's, and the version the one the commit lands at.
+//!
 //! When the version is taken, the winner's actions decide, as Delta's conflict
 //! rules do: a winner that changed the table's metadata or protocol, created it,
 //! or removed a file this commit read fails the commit (paths compared as the
@@ -95,7 +101,23 @@ pub const Commit = struct {
     /// The commit's in-commit timestamp, written into `body` as
     /// `"inCommitTimestamp":<ict>`; a retry past a winner raises it above the winner's.
     ict: ?i64 = null,
+    rows: ?RowIds = null,
 };
+
+pub const RowIds = struct { hwm: i64, counts: []const u64 };
+
+/// `c`'s body as committed at `version`.
+fn render(arena: std.mem.Allocator, c: Commit, version: u64) ![]const u8 {
+    const r = c.rows orelse return c.body;
+    var out = c.body;
+    var next = r.hwm + 1;
+    for (r.counts, 0..) |n, k| {
+        out = try std.mem.replaceOwned(u8, arena, out, try msgfmt.allocPrint(arena, "\"@@B{d}@@\"", .{k}), try msgfmt.allocPrint(arena, "{d}", .{next}));
+        next += @intCast(n);
+    }
+    out = try std.mem.replaceOwned(u8, arena, out, "\"@@V@@\"", try msgfmt.allocPrint(arena, "{d}", .{version}));
+    return std.mem.replaceOwned(u8, arena, out, "@@H@@", try msgfmt.allocPrint(arena, "{d}", .{next - 1}));
+}
 
 /// The log at `root` (a folder path ending in `/`), local or in an object store.
 pub const TableStore = struct {
@@ -202,6 +224,7 @@ const Winner = struct {
     txn: ?[]const u8 = null,
     apps: std.ArrayListUnmanaged([]const u8) = .empty,
     ict: ?i64 = null,
+    row_hwm: ?i64 = null,
 };
 
 fn readWinner(arena: std.mem.Allocator, text: []const u8) !Winner {
@@ -230,6 +253,11 @@ fn readWinner(arena: std.mem.Allocator, text: []const u8) !Winner {
             };
             if (std.mem.eql(u8, k, "txn")) if (body.object.get("appId")) |x| if (x == .string)
                 try w.apps.append(arena, x.string);
+            if (std.mem.eql(u8, k, "domainMetadata")) if (body.object.get("domain")) |d| if (d == .string and std.mem.eql(u8, d.string, "delta.rowTracking")) if (body.object.get("configuration")) |cf| if (cf == .string) {
+                if (std.json.parseFromSliceLeaky(std.json.Value, arena, cf.string, .{}) catch null) |j| if (j == .object) if (j.object.get("rowIdHighWaterMark")) |h| if (h == .integer) {
+                    w.row_hwm = h.integer;
+                };
+            };
         }
     }
     return w;
@@ -271,7 +299,7 @@ pub fn commit(arena: std.mem.Allocator, store: Store, name: []const u8, c_in: Co
     while (true) : (attempts += 1) {
         if (attempts >= max_attempts)
             return fail(arena, name, c, try msgfmt.allocPrint(arena, "it lost the race for {d} versions in a row (the last tried was {d})", .{ max_attempts, version }));
-        const made = store.create(arena, version, c.body) catch |e| {
+        const made = store.create(arena, version, try render(arena, c, version)) catch |e| {
             if (e == Error.DeltaStoreUnsafe or e == Error.DeltaCommitUnsynced) return e;
             const outcome = landed(arena, store, version, c.txn_id);
             if (outcome == .mine) {
@@ -285,6 +313,9 @@ pub fn commit(arena: std.mem.Allocator, store: Store, name: []const u8, c_in: Co
         const w = try readWinner(arena, text);
         if (w.txn) |t| if (std.mem.eql(u8, t, c.txn_id)) return version;
         if (try conflict(arena, c, w, version)) |why| return fail(arena, name, c, why);
+        if (c.rows) |*r| if (w.row_hwm) |theirs| if (theirs > r.hwm) {
+            r.hwm = theirs;
+        };
         if (c.ict) |mine| if (w.ict) |theirs| if (theirs >= mine) {
             const was = try msgfmt.allocPrint(arena, "\"inCommitTimestamp\":{d}", .{mine});
             const now = try msgfmt.allocPrint(arena, "\"inCommitTimestamp\":{d}", .{theirs + 1});
@@ -445,6 +476,22 @@ test "commit: an in-commit timestamp a winner reached is raised past it on the r
     var s = FakeStore{ .arena = a, .race = &.{winner} };
     try testing.expectEqual(@as(u64, 5), try commit(a, s.store(), "T", c));
     try testing.expect(std.mem.indexOf(u8, s.commits.get(5).?, "\"inCommitTimestamp\":5001,") != null);
+}
+
+test "commit: row ids are rendered at the version the commit lands at, past a winner's high-water mark" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const winner = "{\"commitInfo\":{\"txnId\":\"W\"}}\n{\"add\":{\"path\":\"w.parquet\",\"baseRowId\":5,\"defaultRowCommitVersion\":4}}\n{\"domainMetadata\":{\"domain\":\"delta.rowTracking\",\"configuration\":\"{\\\"rowIdHighWaterMark\\\":9}\",\"removed\":false}}\n";
+    var c = testCommit(.append, 3, "T");
+    c.body = "{\"commitInfo\":{\"txnId\":\"T\"}}\n{\"add\":{\"path\":\"a.parquet\",\"baseRowId\":\"@@B0@@\",\"defaultRowCommitVersion\":\"@@V@@\"}}\n{\"add\":{\"path\":\"b.parquet\",\"baseRowId\":\"@@B1@@\",\"defaultRowCommitVersion\":\"@@V@@\"}}\n{\"domainMetadata\":{\"domain\":\"delta.rowTracking\",\"configuration\":\"{\\\"rowIdHighWaterMark\\\":@@H@@}\",\"removed\":false}}\n";
+    c.rows = .{ .hwm = 4, .counts = &.{ 3, 2 } };
+    var s = FakeStore{ .arena = a, .race = &.{winner} };
+    try testing.expectEqual(@as(u64, 5), try commit(a, s.store(), "T", c));
+    const got = s.commits.get(5).?;
+    try testing.expect(std.mem.indexOf(u8, got, "\"path\":\"a.parquet\",\"baseRowId\":10,\"defaultRowCommitVersion\":5}") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "\"path\":\"b.parquet\",\"baseRowId\":13,\"defaultRowCommitVersion\":5}") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "rowIdHighWaterMark\\\":14}") != null);
 }
 
 test "commit: a create failing outright names the table, the version and the files; an unreadable outcome is unknown" {

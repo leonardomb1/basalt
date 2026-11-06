@@ -144,13 +144,20 @@ pub fn optimize(gpa: std.mem.Allocator, arena: std.mem.Allocator, root: []const 
     }
     if (picks.items.len == 0) return .{ .removed = 0, .added = 0, .partitions = 0 };
 
-    const p = try write.plan(arena, root, .append, false, null, .snappy, fl.layout.schema);
+    const keeps_rows = keepsRows(st);
+    const read_lay = blk: {
+        const l = (try delta.layoutOf(arena, st, root, picks.items)).layout;
+        break :blk if (keeps_rows) try delta.withRows(arena, st, l) else l;
+    };
+    const plan_schema = if (keeps_rows) (try delta.withRows(arena, st, fl.layout)).schema else fl.layout.schema;
+    const p = try write.plan(arena, root, .append, false, null, .snappy, plan_schema);
     p.optimize = true;
     const sink = try write.Sink.open(gpa, arena, p, opts);
     var g = Guard(*write.Sink).init(sink);
     defer g.abort();
-    const lay = try delta.layoutOf(arena, st, root, picks.items);
-    const src = try Folder.openLayout(arena, &lay.layout, null);
+    const lay_ptr = try arena.create(@TypeOf(read_lay));
+    lay_ptr.* = read_lay;
+    const src = try Folder.openLayout(arena, lay_ptr, null);
     var batch_mem = std.heap.ArenaAllocator.init(pagecache.process);
     defer batch_mem.deinit();
     const s = src.source();
@@ -162,6 +169,17 @@ pub fn optimize(gpa: std.mem.Allocator, arena: std.mem.Allocator, root: []const 
     sink.compacting = picks.items;
     try g.close();
     return .{ .removed = picks.items.len, .added = sink.n_added, .partitions = parts };
+}
+
+/// Whether `st`'s table keeps its rows' ids through a rewrite: writer feature
+/// `rowTracking` with `delta.enableRowTracking`.
+fn keepsRows(st: *const delta.State) bool {
+    const on = for (st.writer_features) |f| {
+        if (std.mem.eql(u8, f, "rowTracking")) break true;
+    } else false;
+    if (!on) return false;
+    const t = st.property("delta.enableRowTracking") orelse return false;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, t, " "), "true");
 }
 
 /// Puts the files action `a` (an `add` or `remove`) names in `set`, as paths
