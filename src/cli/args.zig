@@ -123,11 +123,11 @@ pub fn parseLogFormat(v: []const u8) ?obs.Format {
     return null;
 }
 
-fn printDiag(stderr: *std.Io.Writer, label: []const u8, tag: []const u8, pos: ?ast.Pos, msg: []const u8) !void {
+fn printDiag(stderr: *std.Io.Writer, label: []const u8, level: []const u8, tag: []const u8, pos: ?ast.Pos, msg: []const u8) !void {
     if (pos) |p|
-        try stderr.print("{s}:{d}:{d}: error{s}: {s}\n", .{ label, p.line, p.col, tag, msg })
+        try stderr.print("{s}:{d}:{d}: {s}{s}: {s}\n", .{ label, p.line, p.col, level, tag, msg })
     else
-        try stderr.print("{s}: error{s}: {s}\n", .{ label, tag, msg });
+        try stderr.print("{s}: {s}{s}: {s}\n", .{ label, level, tag, msg });
 }
 
 pub const ErrOut = struct {
@@ -144,17 +144,18 @@ pub const ErrOut = struct {
         file: ?[]const u8 = null,
         transient: bool = false,
         event: []const u8 = "script_error",
+        level: []const u8 = "error",
     };
 
     pub fn report(self: ErrOut, e: Located) !void {
         const file = e.file orelse (ast.Program{ .stmts = &.{}, .files = self.files }).fileOf(e.pos) orelse self.label;
         if (!self.json) {
-            return printDiag(self.w, file, if (e.transient) " (transient)" else "", e.pos, e.msg);
+            return printDiag(self.w, file, e.level, if (e.transient) " (transient)" else "", e.pos, e.msg);
         }
         if (self.bare)
-            try self.w.writeAll("{\"level\":\"error\",\"msg\":")
+            try self.w.print("{{\"level\":\"{s}\",\"msg\":", .{e.level})
         else
-            try self.w.print("{{\"ts\":{d},\"level\":\"error\",\"event\":\"{s}\",\"msg\":", .{ std.time.milliTimestamp(), e.event });
+            try self.w.print("{{\"ts\":{d},\"level\":\"{s}\",\"event\":\"{s}\",\"msg\":", .{ std.time.milliTimestamp(), e.level, e.event });
         try jsontext.string(self.w, e.msg);
         try self.w.writeAll(",\"file\":");
         try jsontext.string(self.w, file);

@@ -7,8 +7,7 @@ own it prints its rows; after `LOAD INTO … AS` it writes them ([LOAD INTO](loa
 WITH pedidos AS (                          -- CTE = named binding
   SELECT filial, num, valor, obra
   FROM erp.dbo.SC5010
-    PUSHDOWN($$D_E_L_E_T_ <> '*'$$)        -- raw predicate, verbatim to the source
-  WHERE valor > 0                          -- translated predicate
+  WHERE D_E_L_E_T_ <> '*' AND valor > 0    -- translated into the source's query
 ), obras AS (                              -- a join's right side is a CTE
   SELECT codigo_obra, nome_obra FROM erp.dbo.obras
 )

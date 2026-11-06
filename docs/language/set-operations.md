@@ -49,8 +49,8 @@ ANCHOR SCHEMA erp.dbo.CT2010;          -- schema authority (optional)
 SELECT *
 FROM EACH TABLE OF (erp.QUERY($$SELECT name, SUBSTRING(name,4,2) FROM sys.tables WHERE name LIKE 'CT2%'$$))
   AS (table_name, CT2_EMPRESA)         -- 2nd name = output tag column
-  PUSHDOWN($$D_E_L_E_T_ <> '*'$$)      -- raw predicate on EVERY branch
-  ANCHOR SCHEMA erp.dbo.CT2010;
+  ANCHOR SCHEMA erp.dbo.CT2010
+WHERE D_E_L_E_T_ <> '*';               -- descends into EVERY branch's query
 ```
 
 The discovery source may also be a full basalt `SELECT`, executed in-engine at

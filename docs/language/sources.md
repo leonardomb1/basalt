@@ -163,8 +163,8 @@ nulls, and a table with a filtered index or an indexed view can be written.
 
 ## Source clauses
 
-These follow the source, in any order. `PUSHDOWN` and the rules for what a SQL
-source is asked to do are on [Pushdown](pushdown.md).
+These follow the source, in any order. The rules for what a SQL source is asked
+to do, and the deprecated `PUSHDOWN`, are on [Pushdown](pushdown.md).
 
 - **`PAGINATE BY page|offset|cursor (param = 'page', size = 100,
   total = 'count', field = 'next', start = 2, max = 50)`** — REST pagination.

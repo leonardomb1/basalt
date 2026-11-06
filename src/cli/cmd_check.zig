@@ -17,7 +17,7 @@ const std = @import("std");
 const unknownOption = @import("args.zig").unknownOption;
 const types = @import("../lang/types.zig");
 
-pub const CheckIssue = struct { msg: []const u8, pos: ?ast.Pos = null, end: ?ast.Pos = null, file: ?[]const u8 = null };
+pub const CheckIssue = struct { msg: []const u8, pos: ?ast.Pos = null, end: ?ast.Pos = null, file: ?[]const u8 = null, warning: bool = false };
 
 pub const CheckOpts = struct {
     overrides: []const analyze.ParamOverride = &.{},
@@ -47,6 +47,7 @@ pub fn checkText(a: std.mem.Allocator, text: []const u8, label: []const u8, dir:
     };
     for (perrs.items) |p| try issues.append(.{ .msg = p.msg, .pos = .{ .line = p.line, .col = p.col }, .end = if (p.end_line > 0) ast.Pos{ .line = p.end_line, .col = p.end_col } else null, .file = prog.fileOf(.{ .line = p.line, .col = p.col, .file = p.file }) });
     if (opts.strict_params) for (opts.overrides) |o| if (try paramProblem(a, prog, o.name)) |why| try issues.append(.{ .msg = why });
+    for (prog.notes) |n| try issues.append(.{ .msg = n.msg, .pos = n.pos, .file = prog.fileOf(n.pos), .warning = true });
 
     var found = std.array_list.Managed(analyze.Issue).init(a);
     var adiag = analyze.Diag{};
@@ -152,10 +153,10 @@ pub fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     if (json) try stdout.writeAll("[");
     for (issues, 0..) |is, k| {
         if (json and k > 0) try stdout.writeByte(',');
-        try eo.report(.{ .msg = is.msg, .pos = is.pos, .end = is.end, .file = is.file });
+        try eo.report(.{ .msg = is.msg, .pos = is.pos, .end = is.end, .file = is.file, .level = if (is.warning) "warning" else "error" });
     }
     if (json) try stdout.writeAll("]\n");
-    if (issues.len > 0) return 1;
+    for (issues) |is| if (!is.warning) return 1;
     if (!json) try stdout.print("ok: {s} checks out\n", .{src.label});
     return 0;
 }
@@ -222,4 +223,15 @@ test "checkText: an error inside an included table function's body, reached from
     try std.testing.expect(std.mem.endsWith(u8, issues[0].file.?, "lib.sql"));
     try std.testing.expectEqual(@as(u32, 3), issues[0].pos.?.line);
     try std.testing.expectEqual(@as(u32, 63), issues[0].pos.?.col);
+}
+
+test "check warns where PUSHDOWN is written, without failing" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const issues = try checkText(a, "SELECT * FROM 'x.csv' PUSHDOWN($$a > 1$$);", "t.sql", ".", .{ .declarations_only = true });
+    try std.testing.expectEqual(@as(usize, 1), issues.len);
+    try std.testing.expect(issues[0].warning);
+    try std.testing.expect(std.mem.indexOf(u8, issues[0].msg, "`PUSHDOWN(...)` is deprecated") != null);
+    try std.testing.expectEqual(@as(u32, 1), issues[0].pos.?.line);
 }

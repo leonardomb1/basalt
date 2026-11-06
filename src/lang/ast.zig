@@ -796,10 +796,13 @@ pub const ExplainStmt = struct {
     pos: Pos,
 };
 
+pub const Note = struct { pos: Pos, msg: []const u8 };
+
 pub const Program = struct {
     stmts: []const Stmt,
     explain: ExplainMode = .none,
     files: []const []const u8 = &.{},
+    notes: []const Note = &.{},
 
     /// The file a position lies in, or null for the script itself.
     pub fn fileOf(self: Program, pos: ?Pos) ?[]const u8 {

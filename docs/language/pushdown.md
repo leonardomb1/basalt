@@ -5,12 +5,13 @@ answer exactly — the filter, the columns, a whole aggregate, a top-N — so le
 crosses the wire. The answer never changes, only where the work happens;
 `EXPLAIN` shows what descended on the scan's `pushdown:` line.
 
-- **`PUSHDOWN(<expr>)`** — a raw predicate sent verbatim into the generated
-  source query's `WHERE`. The argument is a string expression: a `$$...$$`
-  literal (`PUSHDOWN($$D_E_L_E_T_ <> '*'$$)`), a loop-var value
-  (`PUSHDOWN($where)`), or one built with `||`. ANDed with whatever the
-  translated `WHERE` pushes down. Empty ⇒ no clause. Syntax errors surface at
-  the source at runtime (permanent, exit 1).
+- **`PUSHDOWN(<expr>)`** — *deprecated, to be removed*: `check` and `run` warn
+  where it is written. A raw predicate sent verbatim into the generated source
+  query's `WHERE` (a `$$...$$` literal, a loop-var value or one built with `||`),
+  ANDed with whatever the translated `WHERE` pushes down. Write the filter as a
+  `WHERE` instead, which descends into the source's query and into every branch
+  of a union on its own (below); for SQL the translator cannot express, read a
+  raw `conn.QUERY($$SELECT ... WHERE ${where}$$)`.
 - **Projection pushdown** — a table read asks the source only for the columns
   the pipeline provably needs (`SELECT a, b FROM erp.t` is sent as
   `SELECT [a], [b] FROM t`), so a narrow read of a 300-column table moves only

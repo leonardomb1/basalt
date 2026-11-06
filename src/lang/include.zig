@@ -251,7 +251,10 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
     }
     if (main) |m| try out.appendSlice(stmtsOf(m));
     if (kind) |k| try out.insert(0, .{ .kind = k });
-    return .{ .stmts = try out.toOwnedSlice(), .explain = if (main) |m| m.explain else .none };
+    var notes = std.array_list.Managed(ast.Note).init(ctx.arena);
+    for (subs.items) |sp| try notes.appendSlice(sp.notes);
+    if (main) |m| try notes.appendSlice(m.notes);
+    return .{ .stmts = try out.toOwnedSlice(), .explain = if (main) |m| m.explain else .none, .notes = notes.items };
 }
 
 const Located = struct { shown: []const u8, canon: []const u8, canonical: bool, base: Base, text: ?[]const u8 };

@@ -54,7 +54,7 @@ pub fn parseProgram(self: *Parser) Error!ast.Program {
     }
 
     try stmts.insert(0, .{ .kind = .{ .pos = .{ .line = 1, .col = 1 } } });
-    return .{ .stmts = try stmts.toOwnedSlice(), .explain = explain };
+    return .{ .stmts = try stmts.toOwnedSlice(), .explain = explain, .notes = self.notes.items };
 }
 
 /// Whether the statement at token `i` has a body with `;`s of its own (a
@@ -297,7 +297,9 @@ pub fn parseTargetSegment(self: *Parser) Error![]const u8 {
 /// every branch (empty means none), and `ANCHOR SCHEMA <table>`.
 pub fn parseUnionClauses(self: *Parser, hints: *std.array_list.Managed(ast.Hint), pos: Pos) Error!void {
     while (true) {
-        if (self.eatKw("pushdown")) {
+        if (self.isKw("pushdown")) {
+            try self.notePushdown();
+            _ = self.advance();
             _ = try self.expect(.lparen);
             const outer_quals = self.qual_sink;
             self.qual_sink = null;
@@ -313,6 +315,13 @@ pub fn parseUnionClauses(self: *Parser, hints: *std.array_list.Managed(ast.Hint)
             try hints.append(.{ .key = "canon", .value = .{ .ident = q.last() }, .pos = pos });
         } else break;
     }
+}
+
+/// Notes the deprecated `PUSHDOWN(...)` at its keyword: a `WHERE` now descends
+/// into a read's query and into each branch of a union, so a raw predicate is
+/// no longer needed.
+pub fn notePushdown(self: *Parser) Error!void {
+    try self.notes.append(self.arena, .{ .pos = self.curPos(), .msg = "`PUSHDOWN(...)` is deprecated and will be removed: write the filter as a `WHERE`, which descends into the source's query (and into every branch of `EACH TABLE OF` or a union by name) on its own; for raw SQL the translator cannot express, read a `QUERY($$...$$)`" });
 }
 
 /// Lower a reflection expression to a `${...}` template: a `concat`/`||` chain splices

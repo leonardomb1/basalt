@@ -915,7 +915,9 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         .{ .read = .{ .connector = "unit", .form = .unit } };
 
     while (true) {
-        if (self.eatKw("pushdown")) {
+        if (self.isKw("pushdown")) {
+            try self.notePushdown();
+            _ = self.advance();
             _ = try self.expect(.lparen);
             self.qual_sink = null;
             const e = try self.parseExpr();

@@ -198,6 +198,10 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     const run_id: u64 = @intCast(std.time.milliTimestamp());
     var logger = obs.Logger.init(run_id, opts.log.format, if (opts.log.quiet) .err else opts.log.level);
     logger.quiet = opts.log.quiet;
+    for (raw_program.notes) |n| {
+        const file = raw_program.fileOf(n.pos);
+        logger.log(.warn, "{s}{s}{d}:{d}: {s}", .{ file orelse "", if (file != null) ":" else "", n.pos.line, n.pos.col, n.msg });
+    }
     const t0 = std.time.milliTimestamp();
     var rows_read = obs.RowCounter.init(0);
 

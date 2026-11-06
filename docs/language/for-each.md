@@ -4,13 +4,13 @@ Plan-time fan-out — one pipeline (or dispatch) per row of a discovery source.
 A catalog of tables, each read and loaded under a per-row name:
 
 ```sql
-FOR EACH ROW OF ($tables) AS (name, where)
+FOR EACH ROW OF ($tables) AS (name, since)
   PARALLEL ON ERROR CONTINUE           -- or SEQUENTIAL / ON ERROR STOP
   LOAD INTO sr.IDENTIFIER('fluig_' || lower($name))
     USING stream_load UPSERT AS        -- bare UPSERT: PK inferred from source
   SELECT *, now() AS extraction_timestamp
   FROM fluig.dbo.IDENTIFIER($name)     -- a per-row TABLE read
-  PUSHDOWN($where);                    -- raw predicate value ("" ⇒ no WHERE)
+  WHERE updated_at >= $since;          -- the row's value, translated into the query
 END FOR;
 ```
 
@@ -59,7 +59,7 @@ or object reference (the precedent is Snowflake / Databricks `IDENTIFIER`).
 | a per-row file path | `FROM IDENTIFIER('dir/' \|\| $name \|\| '.csv')` (the extension must be literal) |
 | a computed sink name | `LOAD INTO conn.IDENTIFIER('pre_' \|\| lower($name))` |
 | a per-row sink file | `LOAD INTO IDENTIFIER('dir/' \|\| $name \|\| '.csv')` (extension literal, as above — it picks the writer) |
-| a raw predicate value | `PUSHDOWN($where)` |
+| a raw predicate text | `FROM conn.QUERY($$SELECT * FROM ${name} WHERE ${where}$$)` |
 | a conditional key | `UPSERT ON (IDENTIFIER(if($pk = '', $name \|\| 'id', $pk)))` |
 | a per-row column *name* | `SELECT IDENTIFIER($col), COUNT(*) ... GROUP BY IDENTIFIER($col) ORDER BY IDENTIFIER($col)` |
 | a per-row column value | `SELECT $name AS empresa` — a plain expression, no quoting |
@@ -77,7 +77,7 @@ catalog holds only `{name, where}`, never a PK.
 
 ## Raw `${...}` interpolation
 
-Inside a raw `QUERY($$...$$)` or `PUSHDOWN($$...$$)` literal, `${var}` /
+Inside a raw `QUERY($$...$$)` literal, `${var}` /
 `${ <expr> }` still splices loop values into the SQL text (C#-style: nested
 string literals in the hole need no escaping) — `QUERY($$SELECT ${cols} FROM
 ${name}$$)`. Prefer `$var` + `IDENTIFIER()` everywhere a *name* is meant;

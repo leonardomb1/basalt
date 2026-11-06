@@ -14,7 +14,7 @@ literal arguments at the call site, defaults fill omitted trailing arguments.
 A body starting with `LOAD`/`FOR`/`CALL`/`SELECT`/`WITH`/`PRINT`/`THROW`, or
 with the statement `CASE` (the one closed by `END CASE`), is a **statement
 function** terminated by `END;` and invoked with `CALL nome(args);` — its
-params bind like loop variables (`$name`, `IDENTIFIER($name)`, `PUSHDOWN($f)`,
+params bind like loop variables (`$name`, `IDENTIFIER($name)`,
 `${name}` in strings), rendered per call through the same machinery as a `FOR
 EACH ROW OF` body. CALL nesting is depth-guarded (16); a statement function is
 not atomic — a mid-body failure leaves earlier loads committed, exactly as if
@@ -45,8 +45,8 @@ ahead of the loop.
 ```sql
 CREATE FUNCTION paid_orders(since DATE, branch STRING DEFAULT '01') RETURNS TABLE AS
   SELECT C5_NUM AS num, C5_CLIENTE AS cliente, C5_EMISSAO AS emissao
-  FROM erp.dbo.SC5010 PUSHDOWN($$D_E_L_E_T_ <> '*'$$)
-  WHERE C5_FILIAL = $branch AND C5_EMISSAO >= $since;
+  FROM erp.dbo.SC5010
+  WHERE D_E_L_E_T_ <> '*' AND C5_FILIAL = $branch AND C5_EMISSAO >= $since;
 
 SELECT num, cliente FROM paid_orders($desde) WHERE cliente <> '000001';
 ```
@@ -70,8 +70,8 @@ then shows. Constant arguments in the same call stay constants.
 ```sql cont
 CREATE FUNCTION itens(pedido) RETURNS TABLE AS
   SELECT C6_ITEM AS item, C6_PRODUTO AS produto, C6_QTDVEN AS qtd
-  FROM erp.dbo.SC6010 PUSHDOWN($$D_E_L_E_T_ <> '*'$$)
-  WHERE C6_NUM = $pedido;
+  FROM erp.dbo.SC6010
+  WHERE D_E_L_E_T_ <> '*' AND C6_NUM = $pedido;
 
 -- one read of SC6010, joined on C6_NUM = p.num
 SELECT p.num, p.cliente, i.produto, i.qtd

@@ -288,7 +288,7 @@ fn checkScript(a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, req
         var e = ErrorInfo{ .msg = is.msg };
         locate(&e, st.text, st.entry_at, is.file orelse "", is.pos, is.end);
         if (k > 0) try w.writeByte(',');
-        try w.writeAll("{\"level\":\"error\",\"msg\":");
+        try w.print("{{\"level\":\"{s}\",\"msg\":", .{if (is.warning) "warning" else "error"});
         try jsontext.string(w, e.msg);
         try w.writeAll(",\"file\":");
         try jsontext.string(w, e.file orelse "script");
