@@ -145,6 +145,60 @@ pub fn z85(arena: std.mem.Allocator, text: []const u8) !?[]u8 {
     return out;
 }
 
+/// `bytes` (a multiple of 4) as Z85 text, each big-endian group of four bytes as
+/// five characters.
+pub fn z85Encode(arena: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    std.debug.assert(bytes.len % 4 == 0);
+    const out = try arena.alloc(u8, bytes.len / 4 * 5);
+    var i: usize = 0;
+    while (i < bytes.len) : (i += 4) {
+        var v: u32 = std.mem.readInt(u32, bytes[i..][0..4], .big);
+        var k: usize = 5;
+        while (k > 0) {
+            k -= 1;
+            out[i / 4 * 5 + k] = z85_chars[v % 85];
+            v /= 85;
+        }
+    }
+    return out;
+}
+
+pub const Out = struct {
+    id: [16]u8,
+    bytes: std.ArrayList(u8) = .empty,
+
+    pub fn init() Out {
+        var id: [16]u8 = undefined;
+        std.crypto.random.bytes(&id);
+        id[6] = (id[6] & 0x0f) | 0x40;
+        id[8] = (id[8] & 0x3f) | 0x80;
+        return .{ .id = id };
+    }
+
+    /// The file's name below the table's root.
+    pub fn name(self: *const Out, arena: std.mem.Allocator) ![]const u8 {
+        return msgfmt.allocPrint(arena, "deletion_vector_{s}.bin", .{&uuids.text(&self.id, .canonical)});
+    }
+
+    /// Adds the vector of ascending distinct rows `xs`, returning its `add`'s
+    /// `deletionVector` as JSON text.
+    pub fn add(self: *Out, arena: std.mem.Allocator, xs: []const u64) ![]const u8 {
+        if (self.bytes.items.len == 0) try self.bytes.append(arena, 1);
+        const offset = self.bytes.items.len;
+        const bitmap = try roaring.serialize(arena, xs);
+        const size: u32 = @intCast(4 + bitmap.len);
+        var head: [8]u8 = undefined;
+        std.mem.writeInt(u32, head[0..4], size, .big);
+        std.mem.writeInt(u32, head[4..8], portable_magic, .little);
+        try self.bytes.appendSlice(arena, &head);
+        try self.bytes.appendSlice(arena, bitmap);
+        var crc: [4]u8 = undefined;
+        std.mem.writeInt(u32, &crc, std.hash.Crc32.hash(self.bytes.items[offset + 4 ..]), .big);
+        try self.bytes.appendSlice(arena, &crc);
+        return msgfmt.allocPrint(arena, "{{\"storageType\":\"u\",\"pathOrInlineDv\":\"{s}\",\"offset\":{d},\"sizeInBytes\":{d},\"cardinality\":{d}}}", .{ try z85Encode(arena, &self.id), offset, size, xs.len });
+    }
+};
+
 /// Where a stored deletion vector is: `<root><prefix>/deletion_vector_<uuid>.bin`
 /// for `u`, the path itself for `p`.
 pub fn location(arena: std.mem.Allocator, root: []const u8, d: Descriptor) ![]const u8 {
@@ -345,4 +399,23 @@ test "descriptors: storage types, offsets and sizes are checked before any read"
             return error.TestUnexpectedResult;
         }
     }
+}
+
+test "deletion vectors written to one file read back through their descriptors, rows and CRCs checked" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, "{s}/", .{try tmp.dir.realpathAlloc(a, ".")});
+    var out = Out.init();
+    const d1 = try out.add(a, &.{ 0, 5, 9 });
+    const d2 = try out.add(a, &.{70_000});
+    try tmp.dir.writeFile(.{ .sub_path = try out.name(a), .data = out.bytes.items });
+    for ([_]struct { []const u8, []const u64 }{ .{ d1, &.{ 0, 5, 9 } }, .{ d2, &.{70_000} } }) |c| {
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, a, c[0], .{});
+        const ref = Ref{ .name = "T", .root = root, .file = "f.parquet", .d = try descriptor("T", "f.parquet", v) };
+        try testing.expectEqualSlices(u64, c[1], try roaring.rowsIn(a, try load(a, &ref, 100_000)));
+    }
+    try testing.expectEqualStrings("HelloWorld", try z85Encode(a, &.{ 0x86, 0x4F, 0xD2, 0x6F, 0xB5, 0x59, 0xF7, 0x5B }));
 }

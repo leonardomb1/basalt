@@ -30,6 +30,12 @@
 //!     routing, a partitioned table's rows sorted by partition first (spilling
 //!     like any sort) so each partition gets one file; with no file touched the
 //!     spool is inserted as it is.
+//! On a table writing deletion vectors (`write.writesDeletionVectors`) the FULL
+//! join's rows also carry their place in their file, and the rewrite merges on
+//! read: a kept row is not written, a merged or deleted one is recorded at its
+//! file's position, and each touched file's deletion vector (its old one with
+//! those rows) is what the commit adds it again with (`vectors`); a file left
+//! with no row is only removed.
 //! Both are the hash join (`join.zig`) with the incoming rows as the build side,
 //! spilling past `--op-memory` like any join, and the files are read a row group
 //! at a time. So memory is bounded by `--op-memory` for each join and the sort, one row group per
@@ -50,6 +56,8 @@ const dtypes = @import("delta_types.zig");
 const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const fit = @import("../parquet/fit.zig");
+const dvs = @import("delta_dv.zig");
+const roaring = @import("roaring.zig");
 const vcol = @import("variant_col.zig");
 const fmtnum = @import("../../exec/eval/format.zig");
 const join = @import("../../exec/op/join.zig");
@@ -77,6 +85,7 @@ pub const Warn = struct { ctx: *anyopaque, f: *const fn (*anyopaque, []const u8)
 /// The file tag a read of the table's files carries, a column no table can name.
 const tag_name = "\x00file";
 const row_name = "\x00row";
+const pos_name = "\x00pos";
 
 /// The span of an UPSERT's keys: per key column its name and type, whether it
 /// partitions the table, and the smallest and largest incoming value. A key of a
@@ -151,7 +160,10 @@ fn own(a: std.mem.Allocator, v: Value) !Value {
 pub const Outcome = struct {
     removed: []const delta.Add,
     read_set: []const []const u8,
+    readds: []const ReAdd = &.{},
 };
+
+pub const ReAdd = struct { add: delta.Add, rows: []const u64 };
 
 pub const Merge = struct {
     gpa: std.mem.Allocator,
@@ -174,6 +186,8 @@ pub const Merge = struct {
     any_dropped: bool = false,
     top: ?i64 = null,
     feed: ?*write.Sink = null,
+    dv: bool = false,
+    hits: []std.ArrayListUnmanaged(u64) = &.{},
 
     pub fn init(gpa: std.mem.Allocator, p: *const write.Plan, opts: Opts) !*Merge {
         const self = try gpa.create(Merge);
@@ -204,6 +218,7 @@ pub const Merge = struct {
             h.* = .null;
         }
         self.bounds = .{ .names = names, .tys = tys, .part = part, .lo = lo, .hi = hi, .float32 = f32s };
+        if (p.snap) |st| self.dv = write.writesDeletionVectors(st);
         return self;
     }
 
@@ -344,8 +359,36 @@ pub const Merge = struct {
         const hit = try self.touch(lay, cands.items.len);
         var touched = std.array_list.Managed(delta.Add).init(a);
         for (cands.items, hit) |f, h| if (h) try touched.append(f);
+        self.hits = try a.alloc(std.ArrayListUnmanaged(u64), touched.items.len);
+        for (self.hits) |*h| h.* = .empty;
         try self.rewrite(out, if (touched.items.len > 0) try self.tagged(a, touched.items) else null);
-        return .{ .removed = touched.items, .read_set = read_set };
+        if (!self.dv) return .{ .removed = touched.items, .read_set = read_set };
+        return .{ .removed = touched.items, .read_set = read_set, .readds = try self.vectors(a, touched.items) };
+    }
+
+    /// Each touched file's rows deleted once this UPSERT commits: those its
+    /// deletion vector deleted and those the rewrite matched or deleted, as a file
+    /// to add again with that vector; a file left with no row is only removed.
+    fn vectors(self: *Merge, a: std.mem.Allocator, touched: []const delta.Add) ![]const ReAdd {
+        var out = std.array_list.Managed(ReAdd).init(a);
+        for (touched, self.hits) |f, h| {
+            var all = std.array_list.Managed(u64).init(a);
+            try all.appendSlice(h.items);
+            if (f.dv) |d| {
+                const ref = dvs.Ref{ .name = self.plan.name, .root = self.plan.root, .file = f.path, .d = try dvs.descriptor(self.plan.name, f.path, d) };
+                try all.appendSlice(try roaring.rowsIn(a, try dvs.load(a, &ref, std.math.maxInt(u64))));
+            }
+            std.mem.sort(u64, all.items, {}, std.sort.asc(u64));
+            var n: usize = 0;
+            for (all.items, 0..) |x, i| if (i == 0 or x != all.items[n - 1]) {
+                all.items[n] = x;
+                n += 1;
+            };
+            const rows = all.items[0..n];
+            if (fileRows(a, f.stats)) |total| if (rows.len >= total) continue;
+            try out.append(.{ .add = f, .rows = rows });
+        }
+        return out.items;
     }
 
     /// A layout over `adds` whose rows carry their file's position in `adds` as
@@ -355,13 +398,14 @@ pub const Merge = struct {
         const base = fl.layout;
         const nc = self.plan.cols.len;
         const nf = nc + self.rowCols();
-        const fields = try a.alloc(types.Schema.Field, nf + 1);
+        const fields = try a.alloc(types.Schema.Field, nf + 1 + @intFromBool(self.dv));
         for (fields[0..nc], self.plan.cols) |*f, c| f.* = .{ .name = c.name, .ty = c.carried().asNullable() };
         if (self.rowCols() == 2) {
             fields[nc] = .{ .name = delta.row_id_name, .ty = types.Type.init(.int).asNullable() };
             fields[nc + 1] = .{ .name = delta.row_version_name, .ty = types.Type.init(.int).asNullable() };
         }
         fields[nf] = .{ .name = tag_name, .ty = types.Type.init(.int).asNullable() };
+        if (self.dv) fields[nf + 1] = .{ .name = pos_name, .ty = types.Type.init(.int).asNullable() };
         const part_fields = try a.alloc(usize, base.part_fields.len + 1);
         @memcpy(part_fields[0..base.part_fields.len], base.part_fields);
         part_fields[base.part_fields.len] = nf;
@@ -377,7 +421,7 @@ pub const Merge = struct {
             f.* = .{ .path = src.path, .size = src.size, .parts = parts, .deletes = src.deletes, .row_base = src.row_base, .row_version = src.row_version };
         }
         const out = try a.create(fit.Layout);
-        out.* = .{ .name = base.name, .root = base.root, .schema = .{ .fields = fields }, .part_fields = part_fields, .files = files, .mapping = base.mapping, .variant_types = base.variant_types, .raw_variants = true };
+        out.* = .{ .name = base.name, .root = base.root, .schema = .{ .fields = fields }, .part_fields = part_fields, .files = files, .mapping = base.mapping, .variant_types = base.variant_types, .raw_variants = true, .pos_field = if (self.dv) nf + 1 else null };
         if (self.rowCols() == 2) {
             const st = self.plan.snap.?;
             out.rows = .{
@@ -592,7 +636,7 @@ pub const Merge = struct {
         const nc = p.cols.len;
         const nr = self.rowCols();
         const tag_at = nc + nr;
-        const nt = tag_at + 1;
+        const nt = tag_at + 1 + @intFromBool(self.dv);
         const rn = nt + p.in_fields.len;
         const masks = [3][]bool{ try t.alloc(bool, b.len), try t.alloc(bool, b.len), try t.alloc(bool, b.len) };
         var counts = [3]usize{ 0, 0, 0 };
@@ -605,6 +649,11 @@ pub const Merge = struct {
             if (class != 0) if (del) |d| if (deletes(d, r)) {
                 class = 3;
             };
+            if (self.dv and exists) {
+                if (class == 0) {
+                    class = 4;
+                } else try self.hits[@intCast(b.columns[tag_at].getValue(r).int)].append(self.mem.allocator(), @intCast(b.columns[tag_at + 1].getValue(r).int));
+            }
             for (masks, 0..) |m, i| m[r] = i == class;
             if (class < 3) counts[class] += 1;
             gone[r] = class == 3 and exists;
@@ -678,7 +727,7 @@ pub const Merge = struct {
         const p = self.plan;
         const nc = p.cols.len;
         const nr = self.rowCols();
-        const nt = nc + nr + 1;
+        const nt = nc + nr + 1 + @intFromBool(self.dv);
         const Part = struct { mask: []bool, n: usize, kind: []const u8, side: enum { live, merged, incoming } };
         const parts = [_]Part{
             .{ .mask = masks[1], .n = counts[1], .kind = "update_preimage", .side = .live },
@@ -784,6 +833,16 @@ pub const Merge = struct {
         return jn;
     }
 };
+
+/// A file's row count by its statistics (`numRecords`), null when they lack it.
+fn fileRows(a: std.mem.Allocator, stats: ?[]const u8) ?u64 {
+    const s = dtypes.parseStats(a, stats orelse return null) orelse return null;
+    return switch (s.get("numRecords") orelse return null) {
+        .integer => |x| std.math.cast(u64, x),
+        .number_string => |t| std.fmt.parseInt(u64, t, 10) catch null,
+        else => null,
+    };
+}
 
 /// Whether row `r` of a change's `delete_when` column deletes its key.
 fn deletes(d: column.Column, r: usize) bool {

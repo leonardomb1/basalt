@@ -875,6 +875,88 @@ test "Delta change data feed on a table tracking row ids: an UPSERT's change fil
     );
 }
 
+test "Delta deletion vectors: an UPSERT marks the rows it replaces or deletes in a vector and writes only the changed rows" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT * FROM '$B/a.csv';", 1);
+    const v0 = try logFile(a, &tmp, "t", 0);
+    var meta: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, v0, '\n');
+    while (lines.next()) |l| if (std.mem.startsWith(u8, l, "{\"metaData\":")) {
+        meta = l;
+    };
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000001.json", .data = try std.mem.concat(a, u8, &.{
+        "{\"commitInfo\":{\"timestamp\":1}}\n",
+        "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"deletionVectors\"],\"writerFeatures\":[\"deletionVectors\"]}}\n",
+        try std.mem.replaceOwned(u8, a, meta, "\"configuration\":{}", "\"configuration\":{\"delta.enableDeletionVectors\":\"true\",\"delta.enableChangeDataFeed\":\"true\",\"delta.checkpointInterval\":\"2\"}"),
+        "\n",
+    }) });
+
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT 2 AS id, 'a' AS grp, 99 AS amt UNION ALL SELECT 4, 'b', 7;", 4);
+    const v2 = try logFile(a, &tmp, "t", 2);
+    try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "t", 2, "remove"));
+    try testing.expectEqual(@as(usize, 2), try actions(a, &tmp, "t", 2, "add"));
+    try testing.expect(std.mem.indexOf(u8, v2, "\"deletionVector\":{\"storageType\":\"u\",\"pathOrInlineDv\":\"") != null);
+    try testing.expect(std.mem.indexOf(u8, v2, "\"cardinality\":1}") != null);
+    try testing.expect(std.mem.indexOf(u8, v2, "\\\"tightBounds\\\":false") != null);
+    try testing.expectEqualStrings("id,grp,amt\n1,a,10\n2,a,99\n3,b,5\n4,b,7\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+    const at = std.mem.indexOf(u8, v2, "{\"add\":{\"path\":\"part-").? + "{\"add\":{\"path\":\"".len;
+    const fresh = v2[at .. at + std.mem.indexOfScalar(u8, v2[at..], '"').?];
+    try testing.expectEqualStrings("n\n2\n", try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT COUNT(*) AS n FROM '$B/t/{s}'", .{fresh})));
+
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT 1 AS id, 'a' AS grp, 11 AS amt;", 1);
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 3), "\"cardinality\":2}") != null);
+    try testing.expectEqualStrings("id,grp,amt\n1,a,11\n2,a,99\n3,b,5\n4,b,7\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn, name = 'feed') AS SELECT 3 AS id, 'b' AS grp, 0 AS amt, 'd' AS op, 1 AS seq, 1 AS lsn;", 1);
+    const v4 = try logFile(a, &tmp, "t", 4);
+    try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "t", 4, "remove"));
+    try testing.expectEqual(@as(usize, 0), try actions(a, &tmp, "t", 4, "add"));
+    try testing.expect(std.mem.indexOf(u8, v4, "\"deletionVector\":{\"storageType\":\"u\"") != null);
+    try testing.expectEqualStrings("id,grp,amt\n1,a,11\n2,a,99\n4,b,7\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+    try testing.expectEqualStrings(
+        "id,amt,_change_type,_commit_version\n2,99,update_postimage,2\n2,20,update_preimage,2\n4,7,insert,2\n1,11,update_postimage,3\n1,10,update_preimage,3\n3,5,delete,4\n",
+        try rows(a, &tmp, "SELECT id, amt, _change_type, _commit_version FROM '$B/t/' WITH (changes_from = 2) ORDER BY _commit_version, id, _change_type"),
+    );
+    try testing.expect(exists(&tmp, "t/_delta_log/00000000000000000004.checkpoint.parquet"));
+    try load(&tmp, "CALL delta_optimize('$B/t/');", 1);
+    try testing.expectEqualStrings("id,grp,amt\n1,a,11\n2,a,99\n4,b,7\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+}
+
+test "Delta deletion vectors on a table tracking row ids: a file added again keeps its row-id base, so its kept rows keep their ids" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT id, grp, amt FROM '$B/a.csv';", 1);
+    const v0 = try logFile(a, &tmp, "t", 0);
+    var meta: []const u8 = "";
+    var add0: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, v0, '\n');
+    while (lines.next()) |l| {
+        if (std.mem.startsWith(u8, l, "{\"metaData\":")) meta = l;
+        if (std.mem.startsWith(u8, l, "{\"add\":")) add0 = l;
+    }
+    const conf = "\"configuration\":{\"delta.enableDeletionVectors\":\"true\",\"delta.enableRowTracking\":\"true\",\"delta.rowTracking.materializedRowIdColumnName\":\"_row-id-col-t\",\"delta.rowTracking.materializedRowCommitVersionColumnName\":\"_row-commit-version-col-t\"}";
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000001.json", .data = try std.mem.concat(a, u8, &.{
+        "{\"commitInfo\":{\"timestamp\":1}}\n",
+        "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"deletionVectors\"],\"writerFeatures\":[\"deletionVectors\",\"domainMetadata\",\"rowTracking\"]}}\n",
+        try std.mem.replaceOwned(u8, a, meta, "\"configuration\":{}", conf),
+        "\n",
+        try std.mem.replaceOwned(u8, a, add0, "\"dataChange\":true,", "\"dataChange\":false,\"baseRowId\":0,\"defaultRowCommitVersion\":0,"),
+        "\n{\"domainMetadata\":{\"domain\":\"delta.rowTracking\",\"configuration\":\"{\\\"rowIdHighWaterMark\\\":2}\",\"removed\":false}}\n",
+    }) });
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT 2 AS id, 'z' AS grp, 99 AS amt;", 1);
+    const v2 = try logFile(a, &tmp, "t", 2);
+    try testing.expect(std.mem.indexOf(u8, v2, "\"dataChange\":true,\"baseRowId\":0,\"defaultRowCommitVersion\":0,\"stats\"") != null);
+    try testing.expect(std.mem.indexOf(u8, v2, "\"baseRowId\":3,\"defaultRowCommitVersion\":2,") != null);
+    try testing.expectEqualStrings("id,grp,amt\n1,a,10\n2,z,99\n3,b,5\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+}
+
 test "Delta write: what is refused, at check where it can be seen" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();

@@ -63,6 +63,7 @@ const dlog = @import("delta_log.zig");
 const ckpt = @import("delta_checkpoint.zig");
 const dtypes = @import("delta_types.zig");
 const merge = @import("delta_merge.zig");
+const dvs = @import("delta_dv.zig");
 const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const folder = @import("../../connect/folder.zig");
@@ -857,6 +858,27 @@ const honoured = [_][]const u8{
     "variantShredding",    "variantShredding-preview",
 };
 
+/// Statistics `text` with `tightBounds` false, as a file some of whose rows a
+/// deletion vector removes keeps them: its bounds hold, but may be wider than its
+/// rows'.
+fn looseStats(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch return text;
+    if (v != .object) return text;
+    try v.object.put("tightBounds", .{ .bool = false });
+    var aw = std.Io.Writer.Allocating.init(arena);
+    try std.json.Stringify.value(v, .{}, &aw.writer);
+    return aw.written();
+}
+
+/// Whether an UPSERT into `st` marks the rows it removes in deletion vectors
+/// rather than rewriting their files: the protocol's `deletionVectors` reader
+/// and writer feature, with `delta.enableDeletionVectors`.
+pub fn writesDeletionVectors(st: *const delta.State) bool {
+    if (!oneOf("deletionVectors", st.features) or !oneOf("deletionVectors", st.writer_features)) return false;
+    const v = st.property("delta.enableDeletionVectors") orelse return false;
+    return textconv.boolText(.delta_property, v) orelse false;
+}
+
 /// Refuses a table that asks a writer for what basalt does not do.
 pub fn writable(st: *const delta.State, fields: []const Field, mode: Mode) !void {
     if (st.writer_version > 7)
@@ -1295,6 +1317,50 @@ pub const Sink = struct {
         if (o.writer.offset >= roll_bytes) try self.finishFile(key);
     }
 
+    /// Writes the deletion vectors of files an UPSERT keeps (`readds`) to one file
+    /// under the table, synced before the commit, and adds each file again with
+    /// its vector: its own partition values, row-id base and statistics, these no
+    /// longer tight (`tightBounds` false) as some rows are gone.
+    fn readd(self: *Sink, readds: []const merge.ReAdd, now: i64) !void {
+        const a = self.mem.allocator();
+        const p = self.plan;
+        var out = dvs.Out.init();
+        const descs = try a.alloc([]const u8, readds.len);
+        for (descs, readds) |*d, r| d.* = try out.add(a, r.rows);
+        const full = try std.mem.concat(a, u8, &.{ p.root, try out.name(a) });
+        try self.begun.append(a, full);
+        if (try objstore.openRemote(a, full, "application/octet-stream")) |rw| {
+            errdefer rw.abort();
+            rw.io.writeAll(out.bytes.items) catch |e| return rw.specific(e);
+            rw.io.flush() catch |e| return rw.specific(e);
+            try rw.finish();
+        } else {
+            const f = try std.fs.cwd().createFile(full, .{});
+            defer f.close();
+            try f.writeAll(out.bytes.items);
+            try f.sync();
+            const dir = dlog.trimDir(p.root);
+            if (!self.dirs.contains(dir)) try self.dirs.put(a, try a.dupe(u8, dir), {});
+        }
+        const w = &self.adds.writer;
+        for (readds, descs) |r, d| {
+            const f = r.add;
+            try w.writeAll("{\"add\":{\"path\":");
+            try jsontext.string(w, f.raw);
+            try w.writeAll(",\"partitionValues\":");
+            if (f.parts) |pv| try std.json.Stringify.value(pv, .{}, w) else try w.writeAll("{}");
+            if (f.size) |sz| try w.print(",\"size\":{d}", .{sz});
+            try w.print(",\"modificationTime\":{d},\"dataChange\":true", .{now});
+            if (f.base_row_id) |b| try w.print(",\"baseRowId\":{d}", .{b});
+            if (f.row_version) |v| try w.print(",\"defaultRowCommitVersion\":{d}", .{v});
+            if (f.stats) |st| {
+                try w.writeAll(",\"stats\":");
+                try jsontext.string(w, try looseStats(a, st));
+            }
+            try w.print(",\"deletionVector\":{s}}}}}\n", .{d});
+        }
+    }
+
     fn explainWrite(self: *Sink, e: anyerror) anyerror {
         if (e == pqwrite.Error.UnsupportedParquetDecimal)
             return eval.explain(e, msgfmt.allocPrint(self.mem.allocator(), "a value does not fit its column's type in {s} (a decimal past its precision)", .{self.plan.name}) catch return e);
@@ -1407,12 +1473,14 @@ pub const Sink = struct {
         const a = self.mem.allocator();
         var removes: []const delta.Add = &.{};
         var read_set: []const []const u8 = &.{};
+        var readds: []const merge.ReAdd = &.{};
         if (self.merging) |m| {
             if (m.rows > 0) {
                 const done = try m.finish(self);
                 self.spilled = m.spilled;
                 removes = done.removed;
                 read_set = done.read_set;
+                readds = done.readds;
             } else if (p.snap != null) return;
         } else if (p.mode == .replace) if (p.snap) |st| {
             removes = st.files.values();
@@ -1448,6 +1516,7 @@ pub const Sink = struct {
             }
             try w.writeAll("}}\n");
         }
+        if (readds.len > 0) try self.readd(readds, now);
         if (p.row != null and self.row_counts.items.len > 0)
             try w.writeAll("{\"domainMetadata\":{\"domain\":\"delta.rowTracking\",\"configuration\":\"{\\\"rowIdHighWaterMark\\\":@@H@@}\",\"removed\":false}}\n");
         for (self.dirs.keys()) |d| try dlog.syncDir(d);

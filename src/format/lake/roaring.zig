@@ -127,6 +127,113 @@ pub fn ofRows(arena: std.mem.Allocator, rows: []const bool) Error!Bitmap {
     return .{ .containers = out.items, .cardinality = n, .end = end };
 }
 
+/// The rows `b` holds, ascending.
+pub fn rowsIn(arena: std.mem.Allocator, b: Bitmap) Error![]u64 {
+    const out = try arena.alloc(u64, @intCast(b.cardinality));
+    var n: usize = 0;
+    for (b.containers) |c| {
+        const at = c.high << 16;
+        switch (c.kind) {
+            .array => {
+                var i: usize = 0;
+                while (i < c.data.len) : (i += 2) {
+                    if (n >= out.len) return error.DeletionVectorCorrupt;
+                    out[n] = at + std.mem.readInt(u16, c.data[i..][0..2], .little);
+                    n += 1;
+                }
+            },
+            .run => {
+                var i: usize = 2;
+                while (i < c.data.len) : (i += 4) {
+                    const s0: u64 = std.mem.readInt(u16, c.data[i..][0..2], .little);
+                    const len: u64 = std.mem.readInt(u16, c.data[i + 2 ..][0..2], .little);
+                    for (0..len + 1) |k| {
+                        if (n >= out.len) return error.DeletionVectorCorrupt;
+                        out[n] = at + s0 + k;
+                        n += 1;
+                    }
+                }
+            },
+            .bitset => {
+                var w: usize = 0;
+                while (w < bitset_len) : (w += 8) {
+                    var bits = std.mem.readInt(u64, c.data[w..][0..8], .little);
+                    while (bits != 0) : (bits &= bits - 1) {
+                        if (n >= out.len) return error.DeletionVectorCorrupt;
+                        out[n] = at + w * 8 + @ctz(bits);
+                        n += 1;
+                    }
+                }
+            },
+        }
+    }
+    if (n != out.len) return error.DeletionVectorCorrupt;
+    return out;
+}
+
+/// Ascending distinct rows `xs` in the portable format `parse` reads (no magic):
+/// a bucket per high 32 bits, each a run-less roaring bitmap whose containers are
+/// arrays up to 4096 rows and bitsets past that, with the offsets the format gives.
+pub fn serialize(arena: std.mem.Allocator, xs: []const u64) Error![]u8 {
+    var out = std.ArrayList(u8).empty;
+    var buckets: u64 = 0;
+    var i: usize = 0;
+    while (i < xs.len) : (buckets += 1) {
+        const key = xs[i] >> 32;
+        var j = i;
+        while (j < xs.len and xs[j] >> 32 == key) j += 1;
+        i = j;
+    }
+    try putInt(arena, &out, u64, buckets);
+    i = 0;
+    while (i < xs.len) {
+        const key = xs[i] >> 32;
+        var end = i;
+        while (end < xs.len and xs[end] >> 32 == key) end += 1;
+        try putInt(arena, &out, u32, @intCast(key));
+        const start = out.items.len;
+        var lows = std.ArrayList(struct { low: u16, from: usize, to: usize }).empty;
+        var k = i;
+        while (k < end) {
+            const low: u16 = @truncate(xs[k] >> 16);
+            var m = k;
+            while (m < end and @as(u16, @truncate(xs[m] >> 16)) == low) m += 1;
+            try lows.append(arena, .{ .low = low, .from = k, .to = m });
+            k = m;
+        }
+        try putInt(arena, &out, u32, no_runs);
+        try putInt(arena, &out, u32, @intCast(lows.items.len));
+        for (lows.items) |c| {
+            try putInt(arena, &out, u16, c.low);
+            try putInt(arena, &out, u16, @intCast(c.to - c.from - 1));
+        }
+        const offs_at = out.items.len;
+        try out.appendNTimes(arena, 0, lows.items.len * 4);
+        for (lows.items, 0..) |c, ci| {
+            std.mem.writeInt(u32, out.items[offs_at + ci * 4 ..][0..4], @intCast(out.items.len - start), .little);
+            const n = c.to - c.from;
+            if (n <= max_array) {
+                for (xs[c.from..c.to]) |x| try putInt(arena, &out, u16, @truncate(x));
+            } else {
+                const at = out.items.len;
+                try out.appendNTimes(arena, 0, bitset_len);
+                for (xs[c.from..c.to]) |x| {
+                    const v: u16 = @truncate(x);
+                    out.items[at + v / 8] |= @as(u8, 1) << @intCast(v % 8);
+                }
+            }
+        }
+        i = end;
+    }
+    return out.items;
+}
+
+fn putInt(arena: std.mem.Allocator, out: *std.ArrayList(u8), comptime T: type, x: T) Error!void {
+    var b: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &b, x, .little);
+    try out.appendSlice(arena, &b);
+}
+
 const Cursor = @import("../cursor.zig").Reader(.little, error.DeletionVectorCorrupt);
 
 /// The bitmap `bytes` (the portable format, its magic already taken off) holds,
@@ -402,4 +509,18 @@ test "a bitmap built from a row mask holds those rows, across buckets" {
     for (rows, keep) |r, k| try std.testing.expectEqual(!r, k);
     try std.testing.expectEqual(@as(usize, 2), bm.count(65_000, 1_000));
     try std.testing.expectEqual(@as(u64, 0), (try ofRows(a, &.{ false, false })).cardinality);
+}
+
+test "rows written in the portable format parse back as the same rows, across buckets and containers" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var xs = std.ArrayList(u64).empty;
+    for ([_]u64{ 0, 7, 65_535, 65_536, 1 << 32, (1 << 32) + 3 }) |x| try xs.append(a, x);
+    for (0..5000) |k| try xs.append(a, 200_000 + k * 2);
+    std.mem.sort(u64, xs.items, {}, std.sort.asc(u64));
+    const bm = try parse(a, try serialize(a, xs.items));
+    try std.testing.expectEqual(@as(u64, xs.items.len), bm.cardinality);
+    try std.testing.expectEqualSlices(u64, xs.items, try rowsIn(a, bm));
+    try std.testing.expectEqual(@as(u64, 0), (try parse(a, try serialize(a, &.{}))).cardinality);
 }

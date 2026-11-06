@@ -418,8 +418,20 @@ or the rows' size. A partitioned table's rewritten and inserted rows are sorted
 by partition before they are written (an external sort, also within
 `--op-memory`), so each touched partition gets one new file however the join
 ordered them. A file with a deletion vector is read without its deleted rows,
-so its rewrite drops them, and its `remove` names the deletion vector. basalt
-writes no deletion vectors of its own.
+so its rewrite drops them, and its `remove` names the deletion vector.
+
+On a table with deletion vectors enabled (the `deletionVectors` reader and
+writer feature, with `delta.enableDeletionVectors`) an UPSERT merges on read
+instead: it writes only the rows it inserts and the new values of the ones it
+updates, and marks each row it replaces or deletes in its file's deletion
+vector, so a file's untouched rows are not copied. The vectors (each file's
+old one with the newly removed rows added) go to one
+`deletion_vector_<uuid>.bin` under the table, in the portable bitmap format,
+written and synced before the commit; each touched file is removed and added
+again with its new vector, its partition values, row-id base and statistics
+kept (these marked `tightBounds: false`), and one whose every row is now
+deleted is only removed. A file's rows stay at their positions, so with row
+tracking a kept row keeps its id.
 
 On a table recording a change data feed (`delta.enableChangeDataFeed`) an UPSERT
 that rewrites files also writes what it changed to change data files under

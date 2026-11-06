@@ -53,6 +53,7 @@ pub const Layout = struct {
     variant_types: []const ?std.json.Value = &.{},
     raw_variants: bool = false,
     change_type: ?usize = null,
+    pos_field: ?usize = null,
 
     pub const Rows = struct { id: usize, version: usize, mat_id: []const u8, mat_version: []const u8 };
 
@@ -188,6 +189,7 @@ pub const Layout = struct {
                 if (file.change_type == null) try names.append(try self.fileColumn(arena, change_type_name));
                 continue;
             }
+            if (self.pos_field == fi) continue;
             if (self.rowField(fi) != null) {
                 wants_rows = true;
                 continue;
@@ -231,6 +233,10 @@ pub const Layout = struct {
             }
             if (self.partOf(fi)) |p| {
                 o.* = .{ .value = if (p < file.parts.len) file.parts[p] else .null };
+                continue;
+            }
+            if (self.pos_field == fi) {
+                o.* = .{ .position = try r.wantPositions() };
                 continue;
             }
             if (self.change_type == fi) {
@@ -554,6 +560,7 @@ pub const Fit = struct {
         row_id: struct { mat: ?usize, pos: usize, base: ?i64 },
         row_version: struct { mat: ?usize, default: ?i64 },
         variant: struct { k: usize, jt: std.json.Value, node: ?*const vcol.SNode, mode: vcol.Mode },
+        position: usize,
     };
 
     pub fn apply(self: *const Fit, arena: std.mem.Allocator, b: Batch) !Batch {
@@ -564,6 +571,10 @@ pub const Fit = struct {
                 c.ty = f.ty;
             },
             .variant => |x| c.* = vcol.convert(arena, b.columns[x.k], f.ty, x.jt, x.node, x.mode) catch |e| return if (e == error.OutOfMemory) e else eval.explain(e, msgfmt.allocPrint(arena, "its column `{s}` holds a variant that is not valid Variant binary, or a shredded one the Parquet shredding spec does not allow", .{f.name}) catch "a variant is malformed"),
+            .position => |k| {
+                c.* = b.columns[k];
+                c.ty = f.ty;
+            },
             .value => |val| {
                 var bd = try column.Builder.initCapacity(arena, f.ty, b.len);
                 try bd.appendRepeated(val, b.len);
