@@ -709,7 +709,7 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
                 const b = (try stampedBinding(env, name)) orelse
                     return planErr(env.diag, try msgfmt.allocPrint(env.arena, "unknown binding `{s}`", .{name}));
                 const r = if (b.stages.len == 1 and b.stages[0].node == .union_)
-                    try buildUnion(env, b.stages[0].node.union_, b.stages[0].hints, unionExceptNames(stages[1..]))
+                    try buildUnion(env, b.stages[0].node.union_, b.stages[0].hints, stages[1..])
                 else
                     try buildPipeline(env, try prepareSide(env, (try windowTopK(env.arena, b.stages, stages[1..])) orelse b.stages, stages[1..]));
                 current = r.op;
@@ -717,7 +717,7 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
             }
         },
         .union_ => |u| {
-            const r = try buildUnion(env, u, stages[0].hints, unionExceptNames(stages[1..]));
+            const r = try buildUnion(env, u, stages[0].hints, stages[1..]);
             current = r.op;
             schema = r.schema;
         },
@@ -790,6 +790,7 @@ pub fn readName(rd: ast.Read) []const u8 {
 
 pub const synthReconcile = @import("plan/union.zig").synthReconcile;
 pub const unionSpecs = @import("plan/union.zig").unionSpecs;
+pub const branchWhere = @import("plan/union.zig").branchWhere;
 pub const unionCanon = @import("plan/union.zig").unionCanon;
 pub const setOpName = @import("plan/union.zig").setOpName;
 const windowTopK = @import("plan/union.zig").windowTopK;

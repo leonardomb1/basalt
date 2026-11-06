@@ -18,6 +18,10 @@ const mk = @import("../env.zig").mk;
 const obs = @import("../obs.zig");
 const op = @import("../../exec/op.zig");
 const openSource = @import("../connect.zig").openSource;
+const columnFacts = @import("../connect.zig").columnFacts;
+const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
+const sql_read = @import("../connect/sql_read.zig");
+const pushdown = @import("../pushdown.zig");
 const planErr = @import("../env.zig").planErr;
 const analyze = @import("../analyze.zig");
 const sourceLabel = @import("../connect.zig").sourceLabel;
@@ -318,7 +322,8 @@ pub fn unionExceptNames(after: []const ast.Stage) []const []const u8 {
 
 /// The serial union: every branch opened, reconciled to the canon and drained in
 /// order; used when splitting does not apply. Positional unions leave EXCEPT downstream.
-pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, except_names: []const []const u8) anyerror!PipeRes {
+pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, after: []const ast.Stage) anyerror!PipeRes {
+    const except_names = unionExceptNames(after);
     const arena = env.arena;
     const except: []const []const u8 = if (u.positional) &.{} else except_names;
     const tag_col = forHintIdent(hints, "tag");
@@ -330,6 +335,9 @@ pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, except_names
     const schemas = try arena.alloc(types.Schema, specs.len);
     for (specs) |*s| if (except.len > 0 and s.pipeline == null) {
         if (try exceptColumns(env, s.read, hints, except)) |cols| s.read.cols = cols;
+    };
+    if (!u.positional) for (specs) |*s| if (s.pipeline == null) {
+        s.read.where = try branchWhere(env, s.read, after, tag_col);
     };
     for (specs, 0..) |s, i| {
         if (s.pipeline) |p| {
@@ -374,6 +382,58 @@ pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, except_names
     un.* = .{ .children = children };
     if (u.set == .union_all) return .{ .op = .{ .union_ = un }, .schema = out_schema };
     return buildSetOp(env, u.set, canon, .{ .union_ = un }, out_schema);
+}
+
+/// Branch read `rd`'s WHERE with the part of the filters right after the union
+/// it can take: each conjunct whose every column is one of the branch's table
+/// (by its catalog, `columnFacts`; never the tag column, a computed one, or one
+/// the table lacks) translated into its own SQL as a plain read's leading WHERE
+/// descends. The filter stays above the union, so what does not descend still
+/// holds; a branch whose columns cannot be learned keeps its WHERE. A union by
+/// position is never narrowed, as a branch's column there may go by another name.
+pub fn branchWhere(env: *Env, rd: ast.Read, after: []const ast.Stage, tag_col: ?[]const u8) ![]const u8 {
+    const arena = env.arena;
+    var conj = std.array_list.Managed(*const ast.Expr).init(arena);
+    for (after) |st| {
+        if (st.node != .filter) break;
+        try splitAnd(st.node.filter, &conj);
+    }
+    if (conj.items.len == 0) return rd.where;
+    const conn = env.connections.get(rd.connector) orelse return rd.where;
+    const d = (sqlConnInfo(conn) orelse return rd.where).dialect;
+    if (!sql_read.pushableRead(d, rd)) return rd.where;
+    const facts = (try columnFacts(env, rd)) orelse return rd.where;
+    return narrowed(arena, d, rd, conj.items, tag_col, facts);
+}
+
+/// Read `rd`'s WHERE with each of conjuncts `conj` that reads only columns
+/// `facts` lists (never `tag_col`) translated to dialect `d` and added.
+fn narrowed(arena: std.mem.Allocator, d: pushdown.Dialect, rd: ast.Read, conj: []const *const ast.Expr, tag_col: ?[]const u8, facts: *const pushdown.Facts) ![]const u8 {
+    if (facts.count() == 0) return rd.where;
+    var stages = std.array_list.Managed(ast.Stage).init(arena);
+    try stages.append(.{ .node = .{ .read = rd }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } });
+    for (conj) |e| {
+        var cols = std.StringHashMap(void).init(arena);
+        try pushdown.collectFields(e, &cols);
+        var it = cols.keyIterator();
+        const fits = while (it.next()) |c| {
+            if (tag_col) |t| if (std.mem.eql(u8, c.*, t)) break false;
+            if (!facts.contains(c.*)) break false;
+        } else true;
+        if (fits) try stages.append(.{ .node = .{ .filter = @constCast(e) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } });
+    }
+    if (stages.items.len == 1) return rd.where;
+    const extra = (try pushdown.serialWhereWith(arena, d, stages.items, facts, null)) orelse return rd.where;
+    if (rd.where.len == 0) return extra;
+    return msgfmt.allocPrint(arena, "({s}) AND ({s})", .{ rd.where, extra });
+}
+
+fn splitAnd(e: *const ast.Expr, out: *std.array_list.Managed(*const ast.Expr)) !void {
+    if (e.* == .binary and e.binary.op == .@"and") {
+        try splitAnd(e.binary.l, out);
+        return splitAnd(e.binary.r, out);
+    }
+    try out.append(e);
 }
 
 const side_cols = [2][]const u8{ "__set_left", "__set_right" };
@@ -597,4 +657,35 @@ test "a set operation's column is nullable when any branch's is, wherever the NU
         try std.testing.expectEqual(c.nullable[0], k.nullable);
         try std.testing.expectEqual(c.nullable[1], b.nullable);
     }
+}
+
+test "a union branch takes the filter's conjuncts over its own columns, folded and translated; the tag and computed columns stay above" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const parser = @import("../../lang/sql_parser.zig");
+    var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a,
+        \\CREATE CONNECTION db TYPE sqlserver OPTIONS (host = 'h', database = 'd', user = 'u', password = 'p');
+        \\SELECT * FROM db.dbo.orders
+        \\WHERE (CAST('2026-11-06 18:24:55' AS TIMESTAMP) IS NULL OR updated_at >= date_add('minute', -10, CAST('2026-11-06 18:24:55' AS TIMESTAMP)))
+        \\  AND company = '01' AND _seen > 3;
+    , &pd);
+    var stages: []const ast.Stage = &.{};
+    for (prog.stmts) |st| switch (st) {
+        .output => |o| stages = o.stages,
+        else => {},
+    };
+    var conj = std.array_list.Managed(*const ast.Expr).init(a);
+    for (stages[1..]) |st| if (st.node == .filter) try splitAnd(st.node.filter, &conj);
+    var facts = pushdown.Facts.init(a);
+    try facts.put("updated_at", .{ .text = false });
+    try facts.put("id", .{ .text = false });
+    const rd = stages[0].node.read;
+    try std.testing.expectEqualStrings("([updated_at] >= CAST('2026-11-06 18:14:55' AS DATETIME2))", try narrowed(a, .sqlserver, rd, conj.items, "company", &facts));
+    var with = rd;
+    with.where = "[x] = 1";
+    try std.testing.expectEqualStrings("([x] = 1) AND (([updated_at] >= CAST('2026-11-06 18:14:55' AS DATETIME2)))", try narrowed(a, .sqlserver, with, conj.items, "company", &facts));
+    var none = pushdown.Facts.init(a);
+    try std.testing.expectEqualStrings("", try narrowed(a, .sqlserver, rd, conj.items, "company", &none));
 }

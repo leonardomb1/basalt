@@ -143,7 +143,7 @@ pub const Change = struct {
     pos: usize,
     app: []const u8,
     since: ?i64,
-    kind: types.TypeKind,
+    kind: ?types.TypeKind,
 };
 
 pub const Evolve = enum { keep, merge, overwrite };
@@ -670,7 +670,7 @@ fn changeOf(arena: std.mem.Allocator, p: *const Plan, st: ?*delta.State) !?Chang
     const pt = fields[c.pos].ty;
     if (!pt.unknown and pt.kind != .int and pt.kind != .date and pt.kind != .timestamp)
         return refuse("`position` in `USING changes` is {s}; {s} keeps a feed's position as Delta's `txn` version, a number, so it takes an INT, DATE or TIMESTAMP", .{ try pt.name(arena), p.name });
-    out.kind = if (pt.unknown) .int else pt.kind;
+    out.kind = if (pt.unknown) null else pt.kind;
     const dt = fields[c.del].ty;
     if (!dt.unknown and dt.kind != .bool)
         return refuse("`delete_when` in `USING changes` is {s}, not a condition; write it as one, e.g. `delete_when = op = 'd'`", .{try dt.name(arena)});
@@ -678,11 +678,21 @@ fn changeOf(arena: std.mem.Allocator, p: *const Plan, st: ?*delta.State) !?Chang
     if (seq_ty.isNested()) return refuse("`sequence_by` in `USING changes` is {s}; it orders a key's changes, so it takes a number, date, timestamp or text", .{try seq_ty.name(arena)});
     if (st) |s| {
         out.since = s.txns.get(out.app);
-        if (s.property(try positionKey(arena, out.app))) |rec| if (!std.mem.eql(u8, rec, @tagName(out.kind)))
-            return refuse("{s} keeps the position of `{s}` as {s}, but this run's `position` is {s}; a position read back as another type would compare wrongly, so give it the type the table keeps", .{ p.name, out.app, rec, @tagName(out.kind) });
+        if (out.kind) |k| if (s.property(try positionKey(arena, out.app))) |rec| try samePosition(p.name, out.app, rec, k);
     }
     return out;
 }
+
+/// Refuses a run whose position is of type `got` on table `name`, which keeps
+/// feed `app`'s position as `recorded`.
+fn samePosition(name: []const u8, app: []const u8, recorded: []const u8, got: types.TypeKind) !void {
+    if (std.mem.eql(u8, recorded, @tagName(got))) return;
+    return refuse("{s} keeps the position of `{s}` as {s}, but this run's `position` is {s}; a position read back as another type would compare wrongly, so give it the type the table keeps", .{ name, app, recorded, @tagName(got) });
+}
+
+/// Where a commit's header leaves the position's type, filled in once the rows
+/// have shown it (`Sink.close`).
+const kind_mark = "@@POSITION_KIND@@";
 
 /// The table property that records the type of the position a `USING changes`
 /// feed named `app` keeps (`int`, `date` or `timestamp`), so a run can read the
@@ -1175,8 +1185,9 @@ pub const Sink = struct {
             try w.writeAll(pb.written());
             try w.writeAll(",\"configuration\":{");
             if (p.change) |ch| {
+                try w.writeAll(kind_mark);
                 try jsontext.string(w, try positionKey(a, ch.app));
-                try w.print(":\"{s}\"", .{@tagName(ch.kind)});
+                try w.print(":\"{s}\"", .{kind_mark});
             }
             try w.print("}},\"createdTime\":{d}}}}}\n", .{now});
         } else if (p.new_meta or self.recordsPosition()) {
@@ -1186,7 +1197,7 @@ pub const Sink = struct {
             if (p.max_column_id != null or p.change != null) {
                 var conf = if (o.get("configuration")) |c| (if (c == .object) try c.object.clone() else std.json.ObjectMap.init(a)) else if (st.config) |c| try c.object.clone() else std.json.ObjectMap.init(a);
                 if (p.max_column_id) |m| try conf.put("delta.columnMapping.maxColumnId", .{ .string = try msgfmt.allocPrint(a, "{d}", .{m}) });
-                if (p.change) |ch| try conf.put(try positionKey(a, ch.app), .{ .string = @tagName(ch.kind) });
+                if (p.change) |ch| try conf.put(try positionKey(a, ch.app), .{ .string = kind_mark });
                 try o.put("configuration", .{ .object = conf });
             }
             var parts = std.json.Array.init(a);
@@ -1199,6 +1210,28 @@ pub const Sink = struct {
             try std.json.Stringify.value(std.json.Value{ .object = o }, .{}, w);
             try w.writeAll("}\n");
         }
+    }
+
+    /// Commit body `body` with its feed's position type where the header left
+    /// `kind_mark`: the type the rows' positions had, else (a table created with
+    /// no row) no type at all; a type other than the one the table keeps is refused.
+    fn positionKind(self: *Sink, body: []const u8) ![]const u8 {
+        const p = self.plan;
+        const ch = p.change orelse return body;
+        if (std.mem.indexOf(u8, body, kind_mark) == null) return body;
+        const a = self.mem.allocator();
+        const seen: ?types.TypeKind = if (self.merging) |m| m.pos_kind else null;
+        const kind = seen orelse ch.kind;
+        if (kind) |k| if (p.snap) |st| if (st.property(try positionKey(a, ch.app))) |rec| try samePosition(p.name, ch.app, rec, k);
+        const quoted = "\"" ++ kind_mark ++ "\"";
+        if (kind) |k| {
+            const named = try std.mem.replaceOwned(u8, a, body, quoted, try msgfmt.allocPrint(a, "\"{s}\"", .{@tagName(k)}));
+            return std.mem.replaceOwned(u8, a, named, kind_mark, "");
+        }
+        const lead = std.mem.indexOf(u8, body, kind_mark).?;
+        const end = std.mem.indexOf(u8, body[lead + kind_mark.len ..], quoted) orelse return body;
+        const stop = lead + kind_mark.len + end + quoted.len;
+        return std.mem.concat(a, u8, &.{ body[0..lead], body[stop..] });
     }
 
     /// Whether this write's commit records its feed's position type, which the
@@ -1555,7 +1588,7 @@ pub const Sink = struct {
             },
             .read_version = if (p.snap) |st| st.version else null,
             .txn_id = &self.txn,
-            .body = self.adds.written(),
+            .body = try self.positionKind(self.adds.written()),
             .added = self.begun.items,
             .read_set = read_set,
             .key_root = if (p.snap) |st| st.key_root else "",

@@ -92,6 +92,7 @@ const Value = @import("../../exec/value.zig").Value;
 const unionCanon = @import("../plan.zig").unionCanon;
 const unionExceptNames = @import("../plan.zig").unionExceptNames;
 const unionSpecs = @import("../plan.zig").unionSpecs;
+const branchWhere = @import("../plan.zig").branchWhere;
 const wholeAggStages = @import("../lanes.zig").wholeAggStages;
 
 /// Run one output pipeline: split it into key-range lanes or stream it serially. A
@@ -816,6 +817,9 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
     const canon_opt = forHintIdent(hints, "canon");
     const specs = try unionSpecs(env, u, hints);
     if (specs.len == 0) return planErr(env.diag, "union has no source tables");
+    if (!u.positional) for (specs) |*s| if (s.pipeline == null) {
+        s.read.where = try branchWhere(env, s.read, downstream, tag_col);
+    };
 
     const except = unionExceptNames(downstream);
     const schemas = try arena.alloc(types.Schema, specs.len);

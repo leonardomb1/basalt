@@ -185,6 +185,7 @@ pub const Merge = struct {
     dropped: std.DynamicBitSetUnmanaged = .{},
     any_dropped: bool = false,
     top: ?i64 = null,
+    pos_kind: ?types.TypeKind = null,
     feed: ?*write.Sink = null,
     dv: bool = false,
     hits: []std.ArrayListUnmanaged(u64) = &.{},
@@ -280,6 +281,11 @@ pub const Merge = struct {
                     else => unreachable,
                 };
                 if (self.top == null or x > self.top.?) self.top = x;
+                self.pos_kind = switch (v) {
+                    .int => .int,
+                    .timestamp => .timestamp,
+                    else => .date,
+                };
             }
         }
         const nb = Batch{ .schema = &self.schema, .columns = cols, .len = b.len };

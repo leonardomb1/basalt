@@ -69,8 +69,101 @@ pub const Opts = struct {
 /// null when no rendering is sure to.
 pub fn translatePred(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dialect, opts: Opts) error{OutOfMemory}!?[]const u8 {
     const tx = Tx{ .arena = arena, .dialect = dialect, .o = opts };
-    return tx.pred(e, opts.need);
+    return tx.pred(try folded(arena, e), opts.need);
 }
+
+/// `e` with each part that reads no column folded to its value, and AND / OR
+/// over a folded TRUE or FALSE reduced, so a predicate over bound `$params`
+/// (`$since IS NULL OR at >= date_add('minute', -10, $since)`) descends as the
+/// comparison it comes to. A part that does not evaluate, or whose value changes
+/// each time (`random()`), is left as it is.
+fn folded(arena: std.mem.Allocator, e: *const ast.Expr) error{OutOfMemory}!*const ast.Expr {
+    if (!readsColumn(e) and !literal(e)) {
+        if (eval.constEval(arena, e, &.{}, &.{})) |v| {
+            return mkLit(arena, v) catch |err| return if (err == error.OutOfMemory) error.OutOfMemory else e;
+        } else |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            _ = eval.takeFailure(err);
+            return e;
+        }
+    }
+    switch (e.*) {
+        .binary => |b| {
+            const l = try folded(arena, b.l);
+            const r = try folded(arena, b.r);
+            if (b.op == .@"and" or b.op == .@"or") {
+                const keep = b.op == .@"and";
+                if (l.* == .bool_lit) return if (l.bool_lit == keep) r else l;
+                if (r.* == .bool_lit) return if (r.bool_lit == keep) l else r;
+            }
+            if (l == b.l and r == b.r) return e;
+            const n = try arena.create(ast.Expr);
+            n.* = .{ .binary = .{ .op = b.op, .l = @constCast(l), .r = @constCast(r) } };
+            return n;
+        },
+        .unary => |u| {
+            const x = try folded(arena, u.e);
+            if (x == u.e) return e;
+            const n = try arena.create(ast.Expr);
+            n.* = .{ .unary = .{ .op = u.op, .e = @constCast(x) } };
+            return n;
+        },
+        .call => |c| {
+            const args = try arena.alloc(*ast.Expr, c.args.len);
+            var same = true;
+            for (args, c.args) |*o, x| {
+                o.* = @constCast(try folded(arena, x));
+                same = same and o.* == x;
+            }
+            if (same) return e;
+            var nc = c;
+            nc.args = args;
+            const n = try arena.create(ast.Expr);
+            n.* = .{ .call = nc };
+            return n;
+        },
+        .cast => |c| {
+            const x = try folded(arena, c.e);
+            if (x == c.e) return e;
+            var nc = c;
+            nc.e = @constCast(x);
+            const n = try arena.create(ast.Expr);
+            n.* = .{ .cast = nc };
+            return n;
+        },
+        else => return e,
+    }
+}
+
+/// Whether `e` reads a column (or a lambda's parameter), calls what gives a new
+/// value each time, or reads a clock the statement has not stamped (`now()` is
+/// folded only at the statement's instant), so it cannot be folded.
+fn readsColumn(e: *const ast.Expr) bool {
+    const S = struct {
+        fn hit(_: void, n: *const ast.Expr) ?bool {
+            return switch (n.*) {
+                .field, .lambda_var => true,
+                .call => |c| if (volatile_fns.has(c.name) or (clock_fns.has(c.name) and c.now_us == null)) true else null,
+                else => null,
+            };
+        }
+    };
+    return ast.anyExpr(e, {}, S.hit);
+}
+
+fn literal(e: *const ast.Expr) bool {
+    return switch (e.*) {
+        .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit => true,
+        .cast => |c| literal(c.e),
+        else => false,
+    };
+}
+
+const clock_fns = std.StaticStringMap(void).initComptime(.{ .{"now"}, .{"today"} });
+
+const volatile_fns = std.StaticStringMap(void).initComptime(.{ .{"random"}, .{"rand"}, .{"uuid"}, .{"gen_random_uuid"} });
+
+const mkLit = @import("../env.zig").mkLit;
 
 /// Whether knowing the columns' collations could change how any filter in
 /// `stages` descends at `need`, asked before paying a catalog round trip.
@@ -955,7 +1048,7 @@ test "translateExpr: NOT over an OR with a bool literal" {
     const or_e = try bin(a, .@"or", try bin(a, .gt, try fld(a, "a"), lit1), f);
     const not_e = try a.create(ast.Expr);
     not_e.* = .{ .unary = .{ .op = .not, .e = or_e } };
-    try testing.expectEqualStrings("(NOT (((`a` > 1) OR (1=0))))", (try translateExpr(a, not_e, .mysql, testSchema(), true)).?);
+    try testing.expectEqualStrings("(NOT ((`a` > 1)))", (try translateExpr(a, not_e, .mysql, testSchema(), true)).?);
 }
 
 test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
@@ -974,7 +1067,7 @@ test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
         .{ .src = "CASE v WHEN 1 THEN 1 ELSE 0 END > 0", .want = "((CASE [v] WHEN 1 THEN 1 ELSE 0 END) > 0)" },
         .{ .src = "CAST(v AS INT) > 5", .want = null },
         .{ .src = "CAST(v AS INT) > 5", .want = null, .d = .mysql },
-        .{ .src = "CAST(5 AS INT) > 1", .want = "(CAST(5 AS BIGINT) > 1)" },
+        .{ .src = "CAST(5 AS INT) > 1", .want = "(1=1)" },
         .{ .src = "CAST(v AS STRING) = 'x'", .want = null },
         .{ .src = "lower(status) = 'ok'", .want = "(LOWER([status]) = 'ok')" },
         .{ .src = "length(status) > 2", .want = null },
@@ -1001,7 +1094,7 @@ test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
         .{ .src = "v + 1 > 2", .want = null },
         .{ .src = "ok = TRUE", .want = "([ok] = 1)" },
         .{ .src = "ok = FALSE", .want = "(`ok` = FALSE)", .d = .mysql },
-        .{ .src = "v > 1 OR TRUE", .want = "(([v] > 1) OR (1=1))" },
+        .{ .src = "v > 1 OR TRUE", .want = "(1=1)" },
     };
     for (cases) |tc| {
         var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };

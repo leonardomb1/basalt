@@ -39,9 +39,15 @@ crosses the wire. The answer never changes, only where the work happens;
   functions (`lower upper trim substr replace concat coalesce starts_with
   ends_with contains`). A `$param`, LET or loop variable descends
   as its value — `WHERE D2_EMISSAO >= $since` sends `>= '20240105'`, with a
-  query LET's value decided first. Untranslatable pieces (arithmetic,
-  `now()`/`today()`, user funcs) stay in the engine — the filter is always
-  kept, so results never change, only how much crosses the wire. `EXPLAIN`
+  query LET's value decided first. A part of the predicate that reads no column
+  is computed first and descends as its value, and an `AND` / `OR` it makes
+  TRUE or FALSE reduces, so `WHERE $since IS NULL OR at >= date_add('minute',
+  -10, $since)` descends as `at >= '<since less 10 minutes>'` once `$since` is
+  bound (and as no filter while it is NULL); `now()` and `today()` are computed
+  at the statement's instant, `random()` and the like never. Untranslatable
+  pieces that read a column (arithmetic on one, user funcs) stay in the engine —
+  the filter is always kept, so results never change, only how much crosses the
+  wire. `EXPLAIN`
   prints the descended predicate on a `pushdown:` line. A CTE, derived table or
   table function the query *starts from* counts as that read, and so does a chain
   of them, each reading the one before: every `WHERE` along it descends as if
@@ -92,6 +98,14 @@ crosses the wire. The answer never changes, only where the work happens;
 
   `EXPLAIN` does not connect, so it says `text comparisons decided by the
   collation at run time` where the catalog will decide.
+- **Through a union** — a `WHERE` right after `EACH TABLE OF` or a
+  `UNION [ALL] BY NAME` descends into every branch that is a SQL table read:
+  each `AND`ed part naming only columns that branch's table has (by its
+  catalog, so never the tag column, a computed one or one the table lacks) is
+  translated into that branch's own query, as for a single read, each company's
+  table getting its share. The filter stays above the union too, so a part that
+  did not descend still holds. A union by position is not narrowed, as a
+  branch's column there may go by another name.
 - **Whole-aggregate pushdown** — `read <sql> | filters | GROUP BY` descends as
   one grouped query when every filter translates, the group keys are bare
   columns, and the aggregates are `COUNT SUM AVG MIN MAX` of bare columns,
