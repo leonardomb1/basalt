@@ -69,6 +69,7 @@ const folder = @import("../../connect/folder.zig");
 const jsontext = @import("../../exec/jsontext.zig");
 const objstore = @import("../../store/objstore.zig");
 const pqwrite = @import("../parquet/write.zig");
+const fit = @import("../parquet/fit.zig");
 const percent = @import("../../net/percent.zig");
 const ast = @import("../../lang/ast.zig");
 const azure = @import("../../store/azure.zig");
@@ -142,6 +143,68 @@ pub const Change = struct {
     kind: types.TypeKind,
 };
 
+pub const Evolve = enum { keep, merge, overwrite };
+
+/// A table's nested column type `t` (`schemaString`'s JSON) grown by the struct
+/// fields `in` has that it lacks, at any depth, each added nullable at the end of
+/// its struct; null when `in` adds none or is of another shape, which the write
+/// then refuses as it would without `merge_schema`.
+fn mergedType(arena: std.mem.Allocator, t: std.json.Value, in: types.Type) !?std.json.Value {
+    if (t != .object) return null;
+    const kind = if (t.object.get("type")) |k| (if (k == .string) k.string else "") else "";
+    if (std.mem.eql(u8, kind, "array")) {
+        if (in.kind != .array) return null;
+        const e = (try mergedType(arena, t.object.get("elementType") orelse return null, (in.elem orelse return null).*)) orelse return null;
+        var o = try t.object.clone();
+        try o.put("elementType", e);
+        return .{ .object = o };
+    }
+    if (std.mem.eql(u8, kind, "map")) {
+        if (in.kind != .map) return null;
+        const kv = in.fields orelse return null;
+        const v = (try mergedType(arena, t.object.get("valueType") orelse return null, kv[1].ty)) orelse return null;
+        var o = try t.object.clone();
+        try o.put("valueType", v);
+        return .{ .object = o };
+    }
+    if (!std.mem.eql(u8, kind, "struct") or in.kind != .@"struct") return null;
+    const list = t.object.get("fields") orelse return null;
+    if (list != .array) return null;
+    var out = try std.json.Array.initCapacity(arena, list.array.items.len);
+    var grew = false;
+    for (list.array.items) |fv| {
+        var item = fv;
+        if (fv == .object) if (fv.object.get("name")) |n| if (n == .string) for (in.fields orelse &.{}) |inf| if (std.mem.eql(u8, inf.name, n.string)) {
+            if (try mergedType(arena, fv.object.get("type") orelse .null, inf.ty)) |g| {
+                var o = try fv.object.clone();
+                try o.put("type", g);
+                item = .{ .object = o };
+                grew = true;
+            }
+        };
+        try out.append(item);
+    }
+    for (in.fields orelse &.{}) |inf| {
+        const known = for (list.array.items) |fv| {
+            if (fv == .object) if (fv.object.get("name")) |n| if (n == .string and std.mem.eql(u8, n.string, inf.name)) break true;
+        } else false;
+        if (known) continue;
+        var aw = std.Io.Writer.Allocating.init(arena);
+        try createdJson(&aw.writer, inf.name, inf.ty, 1);
+        var o = std.json.ObjectMap.init(arena);
+        try o.put("name", .{ .string = inf.name });
+        try o.put("type", try std.json.parseFromSliceLeaky(std.json.Value, arena, aw.written(), .{}));
+        try o.put("nullable", .{ .bool = true });
+        try o.put("metadata", .{ .object = std.json.ObjectMap.init(arena) });
+        try out.append(.{ .object = o });
+        grew = true;
+    }
+    if (!grew) return null;
+    var o = try t.object.clone();
+    try o.put("fields", .{ .array = out });
+    return .{ .object = o };
+}
+
 /// A table column the rows leave out (`Col.src`), as PARTIAL COLS allows.
 pub const absent = std.math.maxInt(usize);
 
@@ -186,6 +249,7 @@ pub const Plan = struct {
     /// The incoming rows' columns.
     in_fields: []const types.Schema.Field = &.{},
     change: ?Change = null,
+    new_meta: bool = false,
 
     /// What EXPLAIN and `check` add after the root.
     pub fn label(self: *const Plan, arena: std.mem.Allocator) ![]const u8 {
@@ -211,6 +275,15 @@ pub fn storeProblem(root: []const u8) ?[]const u8 {
 /// that is not UTF-8 is refused: the log's JSON would hold it repaired while the
 /// Parquet files keep it raw, and the column would read back as all NULL.
 pub fn plan(arena: std.mem.Allocator, root: []const u8, mode: Mode, create: bool, partition_by: ?[]const []const u8, codec: codecs.Codec, schema_in: ?types.Schema) !*Plan {
+    return planEvolving(arena, root, mode, create, partition_by, codec, schema_in, .keep);
+}
+
+/// `plan` letting the rows change the table's schema as `evolve` says: `merge`
+/// adds the columns (and struct fields) the rows have that the table lacks and
+/// writes NULL for the table's columns the rows lack; `overwrite`, under a
+/// REPLACE, gives the table the rows' schema whole, and `partition_by` (or the
+/// table's partitioning, if its columns remain) partitions it.
+pub fn planEvolving(arena: std.mem.Allocator, root: []const u8, mode: Mode, create: bool, partition_by: ?[]const []const u8, codec: codecs.Codec, schema_in: ?types.Schema, evolve: Evolve) !*Plan {
     const name = try msgfmt.allocPrint(arena, "Delta table `{s}`", .{root});
     if (storeProblem(root)) |why| return refuse("cannot write {s}: {s}", .{ name, why });
     if (schema_in) |s| for (s.fields) |f| if (!std.unicode.utf8ValidateSlice(f.name))
@@ -232,14 +305,42 @@ pub fn plan(arena: std.mem.Allocator, root: []const u8, mode: Mode, create: bool
     try st.checkProtocol();
     const fields = try tableFields(arena, name, st.schema_string orelse return refuse("{s} has no metaData action in its log", .{name}));
     try writable(st, fields, mode);
+    if (evolve == .overwrite) {
+        if (mode != .replace) return refuse("`overwrite_schema` gives {s} the rows' schema, which only a REPLACE may; to add columns as rows arrive, use `merge_schema`", .{name});
+        const schema = schema_in orelse {
+            p.* = .{ .name = name, .root = root, .mode = mode, .codec = codec, .snap = st, .cols = &.{}, .parts = &.{}, .data = &.{}, .schema_string = st.schema_string.? };
+            return p;
+        };
+        var parts = partition_by orelse st.part_cols;
+        if (partition_by == null) for (st.part_cols) |c| if (indexOf(schema, c) == null) {
+            parts = &.{};
+            break;
+        };
+        p.* = try planCreate(arena, name, root, mode, parts, codec, schema);
+        p.snap = st;
+        p.new_meta = true;
+        return p;
+    }
     if (partition_by) |want| if (!sameNames(want, st.part_cols))
         return refuse("{s} is partitioned by ({s}), not ({s}); `partition_by` applies only when a write creates the table", .{ name, try std.mem.join(arena, ", ", st.part_cols), try std.mem.join(arena, ", ", want) });
     p.* = .{ .name = name, .root = root, .mode = mode, .codec = codec, .snap = st, .cols = &.{}, .parts = &.{}, .data = &.{}, .schema_string = st.schema_string.? };
     const schema = schema_in orelse return p;
     const partial = mode == .upsert and mode.upsert.partial != null;
-    const cols = try arena.alloc(Col, fields.len);
-    for (fields, cols) |f, *c| {
+    const merge_cols = evolve == .merge;
+    var cols_list = std.array_list.Managed(Col).init(arena);
+    try cols_list.resize(fields.len);
+    const cols = cols_list.items;
+    var changed = false;
+    var tree = if (merge_cols) try std.json.parseFromSliceLeaky(std.json.Value, arena, st.schema_string.?, .{}) else std.json.Value.null;
+    for (fields, cols, 0..) |f, *c, fi| {
         const src = indexOf(schema, f.name) orelse {
+            if (merge_cols) {
+                if (!f.nullable) return refuse("{s}'s column `{s}` is NOT NULL, and the rows lack it; `merge_schema` writes NULL for a column the rows lack, which it cannot hold", .{ name, f.name });
+                var none = types.Type.init(.string);
+                none.unknown = true;
+                c.* = try tableCol(arena, name, f, none, absent);
+                continue;
+            }
             if (!partial) return refuse("{s} has column `{s}`, which the rows lack; a write gives every column of the table a value (`CAST(NULL AS ...) AS {s}` leaves it empty)", .{ name, f.name, f.name });
             if (f.metadata) |md| if (md.get("CURRENT_DEFAULT") != null)
                 return refuse("{s}'s column `{s}` has a default value (`CURRENT_DEFAULT`), which basalt does not apply, so a row an UPSERT inserts would not take it; give `{s}` in the rows", .{ name, f.name, f.name });
@@ -248,12 +349,39 @@ pub fn plan(arena: std.mem.Allocator, root: []const u8, mode: Mode, create: bool
             c.* = try tableCol(arena, name, f, none, absent);
             continue;
         };
-        c.* = try tableCol(arena, name, f, schema.fields[src].ty, src);
+        const in_ty = schema.fields[src].ty;
+        if (merge_cols and f.ty != .string and !in_ty.unknown) if (try mergedType(arena, f.ty, in_ty)) |grown| {
+            var nf = f;
+            nf.ty = grown;
+            c.* = try tableColLoose(arena, name, nf, in_ty, src, true);
+            try tree.object.getPtr("fields").?.array.items[fi].object.put("type", grown);
+            changed = true;
+            continue;
+        };
+        c.* = try tableColLoose(arena, name, f, in_ty, src, merge_cols);
     }
-    for (schema.fields) |f| if (indexOfField(fields, f.name) == null and !changeOnly(changesOf(mode), f.name))
-        return refuse("the rows have column `{s}`, which {s} lacks; basalt does not add columns to a Delta table", .{ f.name, name });
-    p.* = .{ .name = name, .root = root, .mode = mode, .codec = codec, .snap = st, .cols = cols, .parts = &.{}, .data = &.{}, .schema_string = st.schema_string.?, .in_fields = schema.fields };
+    for (schema.fields, 0..) |f, src| if (indexOfField(fields, f.name) == null and !changeOnly(changesOf(mode), f.name)) {
+        if (!merge_cols) return refuse("the rows have column `{s}`, which {s} lacks; basalt does not add columns to a Delta table (`WITH (merge_schema = true)` adds it)", .{ f.name, name });
+        const c = try createCol(arena, name, f, src);
+        try cols_list.append(c);
+        var o = std.json.ObjectMap.init(arena);
+        try o.put("name", .{ .string = f.name });
+        try o.put("type", if (c.ty.isNested()) try std.json.parseFromSliceLeaky(std.json.Value, arena, c.delta_type, .{}) else .{ .string = c.delta_type });
+        try o.put("nullable", .{ .bool = true });
+        try o.put("metadata", .{ .object = std.json.ObjectMap.init(arena) });
+        try tree.object.getPtr("fields").?.array.append(.{ .object = o });
+        changed = true;
+    };
+    var schema_string = st.schema_string.?;
+    if (changed) {
+        var aw = std.Io.Writer.Allocating.init(arena);
+        try std.json.Stringify.value(tree, .{}, &aw.writer);
+        schema_string = aw.written();
+    }
+    p.* = .{ .name = name, .root = root, .mode = mode, .codec = codec, .snap = st, .cols = cols_list.items, .parts = &.{}, .data = &.{}, .schema_string = schema_string, .in_fields = schema.fields, .new_meta = changed };
     try split(p, arena, st.part_cols);
+    if (mode != .upsert) for (p.parts) |k| if (p.cols[k].src == absent)
+        return refuse("{s} is partitioned by `{s}`, which the rows lack; a row's partition column says where it is written", .{ name, p.cols[k].name });
     try upsertCols(p, arena);
     p.change = try changeOf(arena, p, st);
     return p;
@@ -484,7 +612,13 @@ fn tableFields(arena: std.mem.Allocator, name: []const u8, text: []const u8) ![]
 
 /// A table column `f` as the rows' column of type `in` is written to it.
 fn tableCol(arena: std.mem.Allocator, name: []const u8, f: Field, in: types.Type, src: usize) !Col {
-    if (f.ty != .string) return nestedCol(arena, name, f, in, src);
+    return tableColLoose(arena, name, f, in, src, false);
+}
+
+/// `tableCol`; `loose` (under `merge_schema`) lets a struct of the rows leave out
+/// fields the table's has, and give its fields in any order.
+fn tableColLoose(arena: std.mem.Allocator, name: []const u8, f: Field, in: types.Type, src: usize, loose: bool) !Col {
+    if (f.ty != .string) return nestedCol(arena, name, f, in, src, loose);
     const t = f.ty.string;
     const c = Col{ .name = f.name, .delta_type = t, .ty = dtypes.scalarType(t, .write) orelse
         return refuse("{s} has column `{s}` of type `{s}`, which basalt does not write", .{ name, f.name, t }), .phys = dtypes.physical(t), .nullable = f.nullable, .src = src };
@@ -503,33 +637,42 @@ fn tableCol(arena: std.mem.Allocator, name: []const u8, f: Field, in: types.Type
 /// as the table's primitive there says (an `integer` as INT32, a `timestamp` as
 /// UTC); the rows' column must have its shape, field names and leaf kinds, a
 /// decimal leaf one the table's holds every value of.
-fn nestedCol(arena: std.mem.Allocator, name: []const u8, f: Field, in: types.Type, src: usize) !Col {
+fn nestedCol(arena: std.mem.Allocator, name: []const u8, f: Field, in: types.Type, src: usize, loose: bool) !Col {
     const ty = try delta.tableType(arena, name, f.name, f.ty);
     var aw = std.Io.Writer.Allocating.init(arena);
     try std.json.Stringify.value(f.ty, .{}, &aw.writer);
     const c = Col{ .name = f.name, .delta_type = aw.written(), .ty = ty, .phys = .{ .leaves = try dtypes.leafPhysicals(arena, f.ty) }, .nullable = f.nullable, .src = src };
     if (in.unknown) return c;
-    if (!fitsNested(in, ty))
+    if (!fitsNested(in, ty, loose))
         return refuse("column `{s}` is {s} in the rows but {s} in {s}; cast it", .{ f.name, try in.name(arena), try ty.name(arena), name });
     return c;
 }
 
 /// Whether values of `in` write as `t`: the same shape and field names, leaves of
 /// one kind, a decimal leaf at most `t`'s scale and fitting its integer digits.
-fn fitsNested(in: types.Type, t: types.Type) bool {
+fn fitsNested(in: types.Type, t: types.Type, loose: bool) bool {
     if (in.kind != t.kind) return false;
     switch (t.kind) {
         .@"struct", .map => {
             const a = in.fields orelse return false;
             const b = t.fields orelse return false;
+            if (loose and t.kind == .@"struct") {
+                for (a) |x| {
+                    const y = for (b) |y| {
+                        if (std.mem.eql(u8, x.name, y.name)) break y;
+                    } else return false;
+                    if (!fitsNested(x.ty, y.ty, true)) return false;
+                }
+                return true;
+            }
             if (a.len != b.len) return false;
             for (a, b) |x, y| {
                 if (t.kind == .@"struct" and !std.mem.eql(u8, x.name, y.name)) return false;
-                if (!fitsNested(x.ty, y.ty)) return false;
+                if (!fitsNested(x.ty, y.ty, loose)) return false;
             }
             return true;
         },
-        .array => return fitsNested((in.elem orelse return false).*, (t.elem orelse return false).*),
+        .array => return fitsNested((in.elem orelse return false).*, (t.elem orelse return false).*, loose),
         .decimal => {
             const ip: u8 = if (in.precision == 0) 38 else in.precision;
             return in.scale <= t.scale and ip -| in.scale <= t.precision - t.scale;
@@ -792,6 +935,19 @@ pub const Sink = struct {
             try w.writeAll(",\"partitionColumns\":");
             try w.writeAll(pb.written());
             try w.print(",\"configuration\":{{}},\"createdTime\":{d}}}}}\n", .{now});
+        } else if (p.new_meta) {
+            const st = p.snap.?;
+            var o = if (st.meta_raw) |m| (if (m == .object) try m.object.clone() else std.json.ObjectMap.init(a)) else std.json.ObjectMap.init(a);
+            try o.put("schemaString", .{ .string = p.schema_string });
+            var parts = std.json.Array.init(a);
+            for (p.parts) |k| try parts.append(.{ .string = p.cols[k].name });
+            try o.put("partitionColumns", .{ .array = parts });
+            if (o.get("id") == null) try o.put("id", .{ .string = st.table_id orelse try a.dupe(u8, &dlog.uuid()) });
+            if (o.get("format") == null) try o.put("format", try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"provider\":\"parquet\",\"options\":{}}", .{}));
+            if (o.get("configuration") == null) try o.put("configuration", st.config orelse .{ .object = std.json.ObjectMap.init(a) });
+            try w.writeAll("{\"metaData\":");
+            try std.json.Stringify.value(std.json.Value{ .object = o }, .{}, w);
+            try w.writeAll("}\n");
         }
     }
 
@@ -861,6 +1017,7 @@ pub const Sink = struct {
     /// outside a narrower column's range, naming the column.
     fn check(self: *Sink, b: Batch) !void {
         for (self.plan.cols) |c| {
+            if (c.src == absent) continue;
             const col = b.columns[c.src];
             const narrow = c.phys.int_bits < 64 and col.data == .i64;
             if (c.nullable and !narrow) continue;
@@ -883,8 +1040,15 @@ pub const Sink = struct {
     fn writeRows(self: *Sink, arena: std.mem.Allocator, b: Batch, rows: ?[]const usize, values: []const ?[]const u8, key: []const u8) !void {
         const p = self.plan;
         const cols = try arena.alloc(column.Column, p.data.len);
+        const n = if (rows) |x| x.len else b.len;
         for (p.data, cols) |k, *c| {
-            const src = b.columns[p.cols[k].src];
+            const pc = p.cols[k];
+            if (pc.src == absent) {
+                c.* = try @import("../../exec/op/join.zig").nullColumn(arena, pc.ty, n);
+                continue;
+            }
+            var src = b.columns[pc.src];
+            if (pc.ty.isNested() and !src.ty.eql(pc.ty)) src = try fit.reshape(arena, src, pc.ty);
             c.* = if (rows) |x| try column.permute(arena, src, x) else src;
         }
         const o = try self.fileFor(key, values);

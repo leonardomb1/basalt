@@ -233,6 +233,7 @@ pub const State = struct {
     v2: ?[]const u8 = null,
     files: std.StringArrayHashMapUnmanaged(Add) = .empty,
     txns: std.StringHashMapUnmanaged(i64) = .empty,
+    meta_raw: ?std.json.Value = null,
     whole: ?*Whole = null,
 
     pub const Whole = struct {
@@ -376,6 +377,7 @@ pub const State = struct {
                 try self.keep(k, o, file);
             } else if (std.mem.eql(u8, k, "metaData")) {
                 try self.meta(str(o.get("id")), str(o.get("schemaString")) orelse continue, o.get("partitionColumns"), o.get("configuration"));
+                self.meta_raw = try ownJson(self.arena, body, whole_depth);
                 try self.keep(k, o, null);
             } else if (std.mem.eql(u8, k, "protocol")) {
                 const rv = o.get("minReaderVersion") orelse continue;
@@ -463,6 +465,23 @@ pub const State = struct {
                 if (cell(c_schema, i) == .string) {
                     const id = cell(c_id, i);
                     try self.meta(if (id == .string) id.string else null, cell(c_schema, i).string, jsonOf(scratch, cell(c_pcols, i)), jsonOf(scratch, cell(c_config, i)));
+                    var o = std.json.ObjectMap.init(scratch);
+                    if (id == .string) try o.put("id", .{ .string = id.string });
+                    for ([_]struct { ?column.Column, []const u8 }{ .{ columnAt(b, "metaData.name"), "name" }, .{ columnAt(b, "metaData.description"), "description" } }) |x| {
+                        const v = cell(x[0], i);
+                        if (v == .string) try o.put(x[1], .{ .string = v.string });
+                    }
+                    var fmt = std.json.ObjectMap.init(scratch);
+                    const prov = cell(columnAt(b, "metaData.format.provider"), i);
+                    try fmt.put("provider", .{ .string = if (prov == .string) prov.string else "parquet" });
+                    try fmt.put("options", jsonOf(scratch, cell(columnAt(b, "metaData.format.options"), i)) orelse .{ .object = std.json.ObjectMap.init(scratch) });
+                    try o.put("format", .{ .object = fmt });
+                    try o.put("schemaString", .{ .string = cell(c_schema, i).string });
+                    try o.put("partitionColumns", jsonOf(scratch, cell(c_pcols, i)) orelse .{ .array = std.json.Array.init(scratch) });
+                    try o.put("configuration", jsonOf(scratch, cell(c_config, i)) orelse .{ .object = std.json.ObjectMap.init(scratch) });
+                    const made = cell(columnAt(b, "metaData.createdTime"), i);
+                    if (made == .int) try o.put("createdTime", .{ .integer = made.int });
+                    self.meta_raw = try ownJson(self.arena, .{ .object = o }, whole_depth);
                 }
                 if (cell(c_rv, i) == .int) {
                     const wv = cell(c_wv, i);
@@ -541,7 +560,8 @@ const checkpoint_columns = [_][]const u8{
     "add.deletionVector.cardinality", "metaData.id",                       "metaData.schemaString",     "metaData.partitionColumns",
     "metaData.configuration",         "protocol.minReaderVersion",         "protocol.minWriterVersion", "protocol.readerFeatures",
     "protocol.writerFeatures",        "checkpointMetadata.version",        "sidecar.path",              "txn.appId",
-    "txn.version",
+    "txn.version",                    "metaData.name",                     "metaData.description",      "metaData.format.provider",
+    "metaData.format.options",        "metaData.createdTime",
 };
 
 fn cell(c: ?column.Column, row: usize) Value {

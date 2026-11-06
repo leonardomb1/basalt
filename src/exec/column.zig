@@ -691,6 +691,26 @@ pub fn copy(arena: std.mem.Allocator, c: Column) error{OutOfMemory}!Column {
         .nested => |nd| .{ .nested = try copyNested(arena, nd, c.len) },
         inline else => |_, tag| dataLike(tag, Shape.of(c.data), try arena.dupe(Elem(tag), fixedOf(tag, c.data)[0..c.len])),
     };
+    if (c.ty.isNested()) out.ty = try ownType(arena, c.ty);
+    return out;
+}
+
+/// Nested type `t` copied into `arena`, its field names and parts with it: a copy
+/// of a nested column outlives the reader whose schema its type came from, as a
+/// parallel sort's runs outlive their lanes' files.
+fn ownType(arena: std.mem.Allocator, t: types.Type) error{OutOfMemory}!types.Type {
+    if (!t.isNested()) return t;
+    var out = t;
+    if (t.fields) |fs| {
+        const nf = try arena.alloc(types.Type.Field, fs.len);
+        for (nf, fs) |*o, f| o.* = .{ .name = try arena.dupe(u8, f.name), .ty = try ownType(arena, f.ty) };
+        out.fields = nf;
+    }
+    if (t.elem) |e| {
+        const ne = try arena.create(types.Type);
+        ne.* = try ownType(arena, e.*);
+        out.elem = ne;
+    }
     return out;
 }
 
@@ -956,7 +976,7 @@ fn sliceNested(arena: std.mem.Allocator, nd: *const Nested, start: usize, n: usi
 /// The first `n` rows of nested storage copied into `arena`, a list's child cut to
 /// the rows they span.
 fn copyNested(arena: std.mem.Allocator, nd: *const Nested, n: usize) error{OutOfMemory}!*const Nested {
-    return newNested(arena, nd.ty, switch (nd.body) {
+    return newNested(arena, try ownType(arena, nd.ty), switch (nd.body) {
         .fields => |fs| blk: {
             const kids = try arena.alloc(Column, fs.len);
             for (fs, kids) |f, *k| k.* = try copy(arena, f);

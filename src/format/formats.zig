@@ -145,7 +145,7 @@ pub const table = [_]Format{
         .lanes = .row_groups,
         .read_keys = &.{ "format", "version" },
         .write = .{},
-        .write_keys = &.{ "format", "partition_by", "compression" },
+        .write_keys = &.{ "format", "partition_by", "compression", "merge_schema", "overwrite_schema" },
     },
     .{
         .tag = .avro,

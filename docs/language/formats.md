@@ -189,7 +189,8 @@ a table.
 `WITH (partition_by = 'c1, c2')` partitions it; a later write takes the table's
 own partition columns, and naming different ones is refused. A write to an
 existing table must give exactly its columns — by name, in any order; one
-missing or one more is refused, as the schema is never changed — each of the
+missing or one more is refused, as the schema is not changed unless the write
+asks (below) — each of the
 table's type: an integer column of the table's `integer`, `short` or `byte` is
 written as one, its range checked; `float` as a 4-byte float; a decimal whose
 scale and integer digits fit the table's is rescaled to it, and a wider one is
@@ -199,6 +200,22 @@ kinds, a decimal leaf the table's holds — its leaves written as the table type
 them, so a Spark table's `struct<id: integer>` gets a 4-byte `id`, and a value
 past it fails the write. A NULL in a column the table declares not nullable
 fails the write naming the column.
+
+`WITH (merge_schema = true)` lets an `APPEND` or `UPSERT` change the schema, as
+Spark's `mergeSchema` does: a column the rows have and the table lacks is added
+to the table, nullable, at the end, and a struct field likewise to its struct at
+any depth (inside a list's element or a map's value too, the rows' struct
+giving its fields in any order); a table column the rows lack is written as
+NULL — refused for one declared not nullable, and for a partition column, which
+says where a row goes. Under an UPSERT a matched row is replaced whole, so a
+column the rows lack becomes NULL there too unless `PARTIAL COLS` keeps it. The
+commit carries the new schema in a `metaData` action that keeps the table's id,
+properties and creation time. A column's type is never changed: one of another
+type is refused as without the option. `WITH (overwrite_schema = true)` on a
+`REPLACE` gives the table the rows' schema whole, as Spark's `overwriteSchema`
+does, partitioned by `partition_by` when given, else by the table's partition
+columns when the rows still have them, else not at all; earlier versions keep
+their schema for `WITH (version = N)`. The two options are exclusive.
 
 Data files are `part-<uuid>.snappy.parquet` (`compression = 'gzip'` or `'none'`
 picks another codec), under Hive-style `col=value/` folders for a partitioned

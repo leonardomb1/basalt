@@ -41,7 +41,8 @@ AS
   (a file), `sheet` (an Excel file), `compression` (a Parquet file or a Delta
   table's data files: `snappy`, `gzip` or `none`; an Avro file's blocks:
   `deflate`, `snappy` or `none`), `partition_by` (a Delta table
-  a write creates), `array` (a JSON file: one top-level array instead of a row
+  a write creates), `merge_schema` and `overwrite_schema` (a Delta table's
+  schema changed by the write, [Writing Delta](formats.md#writing-delta)), `array` (a JSON file: one top-level array instead of a row
   a line), `root` and `row` (an XML file's element names), `newline` and
   `encoding` (a `format = 'records'` file, [Records](formats.md#records)) and
   `label_prefix` (StarRocks, Doris), `cutover` (a REPLACE into PostgreSQL, MySQL

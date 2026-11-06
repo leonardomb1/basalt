@@ -357,6 +357,47 @@ test "Delta USING changes: each run applies the changes past the table's positio
     try testing.expectEqualStrings("id,name\n8,j\n", try rows(a, &tmp, "SELECT id, name FROM '$B/t/' WHERE id = 8"));
 }
 
+test "Delta schema evolution: merge_schema adds the rows' new columns and struct fields and writes NULL for missing ones; overwrite_schema replaces it" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta', partition_by = 'grp') AS SELECT id, grp, CAST(json_object('x', id) AS STRUCT(x INT)) AS s FROM '$B/a.csv';", 1);
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' AS SELECT id, grp, CAST(json_object('x', id) AS STRUCT(x INT)) AS s, amt FROM '$B/a.csv';", "`WITH (merge_schema = true)` adds it");
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (merge_schema = true) AS SELECT id + 10 AS id, grp, CAST(json_object('x', id) AS STRUCT(x INT)) AS s, amt FROM '$B/a.csv' WHERE id = 1;", 1);
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (merge_schema = true) AS SELECT id + 20 AS id, grp, CAST(json_object('y', grp, 'x', id) AS STRUCT(y STRING, x INT)) AS s FROM '$B/a.csv' WHERE id = 2;", 4);
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) PARTIAL COLS (tag) WITH (merge_schema = true) AS SELECT 3 AS id, 'b' AS grp, 'hot' AS tag;", 1);
+    try testing.expectEqualStrings(
+        "id,grp,s,amt,tag\n1,a,\"{\"\"x\"\":1,\"\"y\"\":null}\",,\n2,a,\"{\"\"x\"\":2,\"\"y\"\":null}\",,\n3,b,\"{\"\"x\"\":3,\"\"y\"\":null}\",,hot\n11,a,\"{\"\"x\"\":1,\"\"y\"\":null}\",10,\n22,a,\"{\"\"x\"\":2,\"\"y\"\":\"\"a\"\"}\",,\n",
+        try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"),
+    );
+    const v1 = try logFile(a, &tmp, "t", 1);
+    const v0 = try logFile(a, &tmp, "t", 0);
+    const id_at = std.mem.indexOf(u8, v0, "{\"metaData\":{\"id\":\"").? + 19;
+    try testing.expect(std.mem.indexOf(u8, v1, v0[id_at .. id_at + 36]) != null);
+    try testing.expect(std.mem.indexOf(u8, v1, "\\\"name\\\":\\\"amt\\\",\\\"type\\\":\\\"long\\\",\\\"nullable\\\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 2), "\\\"name\\\":\\\"y\\\",\\\"type\\\":\\\"string\\\"") != null);
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 3), "\\\"name\\\":\\\"tag\\\"") != null);
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' WITH (merge_schema = true) AS SELECT 5 AS id;", "partitioned by `grp`, which the rows lack");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' WITH (merge_schema = true) AS SELECT 'x' AS id, grp FROM '$B/a.csv';", "column `id` is string in the rows but `long`");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' WITH (overwrite_schema = true) AS SELECT 1 AS k;", "which only a REPLACE may");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' REPLACE WITH (merge_schema = true, overwrite_schema = true) AS SELECT 1 AS k;", "give one");
+
+    try load(&tmp, "LOAD INTO '$B/t/' REPLACE WITH (overwrite_schema = true) AS SELECT 'k' AS key, 1.5 AS v, grp FROM '$B/a.csv' WHERE id = 3;", 1);
+    try testing.expectEqualStrings("key,v,grp\nk,1.5,b\n", try rows(a, &tmp, "SELECT * FROM '$B/t/'"));
+    try testing.expect(exists(&tmp, "t/grp=b"));
+    try load(&tmp, "LOAD INTO '$B/t/' REPLACE WITH (overwrite_schema = true, partition_by = 'key') AS SELECT 'k2' AS key, 7 AS n;", 1);
+    try testing.expectEqualStrings("key,n\nk2,7\n", try rows(a, &tmp, "SELECT * FROM '$B/t/'"));
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 5), "\"partitionColumns\":[\"key\"]") != null);
+    try testing.expectEqualStrings("n\n5\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/t/' WITH (version = 3)"));
+
+    try load(&tmp, "LOAD INTO '$B/l/' WITH (format = 'delta') AS SELECT 1 AS id, CAST('[{\"a\":1}]' AS LIST(STRUCT(a INT))) AS l;", 1);
+    try load(&tmp, "LOAD INTO '$B/l/' WITH (merge_schema = true) AS SELECT 2 AS id, CAST('[{\"b\":\"z\",\"a\":2},{\"a\":3}]' AS LIST(STRUCT(b STRING, a INT))) AS l;", 1);
+    try load(&tmp, "LOAD INTO '$B/out.csv' AS SELECT id, l FROM '$B/l/' ORDER BY id;", 4);
+    try testing.expectEqualStrings("id,l\n1,\"[{\"\"a\"\":1,\"\"b\"\":null}]\"\n2,\"[{\"\"a\"\":2,\"\"b\"\":\"\"z\"\"},{\"\"a\"\":3,\"\"b\"\":null}]\"\n", try tmp.dir.readFileAlloc(a, "out.csv", 1 << 10));
+}
+
 test "Delta write: what is refused, at check where it can be seen" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();

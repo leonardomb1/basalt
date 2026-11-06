@@ -1555,7 +1555,7 @@ const Ctx = struct {
         if (!deltaTarget(w, hints) or std.mem.indexOf(u8, w.target, "://") != null or std.mem.indexOf(u8, w.target, "${") != null) return null;
         const opts = try writeOptions(self.arena, w, hints, self.diag);
         const create = (formatFromHints(hints, self.diag) catch null) == .delta;
-        const p = delta_write.plan(self.arena, w.target, delta_write.writeModeOf(w), create, opts.delta.partition_by, opts.delta.codec, schema) catch |e| {
+        const p = delta_write.planEvolving(self.arena, w.target, delta_write.writeModeOf(w), create, opts.delta.partition_by, opts.delta.codec, schema, opts.delta.evolve) catch |e| {
             if (e == lake.Error.LakeTableRefused) return fail(self.diag, "{s}", .{eval.takeFailure(e) orelse @errorName(e)});
             _ = eval.takeFailure(e);
             return null;

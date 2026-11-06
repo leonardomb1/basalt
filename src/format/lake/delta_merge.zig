@@ -348,9 +348,9 @@ pub const Merge = struct {
     fn tagged(self: *Merge, a: std.mem.Allocator, adds: []const delta.Add) !*const fit.Layout {
         const fl = try delta.layoutOf(a, self.plan.snap.?, self.plan.root, adds);
         const base = fl.layout;
-        const nf = base.schema.fields.len;
+        const nf = self.plan.cols.len;
         const fields = try a.alloc(types.Schema.Field, nf + 1);
-        @memcpy(fields[0..nf], base.schema.fields);
+        for (fields[0..nf], self.plan.cols) |*f, c| f.* = .{ .name = c.name, .ty = c.ty.asNullable() };
         fields[nf] = .{ .name = tag_name, .ty = types.Type.init(.int).asNullable() };
         const part_fields = try a.alloc(usize, base.part_fields.len + 1);
         @memcpy(part_fields[0..base.part_fields.len], base.part_fields);

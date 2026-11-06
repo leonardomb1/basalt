@@ -234,7 +234,17 @@ pub const WriteOptions = union(FileFormat) {
 pub const DeltaOptions = struct {
     codec: pqcodec.Codec = .snappy,
     partition_by: ?[]const []const u8 = null,
+    evolve: @import("../../format/lake/delta_write.zig").Evolve = .keep,
 };
+
+/// `merge_schema = true` (the rows may add columns and leave some out) or
+/// `overwrite_schema = true` (a REPLACE gives the table the rows' schema); not both.
+pub fn evolveOf(hints: []const ast.Hint, diag: *Diag) Error!@import("../../format/lake/delta_write.zig").Evolve {
+    const merge = (try hintBool(hints, "merge_schema", diag)) orelse false;
+    const over = (try hintBool(hints, "overwrite_schema", diag)) orelse false;
+    if (merge and over) return fail(diag, "`merge_schema` and `overwrite_schema` are two ways to change a Delta table's schema; give one", .{});
+    return if (over) .overwrite else if (merge) .merge else .keep;
+}
 
 /// `partition_by = 'c1, c2'`: the columns a created Delta table is partitioned
 /// by, in order.
@@ -265,7 +275,7 @@ pub fn writeOptions(arena: std.mem.Allocator, w: ast.Write, hints: []const ast.H
         .json => .{ .json = shape },
         .xml => .{ .xml = names },
         .records => .{ .records = try recordsOptions(hints, diag) },
-        .delta => .{ .delta = .{ .codec = codec, .partition_by = try partitionBy(arena, hints, diag) } },
+        .delta => .{ .delta = .{ .codec = codec, .partition_by = try partitionBy(arena, hints, diag), .evolve = try evolveOf(hints, diag) } },
         .avro => .{ .avro = try avroCodecFromHints(hints, diag) },
     };
 }
