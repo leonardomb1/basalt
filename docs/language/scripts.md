@@ -16,6 +16,7 @@ CREATE FUNCTION t(a) RETURNS TABLE AS SELECT ...;  -- table functions, read with
 LOAD INTO ... AS <query>;         -- output pipeline(s)
 <query>;                          -- terminal SELECT = print to stdout
 CALL p('x');                      -- run a statement function
+CALL delta_optimize('lake/t/');   -- a built-in procedure (Delta maintenance)
 FOR EACH ROW OF (...) ... END FOR;
 CASE ... END CASE;                -- plan-time dispatch
 PRINT <expr>;                     -- progress line on stderr, via the run log

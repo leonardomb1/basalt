@@ -194,6 +194,11 @@ fn expandBlock(cx: *Ctx, stmts: []const ast.Stmt) Error![]const ast.Stmt {
 /// The arguments stay expressions; `run.zig` const-evaluates them at the call site.
 fn expandCallStmt(cx: *Ctx, c: ast.CallStmt) Error!ast.Stmt {
     const fd = cx.fns.get(c.name) orelse {
+        if (std.mem.startsWith(u8, c.name, "delta_")) {
+            const args = try cx.arena.alloc(*ast.Expr, c.args.len);
+            for (c.args, 0..) |a, i| args[i] = try expandExpr(cx, a, null, 0);
+            return .{ .call = .{ .name = c.name, .args = args, .pos = c.pos } };
+        }
         cx.msg.* = msgfmt.allocPrint(cx.arena, "CALL: no function named `{s}`", .{c.name}) catch "CALL: unknown function";
         return error.ExpandFailed;
     };

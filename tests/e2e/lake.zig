@@ -491,6 +491,30 @@ test "Delta deletion vectors: Spark's tables read without their deleted rows, on
     try testing.expectEqualStrings("id\n6\n8\n9\n13\n15\n", try rows(a, &tmp, "SELECT id FROM '$B/log-replay-dv-key-cases/' WHERE id >= 6 AND id <= 15 AND (id < 10 OR id > 12) ORDER BY id", 1));
 }
 
+test "delta_optimize on Spark's table with a deletion vector rewrites its file without the deleted rows, as an OPTIMIZE that changes no data" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try golden(&tmp, "table-with-dv-small");
+    const r = try runIn(a, &tmp, "CALL delta_optimize('$B/table-with-dv-small/');", 1);
+    try testing.expect(r.err == null);
+    const v2 = try tmp.dir.readFileAlloc(a, "table-with-dv-small/_delta_log/00000000000000000002.json", 1 << 16);
+    try testing.expect(std.mem.indexOf(u8, v2, "\"operation\":\"OPTIMIZE\"") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, v2, "{\"add\":"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, v2, "{\"remove\":"));
+    try testing.expect(std.mem.indexOf(u8, v2, "\"dataChange\":true") == null);
+    const add_at = std.mem.indexOf(u8, v2, "{\"add\":").?;
+    const add_line = v2[add_at .. add_at + std.mem.indexOfScalar(u8, v2[add_at..], '\n').?];
+    try testing.expect(std.mem.indexOf(u8, add_line, "deletionVector") == null);
+    try testing.expectEqualStrings("value\n1\n2\n3\n4\n5\n6\n7\n8\n", try lanesAgree(a, &tmp, "SELECT value FROM '$B/table-with-dv-small/' ORDER BY value"));
+    try testing.expectEqualStrings("n\n10\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/table-with-dv-small/' WITH (version = 0)", 1));
+    const again = try runIn(a, &tmp, "CALL delta_optimize('$B/table-with-dv-small/');", 1);
+    try testing.expect(again.err == null);
+    if (tmp.dir.access("table-with-dv-small/_delta_log/00000000000000000003.json", .{})) |_| return error.TestUnexpectedResult else |_| {}
+}
+
 test "Delta deletion vectors with column mapping, partitions and a Spark checkpoint" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

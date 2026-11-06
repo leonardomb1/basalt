@@ -26,6 +26,7 @@ const eval = @import("../exec/eval.zig");
 const driver = @import("../connect/driver.zig");
 const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
+const procedures = @import("procedures.zig");
 const holes = @import("analyze/holes.zig");
 const Value = @import("../exec/value.zig").Value;
 
@@ -555,7 +556,11 @@ pub fn renderBound(env: *Env, p: ast.Pipeline, lr: LoopRow) !ast.Pipeline {
 /// The program was expanded first, which refused a CALL of an unknown, scalar or table
 /// function and filled its defaults, so the callee is a statement function taking every argument.
 pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, run_body: BodyFn) anyerror!void {
-    const fd = env.fns.get(c.name) orelse unreachable;
+    const fd = env.fns.get(c.name) orelse {
+        const p = procedures.lookup(c.name) orelse unreachable;
+        const sc = try outer.scope(env.arena, env.params);
+        return procedures.run(env, p, c, .{ .names = sc.names, .values = sc.values });
+    };
     const body = switch (fd.body) {
         .stmts => |b| b,
         .expr, .table => unreachable,

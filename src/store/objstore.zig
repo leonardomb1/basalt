@@ -88,11 +88,31 @@ pub const Response = struct {
     etag: []const u8 = "",
     retry_after_ms: ?u64 = null,
     content_length: ?u64 = null,
+    modified_ms: ?i64 = null,
 
     pub fn failed(self: Response, err: anyerror) Verdict {
         return .{ .failed = .{ .code = self.code, .err = err, .retry_after_ms = self.retry_after_ms } };
     }
 };
+
+/// An HTTP date (`Wed, 21 Oct 2015 07:28:00 GMT`, the form stores send) as
+/// milliseconds since the epoch; null for any other text.
+pub fn httpDateMs(text: []const u8) ?i64 {
+    var it = std.mem.tokenizeAny(u8, text, " ,:");
+    _ = it.next() orelse return null;
+    const day = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    const mon_name = it.next() orelse return null;
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    const mon = for (months, 1..) |m, i| {
+        if (std.ascii.eqlIgnoreCase(m, mon_name)) break @as(u32, @intCast(i));
+    } else return null;
+    const year = std.fmt.parseInt(i64, it.next() orelse return null, 10) catch return null;
+    var hms: [3]i64 = undefined;
+    for (&hms) |*x| x.* = std.fmt.parseInt(i64, it.next() orelse return null, 10) catch return null;
+    if (day < 1 or day > 31 or hms[0] > 23 or hms[1] > 59 or hms[2] > 60) return null;
+    const days = @import("../exec/civil.zig").daysFromCivil(year, mon, day);
+    return ((days * 24 + hms[0]) * 60 + hms[1]) * 60_000 + hms[2] * 1000;
+}
 
 pub const Call = struct {
     method: std.http.Method,
@@ -194,6 +214,7 @@ fn exchangeOnce(arena: std.mem.Allocator, client: *std.http.Client, call: Call, 
     while (it.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "etag")) out.etag = try arena.dupe(u8, h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "retry-after")) out.retry_after_ms = retryAfterMs(h.value);
+        if (std.ascii.eqlIgnoreCase(h.name, "last-modified")) out.modified_ms = httpDateMs(h.value);
         if (std.ascii.eqlIgnoreCase(h.name, "location") and isRedirect(out.code)) location.* = try arena.dupe(u8, h.value);
     }
     if (location.* != null) {
@@ -430,6 +451,26 @@ pub const Object = struct {
     /// A null `client` has the writer make its own, freed on `finish` or `abort`.
     pub fn openWriter(self: Object, arena: std.mem.Allocator, client: ?*std.http.Client, content_type: []const u8) !Writer {
         return self.provider.vtable.open_writer(self.ptr, arena, client, content_type);
+    }
+
+    /// When the object was last written, by a HEAD's `Last-Modified`; null when the
+    /// store does not say.
+    pub fn modifiedMs(self: Object, arena: std.mem.Allocator, client: *std.http.Client) !?i64 {
+        const hdrs = try self.requestHeaders(arena, "HEAD", "");
+        const r = try exchange(arena, client, .{ .method = .HEAD, .url = self.url, .headers = hdrs });
+        if (r.code != 200) return self.statusToError(r.code, r.body);
+        return r.modified_ms;
+    }
+
+    /// Deletes the object, one signed DELETE; one already gone is no error, as a
+    /// cleanup that failed halfway is simply run again.
+    pub fn delete(self: Object, arena: std.mem.Allocator, client: *std.http.Client) !void {
+        const hdrs = try self.requestHeaders(arena, "DELETE", "");
+        const r = try exchange(arena, client, .{ .method = .DELETE, .url = self.url, .headers = hdrs });
+        switch (r.code) {
+            200, 202, 204, 404 => return,
+            else => return self.statusToError(r.code, r.body),
+        }
     }
 
     /// Writes `bytes` as the object only if none is there, in one request: true
@@ -876,4 +917,11 @@ test "exchange stops a body at max_body" {
     try std.testing.expectError(error.HttpBodyTooLarge, exchange(a, &client, .{ .method = .GET, .url = url, .max_body = 99 }));
     const ok = try exchange(a, &client, .{ .method = .GET, .url = url, .max_body = 100 });
     try std.testing.expectEqual(@as(usize, 100), ok.body.len);
+}
+
+test "an HTTP date reads as milliseconds since the epoch; anything else as null" {
+    try std.testing.expectEqual(@as(?i64, 1445412480000), httpDateMs("Wed, 21 Oct 2015 07:28:00 GMT"));
+    try std.testing.expectEqual(@as(?i64, 0), httpDateMs("Thu, 01 Jan 1970 00:00:00 GMT"));
+    try std.testing.expect(httpDateMs("yesterday") == null);
+    try std.testing.expect(httpDateMs("Wed, 21 Foo 2015 07:28:00 GMT") == null);
 }

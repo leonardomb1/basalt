@@ -256,7 +256,45 @@ them, whoever wrote it) and each `remove` still within
 types, so Spark, delta-rs and DuckDB read it. It is written under a hidden name
 and renamed into place; one that cannot be written is a warning, never the
 write's failure, as the commit it follows has landed. A newer `_last_checkpoint`
-another writer left is not moved back.
+another writer left is not moved back. After a checkpoint the log is cleaned as
+Spark cleans it: of the checkpoints, the newest whose commit is older than
+`delta.logRetentionDuration` (30 days by default) is the oldest version kept,
+and the commits, checkpoints and checksum files below it are deleted, oldest
+first, so time travel reaches back that far and no further.
+`delta.enableExpiredLogCleanup = false` keeps every log file. A commit's age is
+its `commitInfo` timestamp, so a log copied elsewhere keeps its ages. Data files
+are never deleted here; a removed file stays until `VACUUM`.
+
+Two built-in procedures maintain a table, run with `CALL` (a FUNCTION of the
+same name, if the script declares one, is called instead):
+
+```sql ignore
+CALL delta_optimize('s3://lake/orders/');                  -- every partition
+CALL delta_optimize('s3://lake/orders/', 'region = ''eu''');
+CALL delta_vacuum('s3://lake/orders/');                    -- the table's retention
+CALL delta_vacuum('s3://lake/orders/', 336);               -- or a longer one, in hours
+```
+
+`delta_optimize` compacts small files: of the live files a predicate on the
+partition columns keeps (every file without one), those under the writer's
+128 MiB roll in a partition holding two or more of them, or one with a deletion
+vector, are read and written again into as few files as the roll allows, their
+deleted rows dropped. The commit is an `OPTIMIZE` whose actions all say
+`dataChange: false`, as no row changes; it fails as a conflict only when a
+concurrent writer removed a file it read, so appends go on beside it. A
+predicate naming another column is refused. The files it replaced stay on disk,
+as earlier versions read them, until `delta_vacuum` deletes them.
+
+`delta_vacuum` deletes the files no version within the retention reads: every
+file under the table's folder but the newest version's data files and deletion
+vectors, and those a `remove` still within the retention names, once it is older
+than the retention — `delta.deletedFileRetentionDuration`, a week when unset, or
+the longer number of hours given. A shorter retention than the table's is
+refused, as Spark refuses it: a concurrent writer's files not yet committed are
+as new as that. The log and every path with a part starting `_` or `.` are never
+touched, and nothing is committed; versions older than the retention may then
+no longer be readable. A file's age is its modification time (an object's
+`Last-Modified`).
 
 `UPSERT ON (k1, k2)` merges the rows into the table copy-on-write, in one
 commit: a row whose key matches a live row replaces it, a row with a new key is

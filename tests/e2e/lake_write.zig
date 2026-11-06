@@ -398,6 +398,99 @@ test "Delta schema evolution: merge_schema adds the rows' new columns and struct
     try testing.expectEqualStrings("id,l\n1,\"[{\"\"a\"\":1,\"\"b\"\":null}]\"\n2,\"[{\"\"a\"\":2,\"\"b\"\":\"\"z\"\"},{\"\"a\"\":3,\"\"b\"\":null}]\"\n", try tmp.dir.readFileAlloc(a, "out.csv", 1 << 10));
 }
 
+test "Delta log cleanup: a checkpoint past the log's retention deletes the commits and checkpoints below it; off, or within retention, keeps them" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "keep", "zero", "off" }) |root| {
+        try load(&tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/{s}/' WITH (format = 'delta') AS SELECT 0 AS id;", .{root}), 1);
+        const v0 = try logFile(a, &tmp, root, 0);
+        var meta: []const u8 = "";
+        var lines = std.mem.splitScalar(u8, v0, '\n');
+        while (lines.next()) |l| if (std.mem.startsWith(u8, l, "{\"metaData\":")) {
+            meta = l;
+        };
+        const conf = if (std.mem.eql(u8, root, "zero"))
+            "{\"delta.logRetentionDuration\":\"interval 0 seconds\"}"
+        else if (std.mem.eql(u8, root, "off"))
+            "{\"delta.logRetentionDuration\":\"interval 0 seconds\",\"delta.enableExpiredLogCleanup\":\"false\"}"
+        else
+            "{}";
+        const v1 = try std.mem.concat(a, u8, &.{ "{\"commitInfo\":{\"timestamp\":1}}\n", try std.mem.replaceOwned(u8, a, meta, "\"configuration\":{}", try std.fmt.allocPrint(a, "\"configuration\":{s}", .{conf})), "\n" });
+        try tmp.dir.writeFile(.{ .sub_path = try std.fmt.allocPrint(a, "{s}/_delta_log/00000000000000000001.json", .{root}), .data = v1 });
+        for (2..21) |i| try load(&tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/{s}/' AS SELECT {d} AS id;", .{ root, i }), 1);
+        try testing.expectEqualStrings("n,s\n20,209\n", try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT COUNT(*) AS n, SUM(id) AS s FROM '$B/{s}/'", .{root})));
+    }
+    try testing.expect(exists(&tmp, "keep/_delta_log/00000000000000000000.json"));
+    try testing.expect(exists(&tmp, "keep/_delta_log/00000000000000000010.checkpoint.parquet"));
+    try testing.expect(exists(&tmp, "off/_delta_log/00000000000000000000.json"));
+    for ([_]u8{ 0, 1, 9, 10, 19 }) |v| try testing.expect(!exists(&tmp, try std.fmt.allocPrint(a, "zero/_delta_log/{d:0>20}.json", .{v})));
+    try testing.expect(!exists(&tmp, "zero/_delta_log/00000000000000000010.checkpoint.parquet"));
+    try testing.expect(exists(&tmp, "zero/_delta_log/00000000000000000020.checkpoint.parquet"));
+    try testing.expect(exists(&tmp, "zero/_delta_log/00000000000000000020.json"));
+    try testing.expectEqualStrings("n\n20\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/zero/' WITH (version = 20)"));
+    try runRefuses(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT COUNT(*) AS n FROM '$B/zero/' WITH (version = 12);", "versions 20 to 20 can be read");
+}
+
+test "delta_vacuum deletes the files no version within the retention reads; delta_optimize compacts a partition's small files" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta', partition_by = 'grp') AS SELECT id, grp, amt FROM '$B/a.csv';", 1);
+    for (0..3) |i| try load(&tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/t/' AS SELECT id + {d} AS id, grp, amt FROM '$B/a.csv';", .{(i + 1) * 10}), 1);
+    try load(&tmp, "CALL delta_optimize('$B/t/', 'grp = ''a''');", 1);
+    const v4 = try logFile(a, &tmp, "t", 4);
+    try testing.expect(std.mem.indexOf(u8, v4, "\"operation\":\"OPTIMIZE\"") != null);
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, v4, "{\"remove\":"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, v4, "{\"add\":"));
+    try load(&tmp, "CALL delta_optimize('$B/t');", 4);
+    try testing.expectEqual(@as(usize, 4), try actions(a, &tmp, "t", 5, "remove"));
+    try load(&tmp, "CALL delta_optimize('$B/t/');", 1);
+    try testing.expect(!exists(&tmp, "t/_delta_log/00000000000000000006.json"));
+    const all = "SELECT grp, COUNT(*) AS n, SUM(id) AS s, SUM(amt) AS m FROM '$B/t/' GROUP BY grp ORDER BY grp";
+    const want = "grp,n,s,m\na,8,132,120\nb,4,72,20\n";
+    try testing.expectEqualStrings(want, try rows(a, &tmp, all));
+    try runRefuses(a, &tmp, "CALL delta_optimize('$B/t/', 'id > 2');", "may name only");
+    try harness.expectRefusedAlike(gpa, &tmp, "CALL delta_vacuum('$B/t/', 1, 2);", "takes 1 to 2 arguments");
+    try harness.expectRefusedAlike(gpa, &tmp, "CALL delta_nope('$B/t/');", "no function or procedure named `delta_nope`");
+
+    try runRefuses(a, &tmp, "CALL delta_vacuum('$B/t/', 0);", "less than the table's `delta.deletedFileRetentionDuration` of 168 hours");
+    try load(&tmp, "CALL delta_vacuum('$B/t/');", 1);
+    try testing.expectEqual(@as(usize, 10), try dataFiles(a, &tmp));
+
+    const v0 = try logFile(a, &tmp, "t", 0);
+    var meta: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, v0, '\n');
+    while (lines.next()) |l| if (std.mem.startsWith(u8, l, "{\"metaData\":")) {
+        meta = l;
+    };
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000006.json", .data = try std.mem.concat(a, u8, &.{ "{\"commitInfo\":{\"timestamp\":1}}\n", try std.mem.replaceOwned(u8, a, meta, "\"configuration\":{}", "\"configuration\":{\"delta.deletedFileRetentionDuration\":\"interval 0 hours\"}"), "\n" }) });
+    try tmp.dir.writeFile(.{ .sub_path = "t/stray.parquet", .data = "x" });
+    try tmp.dir.makePath("t/_scratch");
+    try tmp.dir.writeFile(.{ .sub_path = "t/_scratch/x.parquet", .data = "x" });
+    try load(&tmp, "CALL delta_vacuum('$B/t/');", 1);
+    try testing.expectEqual(@as(usize, 2), try dataFiles(a, &tmp));
+    try testing.expect(exists(&tmp, "t/_scratch/x.parquet"));
+    try testing.expect(!exists(&tmp, "t/stray.parquet"));
+    try testing.expectEqualStrings(want, try rows(a, &tmp, all));
+}
+
+/// The Parquet files of table `t` outside its hidden folders.
+fn dataFiles(a: std.mem.Allocator, tmp: *testing.TmpDir) !usize {
+    var dir = try tmp.dir.openDir("t", .{ .iterate = true });
+    defer dir.close();
+    var w = try dir.walk(a);
+    var n: usize = 0;
+    while (try w.next()) |e| if (e.kind == .file and std.mem.endsWith(u8, e.path, ".parquet") and !std.mem.startsWith(u8, e.path, "_")) {
+        n += 1;
+    };
+    return n;
+}
+
 test "Delta write: what is refused, at check where it can be seen" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();

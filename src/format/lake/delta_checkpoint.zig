@@ -21,6 +21,10 @@
 //! checkpoint is an optimisation: the commit it follows has landed, so a failure
 //! here is the caller's to report as a warning, never the write's failure.
 //! `_last_checkpoint` is not moved back past a newer checkpoint another writer made.
+//! After a checkpoint the expired log is cleaned (`cleanLog`): commits, older
+//! checkpoints and checksum files below the newest checkpoint past
+//! `delta.logRetentionDuration` are deleted, unless `delta.enableExpiredLogCleanup`
+//! is false.
 //!
 //! The columns (`columns`) are typed as `schemaString` would type them, so the
 //! reader's own type mapping and leaf layouts serve; rows (`Rows`) are built a
@@ -34,6 +38,8 @@ const table = @import("table.zig");
 const column = @import("../../exec/column.zig");
 const msgfmt = @import("../msgfmt.zig");
 const objstore = @import("../../store/objstore.zig");
+const folder = @import("../../connect/folder.zig");
+const http_client = @import("../../net/http_client.zig");
 const pqwrite = @import("../parquet/write.zig");
 const types = @import("../../lang/types.zig");
 const testing = std.testing;
@@ -97,24 +103,117 @@ pub fn due(version: u64, every: u64) bool {
 /// `delta.deletedFileRetentionDuration` (`interval 7 days`, Spark's spelling, in
 /// seconds to weeks) in milliseconds; a week when unset or unreadable.
 pub fn retentionMs(text: ?[]const u8) i64 {
-    const t = std.mem.trim(u8, text orelse return default_retention_ms, " ");
+    return retentionWith(text, default_retention_ms);
+}
+
+/// A duration property as `retentionMs` reads one, `fallback` when unset or unreadable.
+pub fn retentionWith(text: ?[]const u8, fallback: i64) i64 {
+    const default_retention = fallback;
+    const t = std.mem.trim(u8, text orelse return default_retention, " ");
     var it = std.mem.tokenizeScalar(u8, t, ' ');
-    var word = it.next() orelse return default_retention_ms;
-    if (std.ascii.eqlIgnoreCase(word, "interval")) word = it.next() orelse return default_retention_ms;
-    const n = std.fmt.parseInt(i64, word, 10) catch return default_retention_ms;
-    const unit = it.next() orelse return default_retention_ms;
+    var word = it.next() orelse return default_retention;
+    if (std.ascii.eqlIgnoreCase(word, "interval")) word = it.next() orelse return default_retention;
+    const n = std.fmt.parseInt(i64, word, 10) catch return default_retention;
+    const unit = it.next() orelse return default_retention;
     const units = [_]struct { []const u8, i64 }{
         .{ "millisecond", 1 },    .{ "second", 1000 },          .{ "minute", 60 * 1000 },
         .{ "hour", 3600 * 1000 }, .{ "day", 24 * 3600 * 1000 }, .{ "week", 7 * 24 * 3600 * 1000 },
     };
     for (units) |u| {
         const base = if (unit.len > 0 and (unit[unit.len - 1] == 's' or unit[unit.len - 1] == 'S')) unit[0 .. unit.len - 1] else unit;
-        if (std.ascii.eqlIgnoreCase(base, u[0])) return std.math.mul(i64, n, u[1]) catch default_retention_ms;
+        if (std.ascii.eqlIgnoreCase(base, u[0])) return std.math.mul(i64, n, u[1]) catch default_retention;
     }
-    return default_retention_ms;
+    return default_retention;
 }
 
-pub const Written = struct { version: u64, rows: u64, bytes: u64, adds: u64 };
+const default_log_retention_ms: i64 = 30 * 24 * 3600 * 1000;
+
+/// The log of `root`'s table cleaned as Spark cleans it after a checkpoint: of
+/// the complete checkpoints at or below `version`, the newest whose commit is
+/// older than `keep_ms` before `now_ms` is the oldest version kept, and every
+/// commit, checkpoint and checksum file below it is deleted, oldest first, so a
+/// cleanup cut short leaves the log readable from a later checkpoint. A commit's
+/// age is its `commitInfo` (`inCommitTimestamp`, else `timestamp`). Returns the
+/// files deleted.
+pub fn cleanLog(arena: std.mem.Allocator, root: []const u8, version: u64, keep_ms: i64, now_ms: i64) !usize {
+    const log_path = try std.mem.concat(arena, u8, &.{ root, delta.log_dir });
+    const listed = try folder.listRaw(arena, log_path);
+    var commits = std.AutoHashMapUnmanaged(u64, []const u8).empty;
+    var parts = std.AutoHashMapUnmanaged(u64, u32).empty;
+    var whole = std.AutoHashMapUnmanaged(u64, u32).empty;
+    const Doomed = struct { v: u64, url: []const u8 };
+    var all = std.array_list.Managed(Doomed).init(arena);
+    for (listed) |u| {
+        const rel = folder.below(u, log_path);
+        if (std.mem.indexOfAny(u8, rel, "/\\") != null) continue;
+        switch (delta.parseName(rel)) {
+            .commit => |v| {
+                try commits.put(arena, v, u);
+                try all.append(.{ .v = v, .url = u });
+            },
+            .checkpoint => |c| {
+                const g = try parts.getOrPut(arena, c.version);
+                if (!g.found_existing) g.value_ptr.* = 0;
+                g.value_ptr.* += 1;
+                try whole.put(arena, c.version, c.parts);
+                try all.append(.{ .v = c.version, .url = u });
+            },
+            .v2, .other => if (versionOf(rel, ".crc")) |v| try all.append(.{ .v = v, .url = u }),
+        }
+    }
+    var cands = std.array_list.Managed(u64).init(arena);
+    var it = parts.iterator();
+    while (it.next()) |kv| if (kv.key_ptr.* <= version and kv.value_ptr.* == whole.get(kv.key_ptr.*).?) try cands.append(kv.key_ptr.*);
+    std.mem.sort(u64, cands.items, {}, std.sort.desc(u64));
+    const cutoff = now_ms -| keep_ms;
+    const floor = for (cands.items) |c| {
+        const at = commits.get(c) orelse continue;
+        const ts = commitTime(arena, at) orelse continue;
+        if (ts <= cutoff) break c;
+    } else return 0;
+    std.mem.sort(Doomed, all.items, {}, struct {
+        fn lt(_: void, x: Doomed, y: Doomed) bool {
+            return x.v < y.v;
+        }
+    }.lt);
+    var gone: usize = 0;
+    var client: ?std.http.Client = null;
+    defer if (client) |*c| c.deinit();
+    for (all.items) |d| {
+        if (d.v >= floor) break;
+        if (objstore.isUrl(d.url)) {
+            if (client == null) client = http_client.initClient(arena);
+            try (try objstore.parse(arena, d.url)).delete(arena, &client.?);
+        } else std.fs.cwd().deleteFile(d.url) catch |e| if (e != error.FileNotFound) return e;
+        gone += 1;
+    }
+    return gone;
+}
+
+/// The version a log file named `<20 digits><suffix>` is of.
+fn versionOf(name: []const u8, suffix: []const u8) ?u64 {
+    if (!std.mem.endsWith(u8, name, suffix) or name.len != 20 + suffix.len) return null;
+    return std.fmt.parseInt(u64, name[0..20], 10) catch null;
+}
+
+/// When the commit at `url` was made, by its `commitInfo`.
+fn commitTime(arena: std.mem.Allocator, url: []const u8) ?i64 {
+    const text = table.readWhole(arena, url) catch return null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const t = std.mem.trim(u8, line, " \r\t");
+        if (t.len == 0) continue;
+        const v = std.json.parseFromSliceLeaky(std.json.Value, arena, t, .{}) catch continue;
+        if (v != .object) continue;
+        const ci = v.object.get("commitInfo") orelse continue;
+        if (ci != .object) continue;
+        for ([_][]const u8{ "inCommitTimestamp", "timestamp" }) |k| if (ci.object.get(k)) |x| if (x == .integer) return x.integer;
+        return null;
+    }
+    return null;
+}
+
+pub const Written = struct { version: u64, rows: u64, bytes: u64, adds: u64, keep_log_ms: ?i64 = null };
 
 /// The checkpoint of `root`'s table at `version`, written, and `_last_checkpoint`
 /// pointed at it; `now_ms` decides which tombstones have expired.
@@ -154,7 +253,9 @@ pub fn write(arena: std.mem.Allocator, root: []const u8, version: u64, now_ms: i
         };
         try dlog.syncDir(dlog.trimDir(try std.mem.concat(arena, u8, &.{ root, delta.log_dir })));
     }
-    const out = Written{ .version = version, .rows = rows.total, .bytes = sum.bytes, .adds = whole.adds.count() };
+    var out = Written{ .version = version, .rows = rows.total, .bytes = sum.bytes, .adds = whole.adds.count() };
+    const cleans = if (s.property("delta.enableExpiredLogCleanup")) |t| !std.ascii.eqlIgnoreCase(std.mem.trim(u8, t, " "), "false") else true;
+    if (cleans) out.keep_log_ms = retentionWith(s.property("delta.logRetentionDuration"), default_log_retention_ms);
     try pointAt(arena, root, out);
     return out;
 }

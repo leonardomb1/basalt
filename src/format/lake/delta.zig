@@ -55,14 +55,14 @@ const refuse = table.refuse;
 /// One name in `_delta_log/`: a commit, a checkpoint (or one part of one), a V2
 /// checkpoint (named by a UUID), or a file a reader skips (`_last_checkpoint`,
 /// `.crc`, compacted commits, sidecars and staged files).
-const Name = union(enum) {
+pub const Name = union(enum) {
     commit: u64,
     checkpoint: struct { version: u64, part: u32, parts: u32 },
     v2: u64,
     other,
 };
 
-fn parseName(name: []const u8) Name {
+pub fn parseName(name: []const u8) Name {
     var n: usize = 0;
     while (n < name.len and std.ascii.isDigit(name[n])) n += 1;
     if (n == 0) return .other;
@@ -829,9 +829,14 @@ pub fn snapshot(arena: std.mem.Allocator, root: []const u8, at: table.At, listed
 /// `snapshot` at `version`, every action kept whole (`State.whole`), as a
 /// checkpoint of that version holds them.
 pub fn snapshotWhole(arena: std.mem.Allocator, root: []const u8, version: u64) !*State {
+    return snapshotWholeAt(arena, root, .{ .version = version });
+}
+
+/// `snapshotWhole` at `at`, the newest version when it names none.
+pub fn snapshotWholeAt(arena: std.mem.Allocator, root: []const u8, at: table.At) !*State {
     const w = try arena.create(State.Whole);
     w.* = .{};
-    return replay(arena, root, .{ .version = version }, null, w);
+    return replay(arena, root, at, null, w);
 }
 
 fn replay(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?[]const []const u8, whole: ?*State.Whole) !*State {

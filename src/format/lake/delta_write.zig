@@ -250,6 +250,7 @@ pub const Plan = struct {
     in_fields: []const types.Schema.Field = &.{},
     change: ?Change = null,
     new_meta: bool = false,
+    optimize: bool = false,
 
     /// What EXPLAIN and `check` add after the root.
     pub fn label(self: *const Plan, arena: std.mem.Allocator) ![]const u8 {
@@ -597,7 +598,7 @@ fn createdJson(w: *std.Io.Writer, col: []const u8, t_in: types.Type, depth: usiz
 
 const Field = dtypes.Field;
 
-fn tableFields(arena: std.mem.Allocator, name: []const u8, text: []const u8) ![]const Field {
+pub fn tableFields(arena: std.mem.Allocator, name: []const u8, text: []const u8) ![]const Field {
     const v = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch
         return refuse("{s} has a schemaString that is not JSON", .{name});
     return switch (try dtypes.fields(arena, v, .strict)) {
@@ -691,7 +692,7 @@ const honoured = [_][]const u8{
 };
 
 /// Refuses a table that asks a writer for what basalt does not do.
-fn writable(st: *const delta.State, fields: []const Field, mode: Mode) !void {
+pub fn writable(st: *const delta.State, fields: []const Field, mode: Mode) !void {
     if (st.writer_version > 7)
         return refuse("{s} needs Delta writer version {d}; basalt writes writer versions 1 to 7", .{ st.name, st.writer_version });
     if (st.writer_version == 7) for (st.writer_features) |f| {
@@ -858,6 +859,7 @@ pub const Sink = struct {
     spilled: bool = false,
     /// The version the commit became, once it is made.
     committed: ?u64 = null,
+    compacting: ?[]const delta.Add = null,
     warn: ?merge.Warn = null,
     /// Set once `close` or `abort` has freed everything, so an `abort` after a
     /// failed `close` does nothing.
@@ -922,12 +924,14 @@ pub const Sink = struct {
                 for (u.keys, 0..) |k, i| try pred.writer.print("{s}target.`{s}` = source.`{s}`", .{ if (i > 0) " AND " else "", k, k });
                 try jsontext.string(w, pred.written());
             },
-            else => {
+            else => if (p.optimize) {
+                try w.print("{{\"commitInfo\":{{\"timestamp\":{d},\"operation\":\"OPTIMIZE\",\"operationParameters\":{{\"predicate\":\"[]\"", .{now});
+            } else {
                 try w.print("{{\"commitInfo\":{{\"timestamp\":{d},\"operation\":\"WRITE\",\"operationParameters\":{{\"mode\":\"{s}\",\"partitionBy\":", .{ now, if (p.mode == .append) "Append" else "Overwrite" });
                 try jsontext.string(w, pb.written());
             },
         }
-        try w.print("}},\"isBlindAppend\":{s},\"engineInfo\":\"basalt/{s}\",\"txnId\":\"{s}\"}}}}\n", .{ if (p.mode == .append and p.snap != null) "true" else "false", @import("build_options").version, &self.txn });
+        try w.print("}},\"isBlindAppend\":{s},\"engineInfo\":\"basalt/{s}\",\"txnId\":\"{s}\"}}}}\n", .{ if (p.mode == .append and p.snap != null and !p.optimize) "true" else "false", @import("build_options").version, &self.txn });
         if (p.snap == null) {
             try w.writeAll("{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":2}}\n");
             try w.print("{{\"metaData\":{{\"id\":\"{s}\",\"format\":{{\"provider\":\"parquet\",\"options\":{{}}}},\"schemaString\":", .{&dlog.uuid()});
@@ -1146,7 +1150,7 @@ pub const Sink = struct {
             try w.writeByte(':');
             if (v) |t| try jsontext.string(w, t) else try w.writeAll("null");
         }
-        try w.print("}},\"size\":{d},\"modificationTime\":{d},\"dataChange\":true,\"stats\":", .{ sum.bytes, std.time.milliTimestamp() });
+        try w.print("}},\"size\":{d},\"modificationTime\":{d},\"dataChange\":{s},\"stats\":", .{ sum.bytes, std.time.milliTimestamp(), if (self.compacting == null) "true" else "false" });
         try jsontext.string(w, try statsJson(a, p, sum));
         try w.writeAll("}}\n");
         self.n_added += 1;
@@ -1172,9 +1176,15 @@ pub const Sink = struct {
             for (rs, removes) |*r, f| r.* = f.raw;
             read_set = rs;
         };
+        if (self.compacting) |files| {
+            removes = files;
+            const rs = try a.alloc([]const u8, files.len);
+            for (rs, files) |*r, f| r.* = f.raw;
+            read_set = rs;
+        }
         while (self.files.count() > 0) try self.finishFile(self.files.keys()[0]);
         const moved: ?i64 = if (p.change != null) (if (self.merging) |m| m.top else null) else null;
-        if (p.snap != null and self.n_added == 0 and (p.mode == .append or removes.len == 0) and moved == null) return;
+        if (p.snap != null and self.n_added == 0 and ((p.mode == .append and self.compacting == null) or removes.len == 0) and moved == null) return;
         const now = std.time.milliTimestamp();
         const w = &self.adds.writer;
         if (moved) |v| {
@@ -1185,7 +1195,7 @@ pub const Sink = struct {
         for (removes) |f| {
             try w.writeAll("{\"remove\":{\"path\":");
             try jsontext.string(w, f.raw);
-            try w.print(",\"deletionTimestamp\":{d},\"dataChange\":true,\"extendedFileMetadata\":true,\"partitionValues\":", .{now});
+            try w.print(",\"deletionTimestamp\":{d},\"dataChange\":{s},\"extendedFileMetadata\":true,\"partitionValues\":", .{ now, if (self.compacting == null) "true" else "false" });
             if (f.parts) |pv| try std.json.Stringify.value(pv, .{}, w) else try w.writeAll("{}");
             if (f.size) |s| try w.print(",\"size\":{d}", .{s});
             if (f.dv) |dv| {
@@ -1197,7 +1207,7 @@ pub const Sink = struct {
         for (self.dirs.keys()) |d| try dlog.syncDir(d);
         var ts = dlog.TableStore{ .root = p.root };
         self.committed = dlog.commit(a, ts.store(), p.name, .{
-            .kind = if (p.snap == null) .create else switch (p.mode) {
+            .kind = if (p.snap == null) .create else if (self.compacting != null) .upsert else switch (p.mode) {
                 .append => .append,
                 .replace => .replace,
                 .upsert => .upsert,
@@ -1226,10 +1236,19 @@ pub const Sink = struct {
         if (!ckpt.due(v, every)) return;
         var mem = std.heap.ArenaAllocator.init(pagecache.process);
         defer mem.deinit();
-        _ = ckpt.write(mem.allocator(), self.plan.root, v, std.time.milliTimestamp()) catch |e| {
+        const now = std.time.milliTimestamp();
+        const done = ckpt.write(mem.allocator(), self.plan.root, v, now) catch |e| {
             const why = eval.takeFailure(e) orelse @errorName(e);
             const w = self.warn orelse return;
             const msg = msgfmt.allocPrint(mem.allocator(), "{s} committed version {d}, but its checkpoint could not be written ({s}); the table reads as before, from its commits", .{ self.plan.name, v, why }) catch return;
+            w.f(w.ctx, msg);
+            return;
+        };
+        const keep = done.keep_log_ms orelse return;
+        _ = ckpt.cleanLog(mem.allocator(), self.plan.root, v, keep, now) catch |e| {
+            const why = eval.takeFailure(e) orelse @errorName(e);
+            const w = self.warn orelse return;
+            const msg = msgfmt.allocPrint(mem.allocator(), "{s} wrote its checkpoint at version {d}, but its expired log files could not all be deleted ({s}); the next checkpoint tries again", .{ self.plan.name, v, why }) catch return;
             w.f(w.ctx, msg);
         };
     }

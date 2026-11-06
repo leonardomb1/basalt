@@ -335,6 +335,7 @@ pub const WriteOptions = @import("analyze/targets.zig").WriteOptions;
 pub const writeOptions = @import("analyze/targets.zig").writeOptions;
 pub const writeFormat = @import("analyze/targets.zig").writeFormat;
 pub const deltaTarget = @import("analyze/targets.zig").deltaTarget;
+const procedures = @import("procedures.zig");
 
 /// The `$param` a `USING changes` statement's query reads the table's position as.
 pub const since_name = "since";
@@ -566,7 +567,12 @@ fn checkScriptStmt(arena: std.mem.Allocator, s: ast.Stmt, program: ast.Program, 
         .call => |c| {
             const fd = for (program.stmts) |o| {
                 if (o == .func and std.mem.eql(u8, o.func.name, c.name)) break o.func;
-            } else return;
+            } else {
+                const p = procedures.lookup(c.name) orelse
+                    return failPos(diag, c.pos, "CALL: no function or procedure named `{s}` (built-in procedures: delta_optimize, delta_vacuum)", .{c.name});
+                if (try procedures.arityProblem(arena, p, c)) |why| return failPos(diag, c.pos, "{s}", .{why});
+                return;
+            };
             if (fd.body != .stmts or fd.params.len != c.args.len) return;
             const args = try arena.alloc(?*const ast.Expr, c.args.len);
             for (c.args, args) |a, *o| o.* = a;
