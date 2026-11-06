@@ -77,6 +77,7 @@ WHERE day >= '2026-01-01'
 GROUP BY region;
 
 SELECT count(*) AS n_then FROM 's3://lake/sales/' WITH (version = 12);
+SELECT count(*) AS n_monday FROM 's3://lake/sales/' WITH (timestamp = '2026-11-02 06:00:00');
 ```
 
 The log is replayed as the protocol says: the newest complete checkpoint at or
@@ -87,7 +88,14 @@ together with its deletion vector, so a commit that replaces a file's deletion
 vector reads the same whatever order its lines are in. `WITH (version = 12)` reads the table as commit 12 left
 it, as long as the log still holds what that takes; an older version, or a
 commit missing from `_delta_log/`, is refused naming the versions that can be
-read. `_last_checkpoint` is not needed, since the log's listing is read.
+read. `WITH (timestamp = '2026-11-02 06:00:00')` reads the table as it stood
+then (UTC; a date alone is its midnight): the newest version committed at or
+before that time, by each commit's `commitInfo` (`inCommitTimestamp` where the
+table records one, else `timestamp`), found by halves among the readable
+commits. A time before the oldest readable commit or after the newest is
+refused naming that commit's version and time, as Spark refuses it, and
+`version` and `timestamp` together are refused. `_last_checkpoint` is not
+needed, since the log's listing is read.
 
 The schema is the table's (`metaData.schemaString`): a column a file lacks reads
 as NULL, as one added after the file was written does, and a file whose column

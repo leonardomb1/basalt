@@ -491,6 +491,31 @@ fn dataFiles(a: std.mem.Allocator, tmp: *testing.TmpDir) !usize {
     return n;
 }
 
+test "Delta time travel by timestamp: the newest commit at or before the time, by its commitInfo; outside the log's times refused" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT 1 AS id;", 1);
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT 2 AS id;", 1);
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT 3 AS id;", 1);
+    for (0..3) |v| {
+        const path = try std.fmt.allocPrint(a, "t/_delta_log/{d:0>20}.json", .{v});
+        const text = try tmp.dir.readFileAlloc(a, path, 1 << 16);
+        const at = std.mem.indexOf(u8, text, "{\"commitInfo\":{\"timestamp\":").? + 27;
+        const end = at + std.mem.indexOfScalar(u8, text[at..], ',').?;
+        try tmp.dir.writeFile(.{ .sub_path = path, .data = try std.mem.concat(a, u8, &.{ text[0..at], try std.fmt.allocPrint(a, "{d}", .{(v + 1) * 1000}), text[end..] }) });
+    }
+    const q = "SELECT COUNT(*) AS n FROM '$B/t/' WITH (timestamp = '{s}')";
+    for ([_][2][]const u8{ .{ "1970-01-01 00:00:01", "n\n1\n" }, .{ "1970-01-01 00:00:01.999", "n\n1\n" }, .{ "1970-01-01 00:00:02", "n\n2\n" }, .{ "1970-01-01 00:00:03", "n\n3\n" } }) |c|
+        try testing.expectEqualStrings(c[1], try rows(a, &tmp, try std.fmt.allocPrint(a, q, .{c[0]})));
+    try runRefuses(a, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/out.csv' AS {s};", .{try std.fmt.allocPrint(a, q, .{"1970-01-01 00:00:00.5"})}), "its oldest readable commit, version 0, is from 1970-01-01 00:00:01.000 UTC");
+    try runRefuses(a, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/out.csv' AS {s};", .{try std.fmt.allocPrint(a, q, .{"1970-01-01 00:00:04"})}), "its newest commit, version 2, is from 1970-01-01 00:00:03.000 UTC");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/out.csv' AS SELECT id FROM '$B/t/' WITH (timestamp = 'soon');", "is not a date or timestamp");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/out.csv' AS SELECT id FROM '$B/t/' WITH (timestamp = '1970-01-01', version = 1);", "give one");
+}
+
 test "Delta write: what is refused, at check where it can be seen" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();

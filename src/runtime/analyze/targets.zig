@@ -84,10 +84,20 @@ pub fn formatFromHints(hints: []const ast.Hint, diag: *Diag) Error!?FileFormat {
     return fail(diag, "unknown format `{s}` (" ++ formats.names_list ++ ")", .{s});
 }
 
-/// What a lake table read is pinned to: `version = N`, a Delta commit number.
+/// What a lake table read is pinned to: `version = N`, a Delta commit number, or
+/// `timestamp = '2026-11-01 08:00:00'`, the table as it stood then (UTC); not both.
 pub fn lakeAt(hints: []const ast.Hint, diag: *Diag) Error!lake.At {
     var at = lake.At{};
     for (hints) |h| {
+        if (std.mem.eql(u8, h.key, "timestamp")) {
+            const t = switch (h.value) {
+                .str, .ident => |s| s,
+                else => return fail(diag, "`timestamp` is the time to read a Delta table as of, as text: `timestamp = '2026-11-01 08:00:00'`", .{}),
+            };
+            at.timestamp_us = @import("../../exec/eval.zig").parseTimestampText(t) orelse
+                return fail(diag, "`timestamp = '{s}'` is not a date or timestamp (`2026-11-01` or `2026-11-01 08:00:00`, UTC)", .{t});
+            continue;
+        }
         const n: ?i64 = switch (h.value) {
             .int => |i| i,
             .str, .ident => |s| std.fmt.parseInt(i64, s, 10) catch null,
@@ -99,6 +109,8 @@ pub fn lakeAt(hints: []const ast.Hint, diag: *Diag) Error!lake.At {
             at.version = @intCast(v);
         }
     }
+    if (at.version != null and at.timestamp_us != null)
+        return fail(diag, "`version` and `timestamp` both pin the Delta table read; give one", .{});
     return at;
 }
 
@@ -438,7 +450,7 @@ pub fn laneHints(st: ast.Stage) bool {
             if (!in_folder and f != readFormat(p, null)) return false;
             continue;
         }
-        if (std.mem.eql(u8, h.key, "version") and st.node == .read and st.node.read.form == .path and lake.isTablePath(st.node.read.form.path)) continue;
+        if ((std.mem.eql(u8, h.key, "version") or std.mem.eql(u8, h.key, "timestamp")) and st.node == .read and st.node.read.form == .path and lake.isTablePath(st.node.read.form.path)) continue;
         return false;
     }
     return true;

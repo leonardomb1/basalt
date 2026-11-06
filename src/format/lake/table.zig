@@ -42,16 +42,18 @@ pub const Kind = enum {
     }
 };
 
-/// What a read is pinned to: a Delta commit `version`; none reads the newest.
+/// What a read is pinned to: a Delta commit `version`, or the newest commit at or
+/// before `timestamp_us` (UTC microseconds); none reads the newest.
 pub const At = struct {
     version: ?u64 = null,
+    timestamp_us: ?i64 = null,
 
     pub fn eql(a: At, b: At) bool {
-        return a.version == b.version;
+        return a.version == b.version and a.timestamp_us == b.timestamp_us;
     }
 
     pub fn pinned(self: At) bool {
-        return self.version != null;
+        return self.version != null or self.timestamp_us != null;
     }
 };
 

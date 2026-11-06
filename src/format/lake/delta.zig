@@ -105,6 +105,14 @@ const Checkpoint = struct { version: u64, parts: u32 };
 const Parts = std.AutoArrayHashMapUnmanaged(u32, []const u8);
 
 /// What `_delta_log/` lists, and which of it a version is read from.
+/// Milliseconds since the epoch as `2026-11-01 08:00:00.000` (UTC), for messages.
+fn msText(arena: std.mem.Allocator, ms: i64) ![]const u8 {
+    const days = @divFloor(ms, 86_400_000);
+    const rem: u64 = @intCast(ms - days * 86_400_000);
+    const c = @import("../../exec/civil.zig").civilFromDays(days);
+    return msgfmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3} UTC", .{ @as(u64, @intCast(@max(c.y, 0))), c.m, c.d, rem / 3_600_000, rem / 60_000 % 60, rem / 1000 % 60, rem % 1000 });
+}
+
 const Log = struct {
     name: []const u8,
     commits: std.AutoHashMapUnmanaged(u64, []const u8) = .empty,
@@ -137,6 +145,42 @@ const Log = struct {
     }
 
     /// The oldest version every file needed to read it is still there for.
+    /// The newest version committed at or before `t_us`, by commit times
+    /// (`commitInfo`), searched by halves among the readable commits; a time before
+    /// the oldest readable commit or after the newest is refused, as Spark refuses it.
+    fn asOf(self: *const Log, arena: std.mem.Allocator, newest: u64, t_us: i64) !u64 {
+        const t = @divFloor(t_us, 1000);
+        var lo = self.oldest(newest);
+        var hi = newest;
+        const first = try self.commitMs(arena, lo);
+        const last = try self.commitMs(arena, hi);
+        if (t < first) return refuse("{s} has no version as of that time: its oldest readable commit, version {d}, is from {s}", .{ self.name, lo, try msText(arena, first) });
+        if (t > last) return refuse("{s} has no version as of that time: its newest commit, version {d}, is from {s}", .{ self.name, hi, try msText(arena, last) });
+        while (lo < hi) {
+            const mid = lo + (hi - lo + 1) / 2;
+            if (try self.commitMs(arena, mid) <= t) lo = mid else hi = mid - 1;
+        }
+        return lo;
+    }
+
+    /// When commit `v` was made: its `commitInfo`'s `inCommitTimestamp`, else
+    /// `timestamp`, in milliseconds.
+    fn commitMs(self: *const Log, arena: std.mem.Allocator, v: u64) !i64 {
+        const url = self.commits.get(v) orelse return refuse("{s} has no commit file for version {d}, so it cannot tell when that version was made", .{ self.name, v });
+        const text = try table.readWhole(arena, url);
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            const l = std.mem.trim(u8, line, " \r\t");
+            if (l.len == 0) continue;
+            const j = std.json.parseFromSliceLeaky(std.json.Value, arena, l, .{}) catch continue;
+            if (j != .object) continue;
+            const ci = j.object.get("commitInfo") orelse continue;
+            if (ci != .object) continue;
+            for ([_][]const u8{ "inCommitTimestamp", "timestamp" }) |k| if (ci.object.get(k)) |x| if (x == .integer) return x.integer;
+        }
+        return refuse("{s}'s commit {d} records no time (`commitInfo.timestamp`), so a read as of a time cannot place it", .{ self.name, v });
+    }
+
     fn oldest(self: *const Log, newest: u64) u64 {
         var lo: u64 = if (self.commits.contains(0)) 0 else newest;
         for (self.checkpoints.keys(), self.checkpoints.values()) |c, p| {
@@ -856,7 +900,7 @@ fn replay(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?
         try log.add(arena, u, rel);
     }
     const newest = log.latest() orelse return refuse("{s} has no commit in _delta_log/", .{name});
-    const target = at.version orelse newest;
+    const target = if (at.timestamp_us) |t| try log.asOf(arena, newest, t) else at.version orelse newest;
     if (target > newest)
         return refuse("{s} has no version {d} (versions {d} to {d} can be read)", .{ name, target, log.oldest(newest), newest });
     const from = try log.base(target);
