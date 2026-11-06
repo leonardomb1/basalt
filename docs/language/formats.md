@@ -396,7 +396,15 @@ with nothing new commits nothing. A position behind the one the table holds
 fails the run, as the query then read changes already applied, and a writer
 committing a position for the same `name` concurrently fails it as a conflict,
 so a rerun after either applies from where the table stands. The position is a
-number Delta keeps, so `position` takes an INT, DATE or TIMESTAMP. The columns
+number Delta keeps, so `position` takes an INT, DATE or TIMESTAMP; its type is
+kept as the table property `basalt.changes.<name>.position` (`int`, `date` or
+`timestamp`), written with the first position, so `$since` reads back as that
+type before the query runs, whatever the source (a database's column types are
+not known until its query does). A run whose `position` is of another type is
+refused. A table written before basalt kept the type has it taken from the
+query where its source's types are known ahead (a file, a Delta table); where
+they are not, `$since` reads as NULL once, with a warning, so that run reads
+every change again (an UPSERT of the same rows) and records the type. The columns
 the arguments read are not written to a table that lacks them, so a feed's
 `op`, `seq` and `lsn` stay out of a table the write creates; a column wanted in
 the table as well is given twice (`SELECT *, at AS changed_at` with `position =

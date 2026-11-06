@@ -86,6 +86,7 @@ const topNStages = @import("../lanes.zig").topNStages;
 const types = @import("../../lang/types.zig");
 const lake = @import("../../format/lake/table.zig");
 const delta = @import("../../format/lake/delta.zig");
+const delta_write = @import("../../format/lake/delta_write.zig");
 const mkLit = @import("../env.zig").mkLit;
 const Value = @import("../../exec/value.zig").Value;
 const unionCanon = @import("../plan.zig").unionCanon;
@@ -108,16 +109,26 @@ fn bindSince(env: *Env, out: ast.Pipeline) !void {
     const found = (try lake.detect(env.arena, w.target)) orelse return;
     if (found.kind != .delta) return;
     const st = try delta.snapshot(env.arena, w.target, .{}, found.listed);
-    const v = st.txns.get(ch.name orelse w.target) orelse return;
-    _ = env.params.remove(analyze.since_name);
-    _ = env.params_expr.remove(analyze.since_name);
-    var adiag = analyze.Diag{};
-    const plan = try analyze.analyzeOne(env.arena, out, env.bindings, env.connections, env.params_expr, &adiag, env.tables, 1);
-    var kind: types.TypeKind = .int;
-    for (plan.outputs[0].stages) |sg| if (sg.out_schema) |sc| if (sc.indexOf(ast.Changes.pos_col)) |i| {
-        kind = sc.fields[i].ty.kind;
+    const app = ch.name orelse w.target;
+    const v = st.txns.get(app) orelse return;
+    const recorded = st.property(try delta_write.positionKey(env.arena, app));
+    var kind: ?types.TypeKind = if (recorded) |r| std.meta.stringToEnum(types.TypeKind, r) else null;
+    if (kind == null) {
+        _ = env.params.remove(analyze.since_name);
+        _ = env.params_expr.remove(analyze.since_name);
+        var adiag = analyze.Diag{};
+        const plan = try analyze.analyzeOne(env.arena, out, env.bindings, env.connections, env.params_expr, &adiag, env.tables, 1);
+        for (plan.outputs[0].stages) |sg| if (sg.out_schema) |sc| if (sc.indexOf(ast.Changes.pos_col)) |i| {
+            if (!sc.fields[i].ty.unknown) kind = sc.fields[i].ty.kind;
+        };
+    }
+    const known = kind orelse {
+        env.log.log(.warn, "{s} keeps no type for the position of `{s}` (it was written before basalt recorded one) and its source's types are not known before it runs, so $since reads as NULL and every change is read again; this run records the type", .{ w.target, app });
+        try env.params.put(analyze.since_name, .null);
+        try env.params_expr.put(analyze.since_name, nul);
+        return;
     };
-    const val: Value = switch (kind) {
+    const val: Value = switch (known) {
         .date => .{ .date = std.math.cast(i32, v) orelse return planErr(env.diag, "the position the Delta table keeps for this feed is not a date") },
         .timestamp => .{ .timestamp = v },
         else => .{ .int = v },

@@ -957,6 +957,31 @@ test "Delta deletion vectors on a table tracking row ids: a file added again kee
     try testing.expectEqualStrings("id,grp,amt\n1,a,10\n2,z,99\n3,b,5\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
 }
 
+test "Delta USING changes: the table records its position's type, so $since reads back as a timestamp; a run of another type is refused" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,at\n1,2026-11-01 10:00:00\n2,2026-11-02 11:00:00\n" });
+    const apply =
+        \\LOAD INTO '$B/t/' WITH (format = 'delta') UPSERT ON (id)
+        \\  USING changes (sequence_by = _stamp, position = _stamp, name = 'feed')
+        \\AS SELECT id, CAST(at AS TIMESTAMP) AS _stamp FROM '$B/c.csv'
+        \\   WHERE $since IS NULL OR CAST(at AS TIMESTAMP) >= date_add('minute', -10, $since);
+    ;
+    try load(&tmp, apply, 1);
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 0), "\"basalt.changes.feed.position\":\"timestamp\"") != null);
+    try load(&tmp, apply, 1);
+    try testing.expectEqual(@as(usize, 0), try actions(a, &tmp, "t", 1, "metaData"));
+    try testing.expectEqualStrings("id\n1\n2\n", try rows(a, &tmp, "SELECT id FROM '$B/t/' ORDER BY id"));
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = id, position = id, name = 'feed') AS SELECT id FROM '$B/c.csv';", "keeps the position of `feed` as timestamp, but this run's `position` is int");
+
+    try load(&tmp, "LOAD INTO '$B/p/' WITH (format = 'delta') AS SELECT id FROM '$B/c.csv';", 1);
+    try load(&tmp, "LOAD INTO '$B/p/' UPSERT ON (id) USING changes (sequence_by = id, position = id, name = 'n') AS SELECT id FROM '$B/c.csv';", 1);
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "p", 1), "\"basalt.changes.n.position\":\"int\"") != null);
+}
+
 test "Delta write: what is refused, at check where it can be seen" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();

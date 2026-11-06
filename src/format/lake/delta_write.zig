@@ -676,8 +676,19 @@ fn changeOf(arena: std.mem.Allocator, p: *const Plan, st: ?*delta.State) !?Chang
         return refuse("`delete_when` in `USING changes` is {s}, not a condition; write it as one, e.g. `delete_when = op = 'd'`", .{try dt.name(arena)});
     const seq_ty = fields[c.seq].ty;
     if (seq_ty.isNested()) return refuse("`sequence_by` in `USING changes` is {s}; it orders a key's changes, so it takes a number, date, timestamp or text", .{try seq_ty.name(arena)});
-    if (st) |s| out.since = s.txns.get(out.app);
+    if (st) |s| {
+        out.since = s.txns.get(out.app);
+        if (s.property(try positionKey(arena, out.app))) |rec| if (!std.mem.eql(u8, rec, @tagName(out.kind)))
+            return refuse("{s} keeps the position of `{s}` as {s}, but this run's `position` is {s}; a position read back as another type would compare wrongly, so give it the type the table keeps", .{ p.name, out.app, rec, @tagName(out.kind) });
+    }
     return out;
+}
+
+/// The table property that records the type of the position a `USING changes`
+/// feed named `app` keeps (`int`, `date` or `timestamp`), so a run can read the
+/// position back as that type before its query runs.
+pub fn positionKey(arena: std.mem.Allocator, app: []const u8) ![]const u8 {
+    return std.mem.concat(arena, u8, &.{ "basalt.changes.", app, ".position" });
 }
 
 /// A basalt column as a new table's column. A column a whole input held only NULLs
@@ -1162,14 +1173,20 @@ pub const Sink = struct {
             try jsontext.string(w, p.schema_string);
             try w.writeAll(",\"partitionColumns\":");
             try w.writeAll(pb.written());
-            try w.print(",\"configuration\":{{}},\"createdTime\":{d}}}}}\n", .{now});
-        } else if (p.new_meta) {
+            try w.writeAll(",\"configuration\":{");
+            if (p.change) |ch| {
+                try jsontext.string(w, try positionKey(a, ch.app));
+                try w.print(":\"{s}\"", .{@tagName(ch.kind)});
+            }
+            try w.print("}},\"createdTime\":{d}}}}}\n", .{now});
+        } else if (p.new_meta or self.recordsPosition()) {
             const st = p.snap.?;
             var o = if (st.meta_raw) |m| (if (m == .object) try m.object.clone() else std.json.ObjectMap.init(a)) else std.json.ObjectMap.init(a);
             try o.put("schemaString", .{ .string = p.schema_string });
-            if (p.max_column_id) |m| {
+            if (p.max_column_id != null or p.change != null) {
                 var conf = if (o.get("configuration")) |c| (if (c == .object) try c.object.clone() else std.json.ObjectMap.init(a)) else if (st.config) |c| try c.object.clone() else std.json.ObjectMap.init(a);
-                try conf.put("delta.columnMapping.maxColumnId", .{ .string = try msgfmt.allocPrint(a, "{d}", .{m}) });
+                if (p.max_column_id) |m| try conf.put("delta.columnMapping.maxColumnId", .{ .string = try msgfmt.allocPrint(a, "{d}", .{m}) });
+                if (p.change) |ch| try conf.put(try positionKey(a, ch.app), .{ .string = @tagName(ch.kind) });
                 try o.put("configuration", .{ .object = conf });
             }
             var parts = std.json.Array.init(a);
@@ -1182,6 +1199,15 @@ pub const Sink = struct {
             try std.json.Stringify.value(std.json.Value{ .object = o }, .{}, w);
             try w.writeAll("}\n");
         }
+    }
+
+    /// Whether this write's commit records its feed's position type, which the
+    /// table does not yet keep (`positionKey`).
+    fn recordsPosition(self: *Sink) bool {
+        const ch = self.plan.change orelse return false;
+        const st = self.plan.snap orelse return false;
+        const key = positionKey(self.mem.allocator(), ch.app) catch return true;
+        return st.property(key) == null;
     }
 
     pub fn sink(self: *Sink) driver.Sink {
