@@ -44,7 +44,6 @@ const pqwrite = @import("../parquet/write.zig");
 const types = @import("../../lang/types.zig");
 const testing = std.testing;
 
-/// Commits between checkpoints when the table does not set `delta.checkpointInterval`.
 pub const default_interval = 10;
 
 const default_retention_ms: i64 = 7 * 24 * 3600 * 1000;

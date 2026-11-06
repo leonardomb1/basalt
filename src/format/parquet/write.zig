@@ -177,11 +177,6 @@ const Mapping = struct {
     utc: bool = false,
 };
 
-/// A column laid out narrower than its basalt type, or naming a timezone, for a
-/// file that must match a table's schema: an 8-, 16- or 32-bit integer, a 32-bit
-/// float, a timestamp adjusted to UTC; a nested column's `leaves` lay out its
-/// leaves so, in schema order (a struct's fields, a list's element, a map's key
-/// then value), each past the slice taking its type's own.
 pub const Physical = struct {
     int_bits: u8 = 64,
     float32: bool = false,
@@ -836,11 +831,6 @@ pub const Writer = struct {
         _ = try self.finish(null);
     }
 
-    /// One column's statistics over the whole file: `bounded` false when a row
-    /// group held values but no min and max (a NaN), so the file has none. A
-    /// nested column has none of its own but `leaves`, one per leaf no list or map
-    /// lies above (a struct's fields, to any depth), each with its `path` below the
-    /// column and its index among the column's leaves (`leaf`), in schema order.
     pub const ColumnStats = struct {
         nulls: i64 = 0,
         min: ?Value = null,

@@ -54,9 +54,6 @@ pub var replays = std.atomic.Value(u64).init(0);
 
 const refuse = table.refuse;
 
-/// One name in `_delta_log/`: a commit, a checkpoint (or one part of one), a V2
-/// checkpoint (named by a UUID), or a file a reader skips (`_last_checkpoint`,
-/// `.crc`, compacted commits, sidecars and staged files).
 pub const Name = union(enum) {
     commit: u64,
     checkpoint: struct { version: u64, part: u32, parts: u32 },
@@ -735,13 +732,11 @@ fn strings(arena: std.mem.Allocator, v: ?std.json.Value) ![]const []const u8 {
     return out.items;
 }
 
+const whole_depth = 8;
+
 /// `v` copied into `arena`, so it outlives the parse it came from. Kept action
 /// fields (partition values, a deletion vector, the configuration) are flat maps;
 /// nesting past `depth` is dropped.
-/// How deep a whole action (`State.Whole`) is kept: a `metaData`'s format options
-/// are three levels down.
-const whole_depth = 8;
-
 fn ownJson(arena: std.mem.Allocator, v: std.json.Value, depth: u8) !std.json.Value {
     switch (v) {
         .string => |s| return .{ .string = try arena.dupe(u8, s) },
@@ -927,7 +922,6 @@ pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_
 /// A layout over some of a table's live files, `files` aligned with `adds`.
 pub const FileLayout = struct { layout: Layout, files: []Layout.File };
 
-/// The names a layout's hidden row-tracking fields go by (`withRows`).
 pub const row_id_name = "\x00row_id";
 pub const row_version_name = "\x00row_version";
 

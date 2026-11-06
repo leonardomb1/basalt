@@ -337,7 +337,6 @@ pub const writeFormat = @import("analyze/targets.zig").writeFormat;
 pub const deltaTarget = @import("analyze/targets.zig").deltaTarget;
 const procedures = @import("procedures.zig");
 
-/// The `$param` a `USING changes` statement's query reads the table's position as.
 pub const since_name = "since";
 pub const partitionBy = @import("analyze/targets.zig").partitionBy;
 const delta_write = @import("../format/lake/delta_write.zig");

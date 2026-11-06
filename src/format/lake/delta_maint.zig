@@ -44,7 +44,6 @@ const testing = std.testing;
 
 const refuse = table.refuse;
 
-/// What a VACUUM did: the files it deleted, and the files it kept as referenced.
 pub const Vacuumed = struct { deleted: usize, kept: usize };
 
 /// VACUUM of `root`'s table: the retention `retain_ms` (null: the table's), the
@@ -93,8 +92,6 @@ pub fn vacuum(arena: std.mem.Allocator, root: []const u8, retain_ms: ?i64, now_m
     return out;
 }
 
-/// What an OPTIMIZE did: the files it read and removed, the files it wrote, the
-/// partitions it compacted.
 pub const Optimized = struct { removed: usize, added: usize, partitions: usize };
 
 /// OPTIMIZE of `root`'s table, its files kept by `where` (SQL over the partition

@@ -96,10 +96,7 @@ pub const Commit = struct {
     key_root: []const u8 = "",
     /// An UPSERT's test of a winner's added file.
     hold: ?Hold = null,
-    /// The application whose position (`txn`) the commit moves, under `USING changes`.
     app: ?[]const u8 = null,
-    /// The commit's in-commit timestamp, written into `body` as
-    /// `"inCommitTimestamp":<ict>`; a retry past a winner raises it above the winner's.
     ict: ?i64 = null,
     rows: ?RowIds = null,
 };

@@ -63,9 +63,6 @@ const testing = std.testing;
 
 pub const Error = error{ DeltaNullKey, DeltaDuplicateKey, DeltaUpsertTooLarge, DeltaChangeOrder };
 
-/// What the merge reads: the run's spill space, the join's memory, its threads;
-/// and where the write sends a warning it does not fail on (`warn`, its `f`
-/// called with its `ctx` and the message).
 pub const Opts = struct {
     space: ?Space = null,
     op_memory: usize = 2 << 30,

@@ -42,8 +42,6 @@ pub const Kind = enum {
     }
 };
 
-/// What a read is pinned to: a Delta commit `version`, or the newest commit at or
-/// before `timestamp_us` (UTC microseconds); none reads the newest.
 pub const At = struct {
     version: ?u64 = null,
     timestamp_us: ?i64 = null,
