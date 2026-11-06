@@ -1858,7 +1858,9 @@ pub fn setOpStages(self: *Parser, left: []const ast.Stage, right: []const ast.St
     return out.toOwnedSlice();
 }
 
-pub fn appendUnion(self: *Parser, cores: []const Core, distinct: bool, positional: bool, stages: *std.array_list.Managed(ast.Stage), pos: Pos) Error!void {
+pub fn appendUnion(self: *Parser, cores_in: []const Core, distinct: bool, positional: bool, stages: *std.array_list.Managed(ast.Stage), pos: Pos) Error!void {
+    var schema_from: ?ast.Hint = null;
+    const cores = if (positional) cores_in else try liftSchemaFrom(self, cores_in, &schema_from);
     var branches = std.array_list.Managed(ast.UnionBranch).init(self.arena);
     var tag_col: ?[]const u8 = null;
     for (cores) |core| {
@@ -1878,6 +1880,7 @@ pub fn appendUnion(self: *Parser, cores: []const Core, distinct: bool, positiona
     var hints = std.array_list.Managed(ast.Hint).init(self.arena);
     if (tag_col) |tc|
         try hints.append(.{ .key = "tag", .value = .{ .ident = tc }, .pos = pos });
+    if (schema_from) |h| try hints.append(h);
     if (!positional) try self.parseUnionClauses(&hints, pos);
 
     try stages.append(.{
@@ -1886,6 +1889,28 @@ pub fn appendUnion(self: *Parser, cores: []const Core, distinct: bool, positiona
         .pos = pos,
     });
     if (distinct) try stages.append(.{ .node = .{ .distinct = .{ .on = null } }, .hints = &.{}, .pos = pos });
+}
+
+/// `cores` with a `WITH (schema_from = ...)` written after the last branch taken
+/// off that branch's read into `out`: it names the union's schema, which no
+/// single read has.
+fn liftSchemaFrom(self: *Parser, cores: []const Core, out: *?ast.Hint) Error![]const Core {
+    if (cores.len == 0) return cores;
+    const last = cores[cores.len - 1];
+    if (last.stages.len == 0) return cores;
+    const hs = last.stages[0].hints;
+    const at = for (hs, 0..) |h, i| {
+        if (std.mem.eql(u8, h.key, "schema_from")) break i;
+    } else return cores;
+    out.* = hs[at];
+    const kept = try self.arena.alloc(ast.Hint, hs.len - 1);
+    @memcpy(kept[0..at], hs[0..at]);
+    @memcpy(kept[at..], hs[at + 1 ..]);
+    const st = try self.arena.dupe(ast.Stage, last.stages);
+    st[0].hints = kept;
+    const cs = try self.arena.dupe(Core, cores);
+    cs[cs.len - 1].stages = st;
+    return cs;
 }
 
 /// `USING (a, b)`: the right side's columns of those names are renamed apart, the

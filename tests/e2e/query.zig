@@ -791,7 +791,7 @@ test "union reconciles branches to a canon schema (tag, null-fill, drop-extra)" 
 
     const script = try std.fmt.allocPrint(
         alloc,
-        "LOAD INTO '{s}/out.csv' AS\nSELECT '01' AS src, t.* FROM '{s}/a.csv' t\nUNION ALL BY NAME\nSELECT '02' AS src, t.* FROM '{s}/b.csv' t\nANCHOR SCHEMA first;",
+        "LOAD INTO '{s}/out.csv' AS\nSELECT '01' AS src, t.* FROM '{s}/a.csv' t\nUNION ALL BY NAME\nSELECT '02' AS src, t.* FROM '{s}/b.csv' t\nWITH (schema_from = 'first');",
         .{ base, base, base },
     );
     defer alloc.free(script);
@@ -1651,7 +1651,7 @@ test "union: SELECT * EXCEPT drops a column before the branches are reconciled, 
     defer alloc.free(base);
     const with_u =
         \\WITH u AS (SELECT id, CAST(x AS DATE) AS x FROM '$B/ua.csv'
-        \\           UNION ALL BY NAME SELECT id, CAST(x AS INT) AS x FROM '$B/ub.csv' ANCHOR SCHEMA first)
+        \\           UNION ALL BY NAME SELECT id, CAST(x AS INT) AS x FROM '$B/ub.csv' WITH (schema_from = 'first'))
     ;
     const bad = try std.mem.replaceOwned(u8, alloc, "LOAD INTO '$B/bad.csv' AS " ++ with_u ++ "\nSELECT * FROM u;", "$B", base);
     defer alloc.free(bad);

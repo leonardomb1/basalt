@@ -1661,14 +1661,14 @@ const Ctx = struct {
                         .except => "except",
                     }, un.branches.len });
                 const listed = un.discover_query.len == 0 and un.discover_pipeline == null and un.discover_json.len == 0;
-                if (listed) if (env_mod.forHintIdent(lead.hints, "canon")) |c| if (std.mem.indexOf(u8, c, "${") == null) {
+                if (listed) if (env_mod.unionSchemaFrom(lead.hints)) |c| if (std.mem.indexOf(u8, c, "${") == null) {
                     const names = try self.arena.alloc([]const u8, un.branches.len);
                     for (un.branches, names) |b, *n| n.* = unionBranchName(b);
                     const rendered = for (names) |n| {
                         if (std.mem.indexOf(u8, n, "${") != null) break true;
                     } else false;
                     const at = for (lead.hints) |h| {
-                        if (std.mem.eql(u8, h.key, "canon")) break h.pos;
+                        if (std.mem.eql(u8, h.key, "schema_from") or std.mem.eql(u8, h.key, "canon")) break h.pos;
                     } else lead.pos;
                     if (!rendered) if (try unionCanonProblem(self.arena, c, names)) |why| return failPos(self.diag, at, "{s}", .{why});
                 };
@@ -2020,7 +2020,7 @@ pub const rest_read_keys = [_][]const u8{
     "cursor_field",   "total_field",   "max_pages",    "stop_short",  "prefetch",  "retries",
     "retry_statuses", "retry_base_ms", "timeout_ms",   "progress_ms", "paging_in", "total_rows_field",
 };
-const union_read_keys = [_][]const u8{ "tag", "table_field", "tag_field", "tag_substr" };
+const union_read_keys = [_][]const u8{ "tag", "table_field", "tag_field", "tag_substr", "schema_from" };
 
 const ReadKind = struct { what: []const u8, keys: []const []const u8, takes: []const u8 };
 
@@ -2033,7 +2033,7 @@ const file_reads = blk: {
 const stdin_read = ReadKind{ .what = "a STDIN read", .keys = formats.stdin_read_keys, .takes = formats.takes(formats.stdin_read_keys) };
 const rest_read = ReadKind{ .what = "a REST read", .keys = &rest_read_keys, .takes = "items, paginate, bearer_env and the other REST options in docs/language/sources.md" };
 const sql_read = ReadKind{ .what = "a SQL table read", .keys = &[_][]const u8{ "split", "splits", "split_kind" }, .takes = "split, splits, split_kind" };
-const union_read = ReadKind{ .what = "a UNION", .keys = &union_read_keys, .takes = "table_field, tag_field, tag_substr" };
+const union_read = ReadKind{ .what = "a UNION", .keys = &union_read_keys, .takes = "table_field, tag_field, tag_substr, schema_from" };
 const other_read = ReadKind{ .what = "this source", .keys = &.{}, .takes = "no options" };
 
 /// A read's `WITH` key that its kind of source does not read is refused rather

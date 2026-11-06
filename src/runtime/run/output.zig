@@ -814,7 +814,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
 fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: []const ast.Stage, write_stage: ast.Stage, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     const arena = env.arena;
     const tag_col = forHintIdent(hints, "tag");
-    const canon_opt = forHintIdent(hints, "canon");
+    const canon_opt = @import("../env.zig").unionSchemaFrom(hints);
     const specs = try unionSpecs(env, u, hints);
     if (specs.len == 0) return planErr(env.diag, "union has no source tables");
     if (!u.positional) for (specs) |*s| if (s.pipeline == null) {

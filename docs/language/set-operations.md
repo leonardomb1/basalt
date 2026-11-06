@@ -23,6 +23,11 @@ duplicates. Two NULLs count as the same value there, unlike in a join's `ON`.
 
 `BY NAME` lines branches up by column name instead, and is what reconciling N
 similar tables needs. It applies to `UNION` only, and a chain is one or the other.
+`WITH (schema_from = '<table>')`, after the last branch or after `EACH TABLE OF`,
+names the branch whose columns and types the union takes, the others fitted to
+it (`'first'`, the default, takes the first branch's, widened by the rest); a name
+no branch has is refused. It replaces `ANCHOR SCHEMA <table>`, which still works
+but is deprecated: `check` and `run` warn where it is written.
 
 A `BY NAME` branch may be **any query** — a file, a filter, a projection, an
 aggregate — not only `SELECT ['tag' AS c,] t.* FROM <conn>.<table>`. That shape
@@ -41,7 +46,7 @@ column. `UNION BY NAME` also deduplicates.
 SELECT '01' AS CT2_EMPRESA, t.* FROM erp.dbo.CT2010 t
 UNION ALL BY NAME
 SELECT '02' AS CT2_EMPRESA, t.* FROM erp.dbo.CT2020 t
-ANCHOR SCHEMA erp.dbo.CT2010;          -- schema authority (optional)
+WITH (schema_from = 'CT2010');         -- the branch whose schema the union takes (optional)
 ```
 
 ```sql
@@ -49,7 +54,7 @@ ANCHOR SCHEMA erp.dbo.CT2010;          -- schema authority (optional)
 SELECT *
 FROM EACH TABLE OF (erp.QUERY($$SELECT name, SUBSTRING(name,4,2) FROM sys.tables WHERE name LIKE 'CT2%'$$))
   AS (table_name, CT2_EMPRESA)         -- 2nd name = output tag column
-  ANCHOR SCHEMA erp.dbo.CT2010
+  WITH (schema_from = 'CT2010')
 WHERE D_E_L_E_T_ <> '*';               -- descends into EVERY branch's query
 ```
 
@@ -62,7 +67,7 @@ query's leading read when it names a connection; `IN <conn>` overrides it:
 SELECT *
 FROM EACH TABLE OF (SELECT name, substr(name, 4, 2) FROM erp.sys.tables WHERE name LIKE 'CT2%')
   AS (table_name, CT2_EMPRESA)
-  ANCHOR SCHEMA erp.dbo.CT2010;
+  WITH (schema_from = 'CT2010');
 ```
 
 JSON form (array of `{table, tag}` objects, e.g. from a `JSON` param):

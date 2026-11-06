@@ -327,7 +327,7 @@ pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, after: []con
     const arena = env.arena;
     const except: []const []const u8 = if (u.positional) &.{} else except_names;
     const tag_col = forHintIdent(hints, "tag");
-    const canon_opt = forHintIdent(hints, "canon");
+    const canon_opt = @import("../env.zig").unionSchemaFrom(hints);
     const specs = try unionSpecs(env, u, hints);
     if (specs.len == 0) return planErr(env.diag, "union has no source tables");
 

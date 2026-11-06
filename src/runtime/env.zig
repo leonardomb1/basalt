@@ -838,6 +838,12 @@ pub fn hasFlagHint(hints: []const ast.Hint, key: []const u8) bool {
     return false;
 }
 
+/// The branch a union takes its schema from: `WITH (schema_from = '...')`, else
+/// the deprecated `ANCHOR SCHEMA` (its `canon` hint).
+pub fn unionSchemaFrom(hints: []const ast.Hint) ?[]const u8 {
+    return forHintName(hints, "schema_from") orelse forHintIdent(hints, "canon");
+}
+
 pub fn forHintIdent(hints: []const ast.Hint, key: []const u8) ?[]const u8 {
     for (hints) |h| {
         if (std.mem.eql(u8, h.key, key) and h.value == .ident) return h.value.ident;

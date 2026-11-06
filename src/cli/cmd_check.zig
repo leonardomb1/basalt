@@ -235,3 +235,14 @@ test "check warns where PUSHDOWN is written, without failing" {
     try std.testing.expect(std.mem.indexOf(u8, issues[0].msg, "`PUSHDOWN(...)` is deprecated") != null);
     try std.testing.expectEqual(@as(u32, 1), issues[0].pos.?.line);
 }
+
+test "check warns where ANCHOR SCHEMA is written, and takes schema_from silently" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const old = try checkText(a, "SELECT * FROM 'a.csv' UNION ALL BY NAME SELECT * FROM 'b.csv' ANCHOR SCHEMA first;", "t.sql", ".", .{ .declarations_only = true });
+    try std.testing.expectEqual(@as(usize, 1), old.len);
+    try std.testing.expect(old[0].warning and std.mem.indexOf(u8, old[0].msg, "`ANCHOR SCHEMA` is deprecated") != null);
+    const new = try checkText(a, "SELECT * FROM 'a.csv' UNION ALL BY NAME SELECT * FROM 'b.csv' WITH (schema_from = 'first');", "t.sql", ".", .{ .declarations_only = true });
+    try std.testing.expectEqual(@as(usize, 0), new.len);
+}

@@ -1804,7 +1804,7 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/a.csv' p JOIN '$B/a.csv' q ON p.x = q.x WITH (max_build = 0);", "max_build must be positive" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM range('a', 3);", "RANGE bounds must be integer literals" },
         .{ "CREATE CONNECTION f TYPE sftp OPTIONS (host = 'h');\nLOAD INTO '$B/o.csv' AS SELECT * FROM f.t;", "unsupported source connector `sftp`" },
-        .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/a.csv' UNION ALL BY NAME SELECT * FROM '$B/a.csv' ANCHOR SCHEMA nope;", "union canon `nope` is not one of the source tables" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/a.csv' UNION ALL BY NAME SELECT * FROM '$B/a.csv' WITH (schema_from = 'nope');", "union canon `nope` is not one of the source tables" },
         .{ "CREATE CONNECTION h TYPE http OPTIONS (url = 'http://127.0.0.1');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "http connection `h`: unknown attribute `url`" },
         .{ "CREATE CONNECTION h TYPE http OPTIONS (base_url = 'http://127.0.0.1', auth = 'bearer');\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "http connection `h`: auth 'bearer' needs a `token`" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT x, LAG(x, 1, 'no') OVER (ORDER BY x) AS l FROM '$B/a.csv';", "LAG/LEAD default does not fit `x`" },

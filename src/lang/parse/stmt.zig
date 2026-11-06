@@ -309,7 +309,9 @@ pub fn parseUnionClauses(self: *Parser, hints: *std.array_list.Managed(ast.Hint)
             const frag = try self.exprToTemplate(e);
             if (frag.len > 0)
                 try hints.append(.{ .key = "where", .value = .{ .str = frag }, .pos = pos });
-        } else if (self.eatKw("anchor")) {
+        } else if (self.isKw("anchor")) {
+            try self.notes.append(self.arena, .{ .pos = self.curPos(), .msg = "`ANCHOR SCHEMA` is deprecated and will be removed: write `WITH (schema_from = '<table>')` after the union" });
+            _ = self.advance();
             try self.expectKw("schema");
             const q = try self.parseQualNameTok();
             try hints.append(.{ .key = "canon", .value = .{ .ident = q.last() }, .pos = pos });
