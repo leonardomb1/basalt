@@ -28,7 +28,7 @@ pub const Error = error{ VariantCorrupt, OutOfMemory };
 pub fn decode(arena: std.mem.Allocator, value: []const u8, metadata: []const u8) Error![]const u8 {
     const dict = try Dict.parse(metadata);
     var aw = std.Io.Writer.Allocating.init(arena);
-    _ = render(&aw.writer, dict, value, 0) catch |e| return switch (e) {
+    _ = renderAt(&aw.writer, dict, value, 0) catch |e| return switch (e) {
         error.WriteFailed, error.OutOfMemory => error.OutOfMemory,
         error.VariantCorrupt => error.VariantCorrupt,
     };
@@ -77,7 +77,7 @@ fn take(v: []const u8, at: usize, n: usize) Error![]const u8 {
 const max_depth = 64;
 
 /// Renders the value at the start of `v`; returns how many bytes it took.
-fn render(w: *std.Io.Writer, d: Dict, v: []const u8, depth: usize) (Error || std.Io.Writer.Error)!usize {
+fn renderAt(w: *std.Io.Writer, d: Dict, v: []const u8, depth: usize) (Error || std.Io.Writer.Error)!usize {
     if (depth > max_depth) return error.VariantCorrupt;
     if (v.len == 0) return error.VariantCorrupt;
     const basic = v[0] & 0x03;
@@ -107,7 +107,7 @@ fn render(w: *std.Io.Writer, d: Dict, v: []const u8, depth: usize) (Error || std
                 try w.writeByte(':');
                 const off = readUint(offs[i * offset_size ..][0..offset_size]);
                 if (data_at + off > v.len) return error.VariantCorrupt;
-                _ = try render(w, d, v[data_at + off ..], depth + 1);
+                _ = try renderAt(w, d, v[data_at + off ..], depth + 1);
             }
             try w.writeByte('}');
             return data_at + readUint(offs[n * offset_size ..][0..offset_size]);
@@ -125,7 +125,7 @@ fn render(w: *std.Io.Writer, d: Dict, v: []const u8, depth: usize) (Error || std
                 if (i > 0) try w.writeByte(',');
                 const off = readUint(offs[i * offset_size ..][0..offset_size]);
                 if (data_at + off > v.len) return error.VariantCorrupt;
-                _ = try render(w, d, v[data_at + off ..], depth + 1);
+                _ = try renderAt(w, d, v[data_at + off ..], depth + 1);
             }
             try w.writeByte(']');
             return data_at + readUint(offs[n * offset_size ..][0..offset_size]);
@@ -181,36 +181,174 @@ fn primitiveValue(v: []const u8, id: u8) Error!Primitive {
 
 pub const Encoded = struct { value: []const u8, metadata: []const u8 };
 
+pub const Node = union(enum) {
+    prim: []const u8,
+    object: []const Field,
+    array: []const Node,
+};
+
+pub const Field = struct { key: []const u8, value: Node };
+
 /// JSON text `text` as a variant; null for text that is not JSON.
 pub fn encode(arena: std.mem.Allocator, text: []const u8) Error!?Encoded {
     const j = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{ .parse_numbers = false }) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else null;
-    var keys = std.StringArrayHashMapUnmanaged(void).empty;
-    try collectKeys(arena, j, &keys, 0);
-    const sorted = try arena.dupe([]const u8, keys.keys());
-    std.mem.sort([]const u8, sorted, {}, struct {
-        fn lt(_: void, a: []const u8, b: []const u8) bool {
-            return std.mem.order(u8, a, b) == .lt;
-        }
-    }.lt);
-    var ids = std.StringHashMapUnmanaged(u32).empty;
-    for (sorted, 0..) |k, i| try ids.put(arena, k, @intCast(i));
-    var out = std.ArrayList(u8).empty;
-    try put(arena, &out, j, &ids, 0);
-    return .{ .value = out.items, .metadata = try metadataOf(arena, sorted) };
+    return try build(arena, try fromJson(arena, j, 0));
 }
 
-fn collectKeys(arena: std.mem.Allocator, j: std.json.Value, keys: *std.StringArrayHashMapUnmanaged(void), depth: usize) Error!void {
+/// A parsed JSON value as a variant tree, each scalar encoded as `encode` encodes it.
+fn fromJson(arena: std.mem.Allocator, j: std.json.Value, depth: usize) Error!Node {
     if (depth > max_depth) return error.VariantCorrupt;
     switch (j) {
         .object => |o| {
+            const fields = try arena.alloc(Field, o.count());
             var it = o.iterator();
-            while (it.next()) |kv| {
-                try keys.put(arena, kv.key_ptr.*, {});
-                try collectKeys(arena, kv.value_ptr.*, keys, depth + 1);
-            }
+            var i: usize = 0;
+            while (it.next()) |kv| : (i += 1) fields[i] = .{ .key = kv.key_ptr.*, .value = try fromJson(arena, kv.value_ptr.*, depth + 1) };
+            return .{ .object = fields };
         },
-        .array => |xs| for (xs.items) |x| try collectKeys(arena, x, keys, depth + 1),
-        else => {},
+        .array => |xs| {
+            const items = try arena.alloc(Node, xs.items.len);
+            for (items, xs.items) |*o, x| o.* = try fromJson(arena, x, depth + 1);
+            return .{ .array = items };
+        },
+        else => {
+            var out = std.ArrayList(u8).empty;
+            switch (j) {
+                .null => try out.append(arena, 0),
+                .bool => |b| try out.append(arena, if (b) 1 << 2 else 2 << 2),
+                .integer => |x| try putInt(arena, &out, x),
+                .float => |x| try putDouble(arena, &out, x),
+                .number_string => |t| try putNumber(arena, &out, t),
+                .string => |t| try putString(arena, &out, t),
+                else => unreachable,
+            }
+            return .{ .prim = out.items };
+        },
+    }
+}
+
+/// Variant `value` under dictionary `metadata` as a tree, each primitive the
+/// bytes it was encoded as.
+pub fn parse(arena: std.mem.Allocator, value: []const u8, metadata: []const u8) Error!Node {
+    return parseAt(arena, try Dict.parse(metadata), value, 0);
+}
+
+fn parseAt(arena: std.mem.Allocator, d: Dict, v: []const u8, depth: usize) Error!Node {
+    if (depth > max_depth) return error.VariantCorrupt;
+    if (v.len == 0) return error.VariantCorrupt;
+    const header = v[0] >> 2;
+    switch (v[0] & 0x03) {
+        0 => return .{ .prim = v[0..try primLen(v, header)] },
+        1 => return .{ .prim = (try take(v, 0, 1 + @as(usize, header))) },
+        2 => {
+            const offset_size: usize = (header & 0x03) + 1;
+            const id_size: usize = ((header >> 2) & 0x03) + 1;
+            const count_size: usize = if ((header >> 4) & 1 == 1) 4 else 1;
+            const n = readUint(try take(v, 1, count_size));
+            const ids_at = 1 + count_size;
+            const ids = try take(v, ids_at, std.math.mul(usize, n, id_size) catch return error.VariantCorrupt);
+            const offs_at = ids_at + ids.len;
+            const offs = try take(v, offs_at, std.math.mul(usize, n + 1, offset_size) catch return error.VariantCorrupt);
+            const data_at = offs_at + offs.len;
+            const fields = try arena.alloc(Field, n);
+            for (fields, 0..) |*f, i| {
+                const off = readUint(offs[i * offset_size ..][0..offset_size]);
+                if (data_at + off > v.len) return error.VariantCorrupt;
+                f.* = .{ .key = try d.key(readUint(ids[i * id_size ..][0..id_size])), .value = try parseAt(arena, d, v[data_at + off ..], depth + 1) };
+            }
+            return .{ .object = fields };
+        },
+        else => {
+            const offset_size: usize = (header & 0x03) + 1;
+            const count_size: usize = if ((header >> 2) & 1 == 1) 4 else 1;
+            const n = readUint(try take(v, 1, count_size));
+            const offs_at = 1 + count_size;
+            const offs = try take(v, offs_at, std.math.mul(usize, n + 1, offset_size) catch return error.VariantCorrupt);
+            const data_at = offs_at + offs.len;
+            const items = try arena.alloc(Node, n);
+            for (items, 0..) |*o, i| {
+                const off = readUint(offs[i * offset_size ..][0..offset_size]);
+                if (data_at + off > v.len) return error.VariantCorrupt;
+                o.* = try parseAt(arena, d, v[data_at + off ..], depth + 1);
+            }
+            return .{ .array = items };
+        },
+    }
+}
+
+/// How many bytes the primitive of type `id` at the start of `v` takes.
+fn primLen(v: []const u8, id: u8) Error!usize {
+    if (id == 20) return 1 + (try take(v, 1, 16)).len;
+    return (try primitiveValue(v, id)).len;
+}
+
+/// The JSON text of variant tree `node`, as `decode` renders a value.
+pub fn render(arena: std.mem.Allocator, node: Node) Error![]const u8 {
+    var aw = std.Io.Writer.Allocating.init(arena);
+    renderNode(arena, &aw.writer, node, 0) catch |e| return switch (e) {
+        error.WriteFailed, error.OutOfMemory => error.OutOfMemory,
+        error.VariantCorrupt => error.VariantCorrupt,
+    };
+    return aw.written();
+}
+
+fn renderNode(arena: std.mem.Allocator, w: *std.Io.Writer, node: Node, depth: usize) (Error || std.Io.Writer.Error)!void {
+    if (depth > max_depth) return error.VariantCorrupt;
+    switch (node) {
+        .prim => |b| _ = try renderAt(w, .{ .offset_size = 1, .size = 0, .offsets = &.{0}, .bytes = &.{} }, b, depth),
+        .object => |fs| {
+            const sorted = try arena.dupe(Field, fs);
+            std.mem.sort(Field, sorted, {}, fieldLess);
+            try w.writeByte('{');
+            for (sorted, 0..) |f, i| {
+                if (i > 0) try w.writeByte(',');
+                try jsontext.string(w, f.key);
+                try w.writeByte(':');
+                try renderNode(arena, w, f.value, depth + 1);
+            }
+            try w.writeByte('}');
+        },
+        .array => |xs| {
+            try w.writeByte('[');
+            for (xs, 0..) |x, i| {
+                if (i > 0) try w.writeByte(',');
+                try renderNode(arena, w, x, depth + 1);
+            }
+            try w.writeByte(']');
+        },
+    }
+}
+
+/// Variant tree `node` as its binary, with a dictionary of its keys, sorted.
+pub fn build(arena: std.mem.Allocator, node: Node) Error!Encoded {
+    var keys = std.StringArrayHashMapUnmanaged(void).empty;
+    try collectKeys(arena, node, &keys, 0);
+    const sorted = try arena.dupe([]const u8, keys.keys());
+    std.mem.sort([]const u8, sorted, {}, keyLess);
+    var ids = std.StringHashMapUnmanaged(u32).empty;
+    for (sorted, 0..) |k, i| try ids.put(arena, k, @intCast(i));
+    var out = std.ArrayList(u8).empty;
+    try put(arena, &out, node, &ids, 0);
+    return .{ .value = out.items, .metadata = try metadataOf(arena, sorted) };
+}
+
+fn keyLess(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
+fn fieldLess(_: void, a: Field, b: Field) bool {
+    return keyLess({}, a.key, b.key);
+}
+
+fn collectKeys(arena: std.mem.Allocator, node: Node, keys: *std.StringArrayHashMapUnmanaged(void), depth: usize) Error!void {
+    if (depth > max_depth) return error.VariantCorrupt;
+    switch (node) {
+        .prim => {},
+        .object => |fs| for (fs) |f| {
+            try keys.put(arena, f.key, {});
+            try collectKeys(arena, f.value, keys, depth + 1);
+        },
+        .array => |xs| for (xs) |x| try collectKeys(arena, x, keys, depth + 1),
     }
 }
 
@@ -242,56 +380,114 @@ fn putUint(arena: std.mem.Allocator, out: *std.ArrayList(u8), x: usize, width: u
     for (0..width) |i| try out.append(arena, @truncate(x >> @intCast(8 * i)));
 }
 
-fn put(arena: std.mem.Allocator, out: *std.ArrayList(u8), j: std.json.Value, ids: *const std.StringHashMapUnmanaged(u32), depth: usize) Error!void {
+/// Writes `node`; an object's fields go in the order of their keys, and a key
+/// given twice fails.
+fn put(arena: std.mem.Allocator, out: *std.ArrayList(u8), node: Node, ids: *const std.StringHashMapUnmanaged(u32), depth: usize) Error!void {
     if (depth > max_depth) return error.VariantCorrupt;
-    switch (j) {
-        .null => try out.append(arena, 0),
-        .bool => |b| try out.append(arena, if (b) 1 << 2 else 2 << 2),
-        .integer => |x| try putInt(arena, out, x),
-        .float => |x| try putDouble(arena, out, x),
-        .number_string => |t| try putNumber(arena, out, t),
-        .string => |s| try putString(arena, out, s),
+    switch (node) {
+        .prim => |b| try out.appendSlice(arena, b),
         .array => |xs| {
             var parts = std.ArrayList(u8).empty;
-            const offs = try arena.alloc(usize, xs.items.len + 1);
-            for (xs.items, 0..) |x, i| {
+            const offs = try arena.alloc(usize, xs.len + 1);
+            for (xs, 0..) |x, i| {
                 offs[i] = parts.items.len;
                 try put(arena, &parts, x, ids, depth + 1);
             }
-            offs[xs.items.len] = parts.items.len;
+            offs[xs.len] = parts.items.len;
             const os = widthFor(parts.items.len);
-            const large = xs.items.len > 0xff;
+            const large = xs.len > 0xff;
             try out.append(arena, 3 | @as(u8, @intCast((os - 1) | (@as(usize, @intFromBool(large)) << 2))) << 2);
-            try putUint(arena, out, xs.items.len, if (large) 4 else 1);
+            try putUint(arena, out, xs.len, if (large) 4 else 1);
             for (offs) |o| try putUint(arena, out, o, os);
             try out.appendSlice(arena, parts.items);
         },
-        .object => |o| {
-            const names = try arena.dupe([]const u8, o.keys());
-            std.mem.sort([]const u8, names, {}, struct {
-                fn lt(_: void, a: []const u8, b: []const u8) bool {
-                    return std.mem.order(u8, a, b) == .lt;
-                }
-            }.lt);
+        .object => |fs| {
+            const fields = try arena.dupe(Field, fs);
+            std.mem.sort(Field, fields, {}, fieldLess);
+            for (fields[0..fields.len -| 1], fields[@min(1, fields.len)..]) |a, b| if (std.mem.eql(u8, a.key, b.key)) return error.VariantCorrupt;
             var parts = std.ArrayList(u8).empty;
-            const offs = try arena.alloc(usize, names.len + 1);
+            const offs = try arena.alloc(usize, fields.len + 1);
             var max_id: usize = 0;
-            for (names, 0..) |nm, i| {
+            for (fields, 0..) |f, i| {
                 offs[i] = parts.items.len;
-                max_id = @max(max_id, ids.get(nm).?);
-                try put(arena, &parts, o.get(nm).?, ids, depth + 1);
+                max_id = @max(max_id, ids.get(f.key).?);
+                try put(arena, &parts, f.value, ids, depth + 1);
             }
-            offs[names.len] = parts.items.len;
+            offs[fields.len] = parts.items.len;
             const os = widthFor(parts.items.len);
             const is = widthFor(max_id);
-            const large = names.len > 0xff;
+            const large = fields.len > 0xff;
             try out.append(arena, 2 | @as(u8, @intCast((os - 1) | ((is - 1) << 2) | (@as(usize, @intFromBool(large)) << 4))) << 2);
-            try putUint(arena, out, names.len, if (large) 4 else 1);
-            for (names) |nm| try putUint(arena, out, ids.get(nm).?, is);
+            try putUint(arena, out, fields.len, if (large) 4 else 1);
+            for (fields) |f| try putUint(arena, out, ids.get(f.key).?, is);
             for (offs) |off| try putUint(arena, out, off, os);
             try out.appendSlice(arena, parts.items);
         },
     }
+}
+
+pub const Prim = enum { boolean, int8, int16, int32, int64, float, double, decimal4, decimal8, decimal16, date, timestamp, timestamp_ntz, timestamp_nanos, timestamp_nanos_ntz, time, string, binary, uuid };
+
+/// Basalt value `v` (not null) read from a shredded `typed_value` of type `p`, as
+/// the variant primitive that type stands for; a nanosecond timestamp comes as
+/// its raw int64 (`variant_col.rawNanos`).
+pub fn primOf(arena: std.mem.Allocator, v: Value, p: Prim) Error![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    switch (p) {
+        .boolean => try out.append(arena, if (v.bool) 1 << 2 else 2 << 2),
+        .int8 => try fixed(arena, &out, 3, i8, std.math.cast(i8, v.int) orelse return error.VariantCorrupt),
+        .int16 => try fixed(arena, &out, 4, i16, std.math.cast(i16, v.int) orelse return error.VariantCorrupt),
+        .int32 => try fixed(arena, &out, 5, i32, std.math.cast(i32, v.int) orelse return error.VariantCorrupt),
+        .int64 => try fixed(arena, &out, 6, i64, v.int),
+        .float => try fixed(arena, &out, 14, u32, @bitCast(@as(f32, @floatCast(v.float)))),
+        .double => try fixed(arena, &out, 7, u64, @bitCast(v.float)),
+        .decimal4, .decimal8, .decimal16 => {
+            const d = v.decimal;
+            try out.append(arena, @as(u8, switch (p) {
+                .decimal4 => 8,
+                .decimal8 => 9,
+                else => 10,
+            }) << 2);
+            try out.append(arena, d.scale);
+            switch (p) {
+                .decimal4 => try out.appendSlice(arena, std.mem.asBytes(&std.mem.nativeToLittle(i32, std.math.cast(i32, d.unscaled) orelse return error.VariantCorrupt))),
+                .decimal8 => try out.appendSlice(arena, std.mem.asBytes(&std.mem.nativeToLittle(i64, std.math.cast(i64, d.unscaled) orelse return error.VariantCorrupt))),
+                else => try out.appendSlice(arena, std.mem.asBytes(&std.mem.nativeToLittle(i128, d.unscaled))),
+            }
+        },
+        .date => try fixed(arena, &out, 11, i32, std.math.cast(i32, v.date) orelse return error.VariantCorrupt),
+        .timestamp => try fixed(arena, &out, 12, i64, v.timestamp),
+        .timestamp_ntz => try fixed(arena, &out, 13, i64, v.timestamp),
+        .timestamp_nanos => try fixed(arena, &out, 18, i64, v.int),
+        .timestamp_nanos_ntz => try fixed(arena, &out, 19, i64, v.int),
+        .time => try fixed(arena, &out, 17, i64, v.time),
+        .string => try putString(arena, &out, v.string),
+        .binary => {
+            try out.append(arena, 15 << 2);
+            try out.appendSlice(arena, std.mem.asBytes(&std.mem.nativeToLittle(u32, @intCast(v.bytes.len))));
+            try out.appendSlice(arena, v.bytes);
+        },
+        .uuid => {
+            if (v.bytes.len != 16) return error.VariantCorrupt;
+            try out.append(arena, 20 << 2);
+            try out.appendSlice(arena, v.bytes);
+        },
+    }
+    return out.items;
+}
+
+fn fixed(arena: std.mem.Allocator, out: *std.ArrayList(u8), id: u8, comptime T: type, x: T) Error!void {
+    try out.append(arena, id << 2);
+    try out.appendSlice(arena, std.mem.asBytes(&std.mem.nativeToLittle(T, x)));
+}
+
+/// How long a metadata dictionary at the start of `m` is, so one written ahead of
+/// a value can be told from it.
+pub fn metadataLen(m: []const u8) Error!usize {
+    const d = try Dict.parse(m);
+    const last = readUint(d.offsets[d.size * d.offset_size ..][0..d.offset_size]);
+    if (last > d.bytes.len) return error.VariantCorrupt;
+    return m.len - d.bytes.len + last;
 }
 
 fn putInt(arena: std.mem.Allocator, out: *std.ArrayList(u8), x: i64) Error!void {

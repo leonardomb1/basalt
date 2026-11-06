@@ -698,7 +698,7 @@ test "Delta variant: a variant column takes JSON text, is written as Variant bin
     try testing.expectEqualStrings("id,v\n1,\"{\"\"a\"\":{\"\"k\"\":null,\"\"t\"\":true},\"\"b\"\":[1,2.5,\"\"" ++ "y" ** 70 ++ "\"\"]}\"\n2,-12.5\n3,\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
     try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT 2 AS id, '[\"x\"]' AS v;", 1);
     try testing.expectEqualStrings("id,v\n2,\"[\"\"x\"\"]\"\n3,\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' WHERE id > 1 ORDER BY id"));
-    try harness.expectRunRefuses(gpa, &tmp, "LOAD INTO '$B/t/' AS SELECT 9 AS id, '{nope' AS v;", 1, "is a variant in");
+    try harness.expectRunRefuses(gpa, &tmp, "LOAD INTO '$B/t/' AS SELECT 9 AS id, '{nope' AS v;", 1, "holds a variant in");
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' AS SELECT 9 AS id, 5 AS v;", "give it as JSON text");
 }
 
@@ -754,6 +754,9 @@ test "Delta changes: changes_from and changes_to read each commit's inserts, del
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/t/' WITH (changes_to = 3);", "give `changes_from` too");
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/t/' WITH (changes_from = 1, version = 2);", "give one or the other");
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/t/' WITH (changes_from = 'soon');", "neither a commit version nor a date");
+
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000005.json", .data = try std.mem.concat(a, u8, &.{ adds0, "\n" }) });
+    try testing.expectEqualStrings("n,timed\n3,3\n", try rows(a, &tmp, "SELECT COUNT(*) AS n, COUNT(_commit_timestamp) AS timed FROM '$B/t/' WITH (changes_from = 5) WHERE _commit_timestamp > '2026-01-01'"));
 }
 
 test "Delta change data feed: an UPSERT writes its updates, inserts and deletes as change data files, which changes_from reads back" {
@@ -789,6 +792,87 @@ test "Delta change data feed: an UPSERT writes its updates, inserts and deletes 
         try rows(a, &tmp, "SELECT id, grp, amt, _change_type, _commit_version FROM '$B/t/' WITH (changes_from = 2, changes_to = 5) ORDER BY _commit_version, id, _change_type"),
     );
     try testing.expectEqualStrings("id,grp,amt\n2,a,98\n3,b,51\n4,b,7\n5,c,1\n8,a,1\n9,b,2\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+}
+
+test "Delta variants nested in a struct, a list and a map, under column mapping and a change data feed: written, read, upserted, compacted" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = struct {
+        fn field(al: std.mem.Allocator, name: []const u8, ty: []const u8, id: u32) ![]const u8 {
+            return std.fmt.allocPrint(al, "{{\\\"name\\\":\\\"{s}\\\",\\\"type\\\":{s},\\\"nullable\\\":true,\\\"metadata\\\":{{\\\"delta.columnMapping.id\\\":{d},\\\"delta.columnMapping.physicalName\\\":\\\"col-{d}\\\"}}}}", .{ name, ty, id, id });
+        }
+    };
+    const st = try std.fmt.allocPrint(a, "{{\\\"type\\\":\\\"struct\\\",\\\"fields\\\":[{s},{s}]}}", .{ try f.field(a, "v", "\\\"variant\\\"", 3), try f.field(a, "n", "\\\"long\\\"", 4) });
+    const fields = try std.mem.join(a, ",", &.{
+        try f.field(a, "id", "\\\"long\\\"", 1),
+        try f.field(a, "v", "\\\"variant\\\"", 2),
+        try f.field(a, "s", st, 5),
+        try f.field(a, "xs", "{\\\"type\\\":\\\"array\\\",\\\"elementType\\\":\\\"variant\\\",\\\"containsNull\\\":true}", 6),
+        try f.field(a, "m", "{\\\"type\\\":\\\"map\\\",\\\"keyType\\\":\\\"string\\\",\\\"valueType\\\":\\\"variant\\\",\\\"valueContainsNull\\\":true}", 7),
+    });
+    try tmp.dir.makePath("t/_delta_log");
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000000.json", .data = try std.fmt.allocPrint(a,
+        \\{{"commitInfo":{{"timestamp":1}}}}
+        \\{{"protocol":{{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping","variantType"],"writerFeatures":["columnMapping","variantType","changeDataFeed"]}}}}
+        \\{{"metaData":{{"id":"t","format":{{"provider":"parquet","options":{{}}}},"schemaString":"{{\"type\":\"struct\",\"fields\":[{s}]}}","partitionColumns":[],"configuration":{{"delta.columnMapping.mode":"name","delta.columnMapping.maxColumnId":"7","delta.enableChangeDataFeed":"true"}},"createdTime":0}}}}
+        \\
+    , .{fields}) });
+    const row = "SELECT {d} AS id, '{s}' AS v, CAST(json_object('v', '{s}', 'n', {d}) AS STRUCT(v STRING, n INT)) AS s, CAST(json_array('{s}', 'null') AS LIST(STRING)) AS xs, CAST(json_object('k', '{s}') AS MAP(STRING, STRING)) AS m";
+    try load(&tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/t/' AS " ++ row ++ " UNION ALL " ++ row ++ ";", .{ 1, "true", "12.5", 7, "-3", "{\"b\":1,\"a\":[]}", 2, "\"x\"", "null", 8, "{}", "[0]" }), 1);
+    const view = "SELECT id, v, s.v AS sv, s.n AS sn, xs, m['k'] AS mk FROM '$B/t/' ORDER BY id";
+    const both = "id,v,sv,sn,xs,mk\n1,true,12.5,7,\"[\"\"-3\"\",\"\"null\"\"]\",\"{\"\"a\"\":[],\"\"b\"\":1}\"\n2,\"\"\"x\"\"\",null,8,\"[\"\"{}\"\",\"\"null\"\"]\",[0]\n";
+    try testing.expectEqualStrings(both, try rows(a, &tmp, view));
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 1), "\"stats\":\"{\\\"numRecords\\\":2,\\\"minValues\\\":{\\\"col-1\\\":1,\\\"col-5\\\":{\\\"col-4\\\":7}},\\\"maxValues\\\":{\\\"col-1\\\":2,\\\"col-5\\\":{\\\"col-4\\\":8}},\\\"nullCount\\\":{\\\"col-1\\\":0,\\\"col-5\\\":{\\\"col-4\\\":0}}}\"") != null);
+
+    try load(&tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/t/' UPSERT ON (id) AS " ++ row ++ ";", .{ 2, "[1,2]", "{\"z\":false}", 9, "1e2", "\"y\"" }), 4);
+    const after = "id,v,sv,sn,xs,mk\n1,true,12.5,7,\"[\"\"-3\"\",\"\"null\"\"]\",\"{\"\"a\"\":[],\"\"b\"\":1}\"\n2,\"[1,2]\",\"{\"\"z\"\":false}\",9,\"[\"\"100\"\",\"\"null\"\"]\",\"\"\"y\"\"\"\n";
+    try testing.expectEqualStrings(after, try rows(a, &tmp, view));
+    try testing.expectEqualStrings("id,v,_change_type\n2,\"[1,2]\",update_postimage\n2,\"\"\"x\"\"\",update_preimage\n", try rows(a, &tmp, "SELECT id, v, _change_type FROM '$B/t/' WITH (changes_from = 2) ORDER BY _change_type"));
+    try load(&tmp, "CALL delta_optimize('$B/t/');", 1);
+    try testing.expectEqualStrings(after, try rows(a, &tmp, view));
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT ON (v) AS SELECT 1 AS id, 'true' AS v, CAST(NULL AS STRUCT(v STRING, n INT)) AS s, CAST(NULL AS LIST(STRING)) AS xs, CAST(NULL AS MAP(STRING, STRING)) AS m;", "holds a variant, which has no equality");
+}
+
+test "Delta change data feed on a table tracking row ids: an UPSERT's change files beside rewritten rows that keep their ids" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT id, grp, amt FROM '$B/a.csv';", 1);
+    const v0 = try logFile(a, &tmp, "t", 0);
+    var meta: []const u8 = "";
+    var add0: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, v0, '\n');
+    while (lines.next()) |l| {
+        if (std.mem.startsWith(u8, l, "{\"metaData\":")) meta = l;
+        if (std.mem.startsWith(u8, l, "{\"add\":")) add0 = l;
+    }
+    const conf = "\"configuration\":{\"delta.enableChangeDataFeed\":\"true\",\"delta.enableRowTracking\":\"true\",\"delta.rowTracking.materializedRowIdColumnName\":\"_row-id-col-t\",\"delta.rowTracking.materializedRowCommitVersionColumnName\":\"_row-commit-version-col-t\"}";
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000001.json", .data = try std.mem.concat(a, u8, &.{
+        "{\"commitInfo\":{\"timestamp\":1}}\n",
+        "{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":7,\"writerFeatures\":[\"domainMetadata\",\"rowTracking\",\"changeDataFeed\"]}}\n",
+        try std.mem.replaceOwned(u8, a, meta, "\"configuration\":{}", conf),
+        "\n",
+        try std.mem.replaceOwned(u8, a, add0, "\"dataChange\":true,", "\"dataChange\":false,\"baseRowId\":0,\"defaultRowCommitVersion\":0,"),
+        "\n{\"domainMetadata\":{\"domain\":\"delta.rowTracking\",\"configuration\":\"{\\\"rowIdHighWaterMark\\\":2}\",\"removed\":false}}\n",
+    }) });
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT 2 AS id, 'z' AS grp, 99 AS amt UNION ALL SELECT 4, 'b', 7;", 4);
+    try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "t", 2, "cdc"));
+    try testing.expectEqualStrings(
+        "id,amt,_change_type\n2,99,update_postimage\n2,20,update_preimage\n4,7,insert\n",
+        try rows(a, &tmp, "SELECT id, amt, _change_type FROM '$B/t/' WITH (changes_from = 2) ORDER BY id, _change_type"),
+    );
+    const files = try tmp.dir.readFileAlloc(a, "t/_delta_log/00000000000000000002.json", 1 << 20);
+    const at = std.mem.indexOf(u8, files, "{\"add\":{\"path\":\"").? + "{\"add\":{\"path\":\"".len;
+    const rewritten = files[at .. at + std.mem.indexOfScalar(u8, files[at..], '"').?];
+    try testing.expectEqualStrings(
+        "id,rid\n1,0\n2,1\n3,2\n4,\n",
+        try rows(a, &tmp, try std.fmt.allocPrint(a, "SELECT id, \"_row-id-col-t\" AS rid FROM '$B/t/{s}' ORDER BY id", .{rewritten})),
+    );
 }
 
 test "Delta write: what is refused, at check where it can be seen" {

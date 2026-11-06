@@ -25,6 +25,8 @@ const s3 = @import("../../store/s3.zig");
 const scheme = @import("../../store/scheme.zig");
 const stream = @import("../stream.zig");
 const types = @import("../../lang/types.zig");
+const objstore = @import("../../store/objstore.zig");
+const http_client = @import("../../net/http_client.zig");
 const testing = std.testing;
 
 pub const Kind = enum {
@@ -109,6 +111,18 @@ fn holdsIceberg(arena: std.mem.Allocator, root: []const u8) !bool {
 
 fn isIcebergMetadata(name: []const u8) bool {
     return std.mem.endsWith(u8, name, ".metadata.json") or std.mem.endsWith(u8, name, ".metadata.json.gz");
+}
+
+/// When file `url` was last modified, in milliseconds since the epoch: a local
+/// file's from the file system, an object's from its `Last-Modified` (`client`
+/// made on first use); null when it is gone or the store gives no time.
+pub fn modifiedMs(arena: std.mem.Allocator, url: []const u8, client: *?std.http.Client) !?i64 {
+    if (objstore.isUrl(url)) {
+        if (client.* == null) client.* = http_client.initClient(arena);
+        return (try objstore.parse(arena, url)).modifiedMs(arena, &client.*.?);
+    }
+    const s = std.fs.cwd().statFile(url) catch |e| return if (e == error.FileNotFound) null else e;
+    return @as(i64, @intCast(@divTrunc(s.mtime, std.time.ns_per_ms)));
 }
 
 /// A listing, or none when a local folder was only opened.

@@ -50,6 +50,7 @@ const dtypes = @import("delta_types.zig");
 const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const fit = @import("../parquet/fit.zig");
+const vcol = @import("variant_col.zig");
 const fmtnum = @import("../../exec/eval/format.zig");
 const join = @import("../../exec/op/join.zig");
 const msgfmt = @import("../msgfmt.zig");
@@ -183,7 +184,7 @@ pub const Merge = struct {
         const fields = try a.alloc(types.Schema.Field, p.in_fields.len + 1);
         for (p.in_fields, fields[0..p.in_fields.len]) |f, *o| o.* = .{ .name = f.name, .ty = f.ty.asNullable() };
         for (p.cols) |c| if (c.src != write.absent) {
-            fields[c.src].ty = c.ty.asNullable();
+            fields[c.src].ty = c.carried().asNullable();
         };
         fields[p.in_fields.len] = .{ .name = row_name, .ty = types.Type.init(.int).asNullable() };
         self.schema = .{ .fields = fields };
@@ -285,7 +286,12 @@ pub const Merge = struct {
     /// the column's type.
     fn normal(self: *Merge, t: std.mem.Allocator, b: Batch, c: write.Col) !column.Column {
         const in = b.columns[c.src];
-        if (self.plan.in_fields[c.src].ty.unknown) return join.nullColumn(t, c.ty, b.len);
+        if (self.plan.in_fields[c.src].ty.unknown) return join.nullColumn(t, c.carried(), b.len);
+        if (c.variant_json) |jt| return vcol.convert(t, in, c.ty, jt, null, .raw) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            const bad = vcol.failed_text;
+            return self.fail(e, "column `{s}` holds a variant in {s}, but a row holds {s}, which is not JSON", .{ c.name, self.plan.name, bad[0..@min(bad.len, 60)] });
+        };
         var out = in;
         out.ty = c.ty.asNullable();
         if (c.phys.float32 and in.data == .f64) {
@@ -350,7 +356,7 @@ pub const Merge = struct {
         const nc = self.plan.cols.len;
         const nf = nc + self.rowCols();
         const fields = try a.alloc(types.Schema.Field, nf + 1);
-        for (fields[0..nc], self.plan.cols) |*f, c| f.* = .{ .name = c.name, .ty = c.ty.asNullable() };
+        for (fields[0..nc], self.plan.cols) |*f, c| f.* = .{ .name = c.name, .ty = c.carried().asNullable() };
         if (self.rowCols() == 2) {
             fields[nc] = .{ .name = delta.row_id_name, .ty = types.Type.init(.int).asNullable() };
             fields[nc + 1] = .{ .name = delta.row_version_name, .ty = types.Type.init(.int).asNullable() };
@@ -371,7 +377,7 @@ pub const Merge = struct {
             f.* = .{ .path = src.path, .size = src.size, .parts = parts, .deletes = src.deletes, .row_base = src.row_base, .row_version = src.row_version };
         }
         const out = try a.create(fit.Layout);
-        out.* = .{ .name = base.name, .root = base.root, .schema = .{ .fields = fields }, .part_fields = part_fields, .files = files, .mapping = base.mapping, .variants = base.variants };
+        out.* = .{ .name = base.name, .root = base.root, .schema = .{ .fields = fields }, .part_fields = part_fields, .files = files, .mapping = base.mapping, .variant_types = base.variant_types, .raw_variants = true };
         if (self.rowCols() == 2) {
             const st = self.plan.snap.?;
             out.rows = .{
@@ -530,7 +536,7 @@ pub const Merge = struct {
         const shape = try a.create(types.Schema);
         const fed: usize = @intFromBool(self.feed != null);
         const tf = try a.alloc(types.Schema.Field, p.cols.len + self.rowCols() + fed);
-        for (tf[0..p.cols.len], p.cols) |*f, c| f.* = .{ .name = c.name, .ty = c.ty.asNullable() };
+        for (tf[0..p.cols.len], p.cols) |*f, c| f.* = .{ .name = c.name, .ty = c.carried().asNullable() };
         if (self.rowCols() == 2) {
             tf[p.cols.len] = .{ .name = delta.row_id_name, .ty = types.Type.init(.int).asNullable() };
             tf[p.cols.len + 1] = .{ .name = delta.row_version_name, .ty = types.Type.init(.int).asNullable() };
@@ -625,14 +631,14 @@ pub const Merge = struct {
         }
         for (cols[0..nc], p.cols, 0..) |*c, pc, k| {
             const fresh = if (p.partial) |pl| std.mem.indexOfScalar(usize, pl, k) != null else true;
-            const incoming = if (pc.src == write.absent) try join.nullColumn(t, pc.ty, b.len) else b.columns[nt + pc.src];
+            const incoming = if (pc.src == write.absent) try join.nullColumn(t, pc.carried(), b.len) else b.columns[nt + pc.src];
             const from = [3]column.Column{ b.columns[k], if (fresh) incoming else b.columns[k], incoming };
             var n: usize = 0;
             for (from, masks, counts) |src, m, cnt| if (cnt > 0) {
                 chunks[n] = try column.gather(t, src, m, cnt);
                 n += 1;
             };
-            c.* = if (n == 0) try join.nullColumn(t, pc.ty, 0) else if (n == 1) chunks[0] else try column.concat(t, chunks[0..n], kept);
+            c.* = if (n == 0) try join.nullColumn(t, pc.carried(), 0) else if (n == 1) chunks[0] else try column.concat(t, chunks[0..n], kept);
         }
         if (self.feed == null) return .{ .schema = shape, .columns = cols, .len = kept };
         const ch = try self.changes(t, b, masks, counts, gone, n_gone);
@@ -686,7 +692,7 @@ pub const Merge = struct {
         var chunks: [parts.len]column.Column = undefined;
         for (cols[0..nc], p.cols, 0..) |*c, pc, k| {
             const fresh = if (p.partial) |pl| std.mem.indexOfScalar(usize, pl, k) != null else true;
-            const incoming = if (pc.src == write.absent) try join.nullColumn(t, pc.ty, b.len) else b.columns[nt + pc.src];
+            const incoming = if (pc.src == write.absent) try join.nullColumn(t, pc.carried(), b.len) else b.columns[nt + pc.src];
             for (parts, &chunks) |part, *o| o.* = try column.gather(t, switch (part.side) {
                 .live => b.columns[k],
                 .merged => if (fresh) incoming else b.columns[k],
@@ -722,7 +728,7 @@ pub const Merge = struct {
         const nc = self.plan.cols.len;
         const nr = self.rowCols();
         const cols = try t.alloc(column.Column, nc + nr + @intFromBool(self.feed != null));
-        for (cols[0..nc], self.plan.cols) |*c, pc| c.* = if (pc.src == write.absent) try join.nullColumn(t, pc.ty, b.len) else b.columns[pc.src];
+        for (cols[0..nc], self.plan.cols) |*c, pc| c.* = if (pc.src == write.absent) try join.nullColumn(t, pc.carried(), b.len) else b.columns[pc.src];
         for (cols[nc .. nc + nr]) |*c| c.* = try join.nullColumn(t, types.Type.init(.int).asNullable(), b.len);
         if (self.feed != null) cols[nc + nr] = try join.nullColumn(t, types.Type.init(.string).asNullable(), b.len);
         return .{ .schema = shape, .columns = cols, .len = b.len };

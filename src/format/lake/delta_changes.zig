@@ -13,6 +13,8 @@
 //! (`delta.enableChangeDataFeed`) where it starts and in every `metaData` inside
 //! it, and every commit in it still in `_delta_log/`; a range by time starts at
 //! the first commit at or after its start and ends at the last at or before its end.
+//! A commit's time is its `commitInfo`'s (`inCommitTimestamp`, else `timestamp`),
+//! or, where it records none, its commit file's modification time, as Spark takes it.
 
 const std = @import("std");
 const msgfmt = @import("../msgfmt.zig");
@@ -256,6 +258,11 @@ fn commitChanges(arena: std.mem.Allocator, log: *const delta.Log, name: []const 
         }
     }
     const got = if (cdc.items.len > 0) cdc.items else try paired(arena, plain.items);
+    if (ms == null and got.len > 0) {
+        var client: ?std.http.Client = null;
+        defer if (client) |*cl| cl.deinit();
+        ms = try table.modifiedMs(arena, url, &client);
+    }
     for (got) |*ch| ch.ms = ms;
     try out.appendSlice(arena, got);
 }

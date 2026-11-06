@@ -44,6 +44,7 @@ const folder = @import("../../connect/folder.zig");
 const table = @import("table.zig");
 const types = @import("../../lang/types.zig");
 const uuid = @import("../uuid.zig");
+const vcol = @import("variant_col.zig");
 const testing = std.testing;
 
 pub const log_dir = "_delta_log/";
@@ -670,9 +671,7 @@ pub const State = struct {
             if (oneOf(f, &.{ "columnMapping", "deletionVectors", "timestampNtz", "vacuumProtocolCheck", "v2Checkpoint" })) continue;
             if (oneOf(f, &.{ "catalogManaged", "catalogOwned-preview" }))
                 return refuse("{s} is catalog-managed (reader feature `{s}`): its newest commits are held by a catalog, not in _delta_log/", .{ self.name, f });
-            if (oneOf(f, &.{ "typeWidening", "typeWidening-preview", "variantType", "variantType-preview" })) continue;
-            if (oneOf(f, &.{ "variantShredding", "variantShredding-preview" }))
-                return refuse("{s} uses reader feature `{s}`, which basalt does not read", .{ self.name, f });
+            if (oneOf(f, &.{ "typeWidening", "typeWidening-preview", "variantType", "variantType-preview", "variantShredding", "variantShredding-preview" })) continue;
             return refuse("{s} needs reader feature `{s}`, which basalt does not know; reading without it could return wrong rows", .{ self.name, f });
         }
     }
@@ -765,7 +764,7 @@ fn schemaOf(arena: std.mem.Allocator, name: []const u8, text: []const u8) !types
     return (try parseSchema(arena, name, text, null)).schema;
 }
 
-const Parsed = struct { schema: types.Schema, mapping: ?*const Mapping = null, variants: []const usize = &.{} };
+const Parsed = struct { schema: types.Schema, mapping: ?*const Mapping = null, variants: []const ?std.json.Value = &.{} };
 
 /// `schemaOf`, with how the files name each column when the table maps them `by`.
 fn parseSchema(arena: std.mem.Allocator, name: []const u8, text: []const u8, by: ?Mapping.By) !Parsed {
@@ -839,26 +838,25 @@ fn structFields(arena: std.mem.Allocator, name: []const u8, col: []const u8, v: 
     const out = try arena.alloc(types.Type.Field, fields.len);
     for (fields, out) |f, *o| {
         const full = if (col.len == 0) f.name else try std.mem.concat(arena, u8, &.{ col, ".", f.name });
-        const top_variant = col.len == 0 and isVariant(f.ty);
-        o.* = .{ .name = f.name, .ty = (if (top_variant) types.Type.init(.string) else try typeOf(arena, name, full, f.ty, depth + 1)).asNullable() };
+        o.* = .{ .name = f.name, .ty = (try typeOf(arena, name, full, f.ty, depth + 1)).asNullable() };
     }
     return out;
 }
 
-fn isVariant(t: std.json.Value) bool {
-    return t == .string and std.mem.eql(u8, t.string, "variant");
-}
-
-/// The top-level columns of `schemaString` value `v` whose type is `variant`, as
-/// indices of its fields.
-fn variantFields(arena: std.mem.Allocator, v: std.json.Value) ![]const usize {
+/// Each top-level column of `schemaString` value `v`'s Delta type where it holds
+/// a variant, null where not; empty when no column does.
+fn variantFields(arena: std.mem.Allocator, v: std.json.Value) ![]const ?std.json.Value {
     const fields = switch (try dtypes.fields(arena, v, .lenient)) {
         .fields => |fs| fs,
         .problem => return &.{},
     };
-    var out = std.ArrayList(usize).empty;
-    for (fields, 0..) |f, i| if (isVariant(f.ty)) try out.append(arena, i);
-    return out.items;
+    const out = try arena.alloc(?std.json.Value, fields.len);
+    var any = false;
+    for (fields, out) |f, *o| {
+        o.* = if (vcol.holds(f.ty)) f.ty else null;
+        any = any or o.* != null;
+    }
+    return if (any) out else &.{};
 }
 
 /// Column `col`'s `schemaString` type `t` as basalt's, as the reader types it.
@@ -871,7 +869,7 @@ pub fn tableType(arena: std.mem.Allocator, name: []const u8, col: []const u8, t:
 fn typeOf(arena: std.mem.Allocator, name: []const u8, col: []const u8, t: std.json.Value, depth: usize) anyerror!types.Type {
     if (depth >= table.max_depth) return refuse("{s} has a schemaString nested deeper than {d} levels", .{ name, table.max_depth });
     switch (t) {
-        .string => |s| return if (depth == 0 and std.mem.eql(u8, s, "variant")) types.Type.init(.string) else primitive(name, col, s),
+        .string => |s| return if (std.mem.eql(u8, s, "variant")) types.Type.init(.string) else primitive(name, col, s),
         .object => |o| {
             const kind = str(o.get("type")) orelse "";
             if (std.mem.eql(u8, kind, "struct")) return .{ .kind = .@"struct", .fields = try structFields(arena, name, col, t, depth) };
@@ -892,8 +890,6 @@ fn typeOf(arena: std.mem.Allocator, name: []const u8, col: []const u8, t: std.js
 }
 
 fn primitive(name: []const u8, col: []const u8, t: []const u8) !types.Type {
-    if (std.mem.eql(u8, t, "variant"))
-        return refuse("{s} has a variant `{s}` inside a struct, list or map; basalt reads a variant only as a top-level column", .{ name, col });
     return dtypes.scalarType(t, .read) orelse
         refuse("{s} has a column `{s}` of type `{s}`, which basalt does not read", .{ name, col, t });
 }
@@ -922,6 +918,20 @@ pub fn resolve(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_
 
 /// A layout over some of a table's live files, `files` aligned with `adds`.
 pub const FileLayout = struct { layout: Layout, files: []Layout.File };
+
+/// Layout `l` reading its variants as raw Variant binary (`variant_col.raw_type`)
+/// rather than JSON text, for a rewrite that copies rows as they are.
+pub fn rawVariants(arena: std.mem.Allocator, l: Layout) !Layout {
+    var out = l;
+    if (l.variant_types.len == 0) return out;
+    const fields = try arena.dupe(types.Schema.Field, l.schema.fields);
+    for (fields, 0..) |*f, i| if (i < l.variant_types.len) if (l.variant_types[i]) |j| {
+        f.ty = try vcol.rawType(arena, f.ty, j);
+    };
+    out.schema = .{ .fields = fields };
+    out.raw_variants = true;
+    return out;
+}
 
 pub const row_id_name = "\x00row_id";
 pub const row_version_name = "\x00row_version";
@@ -989,7 +999,7 @@ pub fn layoutOf(arena: std.mem.Allocator, st: *const State, root: []const u8, ad
         }
     }
     const out = try arena.create(FileLayout);
-    out.* = .{ .layout = .{ .name = name, .root = root, .schema = schema, .part_fields = part_fields, .files = files, .mapping = parsed.mapping, .variants = parsed.variants }, .files = files };
+    out.* = .{ .layout = .{ .name = name, .root = root, .schema = schema, .part_fields = part_fields, .files = files, .mapping = parsed.mapping, .variant_types = parsed.variants }, .files = files };
     return out;
 }
 
@@ -1206,7 +1216,7 @@ test "protocol: reader versions and features, refused only where the table uses 
     try st.checkProtocol();
     for ([_][2][]const u8{
         .{ "catalogManaged", "catalog-managed" },
-        .{ "variantShredding", "reader feature `variantShredding`, which basalt does not read" },
+        .{ "variantFancy", "reader feature `variantFancy`, which basalt does not know" },
         .{ "fancyNew", "reader feature `fancyNew`, which basalt does not know" },
     }) |c| {
         st.features = &.{c[0]};
@@ -1247,10 +1257,10 @@ test "schemaString: primitives, and a struct, an array and a map as nested colum
     }
     try testing.expectEqual(@as(u8, 12), s.fields[1].ty.precision);
     try testing.expectEqual(@as(u8, 3), s.fields[1].ty.scale);
-    try testing.expectError(table.Error.LakeTableRefused, schemaOf(a, "T",
+    const nested = try schemaOf(a, "T",
         \\{"type":"struct","fields":[{"name":"s","type":{"type":"struct","fields":[{"name":"v","type":"variant","nullable":true,"metadata":{}}]},"nullable":true,"metadata":{}}]}
-    ));
-    try testing.expectEqualStrings("T has a variant `s.v` inside a struct, list or map; basalt reads a variant only as a top-level column", eval.takeFailure(table.Error.LakeTableRefused).?);
+    );
+    try testing.expectEqualStrings("struct(v string)", try nested.fields[0].ty.name(a));
     const top = try schemaOf(a, "T",
         \\{"type":"struct","fields":[{"name":"v","type":"variant","nullable":true,"metadata":{}}]}
     );

@@ -118,7 +118,7 @@ pub fn leafPhysicals(arena: std.mem.Allocator, t: std.json.Value) ![]const pqwri
 fn addLeaves(arena: std.mem.Allocator, out: *std.ArrayList(pqwrite.Physical), t: std.json.Value, depth: usize) !void {
     if (depth >= table.max_depth) return;
     const o = switch (t) {
-        .string => |s| return out.append(arena, physical(s)),
+        .string => |s| return if (std.mem.eql(u8, s, "variant")) out.appendSlice(arena, &.{ .{ .stats = false }, .{ .stats = false } }) else out.append(arena, physical(s)),
         .object => |o| o,
         else => return,
     };

@@ -31,7 +31,6 @@ const dvs = @import("delta_dv.zig");
 const write = @import("delta_write.zig");
 const table = @import("table.zig");
 const folder = @import("../../connect/folder.zig");
-const http_client = @import("../../net/http_client.zig");
 const objstore = @import("../../store/objstore.zig");
 const msgfmt = @import("../msgfmt.zig");
 const merge = @import("delta_merge.zig");
@@ -81,14 +80,9 @@ pub fn vacuum(arena: std.mem.Allocator, root: []const u8, retain_ms: ?i64, now_m
             out.kept += 1;
             continue;
         }
-        const remote = objstore.isUrl(u);
-        if (remote and client == null) client = http_client.initClient(arena);
-        const made = if (remote) (try (try objstore.parse(arena, u)).modifiedMs(arena, &client.?)) orelse continue else blk: {
-            const s = std.fs.cwd().statFile(u) catch |e| if (e == error.FileNotFound) continue else return e;
-            break :blk @as(i64, @intCast(@divTrunc(s.mtime, std.time.ns_per_ms)));
-        };
+        const made = (try table.modifiedMs(arena, u, &client)) orelse continue;
         if (made > cutoff) continue;
-        if (remote) try (try objstore.parse(arena, u)).delete(arena, &client.?) else std.fs.cwd().deleteFile(u) catch |e| if (e != error.FileNotFound) return e;
+        if (objstore.isUrl(u)) try (try objstore.parse(arena, u)).delete(arena, &client.?) else std.fs.cwd().deleteFile(u) catch |e| if (e != error.FileNotFound) return e;
         out.deleted += 1;
     }
     return out;
@@ -145,7 +139,7 @@ pub fn optimize(gpa: std.mem.Allocator, arena: std.mem.Allocator, root: []const 
 
     const keeps_rows = keepsRows(st);
     const read_lay = blk: {
-        const l = (try delta.layoutOf(arena, st, root, picks.items)).layout;
+        const l = try delta.rawVariants(arena, (try delta.layoutOf(arena, st, root, picks.items)).layout);
         break :blk if (keeps_rows) try delta.withRows(arena, st, l) else l;
     };
     const plan_schema = if (keeps_rows) (try delta.withRows(arena, st, fl.layout)).schema else fl.layout.schema;

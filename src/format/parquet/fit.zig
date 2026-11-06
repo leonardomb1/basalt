@@ -32,7 +32,7 @@ const cast = @import("../../exec/eval/cast.zig");
 const parseFooterOf = @import("folder.zig").parseFooterOf;
 const roaring = @import("../lake/roaring.zig");
 const dtypes = @import("../lake/delta_types.zig");
-const variant = @import("../lake/variant.zig");
+const vcol = @import("../lake/variant_col.zig");
 const types = @import("../../lang/types.zig");
 const testing = std.testing;
 
@@ -50,7 +50,8 @@ pub const Layout = struct {
     files: []const File,
     mapping: ?*const Mapping = null,
     rows: ?Rows = null,
-    variants: []const usize = &.{},
+    variant_types: []const ?std.json.Value = &.{},
+    raw_variants: bool = false,
     change_type: ?usize = null,
 
     pub const Rows = struct { id: usize, version: usize, mat_id: []const u8, mat_version: []const u8 };
@@ -210,7 +211,8 @@ pub const Layout = struct {
             const rf = self.rows.?;
             for ([_][]const u8{ rf.mat_id, rf.mat_version }) |m| if (m.len > 0) try names.append(try self.fileColumn(arena, m));
         }
-        const r = self.openFile(arena, file, names.items) catch |e| {
+        var tree: ?*const vcol.SNode = null;
+        const r = self.openFile(arena, file, names.items, &tree) catch |e| {
             if (e == error.OutOfMemory) return e;
             const why = eval.peekFailure(e) orelse @errorName(e);
             return eval.explain(e, msgfmt.allocPrint(arena, "{s} could not read its file `{s}` ({s})", .{ self.name, below(file.path, self.root), why }) catch self.name);
@@ -248,11 +250,12 @@ pub const Layout = struct {
                 continue;
             };
             const got = r.schema.fields[k].ty;
-            if (std.mem.indexOfScalar(usize, self.variants, fi) != null) {
-                if (!isVariantFile(got)) return eval.explain(Error.LakeFileMismatch, msgfmt.allocPrint(arena, "{s} has file `{s}` whose variant column `{s}` is {s}, not a struct of binary `value` and `metadata`", .{
-                    self.name, below(file.path, self.root), want.name, try got.name(arena),
+            if (if (fi < self.variant_types.len) self.variant_types[fi] else null) |j| {
+                const raw_want = if (self.raw_variants) want.ty else try vcol.rawType(arena, want.ty, j);
+                if (!fitsType(got, raw_want)) return eval.explain(Error.LakeFileMismatch, msgfmt.allocPrint(arena, "{s} has file `{s}` whose column `{s}` is {s}, not {s} as in the table's schema (a variant as the struct of binary `value` and `metadata`)", .{
+                    self.name, below(file.path, self.root), want.name, try got.name(arena), try raw_want.name(arena),
                 }) catch self.name);
-                o.* = .{ .variant = k };
+                o.* = .{ .variant = .{ .k = k, .jt = j, .node = if (tree) |t| t.child(want.name) else null, .mode = if (self.raw_variants) .raw else .text } };
                 continue;
             }
             if (!fitsType(got, want.ty)) return eval.explain(Error.LakeFileMismatch, msgfmt.allocPrint(arena, "{s} has file `{s}` whose column `{s}` is {s}, not {s} as in the table's schema", .{
@@ -266,13 +269,24 @@ pub const Layout = struct {
         return r;
     }
 
-    fn openFile(self: *const Layout, arena: std.mem.Allocator, file: File, names: []const []const u8) !*Reader {
-        const m = self.mapping orelse return Reader.openSized(arena, file.path, file.size, names);
+    /// The file's reader of `names`; where the table has variants, also the file's
+    /// schema as it was (`tree`), the shredded nanosecond timestamps below them
+    /// read as their raw int64 so a copy keeps every digit.
+    fn openFile(self: *const Layout, arena: std.mem.Allocator, file: File, names: []const []const u8, tree: *?*const vcol.SNode) !*Reader {
+        if (self.mapping == null and self.variant_types.len == 0) return Reader.openSized(arena, file.path, file.size, names);
         const src = try Bytes.openSized(arena, file.path, file.size);
         errdefer src.close();
         var footer_start: u64 = 0;
         var md = try parseFooterOf(arena, src, &footer_start);
-        md.schema = try m.rename(arena, md.schema);
+        if (self.mapping) |m| md.schema = try m.rename(arena, md.schema);
+        if (self.variant_types.len > 0) {
+            const t = try arena.create(vcol.SNode);
+            t.* = vcol.schemaTree(arena, md.schema) catch |e| return if (e == error.OutOfMemory) e else error.UnsupportedParquetSchema;
+            tree.* = t;
+            const tops = try arena.alloc(bool, self.schema.fields.len);
+            for (tops, self.schema.fields, 0..) |*x, f, i| x.* = i < self.variant_types.len and self.variant_types[i] != null and f.name.len > 0;
+            md.schema = try vcol.rawNanos(arena, md.schema, self.schema.fields, tops);
+        }
         return Reader.openParsed(arena, src, md, footer_start, file.path, names);
     }
 };
@@ -425,39 +439,6 @@ const Renamer = struct {
     }
 };
 
-fn isVariantFile(got: types.Type) bool {
-    if (got.kind != .@"struct") return false;
-    for ([_][]const u8{ "value", "metadata" }) |n| {
-        const f = fieldNamed(got, n) orelse return false;
-        if (f.ty.kind != .bytes) return false;
-    }
-    return true;
-}
-
-/// A file's variant column (a struct of `value` and `metadata`) as its values'
-/// JSON text; a corrupt value fails naming the column.
-fn variantText(arena: std.mem.Allocator, col: column.Column, want: types.Schema.Field) !column.Column {
-    const fs = col.data.nested.body.fields;
-    var vi: usize = 0;
-    var mi: usize = 0;
-    for (col.ty.fields.?, 0..) |f, i| {
-        if (std.mem.eql(u8, f.name, "value")) vi = i;
-        if (std.mem.eql(u8, f.name, "metadata")) mi = i;
-    }
-    var bd = try column.Builder.initCapacity(arena, want.ty, col.len);
-    for (0..col.len) |r| {
-        const v = if (col.validity.get(r)) fs[vi].getValue(r) else Value.null;
-        const m = if (col.validity.get(r)) fs[mi].getValue(r) else Value.null;
-        if (v == .null or m == .null) {
-            try bd.appendNull();
-            continue;
-        }
-        const text = variant.decode(arena, v.bytes, m.bytes) catch |e| return if (e == error.OutOfMemory) e else eval.explain(e, msgfmt.allocPrint(arena, "its variant column `{s}` has a value that is not valid Variant binary", .{want.name}) catch "a variant value is not valid Variant binary");
-        try bd.append(.{ .string = text });
-    }
-    return bd.finish();
-}
-
 /// Whether a file's column of type `got` reads as the table's `want`: the same kind,
 /// a decimal at the same scale (its precision is relabelled), and a struct's
 /// fields fitting by name where both have them, a list's or a map's parts alike.
@@ -572,7 +553,7 @@ pub const Fit = struct {
         value: Value,
         row_id: struct { mat: ?usize, pos: usize, base: ?i64 },
         row_version: struct { mat: ?usize, default: ?i64 },
-        variant: usize,
+        variant: struct { k: usize, jt: std.json.Value, node: ?*const vcol.SNode, mode: vcol.Mode },
     };
 
     pub fn apply(self: *const Fit, arena: std.mem.Allocator, b: Batch) !Batch {
@@ -582,7 +563,7 @@ pub const Fit = struct {
                 c.* = if (f.ty.isNested() or widens(b.columns[k].ty, f.ty)) try reshape(arena, b.columns[k], f.ty) else b.columns[k];
                 c.ty = f.ty;
             },
-            .variant => |k| c.* = try variantText(arena, b.columns[k], f),
+            .variant => |x| c.* = vcol.convert(arena, b.columns[x.k], f.ty, x.jt, x.node, x.mode) catch |e| return if (e == error.OutOfMemory) e else eval.explain(e, msgfmt.allocPrint(arena, "its column `{s}` holds a variant that is not valid Variant binary, or a shredded one the Parquet shredding spec does not allow", .{f.name}) catch "a variant is malformed"),
             .value => |val| {
                 var bd = try column.Builder.initCapacity(arena, f.ty, b.len);
                 try bd.appendRepeated(val, b.len);

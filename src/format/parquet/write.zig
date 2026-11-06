@@ -181,6 +181,7 @@ pub const Physical = struct {
     int_bits: u8 = 64,
     float32: bool = false,
     utc: bool = false,
+    stats: bool = true,
     leaves: []const Physical = &.{},
 };
 
