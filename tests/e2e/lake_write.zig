@@ -756,6 +756,41 @@ test "Delta changes: changes_from and changes_to read each commit's inserts, del
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/t/' WITH (changes_from = 'soon');", "neither a commit version nor a date");
 }
 
+test "Delta change data feed: an UPSERT writes its updates, inserts and deletes as change data files, which changes_from reads back" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta', partition_by = 'grp') AS SELECT * FROM '$B/a.csv';", 1);
+    const v0 = try logFile(a, &tmp, "t", 0);
+    var meta: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, v0, '\n');
+    while (lines.next()) |l| if (std.mem.startsWith(u8, l, "{\"metaData\":")) {
+        meta = l;
+    };
+    const fed = try std.mem.replaceOwned(u8, a, meta, "\"configuration\":{}", "\"configuration\":{\"delta.enableChangeDataFeed\":\"true\"}");
+    try testing.expect(!std.mem.eql(u8, fed, meta));
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000001.json", .data = try std.mem.concat(a, u8, &.{ "{\"commitInfo\":{\"timestamp\":1}}\n", fed, "\n" }) });
+
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT 2 AS id, 'a' AS grp, 99 AS amt UNION ALL SELECT 4, 'b', 7;", 1);
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 2), "{\"cdc\":{\"path\":\"_change_data/grp=a/cdc-") != null);
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) PARTIAL COLS (amt) AS SELECT 3 AS id, 50 AS amt;", 1);
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn, name = 'feed') AS SELECT 1 AS id, 'a' AS grp, 0 AS amt, 'd' AS op, 1 AS seq, 1 AS lsn;", 1);
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT 5 AS id, 'c' AS grp, 1 AS amt;", 1);
+    try testing.expectEqual(@as(usize, 0), try actions(a, &tmp, "t", 5, "cdc"));
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT 2 AS id, 'a' AS grp, 98 AS amt UNION ALL SELECT 3, 'b', 51 UNION ALL SELECT 8, 'a', 1 UNION ALL SELECT 9, 'b', 2;", 4);
+    try testing.expectEqual(@as(usize, 2), try actions(a, &tmp, "t", 6, "cdc"));
+    try testing.expectEqual(@as(usize, 2), try actions(a, &tmp, "t", 6, "add"));
+    try testing.expectEqualStrings("n\n6\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/t/' WITH (changes_from = 6)"));
+
+    try testing.expectEqualStrings(
+        "id,grp,amt,_change_type,_commit_version\n2,a,99,update_postimage,2\n2,a,20,update_preimage,2\n4,b,7,insert,2\n3,b,50,update_postimage,3\n3,b,5,update_preimage,3\n1,a,10,delete,4\n5,c,1,insert,5\n",
+        try rows(a, &tmp, "SELECT id, grp, amt, _change_type, _commit_version FROM '$B/t/' WITH (changes_from = 2, changes_to = 5) ORDER BY _commit_version, id, _change_type"),
+    );
+    try testing.expectEqualStrings("id,grp,amt\n2,a,98\n3,b,51\n4,b,7\n5,c,1\n8,a,1\n9,b,2\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+}
+
 test "Delta write: what is refused, at check where it can be seen" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
@@ -791,12 +826,6 @@ test "Delta write: what is refused, at check where it can be seen" {
     try load(&tmp, "LOAD INTO '$B/ao/' AS SELECT * FROM '$B/a.csv';", 1);
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/ao/' REPLACE AS SELECT * FROM '$B/a.csv';", "is append-only");
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/ao/' UPSERT ON (id) AS SELECT * FROM '$B/a.csv';", "so an UPSERT cannot remove its files");
-
-    const cdf = try std.mem.replaceOwned(u8, a, v0, "\"configuration\":{}", "\"configuration\":{\"delta.enableChangeDataFeed\":\"true\"}");
-    try tmp.dir.makePath("cdf/_delta_log");
-    try tmp.dir.writeFile(.{ .sub_path = "cdf/_delta_log/00000000000000000000.json", .data = cdf });
-    try load(&tmp, "LOAD INTO '$B/cdf/' AS SELECT * FROM '$B/a.csv';", 1);
-    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/cdf/' UPSERT ON (id) AS SELECT * FROM '$B/a.csv';", "records a change data feed");
 }
 
 /// The number of `action` lines in version `v` of the table at `root`.

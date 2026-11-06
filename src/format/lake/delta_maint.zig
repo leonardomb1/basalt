@@ -10,7 +10,9 @@
 //! concurrent writer's files not yet committed are as new as the retention lets
 //! them be. A file's age is its modification time, a local file's from the file
 //! system and an object's from its `Last-Modified`. The log (`_delta_log/`) and
-//! every path a part of which starts with `_` or `.` are never touched. Nothing
+//! every path a part of which starts with `_` or `.` are never touched, but for
+//! the change data files under `_change_data/`, which no version reads and which
+//! age out with the retention as data files do. Nothing
 //! is committed: VACUUM changes no version, only which old ones stay readable.
 //!
 //! OPTIMIZE compacts a partition's small files (under the writer's 128 MiB roll)
@@ -204,7 +206,8 @@ fn below(arena: std.mem.Allocator, root: []const u8, path: []const u8) ![]const 
 /// Whether a path below the root is one VACUUM never deletes: in the log, or with
 /// any part starting `_` or `.`.
 fn hidden(rel: []const u8) bool {
-    var it = std.mem.splitAny(u8, rel, "/\\");
+    const r = if (std.mem.startsWith(u8, rel, "_change_data/")) rel["_change_data/".len..] else rel;
+    var it = std.mem.splitAny(u8, r, "/\\");
     while (it.next()) |part| if (part.len > 0 and (part[0] == '_' or part[0] == '.')) return true;
     return false;
 }
@@ -212,7 +215,9 @@ fn hidden(rel: []const u8) bool {
 test "VACUUM never touches the log or a hidden path" {
     try testing.expect(hidden("_delta_log/00000000000000000000.json"));
     try testing.expect(hidden("x=1/.part.crc"));
-    try testing.expect(hidden("_change_data/c.parquet"));
+    try testing.expect(!hidden("_change_data/c.parquet"));
+    try testing.expect(!hidden("_change_data/x=1/cdc-0.parquet"));
+    try testing.expect(hidden("_change_data/.c.parquet.crc"));
     try testing.expect(!hidden("x=1/part-0.parquet"));
     try testing.expect(!hidden("deletion_vector_1.bin"));
 }

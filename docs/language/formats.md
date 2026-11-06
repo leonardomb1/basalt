@@ -336,7 +336,8 @@ than the retention — `delta.deletedFileRetentionDuration`, a week when unset, 
 the longer number of hours given. A shorter retention than the table's is
 refused, as Spark refuses it: a concurrent writer's files not yet committed are
 as new as that. The log and every path with a part starting `_` or `.` are never
-touched, and nothing is committed; versions older than the retention may then
+touched, but for the change data files under `_change_data/`, which age out as
+data files do; nothing is committed; versions older than the retention may then
 no longer be readable. A file's age is its modification time (an object's
 `Last-Modified`).
 
@@ -410,10 +411,19 @@ or the rows' size. A partitioned table's rewritten and inserted rows are sorted
 by partition before they are written (an external sort, also within
 `--op-memory`), so each touched partition gets one new file however the join
 ordered them. A file with a deletion vector is read without its deleted rows,
-so its rewrite drops them, and its `remove` names the deletion vector. A table
-recording a change data feed (`delta.enableChangeDataFeed`) is refused, as its
-rewritten files would misreport every row as changed. basalt writes no deletion
-vectors of its own.
+so its rewrite drops them, and its `remove` names the deletion vector. basalt
+writes no deletion vectors of its own.
+
+On a table recording a change data feed (`delta.enableChangeDataFeed`) an UPSERT
+that rewrites files also writes what it changed to change data files under
+`_change_data/` (partitioned as the table is and sorted with the rewritten rows,
+so each touched partition gets one, each a `cdc` action of the commit), so a reader of the feed does not take every row of a rewritten file as
+deleted and inserted again: a matched row's old values as `update_preimage` and
+its new ones as `update_postimage` (under `PARTIAL COLS`, the columns it leaves
+as they were), an inserted row as `insert`, and a row a `USING changes` delete
+removes as `delete`. An UPSERT that rewrites no file, an append and a `REPLACE`
+write none, as their added and removed files say what changed, and
+`delta_optimize` none either, as it changes no row.
 
 The commit is created only if no writer made that version first: a local one by
 hard-linking a fully written, synced hidden file to its name, an object store's

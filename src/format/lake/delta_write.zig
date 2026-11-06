@@ -904,8 +904,6 @@ pub fn writable(st: *const delta.State, fields: []const Field, mode: Mode) !void
     }
     if (mode != .append) if (st.property("delta.appendOnly")) |v| if (textconv.boolText(.delta_property, v).?)
         return refuse("{s} is append-only (`delta.appendOnly`), so {s} cannot remove its files", .{ st.name, if (mode == .replace) "a REPLACE" else "an UPSERT" });
-    if (mode == .upsert) if (st.property("delta.enableChangeDataFeed")) |v| if (textconv.boolText(.delta_property, v).?)
-        return refuse("{s} records a change data feed (`delta.enableChangeDataFeed`), which an UPSERT's rewritten files would misreport (every row of a rewritten file as deleted and inserted); basalt does not write the change files that would say which rows changed", .{st.name});
 }
 
 fn oneOf(s: []const u8, set: []const []const u8) bool {
@@ -1005,6 +1003,8 @@ fn statTree(w: *std.Io.Writer, items: []const Stat, depth: usize) !void {
 }
 
 /// A data file being written, its names and values on its own arena.
+const change_dir = "_change_data/";
+
 const Open = struct {
     mem: *std.heap.ArenaAllocator,
     writer: *pqwrite.Writer,
@@ -1012,6 +1012,7 @@ const Open = struct {
     full: []const u8,
     values: []const ?[]const u8,
     used: u64,
+    cdc: bool = false,
 };
 
 pub const Sink = struct {
@@ -1021,6 +1022,9 @@ pub const Sink = struct {
     plan: *const Plan,
     file_schema: types.Schema,
     phys: []const pqwrite.Physical,
+    cdc_schema: types.Schema = .{ .fields = &.{} },
+    cdc_phys: []const pqwrite.Physical = &.{},
+    feed: bool = false,
     files: std.StringArrayHashMapUnmanaged(*Open) = .empty,
     tick: u64 = 0,
     /// The commit being built: its header, then the `add` action of every data
@@ -1094,6 +1098,17 @@ pub const Sink = struct {
         }
         self.file_schema = .{ .fields = fields };
         self.phys = phys;
+        if (p.mode == .upsert) if (p.snap) |st| if (st.property("delta.enableChangeDataFeed")) |v| if (textconv.boolText(.delta_property, v) orelse false) {
+            const cf = try a.alloc(types.Schema.Field, p.data.len + 1);
+            @memcpy(cf[0..p.data.len], fields[0..p.data.len]);
+            cf[p.data.len] = .{ .name = fit.change_type_name, .ty = types.Type.init(.string).asNullable() };
+            const cp = try a.alloc(pqwrite.Physical, p.data.len + 1);
+            @memcpy(cp[0..p.data.len], phys[0..p.data.len]);
+            cp[p.data.len] = .{};
+            self.cdc_schema = .{ .fields = cf };
+            self.cdc_phys = cp;
+            self.feed = true;
+        };
         try self.header();
         return self;
     }
@@ -1179,10 +1194,21 @@ pub const Sink = struct {
     /// write is freed before the next, so the work and memory are the batch's
     /// whatever the number of partitions in it.
     pub fn route(self: *Sink, arena: std.mem.Allocator, b: Batch) !void {
+        return self.routeTo(arena, b, false);
+    }
+
+    /// Writes change rows to the table's change data files: rows shaped as `plan`
+    /// reads them with their `_change_type` last, routed by partition as `route`
+    /// routes rows.
+    pub fn routeChanges(self: *Sink, arena: std.mem.Allocator, b: Batch) !void {
+        return self.routeTo(arena, b, true);
+    }
+
+    fn routeTo(self: *Sink, arena: std.mem.Allocator, b: Batch, cdc: bool) !void {
         if (b.len == 0) return;
         try self.check(b);
         const p = self.plan;
-        if (p.parts.len == 0) return self.writeRows(arena, b, null, &.{}, "");
+        if (p.parts.len == 0) return self.writeRows(arena, b, null, &.{}, "", cdc);
         const Group = struct { n: usize, end: usize = 0, values: []const ?[]const u8 };
         var groups: std.StringArrayHashMapUnmanaged(Group) = .empty;
         const of = try arena.alloc(u32, b.len);
@@ -1220,7 +1246,7 @@ pub const Sink = struct {
         var each = std.heap.ArenaAllocator.init(self.gpa);
         defer each.deinit();
         for (groups.keys(), groups.values()) |k, g| {
-            try self.writeRows(each.allocator(), b, idx[g.end - g.n .. g.end], g.values, k);
+            try self.writeRows(each.allocator(), b, idx[g.end - g.n .. g.end], g.values, k, cdc);
             _ = each.reset(.retain_capacity);
         }
     }
@@ -1249,14 +1275,19 @@ pub const Sink = struct {
 
     /// Writes the rows of `b` at `rows` (every row when null) to the file of the
     /// partition `key` names.
-    fn writeRows(self: *Sink, arena: std.mem.Allocator, b: Batch, rows: ?[]const usize, values: []const ?[]const u8, key: []const u8) !void {
+    fn writeRows(self: *Sink, arena: std.mem.Allocator, b: Batch, rows: ?[]const usize, values: []const ?[]const u8, part_key: []const u8, cdc: bool) !void {
         const p = self.plan;
-        const row_src: ?[2]usize = if (p.row) |r| r.src else null;
-        const cols = try arena.alloc(column.Column, p.data.len + @as(usize, if (row_src != null) 2 else 0));
+        const row_src: ?[2]usize = if (cdc) null else if (p.row) |r| r.src else null;
+        const cols = try arena.alloc(column.Column, p.data.len + @as(usize, if (row_src != null) 2 else if (cdc) 1 else 0));
         const n = if (rows) |x| x.len else b.len;
         if (row_src) |rs| for (rs, cols[p.data.len..]) |k, *c| {
             c.* = if (rows) |x| try column.permute(arena, b.columns[k], x) else b.columns[k];
         };
+        if (cdc) {
+            const kind = b.columns[b.columns.len - 1];
+            cols[p.data.len] = if (rows) |x| try column.permute(arena, kind, x) else kind;
+        }
+        const key = if (cdc) try std.mem.concat(arena, u8, &.{ "\x01", part_key }) else part_key;
         for (p.data, cols[0..p.data.len]) |k, *c| {
             const pc = p.cols[k];
             if (pc.src == absent) {
@@ -1268,8 +1299,8 @@ pub const Sink = struct {
             if (pc.ty.isNested() and !src.ty.eql(pc.ty)) src = try fit.reshape(arena, src, pc.ty);
             c.* = if (rows) |x| try column.permute(arena, src, x) else src;
         }
-        const o = try self.fileFor(key, values);
-        o.writer.writeBatch(arena, .{ .schema = &self.file_schema, .columns = cols, .len = if (rows) |x| x.len else b.len }) catch |e| return self.explainWrite(e);
+        const o = try self.fileFor(key, values, cdc);
+        o.writer.writeBatch(arena, .{ .schema = if (cdc) &self.cdc_schema else &self.file_schema, .columns = cols, .len = if (rows) |x| x.len else b.len }) catch |e| return self.explainWrite(e);
         self.tick += 1;
         o.used = self.tick;
         if (o.writer.offset >= roll_bytes) try self.finishFile(key);
@@ -1283,7 +1314,7 @@ pub const Sink = struct {
         return e;
     }
 
-    fn fileFor(self: *Sink, key: []const u8, values: []const ?[]const u8) !*Open {
+    fn fileFor(self: *Sink, key: []const u8, values: []const ?[]const u8, cdc: bool) !*Open {
         if (self.files.get(key)) |o| return o;
         if (self.files.count() >= max_open) {
             var oldest: usize = 0;
@@ -1301,13 +1332,14 @@ pub const Sink = struct {
         const a = mem.allocator();
         var aw = std.Io.Writer.Allocating.init(a);
         const w = &aw.writer;
+        if (cdc) try w.writeAll(change_dir);
         for (self.plan.parts, values) |k, v| {
             try escapePath(w, self.plan.cols[k].fileName());
             try w.writeByte('=');
             if (v) |t| try escapePath(w, t) else try w.writeAll("__HIVE_DEFAULT_PARTITION__");
             try w.writeByte('/');
         }
-        try w.print("part-{s}{s}", .{ &dlog.uuid(), switch (self.plan.codec) {
+        try w.print("{s}-{s}{s}", .{ if (cdc) "cdc" else "part", &dlog.uuid(), switch (self.plan.codec) {
             .snappy => ".snappy.parquet",
             .gzip => ".gz.parquet",
             else => ".parquet",
@@ -1315,13 +1347,13 @@ pub const Sink = struct {
         const rel = aw.written();
         const full = try std.mem.concat(a, u8, &.{ self.plan.root, rel });
         if (!objstore.isUrl(full)) if (std.fs.path.dirname(full)) |d| try std.fs.cwd().makePath(d);
-        const writer = try pqwrite.Writer.openPhysical(a, full, self.file_schema, self.plan.codec, .truncate, self.phys);
+        const writer = try pqwrite.Writer.openPhysical(a, full, if (cdc) self.cdc_schema else self.file_schema, self.plan.codec, .truncate, if (cdc) self.cdc_phys else self.phys);
         writer.field_ids = self.plan.field_ids;
         try self.begun.append(self.mem.allocator(), try self.mem.allocator().dupe(u8, full));
         const o = try a.create(Open);
         const kept = try a.alloc(?[]const u8, values.len);
         for (kept, values) |*k, v| k.* = if (v) |t| try a.dupe(u8, t) else null;
-        o.* = .{ .mem = mem, .writer = writer, .rel = rel, .full = full, .values = kept, .used = self.tick };
+        o.* = .{ .mem = mem, .writer = writer, .rel = rel, .full = full, .values = kept, .used = self.tick, .cdc = cdc };
         try self.files.put(self.mem.allocator(), try a.dupe(u8, key), o);
         return o;
     }
@@ -1355,7 +1387,7 @@ pub const Sink = struct {
         }
         const p = self.plan;
         const w = &self.adds.writer;
-        try w.writeAll("{\"add\":{\"path\":");
+        try w.writeAll(if (o.cdc) "{\"cdc\":{\"path\":" else "{\"add\":{\"path\":");
         try jsontext.string(w, try uriPath(a, o.rel));
         try w.writeAll(",\"partitionValues\":{");
         for (p.parts, o.values, 0..) |k, v, i| {
@@ -1363,6 +1395,10 @@ pub const Sink = struct {
             try jsontext.string(w, p.cols[k].fileName());
             try w.writeByte(':');
             if (v) |t| try jsontext.string(w, t) else try w.writeAll("null");
+        }
+        if (o.cdc) {
+            try w.print("}},\"size\":{d},\"dataChange\":false}}}}\n", .{sum.bytes});
+            return;
         }
         try w.print("}},\"size\":{d},\"modificationTime\":{d},\"dataChange\":{s},", .{ sum.bytes, std.time.milliTimestamp(), if (self.compacting == null) "true" else "false" });
         if (p.row != null) {
