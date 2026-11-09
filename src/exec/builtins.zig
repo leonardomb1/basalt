@@ -48,6 +48,8 @@ test "builtins: exactly these lack a vectorized kernel" {
         "json_range",
         "json_slice",
         "json_concat",
+        "__change_need",
+        "__change_last",
     };
     for (rowwise_only) |n| try std.testing.expect(lookup(n) != null);
     for (table) |b| {
