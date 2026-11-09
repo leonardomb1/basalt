@@ -429,8 +429,9 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
     }
 
     const lpos = self.curPos();
-    if (try parseLimit(self)) |lim|
-        try stages.append(.{ .node = .{ .limit = lim }, .hints = &.{}, .pos = lpos });
+    if (try parseLimit(self)) |lim| {
+        if (lim.with_ties) try withTies(self, stages, lim, lpos) else try stages.append(.{ .node = .{ .limit = lim }, .hints = &.{}, .pos = lpos });
+    }
 
     if (hidden_drop) |keep|
         try stages.append(.{ .node = .{ .select = keep }, .hints = &.{}, .pos = self.curPos() });
@@ -699,6 +700,11 @@ fn parseLimit(self: *Parser) Error!?ast.Limit {
             counted = true;
             if (self.eatKw("limit")) {
                 if (!self.eatKw("all")) try limitCount(self, "LIMIT", &lim.count, &lim.count_expr);
+                if (self.isKw("with") and self.i + 1 < self.toks.len and eqlNoCase(self.toks[self.i + 1].text, "ties")) {
+                    _ = self.advance();
+                    _ = self.advance();
+                    lim.with_ties = true;
+                }
                 continue;
             }
             _ = self.advance();
@@ -707,9 +713,10 @@ fn parseLimit(self: *Parser) Error!?ast.Limit {
             if (self.isKw("row") or self.isKw("rows")) lim.count = 1 else try limitCount(self, "FETCH FIRST", &lim.count, &lim.count_expr);
             if (!self.eatKw("row") and !self.eatKw("rows"))
                 return self.fail(self.curPos(), "expected `ROWS ONLY` after FETCH FIRST n", .{});
-            if (self.isKw("with"))
-                return self.fail(self.curPos(), "FETCH FIRST ... WITH TIES is not supported; write ROWS ONLY", .{});
-            try self.expectKw("only");
+            if (self.eatKw("with")) {
+                try self.expectKw("ties");
+                lim.with_ties = true;
+            } else try self.expectKw("only");
         } else if (self.eatKw("offset")) {
             if (offset) return self.fail(kpos, "a query takes one OFFSET", .{});
             offset = true;
@@ -1219,6 +1226,10 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         if (using_sel) |items| try stages.append(.{ .node = .{ .select = items }, .hints = &.{}, .pos = jpos });
     }
 
+    while (self.isKw("pivot") or self.isKw("unpivot")) {
+        if (self.isKw("pivot")) try parsePivot(self, &stages, &aliases) else try parseUnpivot(self, &stages, &aliases);
+    }
+
     var corr_hidden = std.array_list.Managed([]const u8).init(self.arena);
     {
         var fpos = pos;
@@ -1301,48 +1312,77 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     var group: []const ast.QualName = &.{};
     var group_hidden = std.array_list.Managed(ast.SelectItem).init(self.arena);
     var input_named = std.array_list.Managed([]const u8).init(self.arena);
+    var grouping_sets: ?KeySets = null;
+    const group_pos = self.curPos();
     if (self.eatKw("group")) {
         try self.expectKw("by");
         var keys = std.array_list.Managed(ast.QualName).init(self.arena);
-        while (true) {
-            const gpos = self.curPos();
-            const ge = try self.parseExpr();
-            var q: ast.QualName = undefined;
-            if (ge.* == .int_lit) {
-                const n = ge.int_lit;
-                if (n < 1 or n > @as(i64, @intCast(raw_items.items.len)))
-                    return self.fail(gpos, "GROUP BY position {d} is out of range", .{n});
-                const ri = raw_items.items[@intCast(n - 1)];
-                if (ri == .win) return self.fail(gpos, "GROUP BY position {d} is a window function — group on it in an outer query", .{n});
-                if (ri != .item) return self.fail(gpos, "GROUP BY position {d} refers to `*`", .{n});
-                q = switch (ri.item) {
-                    .field => |f| stripQual(f, &aliases),
-                    .computed => |c| blk: {
-                        if (containsAgg(c.expr))
-                            return self.fail(gpos, "GROUP BY position {d} names the aggregate `{s}` — a position may only name a grouping key", .{ n, c.name });
-                        break :blk try self.singleName(c.name);
-                    },
-                    else => return self.fail(gpos, "GROUP BY position {d} refers to `*`", .{n}),
-                };
-            } else if (ge.* == .field and !structish(ge.field, &aliases)) {
-                if (ge.field.parts.len == 1) {
-                    const n = ge.field.parts[0];
-                    switch (try groupNameHome(self, raw_items.items, n, &aliases)) {
-                        .input => {},
-                        .input_under_alias => try input_named.append(n),
-                        .alias => try unambiguous(self, dups.items, n, "GROUP BY", gpos),
+        const Keys = struct {
+            p: *Parser,
+            raw: @TypeOf(&raw_items),
+            aliases: *AliasSet,
+            dups: []const Parser.DupName,
+            hidden: *std.array_list.Managed(ast.SelectItem),
+            input_named: *std.array_list.Managed([]const u8),
+            expr_aliases: @TypeOf(&expr_aliases),
+            keys: *std.array_list.Managed(ast.QualName),
+
+            /// One key expression, its place in `keys`; a key named twice keeps one.
+            pub fn parse(k: @This()) Error!usize {
+                const self_ = k.p;
+                const gpos = self_.curPos();
+                const ge = try self_.parseExpr();
+                var q: ast.QualName = undefined;
+                if (ge.* == .int_lit) {
+                    const n = ge.int_lit;
+                    if (n < 1 or n > @as(i64, @intCast(k.raw.items.len)))
+                        return self_.fail(gpos, "GROUP BY position {d} is out of range", .{n});
+                    const ri = k.raw.items[@intCast(n - 1)];
+                    if (ri == .win) return self_.fail(gpos, "GROUP BY position {d} is a window function — group on it in an outer query", .{n});
+                    if (ri != .item) return self_.fail(gpos, "GROUP BY position {d} refers to `*`", .{n});
+                    q = switch (ri.item) {
+                        .field => |f| stripQual(f, k.aliases),
+                        .computed => |c| blk: {
+                            if (containsAgg(c.expr))
+                                return self_.fail(gpos, "GROUP BY position {d} names the aggregate `{s}` — a position may only name a grouping key", .{ n, c.name });
+                            break :blk try self_.singleName(c.name);
+                        },
+                        else => return self_.fail(gpos, "GROUP BY position {d} refers to `*`", .{n}),
+                    };
+                } else if (ge.* == .field and !structish(ge.field, k.aliases)) {
+                    if (ge.field.parts.len == 1) {
+                        const n = ge.field.parts[0];
+                        switch (try groupNameHome(self_, k.raw.items, n, k.aliases)) {
+                            .input => {},
+                            .input_under_alias => try k.input_named.append(n),
+                            .alias => try unambiguous(self_, k.dups, n, "GROUP BY", gpos),
+                        }
                     }
+                    q = stripQual(ge.field, k.aliases);
+                } else {
+                    if (containsAgg(ge)) return self_.fail(gpos, "GROUP BY cannot group on an aggregate", .{});
+                    const b = try self_.bindName(ge, k.expr_aliases.items);
+                    if (!b.item and !providesName(k.hidden.items, b.name)) try k.hidden.append(.{ .computed = .{ .name = b.name, .expr = try self_.stripExpr(ge, k.aliases) } });
+                    q = try self_.singleName(b.name);
                 }
-                q = stripQual(ge.field, &aliases);
-            } else {
-                if (containsAgg(ge)) return self.fail(gpos, "GROUP BY cannot group on an aggregate", .{});
-                const b = try self.bindName(ge, expr_aliases.items);
-                if (!b.item and !providesName(group_hidden.items, b.name)) try group_hidden.append(.{ .computed = .{ .name = b.name, .expr = try self.stripExpr(ge, &aliases) } });
-                q = try self.singleName(b.name);
+                for (k.keys.items, 0..) |have, i| if (qualEql(have, q)) return i;
+                try k.keys.append(q);
+                return k.keys.items.len - 1;
             }
-            try keys.append(q);
+        };
+        const key_parser = Keys{ .p = self, .raw = &raw_items, .aliases = &aliases, .dups = dups.items, .hidden = &group_hidden, .input_named = &input_named, .expr_aliases = &expr_aliases, .keys = &keys };
+        var plain = std.array_list.Managed(usize).init(self.arena);
+        var factors = std.array_list.Managed(KeySets).init(self.arena);
+        while (true) {
+            if (atGroupingStart(self)) {
+                try factors.append(try parseGroupingElement(self, key_parser));
+            } else {
+                const at = try key_parser.parse();
+                if (std.mem.indexOfScalar(usize, plain.items, at) == null) try plain.append(at);
+            }
             if (!self.eat(.comma)) break;
         }
+        if (factors.items.len > 0) grouping_sets = try crossSets(self, plain.items, factors.items, group_pos);
         group = try keys.toOwnedSlice();
         if (input_named.items.len > 0) {
             var kept_aliases = std.array_list.Managed(ExprAlias).init(self.arena);
@@ -1354,8 +1394,31 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     var having: ?*ast.Expr = null;
     if (self.eatKw("having")) having = try self.parseExpr();
 
+    const real_keys = group;
+    const grouping_used = try self.arena.alloc(bool, group.len);
+    @memset(grouping_used, false);
+    if (grouping_sets != null) {
+        for (raw_items.items) |*ri| if (ri.* == .item and ri.item == .computed) {
+            ri.item.computed.expr = try groupingCalls(self, ri.item.computed.expr, group, grouping_used, group_pos);
+        };
+        if (having) |h| having = try groupingCalls(self, h, group, grouping_used, group_pos);
+        var all = std.array_list.Managed(ast.QualName).init(self.arena);
+        try all.appendSlice(group);
+        for (group, grouping_used) |k, used| if (used) try all.append(try self.singleName(try groupingName(self, k)));
+        group = try all.toOwnedSlice();
+    }
+
+    var qualify: ?*ast.Expr = null;
+    const qualify_pos = self.curPos();
+    self.win_sink = &win_calls;
+    if (self.eatKw("qualify")) qualify = try self.parseExpr();
+    self.win_sink = null;
+
     var named = std.array_list.Managed(Parser.NamedWindow).init(self.arena);
     if (self.eatKw("window")) try self.parseWindowClause(&named);
+    self.win_sink = &win_calls;
+    if (qualify == null and self.eatKw("qualify")) qualify = try self.parseExpr();
+    self.win_sink = null;
     const specs = try self.arena.alloc(Window.Spec, win_calls.items.len);
     for (win_calls.items, specs) |*c, *sp| {
         const r = try self.resolveSpec(c.spec, named.items, 0);
@@ -1490,6 +1553,12 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         }
     }
 
+    if (qualify) |q| {
+        const named_out = try qualifyNames(self, q, win_calls.items, post.items);
+        qualify = try self.stripExpr(named_out, &aliases);
+        if (!Window.refsWindow(qualify.?, win_calls.items))
+            return self.fail(qualify_pos, "QUALIFY filters on a window function's result, and this one names none — use WHERE or HAVING", .{});
+    }
     for (aggs.items) |a| if (a.arg) |arg| if (Window.refsWindow(arg, win_calls.items))
         return self.fail(pos, "an aggregate cannot take a window function's result — compute the window in a derived table or CTE first", .{});
     var agg_mode = aggs.items.len > 0 or group.len > 0;
@@ -1497,6 +1566,9 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         for (win_post.items) |at| {
             if (containsAgg(post.items[at].computed.expr)) agg_mode = true;
         }
+        if (qualify) |q| if (containsAgg(q)) {
+            agg_mode = true;
+        };
         for (win_calls.items, specs) |c, sp| {
             if (c.arg) |a| if (containsAgg(a)) {
                 agg_mode = true;
@@ -1521,6 +1593,10 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             it.expr = try L.lift(self, try self.groupKeyRefs(it.expr, group, ea), &aggs, ea, pos);
             lifted = true;
         }
+        if (qualify) |q| {
+            qualify = try L.lift(self, try self.groupKeyRefs(q, group, ea), &aggs, ea, pos);
+            lifted = true;
+        }
         for (win_calls.items, specs) |*c, *sp| {
             if (c.arg) |a| c.arg = try L.lift(self, try self.groupKeyRefs(a, group, ea), &aggs, ea, pos);
             const part = try self.arena.dupe(*ast.Expr, sp.partition);
@@ -1533,6 +1609,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         for (aggs.items) |a| if (a.arg) |arg| if (Window.refsWindow(arg, win_calls.items))
             return self.fail(pos, "an aggregate cannot take a window function's result — compute the window in a derived table or CTE first", .{});
         for (win_post.items) |at| try self.groupedOnly(post.items[at].computed.expr, group, aggs.items, win_calls.items, pos);
+        if (qualify) |q| try self.groupedOnly(q, group, aggs.items, win_calls.items, pos);
         for (win_calls.items, specs) |c, sp| {
             if (c.arg) |a| try self.groupedOnly(a, group, aggs.items, win_calls.items, pos);
             for (sp.partition) |e| try self.groupedOnly(e, group, aggs.items, win_calls.items, pos);
@@ -1551,8 +1628,8 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         if (aggs.items.len == 0 and win_calls.items.len == 0)
             return self.fail(pos, "GROUP BY without aggregate functions in SELECT or HAVING", .{});
         for (aggs.items) |a| {
-            if (a.distinct and a.func != .count)
-                return self.fail(pos, "DISTINCT is only supported inside COUNT", .{});
+            if (a.distinct and a.func != .count and a.func != .array_agg and a.func != .string_agg)
+                return self.fail(pos, "DISTINCT is only supported inside COUNT, ARRAY_AGG and STRING_AGG", .{});
         }
 
         try items.appendSlice(group_hidden.items);
@@ -1603,11 +1680,26 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             try stages.append(.{ .node = .{ .select = try kept.toOwnedSlice() }, .hints = &.{}, .pos = pos });
         }
         const aggs_out = try aggs.toOwnedSlice();
+        var agg_by = group;
+        var key_names: []const ast.SelectItem.Rename = &.{};
+        var on_empty: []const []const u8 = &.{};
+        if (grouping_sets) |sets| {
+            const expanded = try expandGroupingSets(self, &stages, real_keys, sets, grouping_used, pos);
+            agg_by = expanded.by;
+            key_names = expanded.names;
+            on_empty = expanded.on_empty;
+            lifted = true;
+        }
         try stages.append(.{
-            .node = .{ .aggregate = .{ .aggs = aggs_out, .by = group } },
+            .node = .{ .aggregate = .{ .aggs = aggs_out, .by = agg_by, .on_empty = on_empty } },
             .hints = &.{},
             .pos = pos,
         });
+        if (grouping_sets != null) {
+            const back = try self.arena.alloc(ast.SelectItem, 1);
+            back[0] = .{ .star_rename = key_names };
+            try stages.append(.{ .node = .{ .select = back }, .hints = &.{}, .pos = pos });
+        }
         if (having_filter) |hf| {
             try self.groupedOnly(hf, group, aggs_out, &.{}, pos);
             try stages.append(.{ .node = .{ .filter = hf }, .hints = &.{}, .pos = pos });
@@ -1644,6 +1736,9 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             const it = &post.items[at].computed;
             it.expr = try low.carryExpr(it.expr);
         };
+        if (!agg_mode) if (qualify) |q| {
+            qualify = try low.carryExpr(q);
+        };
         const wstages = try low.stages(specs, pos);
         if (agg_mode) {
             if (low.pre.items.len > 0) {
@@ -1660,6 +1755,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             }
         }
         try stages.appendSlice(wstages);
+        if (qualify) |q| try stages.append(.{ .node = .{ .filter = q }, .hints = &.{}, .pos = pos });
         var drop = std.array_list.Managed([]const u8).init(self.arena);
         try drop.appendSlice(low.hidden.items);
         for (win_calls.items) |c| if (c.out) |o| try drop.append(o);
@@ -1699,6 +1795,389 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         .final_names = final_names,
         .where_end = where_end,
     };
+}
+
+/// `ORDER BY k LIMIT n WITH TIES`: the rows ranked by the sort's keys and those of
+/// rank `n` or better kept, then sorted, so a row tied with the last stays.
+fn withTies(self: *Parser, stages: *std.array_list.Managed(ast.Stage), lim: ast.Limit, pos: Pos) Error!void {
+    const last = stages.items.len - 1;
+    if (stages.items.len == 0 or stages.items[last].node != .sort)
+        return self.fail(pos, "WITH TIES needs an ORDER BY to say what ties", .{});
+    if (lim.offset != 0 or lim.offset_expr != null) return self.fail(pos, "WITH TIES takes no OFFSET", .{});
+    const rank_col = "__rk";
+    const funcs = try self.arena.alloc(ast.WindowFunc, 1);
+    funcs[0] = .{ .func = .{ .win = .rank }, .out = rank_col };
+    const sort = stages.items[last];
+    const bound = lim.count_expr orelse try self.mk(.{ .int_lit = std.math.cast(i64, lim.count) orelse std.math.maxInt(i64) });
+    const keep = try self.mk(.{ .binary = .{ .op = .le, .l = try self.mk(.{ .field = try self.singleName(rank_col) }), .r = bound } });
+    stages.items[last] = .{ .node = .{ .window = .{ .funcs = funcs, .order_by = sort.node.sort.keys } }, .hints = &.{}, .pos = pos };
+    try stages.append(.{ .node = .{ .filter = keep }, .hints = &.{}, .pos = pos });
+    try stages.append(sort);
+    const drop = try self.arena.alloc([]const u8, 1);
+    drop[0] = rank_col;
+    const rest = try self.arena.alloc(ast.SelectItem, 1);
+    rest[0] = .{ .star_except = drop };
+    try stages.append(.{ .node = .{ .select = rest }, .hints = &.{}, .pos = pos });
+}
+
+/// A PIVOT value's column name: what it is written as, or its AS.
+fn pivotValueName(self: *Parser, v: *const ast.Expr, pos: Pos) Error![]const u8 {
+    return switch (v.*) {
+        .str_lit => |s| s,
+        .int_lit => |n| std.fmt.allocPrint(self.arena, "{d}", .{n}),
+        else => self.fail(pos, "name this PIVOT value with AS", .{}),
+    };
+}
+
+/// `AS name` after a PIVOT or UNPIVOT: the bare `name.` its output answers to.
+fn pivotAlias(self: *Parser, aliases: *AliasSet) Error!void {
+    if (!self.eatKw("as")) return;
+    const pos = self.curPos();
+    const name = try self.expectIdent();
+    aliases.put(name, .left) catch return self.fail(pos, "the name `{s}` is already taken in this FROM", .{name});
+}
+
+/// `PIVOT (agg(x) [AS a], ... FOR col IN (value [AS name], ...)) [AS p]`: one aggregate
+/// per value, over the rows holding it, grouped on every other input column.
+fn parsePivot(self: *Parser, stages: *std.array_list.Managed(ast.Stage), aliases: *AliasSet) Error!void {
+    const pos = self.curPos();
+    try self.expectKw("pivot");
+    _ = try self.expect(.lparen);
+    const Asked = struct { call: ast.Expr.Call, alias: ?[]const u8 };
+    var asked = std.array_list.Managed(Asked).init(self.arena);
+    while (true) {
+        const apos = self.curPos();
+        const e = try self.stripExpr(try self.parseExpr(), aliases);
+        if (e.* != .call or aggregates.lookup(e.call.name) == null) return self.fail(apos, "PIVOT takes aggregates before its FOR", .{});
+        try asked.append(.{ .call = e.call, .alias = if (self.eatKw("as")) try self.expectIdent() else null });
+        if (!self.eat(.comma)) break;
+    }
+    try self.expectKw("for");
+    const col = stripQual(try self.parseColRef(), aliases);
+    try self.expectKw("in");
+    _ = try self.expect(.lparen);
+    var items = std.array_list.Managed(ast.AggItem).init(self.arena);
+    while (true) {
+        const vpos = self.curPos();
+        const v = try self.parseExpr();
+        const value_name = if (self.eatKw("as")) try self.expectIdent() else try pivotValueName(self, v, vpos);
+        const cond = try self.mk(.{ .binary = .{ .op = .eq, .l = try self.mk(.{ .field = col }), .r = v } });
+        for (asked.items) |a| {
+            const f = try self.applyFilter(a.call.name, @constCast(a.call.args), cond, vpos);
+            const name = if (a.alias) |al|
+                try std.fmt.allocPrint(self.arena, "{s}_{s}", .{ value_name, al })
+            else if (asked.items.len > 1)
+                try std.fmt.allocPrint(self.arena, "{s}_{s}", .{ value_name, a.call.name })
+            else
+                value_name;
+            try items.append(.{ .name = name, .func = aggregates.lookup(f.name).?, .arg = if (f.args.len > 0) f.args[0] else null, .distinct = a.call.distinct });
+        }
+        if (!self.eat(.comma)) break;
+    }
+    _ = try self.expect(.rparen);
+    _ = try self.expect(.rparen);
+    var fields = std.array_list.Managed(ast.QualName).init(self.arena);
+    for (asked.items) |a| for (a.call.args) |arg| try self.collectFields(arg, &fields);
+    var rest = std.array_list.Managed([]const u8).init(self.arena);
+    try rest.append(col.last());
+    for (fields.items) |q| if (!q.dollar and !ast.nameIn(rest.items, q.last())) try rest.append(q.last());
+    try stages.append(.{ .node = .{ .aggregate = .{ .aggs = try items.toOwnedSlice(), .by = &.{}, .by_rest = try rest.toOwnedSlice() } }, .hints = &.{}, .pos = pos });
+    try pivotAlias(self, aliases);
+}
+
+/// `UNPIVOT [INCLUDE NULLS | EXCLUDE NULLS] (value FOR name IN (col [AS 'label'], ...))
+/// [AS u]`: each input row made one row per column listed, NULLs left out unless asked
+/// for, the other columns kept.
+fn parseUnpivot(self: *Parser, stages: *std.array_list.Managed(ast.Stage), aliases: *AliasSet) Error!void {
+    const pos = self.curPos();
+    try self.expectKw("unpivot");
+    var keep_nulls = false;
+    if (self.eatKw("include")) {
+        try self.expectKw("nulls");
+        keep_nulls = true;
+    } else if (self.eatKw("exclude")) try self.expectKw("nulls");
+    _ = try self.expect(.lparen);
+    const value = try self.expectIdent();
+    try self.expectKw("for");
+    const label = try self.expectIdent();
+    try self.expectKw("in");
+    _ = try self.expect(.lparen);
+    const Col = struct { q: ast.QualName, label: []const u8 };
+    var cols = std.array_list.Managed(Col).init(self.arena);
+    while (true) {
+        const q = stripQual(try self.parseColRef(), aliases);
+        var name = q.last();
+        if (self.eatKw("as")) name = (try self.expect(.string)).text;
+        try cols.append(.{ .q = q, .label = name });
+        if (!self.eat(.comma)) break;
+    }
+    _ = try self.expect(.rparen);
+    _ = try self.expect(.rparen);
+
+    const hidden = "__up";
+    var ids = std.array_list.Managed(u8).init(self.arena);
+    for (cols.items, 0..) |_, i| {
+        if (i > 0) try ids.append(',');
+        try ids.writer().print("{d}", .{i});
+    }
+    const with_id = try self.arena.alloc(ast.SelectItem, 2);
+    with_id[0] = .star;
+    with_id[1] = .{ .computed = .{ .name = hidden, .expr = try self.mk(.{ .str_lit = ids.items }) } };
+    try stages.append(.{ .node = .{ .select = with_id }, .hints = &.{}, .pos = pos });
+    try stages.append(.{ .node = .{ .explode = .{ .field = hidden, .as_name = null, .delim = "," } }, .hints = &.{}, .pos = pos });
+
+    var label_e = try self.mk(.null_lit);
+    var value_e = try self.mk(.null_lit);
+    var i = cols.items.len;
+    while (i > 0) {
+        i -= 1;
+        const id = try std.fmt.allocPrint(self.arena, "{d}", .{i});
+        const at = try self.mk(.{ .binary = .{ .op = .eq, .l = try self.mk(.{ .field = try self.singleName(hidden) }), .r = try self.mk(.{ .str_lit = id }) } });
+        label_e = try self.mk(.{ .cond = .{ .cond = at, .then = try self.mk(.{ .str_lit = cols.items[i].label }), .els = label_e } });
+        value_e = try self.mk(.{ .cond = .{ .cond = at, .then = try self.mk(.{ .field = cols.items[i].q }), .els = value_e } });
+    }
+    var dropped = std.array_list.Managed([]const u8).init(self.arena);
+    try dropped.append(hidden);
+    for (cols.items) |c| try dropped.append(c.q.last());
+    const out = try self.arena.alloc(ast.SelectItem, 3);
+    out[0] = .{ .star_except = try dropped.toOwnedSlice() };
+    out[1] = .{ .computed = .{ .name = label, .expr = label_e } };
+    out[2] = .{ .computed = .{ .name = value, .expr = value_e } };
+    try stages.append(.{ .node = .{ .select = out }, .hints = &.{}, .pos = pos });
+    if (!keep_nulls) {
+        const present = try self.mk(.{ .is_null = .{ .e = try self.mk(.{ .field = try self.singleName(value) }), .negated = true } });
+        try stages.append(.{ .node = .{ .filter = present }, .hints = &.{}, .pos = pos });
+    }
+    try pivotAlias(self, aliases);
+}
+
+/// Grouping sets as lists of places in the GROUP BY's keys.
+const KeySets = []const []const usize;
+
+const set_col = "__gs";
+const max_grouping_sets = 4096;
+
+/// Whether the parser stands at `ROLLUP (`, `CUBE (` or `GROUPING SETS (`.
+fn atGroupingStart(self: *Parser) bool {
+    if ((self.isKw("rollup") or self.isKw("cube")) and self.peekTag() == .lparen) return true;
+    return self.isKw("grouping") and self.i + 1 < self.toks.len and eqlNoCase(self.toks[self.i + 1].text, "sets");
+}
+
+/// The sets one `ROLLUP (...)`, `CUBE (...)` or `GROUPING SETS (...)` stands for.
+pub fn parseGroupingElement(self: *Parser, keys: anytype) Error!KeySets {
+    const pos = self.curPos();
+    var out = std.array_list.Managed([]const usize).init(self.arena);
+    if (self.eatKw("grouping")) {
+        try self.expectKw("sets");
+        _ = try self.expect(.lparen);
+        while (true) {
+            if (atGroupingStart(self)) {
+                try out.appendSlice(try parseGroupingElement(self, keys));
+            } else try out.append(try parseKeyGroup(self, keys));
+            if (!self.eat(.comma)) break;
+        }
+        _ = try self.expect(.rparen);
+        return out.toOwnedSlice();
+    }
+    const cube = self.isKw("cube");
+    _ = self.advance();
+    _ = try self.expect(.lparen);
+    var items = std.array_list.Managed([]const usize).init(self.arena);
+    while (true) {
+        try items.append(try parseKeyGroup(self, keys));
+        if (!self.eat(.comma)) break;
+    }
+    _ = try self.expect(.rparen);
+    if (!cube) {
+        var n = items.items.len + 1;
+        while (n > 0) {
+            n -= 1;
+            try out.append(try unionOf(self, items.items[0..n]));
+        }
+        return out.toOwnedSlice();
+    }
+    if (items.items.len > 12) return self.fail(pos, "CUBE of {d} items makes too many grouping sets — name them in GROUPING SETS", .{items.items.len});
+    var mask: usize = (@as(usize, 1) << @intCast(items.items.len));
+    while (mask > 0) {
+        mask -= 1;
+        var some = std.array_list.Managed([]const usize).init(self.arena);
+        for (items.items, 0..) |it, i| if (mask & (@as(usize, 1) << @intCast(items.items.len - 1 - i)) != 0) try some.append(it);
+        try out.append(try unionOf(self, some.items));
+    }
+    return out.toOwnedSlice();
+}
+
+/// `()`, `(a, b)` or a lone `a`; `(a + 1) * 2` is one key that opens with a parenthesis.
+fn parseKeyGroup(self: *Parser, keys: anytype) Error![]const usize {
+    var out = std.array_list.Managed(usize).init(self.arena);
+    if (self.at(.lparen) and tupleAhead(self)) {
+        _ = self.advance();
+        if (self.eat(.rparen)) return out.toOwnedSlice();
+        while (true) {
+            try out.append(try keys.parse());
+            if (!self.eat(.comma)) break;
+        }
+        _ = try self.expect(.rparen);
+        return out.toOwnedSlice();
+    }
+    try out.append(try keys.parse());
+    return out.toOwnedSlice();
+}
+
+/// Whether the parenthesis here closes right before a `,` or a `)`.
+fn tupleAhead(self: *Parser) bool {
+    var depth: usize = 0;
+    var i = self.i;
+    while (i < self.toks.len) : (i += 1) {
+        switch (self.toks[i].tag) {
+            .lparen => depth += 1,
+            .rparen => {
+                depth -= 1;
+                if (depth == 0) {
+                    if (i + 1 >= self.toks.len) return false;
+                    const t = self.toks[i + 1].tag;
+                    return t == .comma or t == .rparen;
+                }
+            },
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn unionOf(self: *Parser, lists: []const []const usize) Error![]const usize {
+    var out = std.array_list.Managed(usize).init(self.arena);
+    for (lists) |l| for (l) |k| if (std.mem.indexOfScalar(usize, out.items, k) == null) try out.append(k);
+    return out.toOwnedSlice();
+}
+
+/// Every combination of one set from each of `factors`, the plain keys in all of them.
+fn crossSets(self: *Parser, plain: []const usize, factors: []const KeySets, pos: Pos) Error!KeySets {
+    var acc = std.array_list.Managed([]const usize).init(self.arena);
+    try acc.append(plain);
+    for (factors) |f| {
+        var next = std.array_list.Managed([]const usize).init(self.arena);
+        for (acc.items) |have| for (f) |set| {
+            try next.append(try unionOf(self, &.{ have, set }));
+            if (next.items.len > max_grouping_sets) return self.fail(pos, "this GROUP BY makes more than {d} grouping sets", .{max_grouping_sets});
+        };
+        acc = next;
+    }
+    return acc.toOwnedSlice();
+}
+
+fn groupingName(self: *Parser, k: ast.QualName) Error![]const u8 {
+    return std.fmt.allocPrint(self.arena, "__gb_{s}", .{k.last()});
+}
+
+fn groupedKeyName(self: *Parser, k: ast.QualName) Error![]const u8 {
+    return std.fmt.allocPrint(self.arena, "__gk_{s}", .{k.last()});
+}
+
+/// `e` with each `GROUPING(a, b)` turned into its hidden columns, a bit each, the last
+/// key the lowest, and `used` marking those keys.
+fn groupingCalls(self: *Parser, e: *ast.Expr, keys: []const ast.QualName, used: []bool, pos: Pos) Error!*ast.Expr {
+    const Cx = struct {
+        p: *Parser,
+        keys: []const ast.QualName,
+        used: []bool,
+        pos: Pos,
+        fn recur(cx: @This(), n: *const ast.Expr) Error!*ast.Expr {
+            if (n.* != .call or !std.mem.eql(u8, n.call.name, "grouping")) return ast.rebuildExpr(cx.p.arena, n, cx, recur);
+            if (n.call.args.len == 0) return cx.p.fail(cx.pos, "GROUPING takes the grouping keys it reports on", .{});
+            var acc: ?*ast.Expr = null;
+            for (n.call.args) |a| {
+                if (a.* != .field) return cx.p.fail(cx.pos, "GROUPING takes grouping keys by name", .{});
+                const at = for (cx.keys, 0..) |k, i| {
+                    if (std.mem.eql(u8, k.last(), a.field.last())) break i;
+                } else return cx.p.fail(cx.pos, "GROUPING names `{s}`, which is not a grouping key", .{a.field.last()});
+                cx.used[at] = true;
+                const bit = try cx.p.mk(.{ .field = try cx.p.singleName(try groupingName(cx.p, cx.keys[at])) });
+                acc = if (acc) |have| blk: {
+                    const two = try cx.p.mk(.{ .int_lit = 2 });
+                    const doubled = try cx.p.mk(.{ .binary = .{ .op = .mul, .l = have, .r = two } });
+                    break :blk try cx.p.mk(.{ .binary = .{ .op = .add, .l = doubled, .r = bit } });
+                } else bit;
+            }
+            return acc.?;
+        }
+    };
+    return Cx.recur(.{ .p = self, .keys = keys, .used = used, .pos = pos }, e);
+}
+
+const ExpandedSets = struct { by: []const ast.QualName, names: []const ast.SelectItem.Rename, on_empty: []const []const u8 };
+
+/// Each input row made one row per grouping set, a hidden key saying which, and each
+/// GROUP BY key a hidden copy that is NULL in the sets without it. The aggregate groups
+/// on those, so a key still reads as itself inside `SUM(a)`, and a NULL a key's own
+/// data holds stays apart from the NULL of a set without it. A set of no keys answers
+/// even over no rows, as a plain aggregate does (`on_empty`, those sets' ids).
+fn expandGroupingSets(self: *Parser, stages: *std.array_list.Managed(ast.Stage), keys: []const ast.QualName, sets: KeySets, used: []const bool, pos: Pos) Error!ExpandedSets {
+    var ids = std.array_list.Managed(u8).init(self.arena);
+    for (sets, 0..) |_, i| {
+        if (i > 0) try ids.append(',');
+        try ids.writer().print("{d}", .{i});
+    }
+    const with_id = try self.arena.alloc(ast.SelectItem, 2);
+    with_id[0] = .star;
+    with_id[1] = .{ .computed = .{ .name = set_col, .expr = try self.mk(.{ .str_lit = ids.items }) } };
+    try stages.append(.{ .node = .{ .select = with_id }, .hints = &.{}, .pos = pos });
+    try stages.append(.{ .node = .{ .explode = .{ .field = set_col, .as_name = null, .delim = "," } }, .hints = &.{}, .pos = pos });
+
+    var items = std.array_list.Managed(ast.SelectItem).init(self.arena);
+    try items.append(.star);
+    var by = std.array_list.Managed(ast.QualName).init(self.arena);
+    var names = std.array_list.Managed(ast.SelectItem.Rename).init(self.arena);
+    for (keys, used, 0..) |k, is_used, at| {
+        var without: ?*ast.Expr = null;
+        for (sets, 0..) |set, i| {
+            if (std.mem.indexOfScalar(usize, set, at) != null) continue;
+            const id = try std.fmt.allocPrint(self.arena, "{d}", .{i});
+            const col = try self.mk(.{ .field = try self.singleName(set_col) });
+            const eq = try self.mk(.{ .binary = .{ .op = .eq, .l = col, .r = try self.mk(.{ .str_lit = id }) } });
+            without = if (without) |w| try self.mk(.{ .binary = .{ .op = .@"or", .l = w, .r = eq } }) else eq;
+        }
+        const name = try groupedKeyName(self, k);
+        const own = try self.mk(.{ .field = k });
+        const cond = without orelse try self.mk(.{ .bool_lit = false });
+        const copy = try self.mk(.{ .cond = .{ .cond = cond, .then = try self.mk(.null_lit), .els = own } });
+        try items.append(.{ .computed = .{ .name = name, .expr = copy } });
+        try by.append(try self.singleName(name));
+        try names.append(.{ .from = name, .to = k.last() });
+        if (is_used) {
+            const bit_name = try groupingName(self, k);
+            const bit = try self.mk(.{ .cond = .{ .cond = cond, .then = try self.mk(.{ .int_lit = 1 }), .els = try self.mk(.{ .int_lit = 0 }) } });
+            try items.append(.{ .computed = .{ .name = bit_name, .expr = bit } });
+            try by.append(try self.singleName(bit_name));
+        }
+    }
+    try by.append(try self.singleName(set_col));
+    try stages.append(.{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
+    var totals = std.array_list.Managed([]const u8).init(self.arena);
+    for (sets, 0..) |set, i| if (set.len == 0) try totals.append(try std.fmt.allocPrint(self.arena, "{d}", .{i}));
+    return .{ .by = try by.toOwnedSlice(), .names = try names.toOwnedSlice(), .on_empty = try totals.toOwnedSlice() };
+}
+
+/// QUALIFY's `e` with each bare name of a window function's output, or of a SELECT
+/// item computed over one, replaced by what it stands for, as the filter runs before
+/// the SELECT list is made.
+fn qualifyNames(self: *Parser, e: *ast.Expr, calls: []const Parser.WinCall, post: []const ast.SelectItem) Error!*ast.Expr {
+    const Cx = struct {
+        p: *Parser,
+        calls: []const Parser.WinCall,
+        post: []const ast.SelectItem,
+        fn recur(cx: @This(), n: *const ast.Expr) Error!*ast.Expr {
+            if (n.* == .field and n.field.parts.len == 1 and !n.field.dollar) {
+                const name = n.field.parts[0];
+                for (cx.calls) |c| if (c.out) |o| if (std.mem.eql(u8, o, name))
+                    return cx.p.mk(.{ .field = try cx.p.singleName(c.hidden) });
+                for (cx.post) |it| if (it == .computed and std.mem.eql(u8, it.computed.name, name) and Window.refsWindow(it.computed.expr, cx.calls))
+                    return it.computed.expr;
+            }
+            return ast.rebuildExpr(cx.p.arena, n, cx, recur);
+        }
+    };
+    return Cx.recur(.{ .p = self, .calls = calls, .post = post }, e);
 }
 
 /// Whether two column names are the same name, part by part.
@@ -1817,10 +2296,6 @@ pub fn parseSetOps(self: *Parser, cores: []const Core, ops: []const SetOpTok, st
     for (ops) |o| {
         if (o.named)
             return self.fail(o.pos, "`BY NAME` applies to a chain of UNIONs only; INTERSECT and EXCEPT line columns up by position", .{});
-        if (o.all and o.kind != .union_) {
-            const kw = if (o.kind == .intersect) "INTERSECT" else "EXCEPT";
-            return self.fail(o.pos, "`{s} ALL` is not supported yet; `{s}` removes duplicates", .{ kw, kw });
-        }
     }
     if (self.isKw("anchor") or self.isKw("pushdown"))
         return self.fail(self.curPos(), "`{s}` applies to `UNION ALL BY NAME`", .{self.cur().text});
@@ -1831,7 +2306,7 @@ pub fn parseSetOps(self: *Parser, cores: []const Core, ops: []const SetOpTok, st
     for (ops, cores[1..]) |o, c| {
         if (o.kind == .intersect) {
             const last = &terms.items[terms.items.len - 1];
-            last.* = try self.setOpStages(last.*, c.stages, .intersect, false, pos);
+            last.* = try self.setOpStages(last.*, c.stages, .intersect, false, o.all, pos);
         } else {
             try joins.append(o);
             try terms.append(c.stages);
@@ -1840,20 +2315,20 @@ pub fn parseSetOps(self: *Parser, cores: []const Core, ops: []const SetOpTok, st
     var acc = terms.items[0];
     for (joins.items, terms.items[1..]) |o, t| {
         acc = if (o.kind == .except)
-            try self.setOpStages(acc, t, .except, false, pos)
+            try self.setOpStages(acc, t, .except, false, o.all, pos)
         else
-            try self.setOpStages(acc, t, .union_all, !o.all, pos);
+            try self.setOpStages(acc, t, .union_all, !o.all, false, pos);
     }
     try stages.appendSlice(acc);
 }
 
 /// `left <op> right` as a positional union_, plus a DISTINCT for a plain UNION.
-pub fn setOpStages(self: *Parser, left: []const ast.Stage, right: []const ast.Stage, set: ast.SetOp, distinct: bool, pos: Pos) Error![]const ast.Stage {
+pub fn setOpStages(self: *Parser, left: []const ast.Stage, right: []const ast.Stage, set: ast.SetOp, distinct: bool, all: bool, pos: Pos) Error![]const ast.Stage {
     const branches = try self.arena.alloc(ast.UnionBranch, 2);
     branches[0] = try self.unionBranchFromStages(left);
     branches[1] = try self.unionBranchFromStages(right);
     var out = std.array_list.Managed(ast.Stage).init(self.arena);
-    try out.append(.{ .node = .{ .union_ = .{ .branches = branches, .positional = true, .set = set, .pos = pos } }, .hints = &.{}, .pos = pos });
+    try out.append(.{ .node = .{ .union_ = .{ .branches = branches, .positional = true, .set = set, .set_all = all, .pos = pos } }, .hints = &.{}, .pos = pos });
     if (distinct) try out.append(.{ .node = .{ .distinct = .{ .on = null } }, .hints = &.{}, .pos = pos });
     return out.toOwnedSlice();
 }

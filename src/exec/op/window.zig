@@ -102,7 +102,7 @@ pub const Window = struct {
 
     pub const Off = struct { rows: i64 = 0, int: i128 = 0, float: f64 = 0 };
     pub const Bound = union(enum) { unbounded_preceding, preceding: Off, current_row, following: Off, unbounded_following };
-    pub const Frame = struct { range: bool = true, start: Bound = .unbounded_preceding, end: Bound = .current_row };
+    pub const Frame = struct { range: bool = true, start: Bound = .unbounded_preceding, end: Bound = .current_row, exclude: ast.FrameExclude = .none };
     pub const RangeConv = struct { float: bool = false, mul: i128 = 1, scale: u8 = 0 };
 
     pub const Func = struct {
@@ -322,7 +322,21 @@ pub const Window = struct {
         return rk;
     }
 
-    const Frames = struct { fs: []usize, fe: []usize };
+    const Frames = struct {
+        fs: []usize,
+        fe: []usize,
+        exclude: ast.FrameExclude = .none,
+
+        /// Whether position `j` of row `k`'s frame is taken out of it.
+        fn excluded(self: Frames, l: Layout, k: usize, j: usize) bool {
+            return switch (self.exclude) {
+                .none => false,
+                .current_row => j == k,
+                .group => j >= l.gstart[k] and j < l.gend[k],
+                .ties => j != k and j >= l.gstart[k] and j < l.gend[k],
+            };
+        }
+    };
 
     /// Each row's frame as `[fs, fe)` sorted positions, an empty frame as `fs == fe`.
     fn frames(arena: std.mem.Allocator, l: Layout, fr: Frame, rk: ?RangeKeys) !Frames {
@@ -378,7 +392,7 @@ pub const Window = struct {
             }
             ps = pe;
         }
-        return .{ .fs = fs, .fe = fe };
+        return .{ .fs = fs, .fe = fe, .exclude = fr.exclude };
     }
 
     fn offOf(comptime T: type, o: Off) T {
@@ -782,6 +796,17 @@ pub const Window = struct {
                 var s: A.State = if (@hasDecl(A, "init")) A.init(cx, agg) else .{};
                 const n = fr.fs.len;
                 var k: usize = 0;
+                if (fr.exclude != .none) {
+                    while (k < n) : (k += 1) {
+                        if (@hasDecl(A, "reset")) A.reset(&s) else s = .{};
+                        for (fr.fs[k]..fr.fe[k]) |j| {
+                            if (fr.excluded(l, k, j)) continue;
+                            if (try at(col, j, cx)) |x| try step(A.add, &s, x, j, cx);
+                        }
+                        try bd.append(try A.finish(&s, cx));
+                    }
+                    return;
+                }
                 while (k < n) {
                     const pe = l.pend[k];
                     if (@hasDecl(A, "reset")) A.reset(&s) else s = .{};
@@ -857,6 +882,7 @@ pub const Window = struct {
             .bit_or => runOf(BitStack(.@"or"), kind),
             .bit_xor => runOf(aggFuncs.Bits(.xor), kind),
             .var_samp, .var_pop, .stddev_samp, .stddev_pop => if (kind == .int) runAt(Spread(true), .int) else runOf(Spread(false), kind),
+            .any_value, .arg_max, .arg_min, .array_agg, .string_agg, .percentile_cont, .percentile_disc => unreachable,
         };
     }
 
@@ -1155,6 +1181,20 @@ pub const Window = struct {
                                 else => blk: {
                                     const s = fr.?.fs[k];
                                     const e = fr.?.fe[k];
+                                    if (fr.?.exclude != .none) {
+                                        var seen: i64 = 0;
+                                        var got: Value = .null;
+                                        const nth: i64 = if (kind == .nth_value) f.offset else 1;
+                                        for (s..e) |j| {
+                                            if (fr.?.excluded(l, k, j)) continue;
+                                            const x = vc.getValue(j);
+                                            if (f.ignore_nulls and x.isNull()) continue;
+                                            seen += 1;
+                                            if (kind == .last_value or seen == nth) got = x;
+                                            if (kind != .last_value and seen == nth) break;
+                                        }
+                                        break :blk got;
+                                    }
                                     if (f.ignore_nulls) {
                                         const a = cnt[s];
                                         const b = cnt[e];

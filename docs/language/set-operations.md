@@ -19,7 +19,9 @@ ORDER BY id;
 found nowhere in the second; both line columns up by position and remove
 duplicates. Two NULLs count as the same value there, unlike in a join's `ON`.
 `INTERSECT` binds tighter than `UNION` and `EXCEPT` (`a UNION b INTERSECT c` is
-`a UNION (b INTERSECT c)`). `INTERSECT ALL` and `EXCEPT ALL` are not supported.
+`a UNION (b INTERSECT c)`). `INTERSECT ALL` and `EXCEPT ALL` count duplicates: a row
+stays as many times as the fewer of its two counts, or its count in the first branch
+less its count in the second.
 
 `BY NAME` lines branches up by column name instead, and is what reconciling N
 similar tables needs. It applies to `UNION` only, and a chain is one or the other.

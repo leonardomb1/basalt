@@ -135,7 +135,7 @@ test "sql: LIMIT, OFFSET and FETCH FIRST take constants, in either order" {
     const refused = [_][2][]const u8{
         .{ "SELECT id FROM 't.csv' LIMIT id;", "LIMIT takes a constant: an integer, a `$param` or LET, or an expression of them, not a column" },
         .{ "SELECT id FROM 't.csv' LIMIT 1 FETCH FIRST 2 ROWS ONLY;", "a query takes one LIMIT or FETCH FIRST" },
-        .{ "SELECT id FROM 't.csv' FETCH FIRST 2 ROWS WITH TIES;", "FETCH FIRST ... WITH TIES is not supported; write ROWS ONLY" },
+        .{ "SELECT id FROM 't.csv' FETCH FIRST 2 ROWS WITH TIES;", "WITH TIES needs an ORDER BY to say what ties" },
         .{ "SELECT id FROM 't.csv' OFFSET 1 OFFSET 2;", "a query takes one OFFSET" },
         .{ "SELECT id FROM 't.csv' LIMIT -0.5;", "LIMIT must not be negative, got -0.5" },
     };
@@ -606,8 +606,8 @@ test "sql: plain UNION [ALL] lines up by position; INTERSECT binds tighter than 
     try testing.expectEqual(ast.SetOp.intersect, right[0].node.union_.set);
 
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' EXCEPT ALL SELECT k FROM 'y.csv';", &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.msg, "`EXCEPT ALL` is not supported yet") != null);
+    const counted = try parseSource(a, "SELECT k FROM 'x.csv' EXCEPT ALL SELECT k FROM 'y.csv';", &diag);
+    try testing.expect(counted.stmts[counted.stmts.len - 1].output.stages[0].node.union_.set_all);
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' INTERSECT BY NAME SELECT k FROM 'y.csv';", &diag));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "`BY NAME` applies to a chain of UNIONs only") != null);
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' UNION ALL BY NAME SELECT k FROM 'y.csv' UNION ALL SELECT k FROM 'z.csv';", &diag));

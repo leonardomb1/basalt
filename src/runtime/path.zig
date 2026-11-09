@@ -17,6 +17,7 @@
 //! states over the stages; `run/path_tests.zig` holds the two to one answer.
 
 const std = @import("std");
+const aggregates = @import("../lang/aggregates.zig");
 const ast = @import("../lang/ast.zig");
 const connect = @import("connect.zig");
 const lanes = @import("lanes.zig");
@@ -65,7 +66,7 @@ pub fn choose(arena: std.mem.Allocator, stages: []const ast.Stage, head: []const
     if (stages[0].node == .union_ and f.lanes > 1 and !std.mem.eql(u8, f.sink.connector, "csv") and
         branchesAreReads(stages[0].node.union_) and streamsOnly(middle))
         return .union_split;
-    if (footerCount(head)) return .serial;
+    if (footerCount(head) or foldsInInputOrder(head) or foldsInInputOrder(stages)) return .serial;
     if ((f.head_source == .parquet or f.head_source == .csv) and laneEligible(head, f.lanes)) {
         if (lanes.classifyLaneShape(head)) |shape| if (lanes.shapeLaneSafe(shape))
             return .{ .lanes = .{ .source = f.head_source, .shape = shape } };
@@ -85,6 +86,19 @@ pub fn choose(arena: std.mem.Allocator, stages: []const ast.Stage, head: []const
     } };
 }
 
+/// Whether an aggregate of `stages` answers by the order its rows arrive in
+/// (`string_agg`, `array_agg`, `any_value`, `arg_max`, their ties). One lane reads the
+/// input as it stands, spilling included, so the answer does not depend on `-j`. A
+/// PIVOT's keys are known only from the schema, past what the lane paths plan from, and
+/// the lanes' merge knows nothing of a grand total owed over no rows.
+fn foldsInInputOrder(stages: []const ast.Stage) bool {
+    for (stages) |st| if (st.node == .aggregate) {
+        if (st.node.aggregate.by_rest != null or st.node.aggregate.on_empty.len > 0) return true;
+        for (st.node.aggregate.aggs) |a| if (aggregates.spec(a.func).input_ordered) return true;
+    };
+    return false;
+}
+
 /// An ungrouped `COUNT(*)` alone straight off a local Parquet file, which the plan
 /// answers from its footer (`plan.metaShortcut`); on lanes it decoded a column.
 fn footerCount(head: []const ast.Stage) bool {
@@ -92,7 +106,7 @@ fn footerCount(head: []const ast.Stage) bool {
     const rd = head[0].node.read;
     if (!connect.isParquetFileRead(rd) or std.mem.indexOf(u8, rd.form.path, "://") != null) return false;
     const ag = head[1].node.aggregate;
-    if (ag.by.len != 0 or ag.aggs.len == 0) return false;
+    if (ag.by_rest != null or ag.by.len != 0 or ag.aggs.len == 0) return false;
     for (ag.aggs) |a| if (a.func != .count or a.arg != null or a.distinct) return false;
     return true;
 }
@@ -101,7 +115,7 @@ fn footerCount(head: []const ast.Stage) bool {
 /// still turns around when the filter leaves few rows (`run/output.zig`
 /// `flipLaterJoin`), on one worker, and the plan stays serial otherwise.
 pub fn oneLaneTurn(head: []const ast.Stage, f: Facts) ?lanes.SinkShape {
-    if (f.lanes != 1 or !(f.head_source == .parquet or f.head_source == .csv)) return null;
+    if (f.lanes != 1 or !(f.head_source == .parquet or f.head_source == .csv) or foldsInInputOrder(head)) return null;
     if (head.len < 2 or head[0].node != .read or !laneHints(head[0])) return null;
     const shape = lanes.classifyLaneShape(head) orelse return null;
     if (shape != .sink or shape.sink.joins.len == 0 or !lanes.shapeLaneSafe(shape)) return null;

@@ -155,6 +155,11 @@ pub const typing = struct {
         return Type.init(if (bytes) .bytes else .string).withNull(nn);
     }
 
+    pub fn aggArgs(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        for (c.args[1..]) |a| _ = try self.typeOf(a);
+        return Type.init(.bytes);
+    }
+
     pub fn cardinality(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
         if (c.args.len != 1) return self.err("`cardinality` takes one argument, a list or a map", .{});
         const t = try self.argType(c, 0);

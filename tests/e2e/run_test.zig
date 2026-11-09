@@ -5,6 +5,7 @@ test {
     _ = @import("query.zig");
     _ = @import("aggregate.zig");
     _ = @import("window.zig");
+    _ = @import("analytic.zig");
     _ = @import("parallel.zig");
     _ = @import("script.zig");
     _ = @import("format.zig");

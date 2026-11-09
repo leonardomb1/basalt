@@ -186,7 +186,7 @@ pub fn planWholeAggWhy(
 /// asked without a schema: bare keys, and COUNT, SUM, AVG, MIN or MAX of a bare
 /// column (COUNT(*) without DISTINCT).
 pub fn wholeAggShape(ag: ast.Aggregate) bool {
-    if (ag.by.len == 0 and ag.aggs.len == 0) return false;
+    if (ag.by_rest != null or (ag.by.len == 0 and ag.aggs.len == 0)) return false;
     for (ag.by) |q| if (q.parts.len != 1) return false;
     for (ag.aggs) |item| {
         switch (item.func) {
@@ -257,7 +257,7 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
             }
             return try msgfmt.allocPrint(arena, "{s}({s})", .{ if (item.func == .min) "MIN" else "MAX", col });
         },
-        .median, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .var_samp, .var_pop, .stddev_samp, .stddev_pop => return null,
+        .median, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .any_value, .arg_max, .arg_min, .array_agg, .string_agg, .percentile_cont, .percentile_disc => return null,
     }
 }
 

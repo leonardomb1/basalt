@@ -17,6 +17,11 @@
 //! scale, else INT. `variance` and `stddev` are the sample statistics, as in
 //! Postgres, DuckDB, Trino and SQL Server; MySQL and StarRocks read them as the
 //! population ones.
+//!
+//! `packs`: its arguments reach it packed as one column (`exec/agg_args.zig`).
+//! `input_ordered`: its answer depends on the order rows arrive in, so it runs on one
+//! lane, where that order is the input's whatever `-j` says. `windowed`: it takes
+//! `OVER (...)`.
 
 const std = @import("std");
 const ast = @import("ast.zig");
@@ -59,6 +64,8 @@ pub const Result = enum {
     same,
     bool,
     int,
+    list,
+    string,
 };
 
 pub const Spec = struct {
@@ -67,6 +74,9 @@ pub const Spec = struct {
     arg: Arg,
     result: Result,
     max_args: u8 = 1,
+    packs: bool = false,
+    input_ordered: bool = false,
+    windowed: bool = true,
 };
 
 pub const specs = [_]Spec{
@@ -86,7 +96,29 @@ pub const specs = [_]Spec{
     .{ .func = .var_pop, .names = &.{"var_pop"}, .arg = .numeric, .result = .float },
     .{ .func = .stddev_samp, .names = &.{ "stddev_samp", "stddev" }, .arg = .numeric, .result = .float },
     .{ .func = .stddev_pop, .names = &.{"stddev_pop"}, .arg = .numeric, .result = .float },
+    .{ .func = .any_value, .names = &.{"any_value"}, .arg = .any, .result = .same, .input_ordered = true, .windowed = false },
+    .{ .func = .arg_max, .names = &.{ "arg_max", "max_by" }, .arg = .any, .result = .same, .max_args = 2, .packs = true, .input_ordered = true, .windowed = false },
+    .{ .func = .arg_min, .names = &.{ "arg_min", "min_by" }, .arg = .any, .result = .same, .max_args = 2, .packs = true, .input_ordered = true, .windowed = false },
+    .{ .func = .array_agg, .names = &.{ "array_agg", "list_agg" }, .arg = .any, .result = .list, .packs = true, .input_ordered = true, .windowed = false },
+    .{ .func = .string_agg, .names = &.{"string_agg"}, .arg = .any, .result = .string, .max_args = 2, .packs = true, .input_ordered = true, .windowed = false },
+    .{ .func = .percentile_cont, .names = &.{"percentile_cont"}, .arg = .numeric, .result = .float, .packs = true, .windowed = false },
+    .{ .func = .percentile_disc, .names = &.{"percentile_disc"}, .arg = .any, .result = .same, .packs = true, .windowed = false },
 };
+
+/// The argument a packed aggregate is typed by, `e` itself when it does not pack: the
+/// first value of its `__agg_args`, under a FILTER's condition if it has one.
+pub fn typedArg(e: *const ast.Expr) *const ast.Expr {
+    return switch (e.*) {
+        .call => |c| if (std.mem.eql(u8, c.name, packed_fn) and c.args.len >= 2) c.args[1] else e,
+        .cond => |c| if (c.els.* == .null_lit) blk: {
+            const t = typedArg(c.then);
+            break :blk if (t == c.then) e else t;
+        } else e,
+        else => e,
+    };
+}
+
+pub const packed_fn = "__agg_args";
 
 comptime {
     const fields = @typeInfo(AggFunc).@"enum".fields;

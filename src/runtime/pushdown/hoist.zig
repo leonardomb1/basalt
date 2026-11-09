@@ -98,6 +98,7 @@ fn stageNames(
             },
             .window => |wd| for (wd.funcs) |f| try out.append(f.out),
             .aggregate => |ag| {
+                if (ag.by_rest != null) return false;
                 for (ag.by) |q| try out.append(q.last());
                 for (ag.aggs) |a| try out.append(a.name);
                 return true;

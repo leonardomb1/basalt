@@ -5,6 +5,7 @@ const Parser = @import("../sql_parser.zig").Parser;
 const BinInfo = Parser.BinInfo;
 const Error = @import("../sql_parser.zig").Error;
 const Pos = @import("../sql_parser.zig").Pos;
+const Window = @import("window.zig");
 const aggregates = @import("../aggregates.zig");
 const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
@@ -503,13 +504,36 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                     }
                 }
                 try self.moreNullTreatment(&nulls);
-                _ = try self.expect(.rparen);
                 const tpos: Pos = .{ .line = t.line, .col = t.col, .file = t.file };
                 var lower: []const u8 = try std.ascii.allocLowerString(self.arena, t.text);
-                if (aggregates.lookup(lower)) |f| if (args.items.len > aggregates.spec(f).max_args)
-                    return self.fail(tpos, "`{s}` takes one argument, not {d}", .{ lower, args.items.len });
+                const packing: ?aggregates.AggFunc = if (aggregates.lookup(lower)) |f| (if (aggregates.spec(f).packs) f else null) else null;
+                var agg_order: []const Window.OrderExpr = &.{};
+                if (packing != null and self.eatKw("order")) {
+                    try self.expectKw("by");
+                    agg_order = try Window.parseOrderKeys(self);
+                }
+                _ = try self.expect(.rparen);
+                if (packing != null and self.isKw("within")) {
+                    _ = self.advance();
+                    try self.expectKw("group");
+                    _ = try self.expect(.lparen);
+                    try self.expectKw("order");
+                    try self.expectKw("by");
+                    if (agg_order.len > 0) return self.fail(tpos, "`{s}` takes its ORDER BY inside the call or in WITHIN GROUP, not both", .{lower});
+                    agg_order = try Window.parseOrderKeys(self);
+                    _ = try self.expect(.rparen);
+                }
+                if (aggregates.lookup(lower)) |f| if (args.items.len > aggregates.spec(f).max_args) {
+                    const most = aggregates.spec(f).max_args;
+                    if (most == 1) return self.fail(tpos, "`{s}` takes one argument, not {d}", .{ lower, args.items.len });
+                    return self.fail(tpos, "`{s}` takes {d} arguments, not {d}", .{ lower, most, args.items.len });
+                };
                 try self.moreNullTreatment(&nulls);
                 var call_args = try args.toOwnedSlice();
+                if (packing) |f| {
+                    if (self.isKw("over")) return self.fail(tpos, "`{s}` is not available over a window — aggregate in a derived table or CTE and join it back", .{lower});
+                    call_args = try Window.packAggArgs(self, f, lower, call_args, agg_order, tpos);
+                }
                 if (try self.parseFilterClause()) |c| {
                     const f = try self.applyFilter(lower, call_args, c, tpos);
                     lower = f.name;

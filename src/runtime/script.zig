@@ -178,7 +178,7 @@ fn renderUnion(arena: std.mem.Allocator, u: ast.Union, lr: LoopRow) anyerror!ast
             .tag = if (b.tag) |t| try interpAll(arena, t, lr) else null,
             .pipeline = if (b.pipeline) |p| try renderPipeline(arena, p, lr) else null,
         };
-        return .{ .branches = branches, .discover_conn = u.discover_conn, .discover_query = u.discover_query, .discover_json = u.discover_json, .discover_pipeline = u.discover_pipeline, .positional = u.positional, .set = u.set, .pos = u.pos };
+        return .{ .branches = branches, .discover_conn = u.discover_conn, .discover_query = u.discover_query, .discover_json = u.discover_json, .discover_pipeline = u.discover_pipeline, .positional = u.positional, .set = u.set, .set_all = u.set_all, .pos = u.pos };
     }
     return .{
         .branches = u.branches,
@@ -265,7 +265,7 @@ fn renderStage(arena: std.mem.Allocator, src: ast.Stage, lr: LoopRow) anyerror!a
         .aggregate => |ag| {
             const aggs = try arena.alloc(ast.AggItem, ag.aggs.len);
             for (ag.aggs, 0..) |a, i| aggs[i] = .{ .name = a.name, .func = a.func, .arg = if (a.arg) |e| try renderExpr(arena, e, lr) else null, .distinct = a.distinct };
-            dst.node = .{ .aggregate = .{ .aggs = aggs, .by = try renderQuals(arena, ag.by, lr) } };
+            dst.node = .{ .aggregate = .{ .aggs = aggs, .by = try renderQuals(arena, ag.by, lr), .by_rest = ag.by_rest, .on_empty = ag.on_empty } };
         },
         .distinct => |d| if (d.on) |on| {
             dst.node = .{ .distinct = .{ .on = try renderQuals(arena, on, lr) } };

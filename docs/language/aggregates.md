@@ -53,6 +53,87 @@ computed beside the others and dropped after the `LIMIT`, as an aggregate only
 `HAVING` names is. Under `SELECT DISTINCT` it must be one of the list's, as SQL
 requires, and after a `UNION` it must name an output column.
 
+## Collecting and ordered aggregates
+
+| Aggregate | Answers |
+|---|---|
+| `string_agg(x, sep [ORDER BY y])` | the values that are not null as one text, each after its row's `sep`; NULL over none |
+| `array_agg(x [ORDER BY y])`, `list_agg` | every value, nulls too, as a `LIST`, which `UNNEST` and `l[i]` read back; NULL over no rows |
+| `any_value(x)` | the first value that is not null |
+| `arg_max(v, by)`, `max_by` / `arg_min(v, by)`, `min_by` | `v` of the row with the greatest or least `by`, the first such row on a tie; a null `by` never wins |
+| `percentile_cont(f) WITHIN GROUP (ORDER BY x)` | the value a fraction `f` (0 to 1) of the way along, interpolated between two rows; a `FLOAT`, `x` numeric |
+| `percentile_disc(f) WITHIN GROUP (ORDER BY x)` | the first value at or past that place, of `x`'s own type |
+
+```sql
+SELECT customer,
+       string_agg(item, ', ' ORDER BY placed_at)        AS items,
+       array_agg(amount ORDER BY placed_at DESC)[1]     AS latest_amount,
+       arg_max(status, placed_at)                       AS latest_status,
+       percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) AS median_amount
+FROM 'orders.parquet'
+GROUP BY customer;
+```
+
+`string_agg` and `array_agg` take their `ORDER BY` inside the call or, as SQL Server
+writes it, in `WITHIN GROUP (ORDER BY y)`, and take `DISTINCT`. Without an `ORDER BY`
+they go by input order, ties too.
+
+The answer of `string_agg`, `array_agg`, `any_value`, `arg_max` and `arg_min` can
+depend on the order rows arrive in, so a query holding one reads its input on one
+lane, whatever `-j` says, and gives the same answer at every `-j` and when it spills.
+`string_agg`, `array_agg` and the percentiles hold each group's values until the end,
+counted against `--op-memory`. None of these takes `OVER (...)`, and none descends to
+a SQL source: the source's rows are read and folded here.
+
+## ROLLUP, CUBE and GROUPING SETS
+
+Several groupings in one query, each input row counted once per grouping:
+
+```sql
+SELECT region, status, COUNT(*) AS orders, GROUPING(region, status) AS level
+FROM 'orders.parquet'
+GROUP BY ROLLUP(region, status);
+```
+
+- `ROLLUP(a, b)` is the groupings `(a, b)`, `(a)` and `()`, the last the grand total.
+- `CUBE(a, b)` is every combination: `(a, b)`, `(a)`, `(b)`, `()`.
+- `GROUPING SETS ((a, b), (c), ())` lists them, and may hold a `ROLLUP` or `CUBE`.
+- `ROLLUP((a, b), c)` takes `a, b` as one item, and a plain key beside them,
+  `GROUP BY x, ROLLUP(a)`, is in every grouping.
+
+A key a grouping leaves out is NULL in its rows, apart from a group whose own key is
+NULL: `GROUPING(a)` is 1 in the first and 0 in the second, and `GROUPING(a, b)` makes
+a number of those bits, the last key the lowest. A key keeps its value inside an
+aggregate (`MAX(region)` over the grand total). Over no input rows a grouping of no
+keys still answers one row, as a plain aggregate does; one with keys answers none.
+Such a query runs on one lane.
+
+## PIVOT and UNPIVOT
+
+`PIVOT` turns a column's values into columns, grouped on every input column it does
+not use, so a derived table is how to say which those are. `UNPIVOT` does the reverse.
+Both follow `FROM` and its joins, before `WHERE`.
+
+```sql
+SELECT * FROM (SELECT region, status, amount FROM 'orders.parquet') t
+PIVOT (SUM(amount) AS total, COUNT(*) AS n FOR status IN ('open', 'done' AS closed)) AS p
+WHERE p.region <> 'x';
+
+SELECT * FROM 'orders.parquet'
+UNPIVOT (amount FOR quarter IN (q1, q2 AS 'second')) AS u;
+```
+
+Each `PIVOT` value becomes a column named by what it is written as or its `AS`, with
+`_` and the aggregate's alias after it when it has one, or its name when there are
+several; a value other than a text or a whole number needs an `AS`. The values are
+listed, so the columns are known before the query runs; a value no row holds is a
+column of NULLs, or 0 under `COUNT`. A column the input lacks is refused. It runs on
+one lane and reads every column of its input.
+
+`UNPIVOT` makes a row per listed column, with its name or `AS` label and its value,
+leaving out null values unless `UNPIVOT INCLUDE NULLS`. The listed columns must share
+a type; cast them first when they do not.
+
 ## FILTER
 
 Any aggregate takes `FILTER (WHERE <condition>)`, folding only the rows where the

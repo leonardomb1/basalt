@@ -170,13 +170,33 @@ pub const AggregatePlan = struct { by: []usize, aggs: []Agg, schema: types.Schem
 
 pub fn aggregatePlan(arena: std.mem.Allocator, in: types.Schema, ag: ast.Aggregate, params: *const ParamMap, diag: *Diag) Error!AggregatePlan {
     var fields = std.array_list.Managed(types.Schema.Field).init(arena);
-    const by = try arena.alloc(usize, ag.by.len);
-    for (ag.by, 0..) |q, i| {
-        try single(in, q, diag);
-        const idx = in.resolve(q.parts) orelse return fail(diag, "unknown group field `{s}`", .{lastPart(q)});
-        by[i] = idx;
-        try fields.append(.{ .name = lastPart(q), .ty = in.fields[idx].ty, .rel = in.fields[idx].rel, .base = in.fields[idx].base });
-    }
+    const by = if (ag.by_rest) |rest| blk: {
+        var kept = std.array_list.Managed(usize).init(arena);
+        for (rest) |name| {
+            const known = for (in.fields) |f| {
+                if (std.ascii.eqlIgnoreCase(f.name, name)) break true;
+            } else false;
+            if (!known) return fail(diag, "PIVOT names `{s}`, which its input does not have", .{name});
+        }
+        for (in.fields, 0..) |f, idx| {
+            const dropped = for (rest) |name| {
+                if (std.ascii.eqlIgnoreCase(f.name, name)) break true;
+            } else false;
+            if (dropped) continue;
+            try kept.append(idx);
+            try fields.append(.{ .name = f.name, .ty = f.ty, .rel = f.rel, .base = f.base });
+        }
+        break :blk try kept.toOwnedSlice();
+    } else blk: {
+        const out = try arena.alloc(usize, ag.by.len);
+        for (ag.by, 0..) |q, i| {
+            try single(in, q, diag);
+            const idx = in.resolve(q.parts) orelse return fail(diag, "unknown group field `{s}`", .{lastPart(q)});
+            out[i] = idx;
+            try fields.append(.{ .name = lastPart(q), .ty = in.fields[idx].ty, .rel = in.fields[idx].rel, .base = in.fields[idx].base });
+        }
+        break :blk out;
+    };
     const aggs = try arena.alloc(Agg, ag.aggs.len);
     for (ag.aggs, 0..) |item, i| {
         const sub: ?*const ast.Expr = if (item.arg) |a| try substExpr(arena, a, params) else null;
@@ -196,7 +216,7 @@ pub fn aggregatePlan(arena: std.mem.Allocator, in: types.Schema, ag: ast.Aggrega
 pub fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const ast.Expr, in: types.Schema, diag: *Diag) Error!types.Type {
     const sp = aggregates.spec(func);
     if (sp.arg == .star_or_any) return types.Type.init(.int);
-    const a = arg orelse return fail(diag, "this aggregate requires an argument", .{});
+    const a = aggregates.typedArg(arg orelse return fail(diag, "this aggregate requires an argument", .{}));
     if (sp.arg == .numeric and a.* == .str_lit)
         return fail(diag, "`{s}('{s}')` reads the text '{s}', not a column — a name with spaces or symbols takes double quotes: {s}(\"{s}\")", .{ sp.names[0], a.str_lit, a.str_lit, sp.names[0], a.str_lit });
     const at = try exprType(arena, in, a, diag);
@@ -209,6 +229,12 @@ pub fn aggResultType(arena: std.mem.Allocator, func: ast.AggFunc, arg: ?*const a
         .same => at.withNull(true),
         .bool => types.Type.init(.bool).withNull(true),
         .int => types.Type.init(.int).withNull(true),
+        .string => types.Type.init(.string).withNull(true),
+        .list => blk: {
+            const elem = try arena.create(types.Type);
+            elem.* = at.withNull(true);
+            break :blk types.Type{ .kind = .array, .nullable = true, .elem = elem };
+        },
     };
 }
 
@@ -231,6 +257,7 @@ pub fn windowFuncType(f: ast.WinFn, src: types.Type) types.Type {
             .same => src.asNullable(),
             .bool => types.Type.init(.bool).asNullable(),
             .int => types.Type.init(.int).asNullable(),
+            .list, .string => src.asNullable(),
         },
     };
 }
@@ -440,7 +467,7 @@ fn opBound(b: ast.FrameBound, unit: ast.FrameUnit, conv: op.Window.RangeConv, ke
 }
 
 fn opFrame(fr: ast.WinFrame, conv: op.Window.RangeConv, key_kind: types.TypeKind) Error!op.Window.Frame {
-    return .{ .range = fr.unit == .range, .start = opBound(fr.start, fr.unit, conv, key_kind), .end = opBound(fr.end, fr.unit, conv, key_kind) };
+    return .{ .range = fr.unit == .range, .start = opBound(fr.start, fr.unit, conv, key_kind), .end = opBound(fr.end, fr.unit, conv, key_kind), .exclude = fr.exclude };
 }
 
 /// A literal LAG/LEAD default must fit its column, as the run requires; one over

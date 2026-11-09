@@ -32,7 +32,7 @@ pub fn next(self: *Aggregate, arena: std.mem.Allocator) anyerror!?Batch {
     if (self.done) return null;
     self.done = true;
     const set = try self.drainSet();
-    if (self.by.len != 0 and set.len == 0) return null;
+    if (self.by.len != 0 and set.len == 0) return self.emitTotals(arena);
     return try self.emitSets(arena, &.{set}, null);
 }
 

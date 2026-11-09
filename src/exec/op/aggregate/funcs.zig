@@ -26,8 +26,11 @@
 
 const Value = @import("../../value.zig").Value;
 const Decimal = @import("../../value.zig").Decimal;
+const agg_args = @import("../../agg_args.zig");
 const ast = @import("../../../lang/ast.zig");
+const column = @import("../../column.zig");
 const eval = @import("../../eval.zig");
+const fmtnum = @import("../../eval/format.zig");
 const floatord = @import("../../floatord.zig");
 const decimal = @import("../../decimal.zig");
 const simd = @import("../../simd.zig");
@@ -349,6 +352,186 @@ pub const Median = struct {
         return .{ .float = (lo + hi) / 2 };
     }
 };
+
+/// ANY_VALUE: the first value that is not NULL, in input order.
+pub const AnyValue = struct {
+    pub const In = Value;
+    pub const needs_alloc = true;
+    pub const State = struct { has: bool = false, v: Value = .null };
+    pub fn add(s: *State, x: Value, cx: Ctx) !void {
+        if (s.has) return;
+        s.v = try dupeValue(cx.alloc, x);
+        s.has = true;
+    }
+    pub fn merge(d: *State, s: *const State, cx: Ctx) !void {
+        if (s.has) try add(d, s.v, cx);
+    }
+    pub fn own(s: *State, cx: Ctx) !void {
+        if (s.has) s.v = try dupeValue(cx.alloc, s.v);
+    }
+    pub fn finish(s: *const State, _: Ctx) !Value {
+        return s.v;
+    }
+};
+
+/// ARG_MAX (`want` .gt) or ARG_MIN: the first argument of the row with the best
+/// second, the first such row in input order; a row whose second is NULL never wins.
+pub fn ArgBest(comptime want: std.math.Order) type {
+    return struct {
+        pub const In = []const u8;
+        pub const needs_alloc = true;
+        pub const State = struct { row: ?[]const u8 = null };
+        fn key(row: []const u8) Value {
+            var buf: [2]Value = undefined;
+            return agg_args.decode(row, &buf).vals[1];
+        }
+        pub fn add(s: *State, x: []const u8, cx: Ctx) !void {
+            const k = key(x);
+            if (k == .null) return;
+            if (s.row) |have| if ((eval.compareValues(k, key(have)) orelse .eq) != want) return;
+            s.row = try cx.alloc.dupe(u8, x);
+        }
+        pub fn merge(d: *State, s: *const State, cx: Ctx) !void {
+            if (s.row) |r| try add(d, r, cx);
+        }
+        pub fn own(s: *State, cx: Ctx) !void {
+            if (s.row) |r| s.row = try cx.alloc.dupe(u8, r);
+        }
+        pub fn finish(s: *const State, cx: Ctx) !Value {
+            const r = s.row orelse return .null;
+            var buf: [2]Value = undefined;
+            return agg_args.decode(r, &buf).firstAs(cx.scratch, cx.out);
+        }
+    };
+}
+
+/// An aggregate that holds its packed rows until the end: `fin` makes its answer of
+/// them, in input order, a lane's after the lane before.
+pub fn Collect(comptime fin: fn ([]const []const u8, Ctx) anyerror!Value) type {
+    return struct {
+        pub const In = []const u8;
+        pub const needs_alloc = true;
+        const List = std.array_list.Managed([]const u8);
+        pub const State = struct { rows: ?*List = null };
+        pub fn add(s: *State, x: []const u8, cx: Ctx) !void {
+            const l = s.rows orelse blk: {
+                const p = try cx.alloc.create(List);
+                p.* = List.init(cx.alloc);
+                s.rows = p;
+                break :blk p;
+            };
+            try l.append(try cx.alloc.dupe(u8, x));
+        }
+        pub fn merge(d: *State, s: *const State, cx: Ctx) !void {
+            if (s.rows) |l| for (l.items) |x| try add(d, x, cx);
+        }
+        pub fn own(s: *State, cx: Ctx) !void {
+            const src = s.rows orelse return;
+            s.rows = null;
+            for (src.items) |x| try add(s, x, cx);
+        }
+        pub fn finish(s: *const State, cx: Ctx) !Value {
+            const l = s.rows orelse return .null;
+            return fin(l.items, cx);
+        }
+    };
+}
+
+/// Packed rows read back and put in their sort keys' order, ties in input order.
+fn sortedRows(rows: []const []const u8, a: std.mem.Allocator) ![]agg_args.Row {
+    const out = try a.alloc(agg_args.Row, rows.len);
+    for (rows, out) |r, *o| o.* = agg_args.decode(r, try a.alloc(Value, agg_args.valueCount(r)));
+    if (out.len > 0 and out[0].keys.len > 0) std.sort.block(agg_args.Row, out, {}, struct {
+        fn lt(_: void, x: agg_args.Row, y: agg_args.Row) bool {
+            for (x.keys, 0..) |flag, i| {
+                const code = flag - 'a';
+                const desc = code & 1 != 0;
+                const nulls_first = code & 2 != 0;
+                const p = x.vals[x.leading + i];
+                const q = y.vals[y.leading + i];
+                if (p == .null or q == .null) {
+                    if (p == .null and q == .null) continue;
+                    return (p == .null) == nulls_first;
+                }
+                const o = eval.compareValues(p, q) orelse .eq;
+                if (o == .eq) continue;
+                return (o == .lt) != desc;
+            }
+            return false;
+        }
+    }.lt);
+    return out;
+}
+
+/// ARRAY_AGG: every value, NULLs too, as a list.
+pub fn finishList(rows: []const []const u8, cx: Ctx) anyerror!Value {
+    const sorted = try sortedRows(rows, cx.scratch);
+    const elem = cx.out.elem.?.*;
+    var b = column.Builder.init(cx.scratch, elem);
+    for (sorted) |r| try b.append(try r.firstAs(cx.scratch, elem));
+    return column.oneList(cx.scratch, cx.out, try b.finish());
+}
+
+/// STRING_AGG: the values that are not NULL as text, a value's own separator before it.
+pub fn finishString(rows: []const []const u8, cx: Ctx) anyerror!Value {
+    const sorted = try sortedRows(rows, cx.scratch);
+    var out = std.array_list.Managed(u8).init(cx.scratch);
+    var any = false;
+    for (sorted) |r| {
+        if (r.vals[0] == .null) continue;
+        if (any and r.vals[1] != .null) try out.appendSlice(try fmtnum.valueToString(cx.scratch, r.vals[1]));
+        try out.appendSlice(try fmtnum.valueToString(cx.scratch, r.vals[0]));
+        any = true;
+    }
+    return if (any) .{ .string = out.items } else .null;
+}
+
+/// The rows a percentile reads, in its order, NULLs gone, and its fraction.
+fn percentileRows(rows: []const []const u8, cx: Ctx) !struct { rows: []agg_args.Row, p: f64 } {
+    const all = try sortedRows(rows, cx.scratch);
+    var n: usize = 0;
+    for (all) |r| if (r.vals[0] != .null) {
+        all[n] = r;
+        n += 1;
+    };
+    if (n == 0) return .{ .rows = all[0..0], .p = 0 };
+    const p = toF64(cx.scratch, all[0].vals[1]) catch return eval.explain(error.CastFailed, "a percentile's fraction must be a number between 0 and 1");
+    if (!(p >= 0 and p <= 1)) return eval.explain(error.CastFailed, "a percentile's fraction must be a number between 0 and 1");
+    return .{ .rows = all[0..n], .p = p };
+}
+
+fn toF64(a: std.mem.Allocator, v: Value) !f64 {
+    return switch (v) {
+        .int => |x| @floatFromInt(x),
+        .float => |x| x,
+        .decimal => |d| d.toF64(),
+        .string => (try eval.castValueTyped(a, v, types.Type.init(.float))).float,
+        else => error.CastFailed,
+    };
+}
+
+/// PERCENTILE_CONT: the value at the fraction of the way along, between two rows
+/// interpolated.
+pub fn finishCont(rows: []const []const u8, cx: Ctx) anyerror!Value {
+    const got = try percentileRows(rows, cx);
+    if (got.rows.len == 0) return .null;
+    const at = got.p * @as(f64, @floatFromInt(got.rows.len - 1));
+    const lo: usize = @intFromFloat(@floor(at));
+    const hi: usize = @intFromFloat(@ceil(at));
+    const x = try toF64(cx.scratch, got.rows[lo].vals[0]);
+    if (lo == hi) return .{ .float = x };
+    const y = try toF64(cx.scratch, got.rows[hi].vals[0]);
+    return .{ .float = x + (y - x) * (at - @floor(at)) };
+}
+
+/// PERCENTILE_DISC: the first value whose place is at or past the fraction.
+pub fn finishDisc(rows: []const []const u8, cx: Ctx) anyerror!Value {
+    const got = try percentileRows(rows, cx);
+    if (got.rows.len == 0) return .null;
+    const place = @ceil(got.p * @as(f64, @floatFromInt(got.rows.len)));
+    const i: usize = if (place < 1) 0 else @intFromFloat(place - 1);
+    return got.rows[i].firstAs(cx.scratch, cx.out);
+}
 
 /// BOOL_AND (`all`) or BOOL_OR; NULL over no values.
 pub fn BoolFold(comptime all: bool) type {

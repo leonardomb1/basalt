@@ -125,6 +125,29 @@ pub fn emitSets(self: *Aggregate, arena: std.mem.Allocator, sets: []const GroupS
     return Batch{ .schema = self.out_schema, .columns = cols, .len = n };
 }
 
+/// Over no rows at all, a row for each grouping set of no keys (`on_empty`): its keys
+/// NULL, its set's id, its GROUPING bits set, its aggregates from their empty state.
+pub fn emitTotals(self: *Aggregate, arena: std.mem.Allocator) anyerror!?Batch {
+    if (self.on_empty.len == 0) return null;
+    const n = self.on_empty.len;
+    const cols = try arena.alloc(column.Column, self.out_schema.fields.len);
+    const layout = try Layout.init(arena, self.aggs);
+    const tail = try arena.alignedAlloc(u8, .of(Value), @max(layout.size, 1));
+    layout.clear(tail.ptr);
+    var outs = try Outs.init(self, arena, n, false);
+    const tails = try arena.alloc([*]const u8, n);
+    for (self.on_empty, tails) |id, *t| {
+        t.* = tail.ptr;
+        for (outs.boxed, self.out_schema.fields[0..self.by.len], 0..) |*b, f, j| {
+            const last = j + 1 == self.by.len;
+            try b.append(if (last) .{ .string = id } else if (std.mem.startsWith(u8, f.name, "__gb_")) .{ .int = 1 } else .null);
+        }
+    }
+    try outs.chunk(self, layout, tails, &.{}, &.{});
+    try outs.finish(cols);
+    return Batch{ .schema = self.out_schema, .columns = cols, .len = n };
+}
+
 const emit_chunk = 2048;
 
 /// The output columns `emitSets` fills a chunk of groups at a time: fixed-width keys

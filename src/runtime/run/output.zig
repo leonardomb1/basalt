@@ -478,6 +478,7 @@ fn flipKeeps(env: *Env, pre: []const ast.Stage, rest: []const ast.Stage) !?[]con
             break :walk;
         },
         .aggregate => |ag| {
+            if (ag.by_rest != null) return null;
             try quals.appendSlice(ag.by);
             for (ag.aggs) |a| if (a.arg) |e| try pushdown.collectQuals(env.arena, e, &quals);
             break :walk;

@@ -64,6 +64,7 @@ pub const Aggregate = struct {
     spilled: u8 = 0,
     spilled_to: ?*u8 = null,
     pairs: []Pairs = &.{},
+    on_empty: []const []const u8 = &.{},
 
     pub const Spill = @import("aggregate/spill.zig").Spill;
     pub const spillNext = @import("aggregate/spill.zig").spillNext;
@@ -120,6 +121,7 @@ pub const Aggregate = struct {
     pub const argCast = @import("aggregate/accumulate.zig").argCast;
     pub const argColumn = @import("aggregate/accumulate.zig").argColumn;
     pub const emitSets = @import("aggregate/accumulate.zig").emitSets;
+    pub const emitTotals = @import("aggregate/accumulate.zig").emitTotals;
     pub const Layout = @import("aggregate/kernel.zig").Layout;
     pub const foldSingle = @import("aggregate/accumulate.zig").foldSingle;
 };

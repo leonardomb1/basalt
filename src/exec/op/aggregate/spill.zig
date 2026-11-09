@@ -32,6 +32,7 @@ pub fn spillNext(self: *Aggregate, arena: std.mem.Allocator) anyerror!?Batch {
         };
         try sp.finish(self);
         if (set.len > 0) return try self.emitSets(arena, &.{set}, null);
+        if (try self.emitTotals(arena)) |totals| return totals;
     }
     return self.spill.?.replay.?.next(self, self.gpa, arena);
 }

@@ -882,6 +882,14 @@ fn listChild(arena: std.mem.Allocator, l: Nested.List, n: usize) error{OutOfMemo
     return permute(arena, l.child, idx);
 }
 
+/// One list of type `ty` holding column `child`'s rows, as a value.
+pub fn oneList(arena: std.mem.Allocator, ty: types.Type, child: Column) error{OutOfMemory}!value.Value {
+    const offsets = try arena.alloc(i32, 2);
+    offsets[0] = 0;
+    offsets[1] = @intCast(child.len);
+    return .{ .nested = .{ .node = try newNested(arena, ty, .{ .list = .{ .offsets = offsets, .child = child } }), .row = 0 } };
+}
+
 fn newNested(arena: std.mem.Allocator, ty: types.Type, body: Nested.Body) error{OutOfMemory}!*const Nested {
     const out = try arena.create(Nested);
     out.* = .{ .ty = ty, .body = body };

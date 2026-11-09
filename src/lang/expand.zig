@@ -238,7 +238,7 @@ fn expandNode(cx: *Ctx, n: ast.Stage.Node) Error!ast.Stage.Node {
         .aggregate => |ag| blk: {
             const aggs = try cx.arena.alloc(ast.AggItem, ag.aggs.len);
             for (ag.aggs, 0..) |a, i| aggs[i] = .{ .name = a.name, .func = a.func, .arg = if (a.arg) |e| try expandExpr(cx, e, null, 0) else null, .distinct = a.distinct };
-            break :blk .{ .aggregate = .{ .aggs = aggs, .by = ag.by } };
+            break :blk .{ .aggregate = .{ .aggs = aggs, .by = ag.by, .by_rest = ag.by_rest, .on_empty = ag.on_empty } };
         },
         .union_ => |u| blk: {
             var uu = u;

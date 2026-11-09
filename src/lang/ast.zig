@@ -320,7 +320,7 @@ pub const Explode = struct { field: []const u8, as_name: ?[]const u8, delim: ?[]
 /// `count_expr` and `offset_expr` are a LIMIT or OFFSET written as an expression of
 /// `$name`s and literals, evaluated into `count` and `offset` once the script's values
 /// are known; until then `count` is no bound.
-pub const Limit = struct { count: u64, offset: u64 = 0, count_expr: ?*Expr = null, offset_expr: ?*Expr = null };
+pub const Limit = struct { count: u64, offset: u64 = 0, count_expr: ?*Expr = null, offset_expr: ?*Expr = null, with_ties: bool = false };
 
 pub const Distinct = struct { on: ?[]const QualName };
 
@@ -354,9 +354,16 @@ pub const AggFunc = enum {
     var_pop,
     stddev_samp,
     stddev_pop,
+    any_value,
+    arg_max,
+    arg_min,
+    array_agg,
+    string_agg,
+    percentile_cont,
+    percentile_disc,
 };
 pub const AggItem = struct { name: []const u8, func: AggFunc, arg: ?*Expr, distinct: bool = false };
-pub const Aggregate = struct { aggs: []const AggItem, by: []const QualName };
+pub const Aggregate = struct { aggs: []const AggItem, by: []const QualName, by_rest: ?[]const []const u8 = null, on_empty: []const []const u8 = &.{} };
 
 pub const JoinKind = enum { inner, left, semi, anti, right, full, cross };
 
@@ -508,6 +515,7 @@ pub const Union = struct {
     discover_pipeline: ?Pipeline = null,
     positional: bool = false,
     set: SetOp = .union_all,
+    set_all: bool = false,
     pos: Pos,
 };
 
@@ -583,10 +591,13 @@ pub const FrameBound = union(enum) {
         return self == .preceding or self == .following;
     }
 };
+pub const FrameExclude = enum { none, current_row, group, ties };
+
 pub const WinFrame = struct {
     unit: FrameUnit,
     start: FrameBound,
     end: FrameBound,
+    exclude: FrameExclude = .none,
 
     pub fn hasOffset(self: WinFrame) bool {
         return self.start.hasOffset() or self.end.hasOffset();
@@ -594,10 +605,16 @@ pub const WinFrame = struct {
 
     /// The frame as SQL writes it, for EXPLAIN.
     pub fn render(self: WinFrame, arena: std.mem.Allocator) ![]const u8 {
-        return msgfmt.allocPrint(arena, "{s} BETWEEN {s} AND {s}", .{
+        return msgfmt.allocPrint(arena, "{s} BETWEEN {s} AND {s}{s}", .{
             if (self.unit == .rows) "ROWS" else "RANGE",
             try renderBound(self.start, arena),
             try renderBound(self.end, arena),
+            switch (self.exclude) {
+                .none => "",
+                .current_row => " EXCLUDE CURRENT ROW",
+                .group => " EXCLUDE GROUP",
+                .ties => " EXCLUDE TIES",
+            },
         });
     }
 

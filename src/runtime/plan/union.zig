@@ -419,7 +419,7 @@ pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, after: []con
     un.* = .{ .children = children };
     if (env.profile != null) un.label = try msgfmt.allocPrint(arena, "{d} branches{s}", .{ specs.len, if (u.branches.len == 0) ", from discovery" else "" });
     if (u.set == .union_all) return .{ .op = .{ .union_ = un }, .schema = out_schema };
-    return buildSetOp(env, u.set, canon, .{ .union_ = un }, out_schema);
+    return buildSetOp(env, u.set, u.set_all, canon, .{ .union_ = un }, out_schema);
 }
 
 /// Branch read `rd`'s WHERE with the part of the filters right after the union
@@ -486,7 +486,7 @@ fn withSideMarks(arena: std.mem.Allocator, items: []const ast.SelectItem, branch
     return out;
 }
 
-fn buildSetOp(env: *Env, set: ast.SetOp, canon: types.Schema, child: op.Op, schema: types.Schema) anyerror!PipeRes {
+fn buildSetOp(env: *Env, set: ast.SetOp, all: bool, canon: types.Schema, child: op.Op, schema: types.Schema) anyerror!PipeRes {
     const arena = env.arena;
     const by = try arena.alloc(ast.QualName, canon.fields.len);
     const keep = try arena.alloc(ast.SelectItem, canon.fields.len);
@@ -511,8 +511,49 @@ fn buildSetOp(env: *Env, set: ast.SetOp, canon: types.Schema, child: op.Op, sche
 
     const at: ast.Pos = .{ .line = 0, .col = 0 };
     var r = try buildStage(env, .{ .node = .{ .aggregate = .{ .aggs = aggs, .by = by } }, .hints = &.{}, .pos = at }, child, schema);
-    r = try buildStage(env, .{ .node = .{ .filter = pred }, .hints = &.{}, .pos = at }, r.op, r.schema);
+    if (all) {
+        r = try repeatRows(env, set, counted, r);
+    } else {
+        r = try buildStage(env, .{ .node = .{ .filter = pred }, .hints = &.{}, .pos = at }, r.op, r.schema);
+    }
     return buildStage(env, .{ .node = .{ .select = keep }, .hints = &.{}, .pos = at }, r.op, r.schema);
+}
+
+/// `INTERSECT ALL` or `EXCEPT ALL` over the counted rows of `r`: each distinct row as
+/// many times as it stays, the fewer of its two counts, or the left's count less the
+/// right's.
+fn repeatRows(env: *Env, set: ast.SetOp, counted: [2]*ast.Expr, r0: PipeRes) anyerror!PipeRes {
+    const arena = env.arena;
+    const at: ast.Pos = .{ .line = 0, .col = 0 };
+    const times_col = "__times";
+    const marks_col = "__marks";
+    const field = struct {
+        fn of(a: std.mem.Allocator, name: []const u8) !*ast.Expr {
+            const parts = try a.alloc([]const u8, 1);
+            parts[0] = name;
+            return mk(a, .{ .field = .{ .parts = parts } });
+        }
+    }.of;
+    const left_less = try mk(arena, .{ .binary = .{ .op = .lt, .l = counted[0], .r = counted[1] } });
+    const times = if (set == .intersect)
+        try mk(arena, .{ .cond = .{ .cond = left_less, .then = counted[0], .els = counted[1] } })
+    else
+        try mk(arena, .{ .binary = .{ .op = .sub, .l = counted[0], .r = counted[1] } });
+    const with_times = try arena.alloc(ast.SelectItem, 2);
+    with_times[0] = .star;
+    with_times[1] = .{ .computed = .{ .name = times_col, .expr = times } };
+    var r = try buildStage(env, .{ .node = .{ .select = with_times }, .hints = &.{}, .pos = at }, r0.op, r0.schema);
+    const zero = try mk(arena, .{ .int_lit = 0 });
+    const any = try mk(arena, .{ .binary = .{ .op = .gt, .l = try field(arena, times_col), .r = zero } });
+    r = try buildStage(env, .{ .node = .{ .filter = any }, .hints = &.{}, .pos = at }, r.op, r.schema);
+    const args = try arena.alloc(*ast.Expr, 2);
+    args[0] = try mk(arena, .{ .str_lit = "," });
+    args[1] = try mk(arena, .{ .binary = .{ .op = .sub, .l = try field(arena, times_col), .r = try mk(arena, .{ .int_lit = 1 }) } });
+    const with_marks = try arena.alloc(ast.SelectItem, 2);
+    with_marks[0] = .star;
+    with_marks[1] = .{ .computed = .{ .name = marks_col, .expr = try mk(arena, .{ .call = .{ .name = "repeat", .args = args } }) } };
+    r = try buildStage(env, .{ .node = .{ .select = with_marks }, .hints = &.{}, .pos = at }, r.op, r.schema);
+    return buildStage(env, .{ .node = .{ .explode = .{ .field = marks_col, .as_name = null, .delim = "," } }, .hints = &.{}, .pos = at }, r.op, r.schema);
 }
 
 test "windowTopK: a whole-item ROW_NUMBER, filtered by its alias, gets top_k; one inside an expression does not" {

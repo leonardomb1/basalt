@@ -597,6 +597,7 @@ pub fn stageText(arena: std.mem.Allocator, st: ast.Stage) ![]const u8 {
         .sort => |s| try sortText(w, s),
         .window => |wd| try w.writeAll(try ast.windowDetail(arena, wd)),
         .aggregate => |ag| {
+            if (ag.by_rest != null) try w.writeAll("by the other columns; ");
             if (ag.by.len > 0) {
                 try w.writeAll("by ");
                 for (ag.by, 0..) |q, i| {

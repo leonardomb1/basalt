@@ -104,8 +104,13 @@ The frame is the slice of the partition an aggregate or a value function reads:
 - A start after its end is refused where it is written (`ROWS BETWEEN CURRENT ROW
   AND 1 PRECEDING`, `ROWS 2 FOLLOWING`, `ROWS BETWEEN 1 PRECEDING AND 3 PRECEDING`),
   as are `UNBOUNDED FOLLOWING` as a start and `UNBOUNDED PRECEDING` as an end. A
-  `ROWS` offset is a whole number of rows. `GROUPS` frames and frame exclusion
-  (`EXCLUDE …`) are not supported.
+  `ROWS` offset is a whole number of rows. `GROUPS` frames are not supported.
+- `EXCLUDE CURRENT ROW`, `EXCLUDE GROUP` (the row and its peers by `ORDER BY`),
+  `EXCLUDE TIES` (its peers, not itself) and `EXCLUDE NO OTHERS` (the default) take
+  rows out of a frame, after its bounds: `SUM(v) OVER (ORDER BY d ROWS BETWEEN 3
+  PRECEDING AND 3 FOLLOWING EXCLUDE CURRENT ROW)` is what the neighbours add up to. A
+  frame that excludes is computed row by row over the frame, not slid, so a wide one
+  over many rows costs more than one that does not.
 - A `RANGE` offset (`<n> PRECEDING` / `FOLLOWING`) needs exactly one `ORDER BY` key,
   a number, date or timestamp — `check` refuses any other. Over a number the offset
   is in its units (`RANGE BETWEEN 0.5 PRECEDING AND CURRENT ROW` over a price). Over
@@ -126,6 +131,25 @@ The frame is the slice of the partition an aggregate or a value function reads:
 - Without `ORDER BY` a `ROWS` frame — and `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE` —
   counts in input order, as the rows arrive, whatever other windows of the query
   sort by.
+
+## QUALIFY
+
+`QUALIFY` filters on a window function's result, as `HAVING` filters on an
+aggregate's, with no derived table around the query. It takes an inline call, the
+alias of a SELECT item computed over one, or a window named in `WINDOW`, and comes
+after `HAVING`, before or after `WINDOW`:
+
+```sql
+SELECT id, g, updated_at
+FROM 'orders.parquet'
+QUALIFY ROW_NUMBER() OVER (PARTITION BY id ORDER BY updated_at DESC) = 1;
+
+SELECT g, ROW_NUMBER() OVER (ORDER BY v DESC) AS rn
+FROM 'orders.parquet'
+QUALIFY rn <= 3;
+```
+
+A `QUALIFY` that names no window function is refused: `WHERE` or `HAVING` says it.
 
 ## IGNORE NULLS
 

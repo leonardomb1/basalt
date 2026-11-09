@@ -223,6 +223,7 @@ fn extreme(comptime want: std.math.Order, kind: types.TypeKind) *const Kernel {
 pub fn kernelFor(agg: Agg) struct { k: *const Kernel, ty: types.Type } {
     const arg = agg.arg_ty orelse agg.ty;
     const float = types.Type.init(.float);
+    const packed_ty = types.Type.init(.bytes);
     return switch (agg.func) {
         .count => .{ .k = kernelOf(funcs.Count), .ty = agg.ty },
         .sum => switch (agg.ty.kind) {
@@ -248,6 +249,13 @@ pub fn kernelFor(agg: Agg) struct { k: *const Kernel, ty: types.Type } {
         .var_pop => if (arg.kind == .int) .{ .k = kernelOf(funcs.Spread(.var_pop, true)), .ty = arg } else .{ .k = kernelOf(funcs.Spread(.var_pop, false)), .ty = float },
         .stddev_samp => if (arg.kind == .int) .{ .k = kernelOf(funcs.Spread(.stddev_samp, true)), .ty = arg } else .{ .k = kernelOf(funcs.Spread(.stddev_samp, false)), .ty = float },
         .stddev_pop => if (arg.kind == .int) .{ .k = kernelOf(funcs.Spread(.stddev_pop, true)), .ty = arg } else .{ .k = kernelOf(funcs.Spread(.stddev_pop, false)), .ty = float },
+        .any_value => .{ .k = kernelOf(funcs.AnyValue), .ty = agg.ty },
+        .arg_max => .{ .k = kernelOf(funcs.ArgBest(.gt)), .ty = packed_ty },
+        .arg_min => .{ .k = kernelOf(funcs.ArgBest(.lt)), .ty = packed_ty },
+        .array_agg => .{ .k = kernelOf(funcs.Collect(funcs.finishList)), .ty = packed_ty },
+        .string_agg => .{ .k = kernelOf(funcs.Collect(funcs.finishString)), .ty = packed_ty },
+        .percentile_cont => .{ .k = kernelOf(funcs.Collect(funcs.finishCont)), .ty = packed_ty },
+        .percentile_disc => .{ .k = kernelOf(funcs.Collect(funcs.finishDisc)), .ty = packed_ty },
     };
 }
 

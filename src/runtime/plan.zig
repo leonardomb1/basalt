@@ -188,6 +188,7 @@ const Needs = struct {
                     for (on) |q| try self.field(q);
                 },
                 .aggregate => |ag| {
+                    if (ag.by_rest != null) return null;
                     for (ag.by) |q| try self.field(q);
                     for (ag.aggs) |a| if (a.arg) |e| try self.expr(e);
                     defines_output = true;
@@ -209,6 +210,10 @@ const Needs = struct {
                     break;
                 },
                 .limit => {},
+                .explode => |ex| {
+                    try self.name(ex.field);
+                    try self.made.put(ex.as_name orelse ex.field, {});
+                },
                 .window => |wd| {
                     for (wd.partition_by) |q| try self.field(q);
                     for (wd.order_by) |k| try self.field(k.field);
@@ -396,6 +401,7 @@ fn stageReads(arena: std.mem.Allocator, st: ast.Stage, set: *std.StringHashMap(v
             if (j.residual) |e| if (!try exprNames(arena, e, set)) return .opaque_;
         },
         .aggregate => |ag| {
+            if (ag.by_rest != null) return .opaque_;
             for (ag.by) |q| try qualNames(q, set);
             for (ag.aggs) |a| if (a.arg) |e| if (!try exprNames(arena, e, set)) return .opaque_;
             return .defines;
@@ -543,7 +549,7 @@ fn metaShortcut(env: *Env, stages: []const ast.Stage) anyerror!?PipeRes {
     };
     if (!pqdecode.Reader.isPath(path) or csv.CsvReader.isUrl(path)) return null;
     const ag = stages[1].node.aggregate;
-    if (ag.by.len != 0 or ag.aggs.len == 0) return null;
+    if (ag.by_rest != null or ag.by.len != 0 or ag.aggs.len == 0) return null;
 
     const rdr = pqdecode.Reader.open(env.arena, path) catch return null;
     var ad = analyze.Diag{};
@@ -873,7 +879,7 @@ pub fn buildOp(env: *Env, r: analyze.Resolved, child: op.Op) anyerror!PipeRes {
         .aggregate => |ag| blk: {
             const a = try arena.create(op.Aggregate);
             const st = try ownState(env);
-            a.* = .{ .child = child, .in_schema = r.in, .by = ag.by, .aggs = ag.aggs, .out_schema = r.out, .err = env.errctx, .state = st.allocator(), .own_state = st, .gpa = env.gpa, .space = env.space, .spill_at = env.op_memory };
+            a.* = .{ .child = child, .in_schema = r.in, .by = ag.by, .aggs = ag.aggs, .out_schema = r.out, .err = env.errctx, .state = st.allocator(), .own_state = st, .gpa = env.gpa, .space = env.space, .spill_at = env.op_memory, .on_empty = r.stage.node.aggregate.on_empty };
             break :blk .{ .aggregate = a };
         },
     };

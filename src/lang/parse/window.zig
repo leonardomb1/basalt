@@ -223,6 +223,7 @@ pub fn windowArgs(self: *Parser, call: *WinCall, args: []const *ast.Expr) Error!
             }
         },
         .agg => |a| {
+            if (!aggregates.spec(a).windowed) return self.fail(call.pos, "`{s}` is not available over a window — aggregate in a derived table or CTE and join it back", .{name});
             if (args.len == 0 and a != .count) return self.fail(call.pos, "`{s}` needs an argument", .{name});
             if (call.distinct and a != .count) return self.fail(call.pos, "DISTINCT over a window is only supported inside COUNT", .{});
             if (call.distinct and args.len == 0) return self.fail(call.pos, "COUNT(DISTINCT …) needs an argument", .{});
@@ -247,19 +248,54 @@ pub fn parseSpecBody(self: *Parser, pos: Pos) Error!Spec {
     }
     if (self.eatKw("order")) {
         try self.expectKw("by");
-        var keys = std.array_list.Managed(OrderExpr).init(self.arena);
-        while (true) {
-            const e = try self.parseExpr();
-            var desc = false;
-            if (self.eatKw("desc")) desc = true else _ = self.eatKw("asc");
-            try keys.append(.{ .e = e, .desc = desc, .nulls_first = try self.parseNullsFirst(desc) });
-            if (!self.eat(.comma)) break;
-        }
-        spec.order = try keys.toOwnedSlice();
+        spec.order = try parseOrderKeys(self);
     }
     if (self.isKw("rows") or self.isKw("range") or self.isKw("groups")) spec.frame = try self.parseFrame();
     _ = try self.expect(.rparen);
     return spec;
+}
+
+/// The keys of an `ORDER BY` whose two words are behind.
+pub fn parseOrderKeys(self: *Parser) Error![]const OrderExpr {
+    var keys = std.array_list.Managed(OrderExpr).init(self.arena);
+    while (true) {
+        const e = try self.parseExpr();
+        var desc = false;
+        if (self.eatKw("desc")) desc = true else _ = self.eatKw("asc");
+        try keys.append(.{ .e = e, .desc = desc, .nulls_first = try self.parseNullsFirst(desc) });
+        if (!self.eat(.comma)) break;
+    }
+    return keys.toOwnedSlice();
+}
+
+/// The one argument a packing aggregate folds: `args`, then its sort keys, packed
+/// (`exec/agg_args.zig`). `percentile_*(p) WITHIN GROUP (ORDER BY x)` folds `x`, `p`
+/// riding along.
+pub fn packAggArgs(self: *Parser, f: aggregates.AggFunc, name: []const u8, args: []const *ast.Expr, order: []const OrderExpr, pos: Pos) Error![]*ast.Expr {
+    const percentile = f == .percentile_cont or f == .percentile_disc;
+    const want: usize = switch (f) {
+        .string_agg, .arg_max, .arg_min => 2,
+        else => 1,
+    };
+    if (args.len != want) return self.fail(pos, "`{s}` takes {d} argument{s}, not {d}", .{ name, want, if (want == 1) "" else "s", args.len });
+    if (percentile and order.len != 1) return self.fail(pos, "`{s}(fraction)` needs WITHIN GROUP (ORDER BY one expression)", .{name});
+    if (!percentile and order.len > 0 and (f == .arg_max or f == .arg_min)) return self.fail(pos, "`{s}` orders by its second argument, and takes no ORDER BY", .{name});
+    const leading: usize = if (percentile) 2 else args.len;
+    const out = try self.arena.alloc(*ast.Expr, 1 + leading + order.len);
+    var flags = try self.arena.alloc(u8, 1 + order.len);
+    flags[0] = '0' + @as(u8, @intCast(leading));
+    for (order, flags[1..]) |k, *fl| fl.* = 'a' + @as(u8, @intFromBool(k.desc)) + 2 * @as(u8, @intFromBool(k.nulls_first));
+    out[0] = try self.mk(.{ .str_lit = flags });
+    if (percentile) {
+        out[1] = order[0].e;
+        out[2] = @constCast(args[0]);
+    } else for (args, out[1 .. 1 + leading]) |a, *o| {
+        o.* = @constCast(a);
+    }
+    for (order, out[1 + leading ..]) |k, *o| o.* = k.e;
+    const one = try self.arena.alloc(*ast.Expr, 1);
+    one[0] = try self.mk(.{ .call = .{ .name = aggregates.packed_fn, .args = out } });
+    return one;
 }
 
 fn boundWord(b: ast.FrameBound) []const u8 {
@@ -292,6 +328,19 @@ pub fn parseFrame(self: *Parser) Error!ast.WinFrame {
     } else {
         start = try self.parseBound();
     }
+    var exclude: ast.FrameExclude = .none;
+    if (self.eatKw("exclude")) {
+        if (self.eatKw("current")) {
+            try self.expectKw("row");
+            exclude = .current_row;
+        } else if (self.eatKw("group")) {
+            exclude = .group;
+        } else if (self.eatKw("ties")) {
+            exclude = .ties;
+        } else if (self.eatKw("no")) {
+            try self.expectKw("others");
+        } else return self.fail(self.curPos(), "EXCLUDE takes CURRENT ROW, GROUP, TIES or NO OTHERS", .{});
+    }
     if (start == .unbounded_following) return self.fail(fpos, "a frame cannot start at UNBOUNDED FOLLOWING", .{});
     if (end == .unbounded_preceding) return self.fail(fpos, "a frame cannot end at UNBOUNDED PRECEDING", .{});
     if (start.rank() > end.rank())
@@ -315,7 +364,7 @@ pub fn parseFrame(self: *Parser) Error!ast.WinFrame {
             return self.fail(fpos, "a ROWS offset is a whole number of rows", .{}),
         else => {},
     };
-    return .{ .unit = unit, .start = start, .end = end };
+    return .{ .unit = unit, .start = start, .end = end, .exclude = exclude };
 }
 
 /// A frame's INTERVAL unit: a fixed-length `civil.Part`, singular or plural.

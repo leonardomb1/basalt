@@ -39,6 +39,11 @@ pub const vectorized = struct {
         return .{ .scalar = .{ .date = @intCast(civil.dayOf(clockOf(c))) } };
     }
 
+    /// Packing has no kernel: it reads values of any kind, row by row.
+    pub fn aggArgs(_: std.mem.Allocator, _: ast.Expr.Call, _: Batch) VecError!Vec {
+        return error.Unsupported;
+    }
+
     /// A list's or map's length per row, straight from its offsets.
     pub fn cardinality(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
         const col = switch (try evalVec(arena, c.args[0], batch)) {

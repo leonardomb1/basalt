@@ -21,6 +21,7 @@ const Ctx = funcs.Ctx;
 /// null for COUNT, MIN and MAX, which take it as text. Parallel CSV lanes carry
 /// raw text, so the cast happens here.
 pub fn castTo(func: ast.AggFunc, out: types.Type) ?types.Type {
+    if (aggregates.spec(func).packs) return types.Type.init(.bytes).asNullable();
     return switch (aggregates.spec(func).arg) {
         .star_or_any, .any => null,
         .numeric => out.asNullable(),

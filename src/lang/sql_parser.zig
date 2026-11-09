@@ -230,7 +230,7 @@ pub const AliasSet = struct {
     implicit: []const u8 = "",
     sides: []const []const u8 = &.{},
 
-    fn put(self: *AliasSet, name: []const u8, kind: Kind) error{ AliasTaken, TooManyAliases }!void {
+    pub fn put(self: *AliasSet, name: []const u8, kind: Kind) error{ AliasTaken, TooManyAliases }!void {
         for (self.names[0..self.n]) |a| if (std.mem.eql(u8, a, name)) return error.AliasTaken;
         if (self.n == MAX_ALIASES) return error.TooManyAliases;
         self.names[self.n] = name;
@@ -308,7 +308,7 @@ const reserved_after_source = [_][]const u8{
     "natural",  "upsert",   "append", "replace", "split",  "jobs",      "offset",
     "paginate", "retry",    "create", "param",   "having", "and",       "or",
     "not",      "explain",  "costs",  "analyze", "except", "intersect", "window",
-    "fetch",
+    "fetch",    "qualify",  "pivot",  "unpivot",
 };
 
 fn isKwIn(name: []const u8, kws: []const []const u8) bool {

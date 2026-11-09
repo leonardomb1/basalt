@@ -306,7 +306,7 @@ test "Tab's built-in functions are exactly the engine's: every scalar, aggregate
             return false;
         }
     };
-    for (eval.builtins) |b| if (!listed.has(b.name)) {
+    for (eval.builtins) |b| if (!std.mem.startsWith(u8, b.name, "__") and !listed.has(b.name)) {
         std.debug.print("scalar builtin `{s}` is missing from complete.builtin_functions\n", .{b.name});
         return error.TestUnexpectedResult;
     };

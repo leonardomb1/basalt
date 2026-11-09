@@ -90,6 +90,13 @@ pub const per_row = struct {
         return .{ .string = out.written() };
     }
 
+    /// An aggregate's arguments packed as one value (`exec/agg_args.zig`).
+    pub fn aggArgs(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const vals = try arena.alloc(Value, c.args.len - 1);
+        for (c.args[1..], vals) |a, *v| v.* = try evalRow(arena, a, batch, row);
+        return .{ .bytes = try @import("../agg_args.zig").encode(arena, c.args[0].str_lit, vals) };
+    }
+
     pub fn cardinality(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v != .nested or v.nested.node.body != .list) return .null;

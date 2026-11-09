@@ -119,6 +119,7 @@ const base = [_]Builtin{
     .{ .name = "concat", .type_fn = typing.concat, .eval_fn = S(f.Concat).eval, .vec_fn = S(f.Concat).vec },
     .{ .name = "coalesce", .type_fn = typing.coalesce, .eval_fn = per_row.coalesce, .vec_fn = vectorized.coalesce },
     .{ .name = "cardinality", .type_fn = typing.cardinality, .eval_fn = per_row.cardinality, .vec_fn = vectorized.cardinality },
+    .{ .name = "__agg_args", .type_fn = typing.aggArgs, .eval_fn = per_row.aggArgs, .vec_fn = vectorized.aggArgs },
     .{ .name = "starts_with", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.starts_with)).eval, .vec_fn = S(f.Match(.starts_with)).vec },
     .{ .name = "ends_with", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.ends_with)).eval, .vec_fn = S(f.Match(.ends_with)).vec },
     .{ .name = "contains", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.contains)).eval, .vec_fn = S(f.Match(.contains)).vec },
