@@ -2,8 +2,7 @@
 //! its public API; the docs check reads docs/, so it always re-runs. The unit tests run
 //! from the repo root, since one of them reads src/. Coverage builds the
 //! tests with LLVM, since kcov cannot read the self-hosted backend's debug info, and makes
-//! zig-out/ first, since kcov creates only its own folder. `bench-e2e` times the installed
-//! CLI, so it needs -Doptimize=ReleaseFast for meaningful numbers.
+//! zig-out/ first, since kcov creates only its own folder.
 
 const std = @import("std");
 
@@ -152,18 +151,4 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench);
     const bench_step = b.step("bench", "Run SIMD microbenchmarks (ReleaseFast)");
     bench_step.dependOn(&run_bench.step);
-
-    const bench_e2e = b.addExecutable(.{
-        .name = "bench-e2e",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench/e2e.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
-    });
-    const run_bench_e2e = b.addRunArtifact(bench_e2e);
-    run_bench_e2e.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_bench_e2e.addArgs(args);
-    const bench_e2e_step = b.step("bench-e2e", "Run end-to-end query + movement benchmarks");
-    bench_e2e_step.dependOn(&run_bench_e2e.step);
 }

@@ -612,7 +612,7 @@ fi
 # StarRocks: write via stream load, read back through its MySQL-protocol FE.
 if runs starrocks; then
   if brun run -c "CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');
-LOAD INTO sr.basalt_it USING stream_load REPLACE AS SELECT * FROM 'tests/integration/seed.csv';" &&
+LOAD INTO sr.basalt_it REPLACE AS SELECT * FROM 'tests/integration/seed.csv';" &&
      brun run -c "CREATE CONNECTION fe TYPE mysql OPTIONS (host = '127.0.0.1', port = 39030, user = 'root', password = '', database = 'it');
 LOAD INTO '$out/starrocks.csv' AS SELECT * FROM fe.basalt_it ORDER BY id;"; then
     check starrocks "$out/starrocks.csv" tests/integration/expected.csv
@@ -636,13 +636,13 @@ LOAD INTO '$out/timeout_starrocks.csv' AS SELECT id FROM sr.basalt_it ORDER BY i
   printf 'id,s\n2,a\\Nb\n' > "$out/sr_embedded.csv"
   printf 'id,s\n2,a\\Nb\n' > "$out/sr_embedded_expected.csv"
   if $B run -q -c "$SR_CONN
-LOAD INTO sr.it_nullmark USING stream_load REPLACE AS SELECT * FROM '$out/sr_marker.csv';" >"$out/sr_marker.log" 2>&1; then
+LOAD INTO sr.it_nullmark REPLACE AS SELECT * FROM '$out/sr_marker.csv';" >"$out/sr_marker.log" 2>&1; then
     report "starrocks-null-marker (a literal \\N was accepted)" bad
   elif ! grep -q "StreamLoadNullMarkerInData" "$out/sr_marker.log"; then
     report "starrocks-null-marker (wrong message)" bad
     head -3 "$out/sr_marker.log"
   elif brun run -c "$SR_CONN
-LOAD INTO sr.it_nullmark2 USING stream_load REPLACE AS SELECT * FROM '$out/sr_embedded.csv';" &&
+LOAD INTO sr.it_nullmark2 REPLACE AS SELECT * FROM '$out/sr_embedded.csv';" &&
        brun run -c "CREATE CONNECTION fe TYPE mysql OPTIONS (host = '127.0.0.1', port = 39030, user = 'root', password = '', database = 'it');
 LOAD INTO '$out/sr_embedded_out.csv' AS SELECT id, s FROM fe.it_nullmark2 ORDER BY id;"; then
     check starrocks-null-marker "$out/sr_embedded_out.csv" "$out/sr_embedded_expected.csv"
@@ -655,7 +655,7 @@ LOAD INTO '$out/sr_embedded_out.csv' AS SELECT id, s FROM fe.it_nullmark2 ORDER 
   $B run -q -c "$SR_CONN SELECT * FROM sr.QUERY(\$\$DROP TABLE IF EXISTS it_strict\$\$);" >/dev/null 2>&1
   $B run -q -c "$SR_CONN SELECT * FROM sr.QUERY(\$\$CREATE TABLE it_strict (id INT, s VARCHAR(5)) DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES('replication_num' = '1')\$\$);" >/dev/null 2>&1
   if $B run -q -c "$SR_CONN
-LOAD INTO sr.it_strict USING stream_load APPEND AS SELECT 1 AS id, 'abcdefgh' AS s;" >"$out/sr_strict.log" 2>&1; then
+LOAD INTO sr.it_strict APPEND AS SELECT 1 AS id, 'abcdefgh' AS s;" >"$out/sr_strict.log" 2>&1; then
     report "starrocks-strict (a too-long value loaded)" bad
   elif [ "$($B run --format csv -q -c "$SR_CONN SELECT count(*) AS n FROM sr.it_strict;" 2>&1 | tail -1)" != 0 ]; then
     report "starrocks-strict (rows landed)" bad
@@ -664,9 +664,9 @@ LOAD INTO sr.it_strict USING stream_load APPEND AS SELECT 1 AS id, 'abcdefgh' AS
   fi
 
   # read back through a starrocks connection, so the starrocks dialect renders it
-  topnrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_topn USING stream_load"
+  topnrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_topn"
   paramrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');"
-  collrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_coll USING stream_load"
+  collrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_coll"
   catalogrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" it
 fi
 
@@ -843,7 +843,7 @@ if runs doris; then
   DR="CREATE CONNECTION dr TYPE doris OPTIONS (host = '127.0.0.1', port = 49030, load_url = 'http://127.0.0.1:48040', database = 'it', user = 'root', password = '');"
   DB="CREATE CONNECTION db TYPE doris OPTIONS (host = '127.0.0.1', port = 49030, load_url = 'http://127.0.0.1:48040', database = 'it', user = 'root', password = '');"
   if brun run -c "$DR
-LOAD INTO dr.basalt_it USING stream_load REPLACE AS SELECT * FROM 'tests/integration/seed.csv';" &&
+LOAD INTO dr.basalt_it REPLACE AS SELECT * FROM 'tests/integration/seed.csv';" &&
      brun run -c "$DR
 LOAD INTO '$out/doris.csv' AS SELECT * FROM dr.basalt_it ORDER BY id;"; then
     check doris "$out/doris.csv" tests/integration/expected.csv
@@ -857,7 +857,7 @@ LOAD INTO '$out/doris.csv' AS SELECT * FROM dr.basalt_it ORDER BY id;"; then
   # a DOUBLE also checks the DDL — Doris takes no FLOAT, DOUBLE or STRING key.
   printf 'score,note,at\n1.5,"line one\nline two",2026-10-03 10:11:12.123456\n2.25,plain,\n' > "$out/dr_nl.csv"
   if brun run -c "$DR
-LOAD INTO dr.it_newline USING stream_load REPLACE AS SELECT CAST(score AS DOUBLE) AS score, note, CAST(at AS TIMESTAMP) AS at FROM '$out/dr_nl.csv';" &&
+LOAD INTO dr.it_newline REPLACE AS SELECT CAST(score AS DOUBLE) AS score, note, CAST(at AS TIMESTAMP) AS at FROM '$out/dr_nl.csv';" &&
      brun run -c "$DR
 LOAD INTO '$out/dr_nl_out.csv' AS SELECT score, note, at FROM dr.it_newline ORDER BY score;"; then
     brun run -c "LOAD INTO '$out/dr_nl_want.csv' AS SELECT CAST(score AS DOUBLE) AS score, note, CAST(at AS TIMESTAMP) AS at FROM '$out/dr_nl.csv' ORDER BY score;"
@@ -872,9 +872,9 @@ LOAD INTO '$out/dr_nl_out.csv' AS SELECT score, note, at FROM dr.it_newline ORDE
   printf 'k,v\nb,20\nc,3\n' > "$out/dr_up2.csv"
   printf 'k,v\na,1\nb,20\nc,3\n' > "$out/dr_up_want.csv"
   if brun run -c "$DR
-LOAD INTO dr.it_upsert USING stream_load UPSERT ON (k) AS SELECT k, CAST(v AS INT) AS v FROM '$out/dr_up1.csv';" &&
+LOAD INTO dr.it_upsert UPSERT ON (k) AS SELECT k, CAST(v AS INT) AS v FROM '$out/dr_up1.csv';" &&
      brun run -c "$DR
-LOAD INTO dr.it_upsert USING stream_load UPSERT ON (k) AS SELECT k, CAST(v AS INT) AS v FROM '$out/dr_up2.csv';" &&
+LOAD INTO dr.it_upsert UPSERT ON (k) AS SELECT k, CAST(v AS INT) AS v FROM '$out/dr_up2.csv';" &&
      brun run -c "$DR
 LOAD INTO '$out/dr_up_out.csv' AS SELECT k, v FROM dr.it_upsert ORDER BY k;"; then
     check doris-upsert "$out/dr_up_out.csv" "$out/dr_up_want.csv"
@@ -882,9 +882,9 @@ LOAD INTO '$out/dr_up_out.csv' AS SELECT k, v FROM dr.it_upsert ORDER BY k;"; th
     report "doris-upsert (run error)" bad
   fi
 
-  topnrt doris "$DB" "db.it_topn USING stream_load"
+  topnrt doris "$DB" "db.it_topn"
   paramrt doris "$DB"
-  collrt doris "$DB" "db.it_coll USING stream_load"
+  collrt doris "$DB" "db.it_coll"
   catalogrt doris "$DB" it
 fi
 
