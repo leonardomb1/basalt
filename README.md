@@ -150,11 +150,14 @@ zig build -Doptimize=ReleaseFast
 
 | | read | write |
 |---|---|---|
-| **Files** — CSV (any delimiter, Latin-1 and CP1252), Parquet, Arrow IPC, Excel, JSON and NDJSON, XML | ✓ | ✓ |
+| **Files** — CSV (any delimiter, Latin-1 and CP1252), Parquet, Arrow IPC, Excel, JSON and NDJSON, XML, Avro | ✓ | ✓ |
+| **Record files** — fixed-width and bank or EDI lines a query composes | | ✓ |
 | **Compressed and archived** — `.gz`, `.zst`, a member of a `.zip` | ✓ | `.gz` (CSV, JSON, XML) |
+| **Delta Lake** — time travel and the change data feed; append, replace and upsert (copy-on-write, deletion vectors) | ✓ | ✓ |
 | **Object storage** — S3 and S3-compatible, Azure Blob / ADLS Gen2 | ✓ | ✓ |
-| **File servers** — SFTP, Windows and Samba shares (SMB 2.1–3.1.1, NTLMv2 or Kerberos) | ✓ | ✓ |
+| **File servers** — SFTP, Windows and Samba shares (SMB 2.1–3.1.1, NTLMv2 or Kerberos); FTP | ✓ | ✓ (not FTP) |
 | **Databases** — PostgreSQL, MySQL, SQL Server, StarRocks, Apache Doris | ✓ | ✓ |
+| **Change feeds** — SQL Server CDC and a Delta table's feed, applied to any table by `UPSERT ... USING changes` | ✓ | ✓ |
 | **HTTP APIs** — paginated REST, with bearer, basic, OAuth2 and login flows | ✓ | |
 | **Standard input and output** — `FROM STDIN` reads CSV, JSON, NDJSON or XML; a final `SELECT` prints a table, CSV, TSV, JSON or Arrow | ✓ | ✓ |
 
@@ -199,30 +202,70 @@ for parallel lanes. Exit code `75` means a transient failure worth retrying,
 
 ## Performance
 
-Pipelines stream in constant memory and fan out across cores. On one laptop
-(i7-13700H), against DuckDB reading the same files, with every result matching:
+Pipelines stream, fan out across cores, and spill to disk past `--op-memory`
+where a sort, join, `DISTINCT` or `GROUP BY` must hold rows. Against DuckDB on
+TPC-H scale factor 1 as Parquet (6 million `lineitem` rows), best of three, on
+one laptop (i5-1345U, 12 threads, under WSL), with basalt's answers matching
+DuckDB's on every query that returns rows:
+
+| query | basalt 0.13.3 | DuckDB 2.0 |
+|---|---|---|
+| `q01` aggregate | 118 ms | 45 ms |
+| `q03` join and top-N | 198 ms | 50 ms |
+| `q06` filter | 46 ms | 22 ms |
+| `q12` join with CASE | 88 ms | 31 ms |
+| `q13` outer join and NOT LIKE | 166 ms | 77 ms |
+| `q16` DISTINCT and NOT IN | 42 ms | 22 ms |
+| `q18` IN with HAVING | 206 ms | 84 ms |
+| `count(DISTINCT)` | 46 ms | 109 ms |
+| `LIKE` over strings | 99 ms | 118 ms |
+| top-k per partition (window) | 85 ms | 60 ms |
+| `lineitem` to Parquet | 1.36 s | 1.59 s |
+| `lineitem` to CSV | 0.78 s | 6.37 s |
+
+basalt's times include starting the process; DuckDB's are in-process. On
+analytical queries DuckDB is about one and a half to four times faster; on moving
+rows out, basalt's job, basalt is as fast or faster.
+
+## basalt and DuckDB
+
+Both read files with SQL from a single binary, so they are often compared. They
+are built for different jobs:
 
 | | basalt | DuckDB |
 |---|---|---|
-| TPC-H, SSB and TPC-DS queries at scale factor 1 (23 queries) | 67–372 ms | 27–100 ms |
-| 6 million rows, Parquet to CSV | 208 ms | |
+| What it is | a script runner that moves data between systems | an embedded analytical database |
+| Storage of its own | none: it reads and writes other systems | a database file, with transactions and indexes |
+| Used from | the command line, a REPL, a notebook kernel | a library in Python, R, Java, Node, Wasm and more, and a CLI |
+| CSV, Parquet, JSON, Excel | read and write | read and write (Excel through an extension) |
+| XML, Avro | read and write | community extension for XML; Avro read through an extension |
+| Delta Lake | read, time travel, change feed; append, replace, upsert | read, time travel, create and append (extension) |
+| Iceberg | no | read and write through a catalog (extension) |
+| S3, Azure | read and write | read and write (extensions) |
+| SFTP, FTP, SMB shares | read; write but FTP | no |
+| PostgreSQL, MySQL | read and write, filters run by the database, split reads in parallel, UPSERT | read and write by attaching (extensions) |
+| SQL Server, StarRocks, Doris | read and write | SQL Server through an experimental community extension |
+| REST APIs | paging, retries, bearer, basic, OAuth2 and login flows | files over HTTP(S) |
+| Change data capture | SQL Server CDC, applied to any table in batches | no |
+| A script checked before it runs | every statement typed and planned first; `basalt check` offline | each statement bound as it runs |
+| Scripting | `PARAM`, `LET`, `FOR EACH`, `CASE`, functions and pinned libraries | SQL macros |
+| Analytical speed | about 1.5–4× slower (above) | the reference |
 
-So basalt is within a few times of a columnar analytics database on that
-database's home ground, and on its own job, moving rows, it writes about 29
-million a second from Parquet to CSV. The numbers come from
-`zig build bench-e2e`, which anyone can rerun ([bench/README.md](bench/README.md)).
+Use DuckDB to keep and query data in one place, from a program or a notebook;
+use basalt to move data between the systems that hold it, on a schedule.
 
 ## When to use something else
 
-- **Continuous replication.** basalt runs a script to completion; it does not
-  follow a change log. Schedule it with cron, Airflow or the like.
-- **An ungrouped `count(DISTINCT)` far larger than memory.** A sort, a join's
-  build side, `DISTINCT` and a `GROUP BY` spill to disk past `--op-memory`, a
-  parallel `GROUP BY` staying parallel, one partition of its keys per lane; an
-  aggregate with no `GROUP BY` that outgrows memory runs on one lane.
-- **Interactive analytics where milliseconds matter.** On analytical queries
-  DuckDB is still about two to six times faster; basalt's edge is everything around
-  the query: sources, sinks, scripts and checks.
+- **Streaming replication.** basalt reads change feeds in batches: each run
+  takes what is new since the target's last position and stops. It does not hold
+  a connection open following a log; schedule it with cron, Airflow or the like.
+- **One group far larger than memory.** A sort, a join's build side, `DISTINCT`
+  and a `GROUP BY` spill to disk past `--op-memory`, a parallel `GROUP BY` staying
+  parallel; but an ungrouped `count(DISTINCT)`, and the values `median`, the
+  percentiles, `string_agg` and `array_agg` hold for one group, stay in memory.
+- **Interactive analytics where milliseconds matter.** DuckDB is faster on
+  analytical queries (above); basalt's edge is everything around the query:
+  sources, sinks, scripts and checks.
 
 ## Development
 
