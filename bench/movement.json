@@ -1,0 +1,44 @@
+{
+  "parquet_to_csv": {
+    "basalt": "LOAD INTO '{out}/out.csv' AS SELECT * FROM '{data}/parquet/lineitem.parquet';",
+    "duckdb": "COPY (SELECT * FROM read_parquet('{data}/parquet/lineitem.parquet')) TO '{out}/out.csv' (HEADER);",
+    "clickhouse": "INSERT INTO FUNCTION file('{out}/out.csv', CSVWithNames) SELECT * FROM file('{data}/parquet/lineitem.parquet', Parquet)",
+    "polars": "py:pl.scan_parquet(f'{data}/parquet/lineitem.parquet').sink_csv(f'{out}/out.csv')",
+    "datafusion": "py:ctx.read_parquet(f'{data}/parquet/lineitem.parquet').write_csv(f'{out}/out.csv')"
+  },
+  "parquet_to_parquet": {
+    "basalt": "LOAD INTO '{out}/out.parquet' AS SELECT * FROM '{data}/parquet/lineitem.parquet';",
+    "duckdb": "COPY (SELECT * FROM read_parquet('{data}/parquet/lineitem.parquet')) TO '{out}/out.parquet' (FORMAT parquet);",
+    "clickhouse": "INSERT INTO FUNCTION file('{out}/out.parquet', Parquet) SELECT * FROM file('{data}/parquet/lineitem.parquet', Parquet)",
+    "polars": "py:pl.scan_parquet(f'{data}/parquet/lineitem.parquet').sink_parquet(f'{out}/out.parquet')",
+    "datafusion": "py:ctx.read_parquet(f'{data}/parquet/lineitem.parquet').write_parquet(f'{out}/out.parquet')"
+  },
+  "csv_to_parquet": {
+    "basalt": "LOAD INTO '{out}/out.parquet' AS SELECT * FROM '{data}/csv/lineitem.csv';",
+    "duckdb": "COPY (SELECT * FROM read_csv('{data}/csv/lineitem.csv')) TO '{out}/out.parquet' (FORMAT parquet);",
+    "clickhouse": "INSERT INTO FUNCTION file('{out}/out.parquet', Parquet) SELECT * FROM file('{data}/csv/lineitem.csv', CSVWithNames)",
+    "polars": "py:pl.scan_csv(f'{data}/csv/lineitem.csv').sink_parquet(f'{out}/out.parquet')",
+    "datafusion": "py:ctx.read_csv(f'{data}/csv/lineitem.csv').write_parquet(f'{out}/out.parquet')"
+  },
+  "csvgz_to_parquet": {
+    "basalt": "LOAD INTO '{out}/out.parquet' AS SELECT * FROM '{data}/csv/lineitem.csv.gz';",
+    "duckdb": "COPY (SELECT * FROM read_csv('{data}/csv/lineitem.csv.gz')) TO '{out}/out.parquet' (FORMAT parquet);",
+    "clickhouse": "INSERT INTO FUNCTION file('{out}/out.parquet', Parquet) SELECT * FROM file('{data}/csv/lineitem.csv.gz', CSVWithNames)",
+    "polars": "py:pl.read_csv(f'{data}/csv/lineitem.csv.gz').write_parquet(f'{out}/out.parquet')",
+    "datafusion": "py:ctx.read_csv(f'{data}/csv/lineitem.csv.gz', file_extension='.gz', file_compression_type='gzip').write_parquet(f'{out}/out.parquet')"
+  },
+  "ndjson_to_parquet": {
+    "basalt": "LOAD INTO '{out}/out.parquet' AS SELECT * FROM '{data}/ndjson/lineitem.ndjson';",
+    "duckdb": "COPY (SELECT * FROM read_json('{data}/ndjson/lineitem.ndjson')) TO '{out}/out.parquet' (FORMAT parquet);",
+    "clickhouse": "INSERT INTO FUNCTION file('{out}/out.parquet', Parquet) SELECT * FROM file('{data}/ndjson/lineitem.ndjson', JSONEachRow)",
+    "polars": "py:pl.scan_ndjson(f'{data}/ndjson/lineitem.ndjson').sink_parquet(f'{out}/out.parquet')",
+    "datafusion": "py:ctx.read_json(f'{data}/ndjson/lineitem.ndjson', file_extension='.ndjson').write_parquet(f'{out}/out.parquet')"
+  },
+  "orders_transform": {
+    "basalt": "LOAD INTO '{out}/out.parquet' AS SELECT o_orderkey, upper(o_orderpriority) AS priority, o_totalprice * 1.1 AS adjusted, o_orderdate FROM '{data}/parquet/orders.parquet' WHERE o_orderdate >= CAST('1995-01-01' AS DATE);",
+    "duckdb": "COPY (SELECT o_orderkey, upper(o_orderpriority) AS priority, o_totalprice * 1.1 AS adjusted, o_orderdate FROM read_parquet('{data}/parquet/orders.parquet') WHERE o_orderdate >= CAST('1995-01-01' AS DATE)) TO '{out}/out.parquet' (FORMAT parquet);",
+    "clickhouse": "INSERT INTO FUNCTION file('{out}/out.parquet', Parquet) SELECT o_orderkey, upper(o_orderpriority) AS priority, o_totalprice * 1.1 AS adjusted, o_orderdate FROM file('{data}/parquet/orders.parquet', Parquet) WHERE o_orderdate >= CAST('1995-01-01' AS DATE)",
+    "polars": "py:import datetime\npl.scan_parquet(f'{data}/parquet/orders.parquet').filter(pl.col('o_orderdate') >= datetime.date(1995, 1, 1)).select(pl.col('o_orderkey'), pl.col('o_orderpriority').str.to_uppercase().alias('priority'), (pl.col('o_totalprice') * 1.1).alias('adjusted'), pl.col('o_orderdate')).sink_parquet(f'{out}/out.parquet')",
+    "datafusion": "py:ctx.register_parquet('orders', f'{data}/parquet/orders.parquet')\nctx.sql(\"SELECT o_orderkey, upper(o_orderpriority) AS priority, o_totalprice * 1.1 AS adjusted, o_orderdate FROM orders WHERE o_orderdate >= CAST('1995-01-01' AS DATE)\").write_parquet(f'{out}/out.parquet')"
+  }
+}
