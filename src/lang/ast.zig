@@ -13,11 +13,13 @@
 //! collecting a query's columns takes `t` in `t -> t > 1` for one; lambdas are
 //! values only as arguments of the JSON array functions.
 //!
-//! `Write.changes` is `USING changes (...)`, the change feed a Delta UPSERT
-//! applies: the arguments' values are the hidden columns `Changes.seq_col`,
-//! `del_col` and `pos_col` a select stage computes before the write; `drop` names
-//! the output columns they read, which the table need not have and which are not
-//! written; `name` keys the position the table keeps (null: the target's path).
+//! `Write.changes` is `USING changes (...)`, a change feed applied as a plain
+//! UPSERT into any table that takes one: the arguments' values are the hidden
+//! columns `Changes.seq_col`, `del_col` and `pos_col` a select stage computes,
+//! and the stages after it keep each key's latest change (`parse/query.zig`
+//! `changeStages`), so the write gets one row per key, its `position` column the
+//! largest the key's changes held and `_deleted` its delete; `drop` names the
+//! other columns the arguments read, which those stages leave out.
 //!
 //! Expressions. `LetIn` is inlined by `expand.zig`, so the type-checker and
 //! evaluator never see it. `TRY_CAST` is `Cast` with `safe`: a failed conversion
@@ -476,14 +478,22 @@ pub const Write = struct {
 };
 
 pub const Changes = struct {
-    name: ?[]const u8 = null,
+    /// The column `position` names, kept in the table: `$since` is its largest value there.
+    position: []const u8,
     drop: []const []const u8 = &.{},
-    deletes: bool = false,
     pos: Pos,
+
+    /// The column a change's delete is kept as, true for a key the source deleted.
+    pub const deleted_col = "_deleted";
 
     pub const seq_col = "\x00change_seq";
     pub const del_col = "\x00change_del";
     pub const pos_col = "\x00change_pos";
+    pub const rank_col = "\x00change_rank";
+    pub const next_col = "\x00change_next";
+    pub const top_col = "\x00change_top";
+    pub const need_fn = "__change_need";
+    pub const last_fn = "__change_last";
 };
 
 /// `SPLIT BY (col) [JOBS n]`: a clause of its own, so a `WITH` key cannot spell it.

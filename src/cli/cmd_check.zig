@@ -249,6 +249,22 @@ test "check warns where USING stream_load is written, and takes the load without
     try std.testing.expectEqual(@as(usize, 0), new.len);
 }
 
+test "check takes USING changes into any table by key, and refuses it into a file or without a key" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const conns = "CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', fe_port = 9030, be_url = 'http://h:8040', database = 'db', user = 'u', password = 'p');\nCREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'db', user = 'u', password = 'p');\n";
+    const feed = " USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn) AS SELECT 1 AS id, 'i' AS op, 1 AS seq, 10 AS lsn;";
+    for ([_][]const u8{ "LOAD INTO sr.orders UPSERT ON (id)", "LOAD INTO pg.public.orders UPSERT ON (id)" }) |head| {
+        const ok = try checkText(a, try std.mem.concat(a, u8, &.{ conns, head, feed }), "t.sql", ".", .{ .declarations_only = true });
+        try std.testing.expectEqual(@as(usize, 0), ok.len);
+    }
+    const file = try checkText(a, try std.mem.concat(a, u8, &.{ conns, "LOAD INTO 'out.csv'", feed }), "t.sql", ".", .{ .declarations_only = true });
+    try std.testing.expect(file.len == 1 and std.mem.indexOf(u8, file[0].msg, "as an UPSERT into a table") != null);
+    const keyless = try checkText(a, try std.mem.concat(a, u8, &.{ conns, "LOAD INTO sr.orders UPSERT", feed }), "t.sql", ".", .{ .declarations_only = true });
+    try std.testing.expect(keyless.len == 1 and std.mem.indexOf(u8, keyless[0].msg, "write it with `UPSERT ON (<key>)`") != null);
+}
+
 test "check takes a SQL table's change feed options, a $param as the position, and refuses an unknown one" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();

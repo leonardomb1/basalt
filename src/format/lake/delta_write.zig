@@ -105,7 +105,6 @@ pub const Mode = union(enum) {
 pub const Upsert = struct {
     keys: []const []const u8,
     partial: ?[]const []const u8 = null,
-    changes: ?ast.Changes = null,
 };
 
 /// The disposition a LOAD names, as a Delta write takes it.
@@ -117,34 +116,10 @@ pub fn modeOf(m: ast.WriteMode) Mode {
     };
 }
 
-/// `modeOf` for a whole write: an UPSERT under `USING changes` carries them.
-pub fn writeModeOf(w: ast.Write) Mode {
-    var m = modeOf(w.mode);
-    if (m == .upsert) m.upsert.changes = w.changes;
-    return m;
+/// Whether incoming column `name` is row tracking's, which the table keeps itself.
+fn rowTrackingCol(name: []const u8) bool {
+    return std.mem.eql(u8, name, delta.row_id_name) or std.mem.eql(u8, name, delta.row_version_name);
 }
-
-/// Whether incoming column `name` is one a change feed reads but the table does
-/// not take: a hidden change column, or one the `USING changes` arguments read.
-fn changeOnly(ch: ?ast.Changes, name: []const u8) bool {
-    if (std.mem.eql(u8, name, delta.row_id_name) or std.mem.eql(u8, name, delta.row_version_name)) return true;
-    const c = ch orelse return false;
-    if (name.len > 0 and name[0] == 0) return true;
-    return ast.nameIn(c.drop, name);
-}
-
-fn changesOf(mode: Mode) ?ast.Changes {
-    return if (mode == .upsert) mode.upsert.changes else null;
-}
-
-pub const Change = struct {
-    seq: usize,
-    del: usize,
-    pos: usize,
-    app: []const u8,
-    since: ?i64,
-    kind: ?types.TypeKind,
-};
 
 pub const Evolve = enum { keep, merge, overwrite };
 
@@ -395,7 +370,6 @@ pub const Plan = struct {
     partial: ?[]const usize = null,
     /// The incoming rows' columns.
     in_fields: []const types.Schema.Field = &.{},
-    change: ?Change = null,
     new_meta: bool = false,
     optimize: bool = false,
     field_ids: ?*const std.StringHashMapUnmanaged(i32) = null,
@@ -448,7 +422,6 @@ pub fn planEvolving(arena: std.mem.Allocator, root: []const u8, mode: Mode, crea
         p.* = .{ .name = name, .root = root, .mode = mode, .codec = codec, .snap = null, .cols = &.{}, .parts = &.{}, .data = &.{}, .schema_string = "" };
         if (schema_in) |schema| {
             p.* = try planCreate(arena, name, root, mode, partition_by, codec, schema);
-            p.change = try changeOf(arena, p, null);
         }
         return p;
     }
@@ -513,7 +486,7 @@ pub fn planEvolving(arena: std.mem.Allocator, root: []const u8, mode: Mode, crea
         };
         c.* = try tableColLoose(arena, name, f, in_ty, src, merge_cols);
     }
-    for (schema.fields, 0..) |f, src| if (indexOfField(fields, f.name) == null and !changeOnly(changesOf(mode), f.name)) {
+    for (schema.fields, 0..) |f, src| if (indexOfField(fields, f.name) == null and !rowTrackingCol(f.name)) {
         if (!merge_cols) return refuse("the rows have column `{s}`, which {s} lacks; basalt does not add columns to a Delta table (`WITH (merge_schema = true)` adds it)", .{ f.name, name });
         const c = try createCol(arena, name, f, src);
         try cols_list.append(c);
@@ -536,7 +509,6 @@ pub fn planEvolving(arena: std.mem.Allocator, root: []const u8, mode: Mode, crea
     if (mode != .upsert) for (p.parts) |k| if (p.cols[k].src == absent)
         return refuse("{s} is partitioned by `{s}`, which the rows lack; a row's partition column says where it is written", .{ name, p.cols[k].name });
     try upsertCols(p, arena);
-    p.change = try changeOf(arena, p, st);
     if (st.mappingMode() != null) try applyMapping(arena, p, st);
     p.row = try rowPlan(st, name, schema.fields);
     return p;
@@ -617,7 +589,7 @@ fn split(self: *Plan, arena: std.mem.Allocator, part_cols: []const []const u8) !
 
 fn planCreate(arena: std.mem.Allocator, name: []const u8, root: []const u8, mode: Mode, partition_by: ?[]const []const u8, codec: codecs.Codec, schema: types.Schema) !Plan {
     var kept: usize = 0;
-    for (schema.fields) |f| kept += @intFromBool(!changeOnly(changesOf(mode), f.name));
+    for (schema.fields) |f| kept += @intFromBool(!rowTrackingCol(f.name));
     if (kept == 0) return refuse("{s} would have no columns", .{name});
     const cols = try arena.alloc(Col, kept);
     var aw = std.Io.Writer.Allocating.init(arena);
@@ -625,7 +597,7 @@ fn planCreate(arena: std.mem.Allocator, name: []const u8, root: []const u8, mode
     try w.writeAll("{\"type\":\"struct\",\"fields\":[");
     var n: usize = 0;
     for (schema.fields, 0..) |f, src| {
-        if (changeOnly(changesOf(mode), f.name)) continue;
+        if (rowTrackingCol(f.name)) continue;
         const i = n;
         n += 1;
         const c = &cols[i];
@@ -643,62 +615,6 @@ fn planCreate(arena: std.mem.Allocator, name: []const u8, root: []const u8, mode
     try split(&p, arena, partition_by orelse &.{});
     try upsertCols(&p, arena);
     return p;
-}
-
-/// Under `USING changes`, the hidden change columns among the incoming ones and
-/// the position the table holds for the feed's application; a position of a kind
-/// `txn.version` cannot hold, a non-boolean `delete_when` and a position the
-/// rows' type cannot be compared with are refused.
-fn changeOf(arena: std.mem.Allocator, p: *const Plan, st: ?*delta.State) !?Change {
-    const ch = changesOf(p.mode) orelse return null;
-    const at = struct {
-        fn of(fields: []const types.Schema.Field, n: []const u8) usize {
-            for (fields, 0..) |f, i| if (std.mem.eql(u8, f.name, n)) return i;
-            unreachable;
-        }
-    };
-    const fields = p.in_fields;
-    const c = Change{
-        .seq = at.of(fields, ast.Changes.seq_col),
-        .del = at.of(fields, ast.Changes.del_col),
-        .pos = at.of(fields, ast.Changes.pos_col),
-        .app = ch.name orelse p.root,
-        .since = null,
-        .kind = undefined,
-    };
-    var out = c;
-    const pt = fields[c.pos].ty;
-    if (!pt.unknown and pt.kind != .int and pt.kind != .date and pt.kind != .timestamp)
-        return refuse("`position` in `USING changes` is {s}; {s} keeps a feed's position as Delta's `txn` version, a number, so it takes an INT, DATE or TIMESTAMP", .{ try pt.name(arena), p.name });
-    out.kind = if (pt.unknown) null else pt.kind;
-    const dt = fields[c.del].ty;
-    if (!dt.unknown and dt.kind != .bool)
-        return refuse("`delete_when` in `USING changes` is {s}, not a condition; write it as one, e.g. `delete_when = op = 'd'`", .{try dt.name(arena)});
-    const seq_ty = fields[c.seq].ty;
-    if (seq_ty.isNested()) return refuse("`sequence_by` in `USING changes` is {s}; it orders a key's changes, so it takes a number, date, timestamp or text", .{try seq_ty.name(arena)});
-    if (st) |s| {
-        out.since = s.txns.get(out.app);
-        if (out.kind) |k| if (s.property(try positionKey(arena, out.app))) |rec| try samePosition(p.name, out.app, rec, k);
-    }
-    return out;
-}
-
-/// Refuses a run whose position is of type `got` on table `name`, which keeps
-/// feed `app`'s position as `recorded`.
-fn samePosition(name: []const u8, app: []const u8, recorded: []const u8, got: types.TypeKind) !void {
-    if (std.mem.eql(u8, recorded, @tagName(got))) return;
-    return refuse("{s} keeps the position of `{s}` as {s}, but this run's `position` is {s}; a position read back as another type would compare wrongly, so give it the type the table keeps", .{ name, app, recorded, @tagName(got) });
-}
-
-/// Where a commit's header leaves the position's type, filled in once the rows
-/// have shown it (`Sink.close`).
-const kind_mark = "@@POSITION_KIND@@";
-
-/// The table property that records the type of the position a `USING changes`
-/// feed named `app` keeps (`int`, `date` or `timestamp`), so a run can read the
-/// position back as that type before its query runs.
-pub fn positionKey(arena: std.mem.Allocator, app: []const u8) ![]const u8 {
-    return std.mem.concat(arena, u8, &.{ "basalt.changes.", app, ".position" });
 }
 
 /// A basalt column as a new table's column. A column a whole input held only NULLs
@@ -1183,21 +1099,14 @@ pub const Sink = struct {
             try jsontext.string(w, p.schema_string);
             try w.writeAll(",\"partitionColumns\":");
             try w.writeAll(pb.written());
-            try w.writeAll(",\"configuration\":{");
-            if (p.change) |ch| {
-                try w.writeAll(kind_mark);
-                try jsontext.string(w, try positionKey(a, ch.app));
-                try w.print(":\"{s}\"", .{kind_mark});
-            }
-            try w.print("}},\"createdTime\":{d}}}}}\n", .{now});
-        } else if (p.new_meta or self.recordsPosition()) {
+            try w.print(",\"configuration\":{{}},\"createdTime\":{d}}}}}\n", .{now});
+        } else if (p.new_meta) {
             const st = p.snap.?;
             var o = if (st.meta_raw) |m| (if (m == .object) try m.object.clone() else std.json.ObjectMap.init(a)) else std.json.ObjectMap.init(a);
             try o.put("schemaString", .{ .string = p.schema_string });
-            if (p.max_column_id != null or p.change != null) {
+            if (p.max_column_id) |m| {
                 var conf = if (o.get("configuration")) |c| (if (c == .object) try c.object.clone() else std.json.ObjectMap.init(a)) else if (st.config) |c| try c.object.clone() else std.json.ObjectMap.init(a);
-                if (p.max_column_id) |m| try conf.put("delta.columnMapping.maxColumnId", .{ .string = try msgfmt.allocPrint(a, "{d}", .{m}) });
-                if (p.change) |ch| try conf.put(try positionKey(a, ch.app), .{ .string = kind_mark });
+                try conf.put("delta.columnMapping.maxColumnId", .{ .string = try msgfmt.allocPrint(a, "{d}", .{m}) });
                 try o.put("configuration", .{ .object = conf });
             }
             var parts = std.json.Array.init(a);
@@ -1210,37 +1119,6 @@ pub const Sink = struct {
             try std.json.Stringify.value(std.json.Value{ .object = o }, .{}, w);
             try w.writeAll("}\n");
         }
-    }
-
-    /// Commit body `body` with its feed's position type where the header left
-    /// `kind_mark`: the type the rows' positions had, else (a table created with
-    /// no row) no type at all; a type other than the one the table keeps is refused.
-    fn positionKind(self: *Sink, body: []const u8) ![]const u8 {
-        const p = self.plan;
-        const ch = p.change orelse return body;
-        if (std.mem.indexOf(u8, body, kind_mark) == null) return body;
-        const a = self.mem.allocator();
-        const seen: ?types.TypeKind = if (self.merging) |m| m.pos_kind else null;
-        const kind = seen orelse ch.kind;
-        if (kind) |k| if (p.snap) |st| if (st.property(try positionKey(a, ch.app))) |rec| try samePosition(p.name, ch.app, rec, k);
-        const quoted = "\"" ++ kind_mark ++ "\"";
-        if (kind) |k| {
-            const named = try std.mem.replaceOwned(u8, a, body, quoted, try msgfmt.allocPrint(a, "\"{s}\"", .{@tagName(k)}));
-            return std.mem.replaceOwned(u8, a, named, kind_mark, "");
-        }
-        const lead = std.mem.indexOf(u8, body, kind_mark).?;
-        const end = std.mem.indexOf(u8, body[lead + kind_mark.len ..], quoted) orelse return body;
-        const stop = lead + kind_mark.len + end + quoted.len;
-        return std.mem.concat(a, u8, &.{ body[0..lead], body[stop..] });
-    }
-
-    /// Whether this write's commit records its feed's position type, which the
-    /// table does not yet keep (`positionKey`).
-    fn recordsPosition(self: *Sink) bool {
-        const ch = self.plan.change orelse return false;
-        const st = self.plan.snap orelse return false;
-        const key = positionKey(self.mem.allocator(), ch.app) catch return true;
-        return st.property(key) == null;
     }
 
     pub fn sink(self: *Sink) driver.Sink {
@@ -1554,15 +1432,9 @@ pub const Sink = struct {
             read_set = rs;
         }
         while (self.files.count() > 0) try self.finishFile(self.files.keys()[0]);
-        const moved: ?i64 = if (p.change != null) (if (self.merging) |m| m.top else null) else null;
-        if (p.snap != null and self.n_added == 0 and ((p.mode == .append and self.compacting == null) or removes.len == 0) and moved == null) return;
+        if (p.snap != null and self.n_added == 0 and ((p.mode == .append and self.compacting == null) or removes.len == 0)) return;
         const now = std.time.milliTimestamp();
         const w = &self.adds.writer;
-        if (moved) |v| {
-            try w.writeAll("{\"txn\":{\"appId\":");
-            try jsontext.string(w, p.change.?.app);
-            try w.print(",\"version\":{d},\"lastUpdated\":{d}}}}}\n", .{ v, now });
-        }
         for (removes) |f| {
             try w.writeAll("{\"remove\":{\"path\":");
             try jsontext.string(w, f.raw);
@@ -1588,12 +1460,11 @@ pub const Sink = struct {
             },
             .read_version = if (p.snap) |st| st.version else null,
             .txn_id = &self.txn,
-            .body = try self.positionKind(self.adds.written()),
+            .body = self.adds.written(),
             .added = self.begun.items,
             .read_set = read_set,
             .key_root = if (p.snap) |st| st.key_root else "",
             .hold = if (self.merging) |m| m.hold() else null,
-            .app = if (p.change) |ch| ch.app else null,
             .ict = self.ict,
             .rows = if (p.row) |r| (if (self.row_counts.items.len > 0) dlog.RowIds{ .hwm = r.hwm, .counts = self.row_counts.items } else null) else null,
         }) catch |e| {

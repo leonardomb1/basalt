@@ -97,6 +97,34 @@ pub const per_row = struct {
         return .{ .bytes = try @import("../agg_args.zig").encode(arena, c.args[0].str_lit, vals) };
     }
 
+    /// `USING changes`' `sequence_by`, `position` or `delete_when`
+    /// (`__change_need(v, what, target)`): the value; a NULL `delete_when` is false,
+    /// any other NULL fails the run, as no change can be placed without it.
+    pub fn changeNeed(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const v = try evalRow(arena, c.args[0], batch, row);
+        if (!v.isNull()) return v;
+        if (eq(c.args[1].str_lit, "delete_when")) return .{ .bool = false };
+        const why = if (eq(c.args[1].str_lit, "position")) "the position it was read at" else "its place in the order";
+        return failWith(error.CastFailed, "`{s}` of this UPSERT into {s} is NULL in a row; every change needs {s}", .{ c.args[1].str_lit, c.args[2].str_lit, why });
+    }
+
+    /// Whether a change is its key's last (`__change_last(rank, seq, next, names, keys...)`):
+    /// rank 1 in the key's changes by `sequence_by` descending. The next change at the
+    /// same sequence fails the run, as which of the two applies would depend on the run.
+    pub fn changeLast(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        const rank = try evalRow(arena, c.args[0], batch, row);
+        if (rank != .int or rank.int != 1) return .{ .bool = false };
+        const seq = try evalRow(arena, c.args[1], batch, row);
+        const next = try evalRow(arena, c.args[2], batch, row);
+        if (next.isNull() or (compareValues(seq, next) orelse .lt) != .eq) return .{ .bool = true };
+        var vals: std.Io.Writer.Allocating = .init(arena);
+        for (c.args[4..], 0..) |k, i| {
+            if (i > 0) vals.writer.writeAll(", ") catch return error.OutOfMemory;
+            vals.writer.writeAll(try valueToString(arena, try evalRow(arena, k, batch, row))) catch return error.OutOfMemory;
+        }
+        return failWith(error.CastFailed, "the changes hold key ({s}) = ({s}) twice at sequence {s}; `sequence_by` must order a key's changes, or which applies would depend on the run", .{ c.args[3].str_lit, vals.written(), try valueToString(arena, seq) });
+    }
+
     pub fn cardinality(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
         const v = try evalRow(arena, c.args[0], batch, row);
         if (v != .nested or v.nested.node.body != .list) return .null;

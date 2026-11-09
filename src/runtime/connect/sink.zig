@@ -276,7 +276,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
             .delta => |o| {
                 if (w.mode == .upsert and w.mode.upsert.keys.len == 0)
                     return planErr(env.diag, try msgfmt.allocPrint(env.arena, "`UPSERT` into Delta table `{s}` has no key; name it with `UPSERT ON (col)`", .{w.target}));
-                const p = delta_write.planEvolving(env.arena, w.target, delta_write.writeModeOf(w), env.fmt_out == .delta, o.partition_by, o.codec, schema, o.evolve) catch |e|
+                const p = delta_write.planEvolving(env.arena, w.target, delta_write.modeOf(w.mode), env.fmt_out == .delta, o.partition_by, o.codec, schema, o.evolve) catch |e|
                     return planErrT(env.diag, e, try pathFail(env.arena, w.target, e));
                 const ds = delta_write.Sink.open(env.gpa, env.arena, p, .{ .space = env.space, .op_memory = env.op_memory, .threads = env.pipe.threads, .err = env.errctx, .warn = .{ .ctx = env.log, .f = warnLog } }) catch |e|
                     return planErrT(env.diag, e, try pathFail(env.arena, w.target, e));

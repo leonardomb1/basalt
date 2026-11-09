@@ -24,6 +24,18 @@ fn rows(a: std.mem.Allocator, tmp: *testing.TmpDir, query: []const u8) ![]const 
     return tmp.dir.readFileAlloc(a, "out.csv", 1 << 20);
 }
 
+/// The parser refuses `script`, naming `want`.
+fn parseRefuses(a: std.mem.Allocator, script: []const u8, want: []const u8) !void {
+    var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    if (parser.parseSource(a, script, &pd)) |_| {
+        std.debug.print("parsed: {s}\n", .{script});
+        return error.TestUnexpectedResult;
+    } else |_| if (std.mem.indexOf(u8, pd.msg, want) == null) {
+        std.debug.print("want `{s}` in `{s}`\n", .{ want, pd.msg });
+        return error.TestUnexpectedResult;
+    }
+}
+
 /// `run` (not `check`, which cannot see it) refuses `script`, naming `want`.
 fn runRefuses(a: std.mem.Allocator, tmp: *testing.TmpDir, script: []const u8, want: []const u8) !void {
     const base = try tmp.dir.realpathAlloc(a, ".");
@@ -299,7 +311,34 @@ test "Delta file skipping: a filter on a column or a struct's field leaves out t
     try runRefuses(a, &tmp, "LOAD INTO '$B/out.csv' AS SELECT id FROM '$B/t/' WHERE id >= 20;", "could not read its file");
 }
 
-test "Delta USING changes: each run applies the changes past the table's position, the latest per key, deletes too, once" {
+test "Delta USING changes into a table without its position: read whole, the keys the read lacks kept as deleted, then read on from a text position" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "seed.csv", .data = "id,name\n1,a\n5,e\n" });
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT CAST(id AS INT) AS id, name FROM '$B/seed.csv';", 1);
+
+    const apply =
+        \\LOAD INTO '$B/t/' WITH (merge_schema = true) UPSERT ON (id)
+        \\  USING changes (sequence_by = seq, delete_when = op = 'd', position = pos)
+        \\AS SELECT CAST(id AS INT) AS id, name, op, CAST(seq AS INT) AS seq, pos FROM '$B/c.csv' WHERE $since IS NULL OR pos > $since;
+    ;
+    const view = "SELECT id, name, pos, _deleted FROM '$B/t/' ORDER BY id";
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,op,seq,pos\n2,b,i,1,0000002B000004200023\n1,a1,u,2,0000002B000004280003\n" });
+    try load(&tmp, apply, 1);
+    try testing.expectEqualStrings("id,name,pos,_deleted\n1,a1,0000002B000004280003,false\n2,b,0000002B000004200023,false\n5,e,,true\n", try rows(a, &tmp, view));
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 1), "\"protocol\"") == null);
+
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,op,seq,pos\n2,b,i,1,0000002B000004200023\n1,a1,u,2,0000002B000004280003\n2,,d,3,0000002B000004300004\n3,c,i,4,0000002B000004300004\n" });
+    try load(&tmp, apply, 4);
+    try testing.expectEqualStrings("id,name,pos,_deleted\n1,a1,0000002B000004280003,false\n2,,0000002B000004300004,true\n3,c,0000002B000004300004,false\n5,e,,true\n", try rows(a, &tmp, view));
+    try load(&tmp, apply, 1);
+    try testing.expect(!exists(&tmp, "t/_delta_log/00000000000000000003.json"));
+}
+
+test "Delta USING changes: each run applies the changes past the table's largest position, the latest per key, a delete kept as _deleted, once" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
     const a = ar.allocator();
@@ -307,19 +346,19 @@ test "Delta USING changes: each run applies the changes past the table's positio
     defer tmp.cleanup();
     const apply =
         \\LOAD INTO '$B/t/' WITH (format = 'delta', partition_by = 'region') UPSERT ON (id)
-        \\  USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn, name = 'orders_cdc')
+        \\  USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn)
         \\AS SELECT * FROM '$B/c.csv' WHERE lsn > coalesce($since, 0);
     ;
-    const view = "SELECT * FROM '$B/t/' ORDER BY id";
+    const view = "SELECT id, name, region, lsn, _deleted FROM '$B/t/' ORDER BY id";
     const batches = [_][]const u8{
         "id,name,region,op,seq,lsn\n1,a,eu,i,1,10\n2,b,us,i,2,11\n1,a2,eu,u,3,12\n",
         "2,b,us,d,4,13\n3,c,eu,i,5,14\n9,z,us,d,6,15\n",
         "1,a3,us,u,8,16\n3,c,eu,d,7,16\n4,d,eu,i,9,17\n",
     };
     const want = [_][]const u8{
-        "id,name,region\n1,a2,eu\n2,b,us\n",
-        "id,name,region\n1,a2,eu\n3,c,eu\n",
-        "id,name,region\n1,a3,us\n4,d,eu\n",
+        "id,name,region,lsn,_deleted\n1,a2,eu,12,false\n2,b,us,11,false\n",
+        "id,name,region,lsn,_deleted\n1,a2,eu,12,false\n2,b,us,13,true\n3,c,eu,14,false\n9,z,us,15,true\n",
+        "id,name,region,lsn,_deleted\n1,a3,us,16,false\n2,b,us,13,true\n3,c,eu,16,true\n4,d,eu,17,false\n9,z,us,15,true\n",
     };
     var text = std.array_list.Managed(u8).init(a);
     for (batches, want, 0..) |b, w, i| {
@@ -331,28 +370,33 @@ test "Delta USING changes: each run applies the changes past the table's positio
         try testing.expectEqualStrings(w, try rows(a, &tmp, view));
         try testing.expect(!exists(&tmp, try std.fmt.allocPrint(a, "t/_delta_log/{d:0>20}.json", .{i + 1})));
     }
-    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 2), "{\"txn\":{\"appId\":\"orders_cdc\",\"version\":17,") != null);
-    try testing.expectEqual(@as(usize, 2), try actions(a, &tmp, "t", 2, "remove"));
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 2), "\"txn\"") == null);
 
     try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,region,op,seq,lsn\n4,d2,eu,u,10,18\n" });
-    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) PARTIAL COLS (name) USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn, name = 'orders_cdc') AS SELECT * FROM '$B/c.csv' WHERE lsn > $since;", 1);
-    try testing.expectEqualStrings("id,name,region\n1,a3,us\n4,d2,eu\n", try rows(a, &tmp, view));
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) PARTIAL COLS (name) USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn) AS SELECT * FROM '$B/c.csv' WHERE lsn > $since;", 1);
+    try testing.expectEqualStrings("id,name,region,lsn,_deleted\n4,d2,eu,18,false\n", try rows(a, &tmp, "SELECT id, name, region, lsn, _deleted FROM '$B/t/' WHERE id = 4"));
 
     try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,region,op,seq,lsn\n5,e,eu,i,1,30\n5,f,eu,i,1,31\n" });
     try runRefuses(a, &tmp, apply, "twice at sequence 1");
-    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,region,op,seq,lsn\n5,e,eu,i,1,7\n" });
-    try runRefuses(a, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn, name = 'orders_cdc') AS SELECT * FROM '$B/c.csv';", "behind the 18 it holds for `orders_cdc`");
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,region,op,seq,lsn\n5,e,eu,i,2,30\n5,f,eu,i,1,31\n5,g,eu,i,1,32\n" });
+    try load(&tmp, apply, 1);
+    try testing.expectEqualStrings("id,name,lsn\n5,e,32\n", try rows(a, &tmp, "SELECT id, name, lsn FROM '$B/t/' WHERE id = 5"));
+    try load(&tmp, apply, 4);
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,region,op,seq,lsn\n6,e,eu,i,,40\n" });
+    try runRefuses(a, &tmp, apply, "/t/ is NULL in a row; every change needs its place in the order");
     try testing.expect(!exists(&tmp, "t/_delta_log/00000000000000000005.json"));
     try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' APPEND USING changes (sequence_by = seq, position = lsn) AS SELECT * FROM '$B/c.csv';", "write it with `UPSERT ON (<key>)`");
-    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/x.csv' USING changes (sequence_by = seq, position = lsn) AS SELECT * FROM '$B/c.csv';", "applies a change feed to a Delta table");
-    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, delete_when = op = 'd', position = name) AS SELECT id, name, region, op, seq FROM '$B/c.csv';", "takes an INT, DATE or TIMESTAMP");
-    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, delete_when = seq, position = lsn) AS SELECT id, name, region, seq, lsn FROM '$B/c.csv';", "not a condition");
+    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/x.csv' USING changes (sequence_by = seq, position = lsn) AS SELECT * FROM '$B/c.csv';", "applies a change feed as an UPSERT into a table");
+    try parseRefuses(a, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, position = lsn + 1) AS SELECT * FROM '$B/c.csv';", "`position` in `USING changes` is a column");
+    try parseRefuses(a, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, position = lsn, name = 'feed') AS SELECT * FROM '$B/c.csv';", "takes no `name`");
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,region,op,seq,lsn\n6,g,eu,i,1,40\n" });
+    try runRefuses(a, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, delete_when = seq, position = lsn) AS SELECT id, name, region, seq, lsn FROM '$B/c.csv';", "not a condition");
 
     try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,region,op,seq,lsn\n6,g,eu,i,1,40\n" });
-    for (5..11) |_| try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn, name = 'other') AS SELECT * FROM '$B/c.csv' WHERE lsn > coalesce($since, 0) OR TRUE;", 1);
-    try load(&tmp, "LOAD INTO '$B/t/' APPEND AS SELECT 7 AS id, 'h' AS name, 'eu' AS region;", 1);
+    for (5..11) |_| try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn) AS SELECT * FROM '$B/c.csv' WHERE lsn > coalesce($since, 0) OR TRUE;", 1);
+    try load(&tmp, "LOAD INTO '$B/t/' APPEND AS SELECT 7 AS id, 'h' AS name, 'eu' AS region, 0 AS lsn, false AS _deleted;", 1);
     try testing.expect(exists(&tmp, "t/_delta_log/00000000000000000010.checkpoint.parquet"));
-    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,region,op,seq,lsn\n8,i,eu,i,1,18\n8,j,eu,i,2,19\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,name,region,op,seq,lsn\n8,i,eu,i,1,41\n8,j,eu,i,2,42\n" });
     try load(&tmp, apply, 1);
     try testing.expectEqualStrings("id,name\n8,j\n", try rows(a, &tmp, "SELECT id, name FROM '$B/t/' WHERE id = 8"));
 }
@@ -785,7 +829,7 @@ test "Delta change data feed: an UPSERT writes its updates, inserts and deletes 
     try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT 2 AS id, 'a' AS grp, 99 AS amt UNION ALL SELECT 4, 'b', 7;", 1);
     try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 2), "{\"cdc\":{\"path\":\"_change_data/grp=a/cdc-") != null);
     try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) PARTIAL COLS (amt) AS SELECT 3 AS id, 50 AS amt;", 1);
-    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn, name = 'feed') AS SELECT 1 AS id, 'a' AS grp, 0 AS amt, 'd' AS op, 1 AS seq, 1 AS lsn;", 1);
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT 1 AS id, 'a' AS grp, 0 AS amt;", 1);
     try load(&tmp, "LOAD INTO '$B/t/' AS SELECT 5 AS id, 'c' AS grp, 1 AS amt;", 1);
     try testing.expectEqual(@as(usize, 0), try actions(a, &tmp, "t", 5, "cdc"));
     try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT 2 AS id, 'a' AS grp, 98 AS amt UNION ALL SELECT 3, 'b', 51 UNION ALL SELECT 8, 'a', 1 UNION ALL SELECT 9, 'b', 2;", 4);
@@ -794,10 +838,10 @@ test "Delta change data feed: an UPSERT writes its updates, inserts and deletes 
     try testing.expectEqualStrings("n\n6\n", try rows(a, &tmp, "SELECT COUNT(*) AS n FROM '$B/t/' WITH (changes_from = 6)"));
 
     try testing.expectEqualStrings(
-        "id,grp,amt,_change_type,_commit_version\n2,a,99,update_postimage,2\n2,a,20,update_preimage,2\n4,b,7,insert,2\n3,b,50,update_postimage,3\n3,b,5,update_preimage,3\n1,a,10,delete,4\n5,c,1,insert,5\n",
+        "id,grp,amt,_change_type,_commit_version\n2,a,99,update_postimage,2\n2,a,20,update_preimage,2\n4,b,7,insert,2\n3,b,50,update_postimage,3\n3,b,5,update_preimage,3\n1,a,0,update_postimage,4\n1,a,10,update_preimage,4\n5,c,1,insert,5\n",
         try rows(a, &tmp, "SELECT id, grp, amt, _change_type, _commit_version FROM '$B/t/' WITH (changes_from = 2, changes_to = 5) ORDER BY _commit_version, id, _change_type"),
     );
-    try testing.expectEqualStrings("id,grp,amt\n2,a,98\n3,b,51\n4,b,7\n5,c,1\n8,a,1\n9,b,2\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+    try testing.expectEqualStrings("id,grp,amt\n1,a,0\n2,a,98\n3,b,51\n4,b,7\n5,c,1\n8,a,1\n9,b,2\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
 }
 
 test "Delta variants nested in a struct, a list and a map, under column mapping and a change data feed: written, read, upserted, compacted" {
@@ -881,7 +925,7 @@ test "Delta change data feed on a table tracking row ids: an UPSERT's change fil
     );
 }
 
-test "Delta deletion vectors: an UPSERT marks the rows it replaces or deletes in a vector and writes only the changed rows" {
+test "Delta deletion vectors: an UPSERT marks the rows it replaces in a vector and writes only the changed rows" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
     const a = ar.allocator();
@@ -917,19 +961,19 @@ test "Delta deletion vectors: an UPSERT marks the rows it replaces or deletes in
     try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 3), "\"cardinality\":2}") != null);
     try testing.expectEqualStrings("id,grp,amt\n1,a,11\n2,a,99\n3,b,5\n4,b,7\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
 
-    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn, name = 'feed') AS SELECT 3 AS id, 'b' AS grp, 0 AS amt, 'd' AS op, 1 AS seq, 1 AS lsn;", 1);
+    try load(&tmp, "LOAD INTO '$B/t/' UPSERT ON (id) AS SELECT 3 AS id, 'b' AS grp, 0 AS amt;", 1);
     const v4 = try logFile(a, &tmp, "t", 4);
     try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "t", 4, "remove"));
-    try testing.expectEqual(@as(usize, 0), try actions(a, &tmp, "t", 4, "add"));
+    try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "t", 4, "add"));
     try testing.expect(std.mem.indexOf(u8, v4, "\"deletionVector\":{\"storageType\":\"u\"") != null);
-    try testing.expectEqualStrings("id,grp,amt\n1,a,11\n2,a,99\n4,b,7\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+    try testing.expectEqualStrings("id,grp,amt\n1,a,11\n2,a,99\n3,b,0\n4,b,7\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
     try testing.expectEqualStrings(
-        "id,amt,_change_type,_commit_version\n2,99,update_postimage,2\n2,20,update_preimage,2\n4,7,insert,2\n1,11,update_postimage,3\n1,10,update_preimage,3\n3,5,delete,4\n",
+        "id,amt,_change_type,_commit_version\n2,99,update_postimage,2\n2,20,update_preimage,2\n4,7,insert,2\n1,11,update_postimage,3\n1,10,update_preimage,3\n3,0,update_postimage,4\n3,5,update_preimage,4\n",
         try rows(a, &tmp, "SELECT id, amt, _change_type, _commit_version FROM '$B/t/' WITH (changes_from = 2) ORDER BY _commit_version, id, _change_type"),
     );
     try testing.expect(exists(&tmp, "t/_delta_log/00000000000000000004.checkpoint.parquet"));
     try load(&tmp, "CALL delta_optimize('$B/t/');", 1);
-    try testing.expectEqualStrings("id,grp,amt\n1,a,11\n2,a,99\n4,b,7\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+    try testing.expectEqualStrings("id,grp,amt\n1,a,11\n2,a,99\n3,b,0\n4,b,7\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
 }
 
 test "Delta deletion vectors on a table tracking row ids: a file added again keeps its row-id base, so its kept rows keep their ids" {
@@ -963,7 +1007,7 @@ test "Delta deletion vectors on a table tracking row ids: a file added again kee
     try testing.expectEqualStrings("id,grp,amt\n1,a,10\n2,z,99\n3,b,5\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
 }
 
-test "Delta USING changes: the table records its position's type, so $since reads back as a timestamp; a run of another type is refused" {
+test "Delta USING changes: a timestamp position reads back as one, so $since takes date arithmetic" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
     const a = ar.allocator();
@@ -972,20 +1016,14 @@ test "Delta USING changes: the table records its position's type, so $since read
     try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,at\n1,2026-11-01 10:00:00\n2,2026-11-02 11:00:00\n" });
     const apply =
         \\LOAD INTO '$B/t/' WITH (format = 'delta') UPSERT ON (id)
-        \\  USING changes (sequence_by = _stamp, position = _stamp, name = 'feed')
+        \\  USING changes (sequence_by = _stamp, position = _stamp)
         \\AS SELECT id, CAST(at AS TIMESTAMP) AS _stamp FROM '$B/c.csv'
         \\   WHERE $since IS NULL OR CAST(at AS TIMESTAMP) >= date_add('minute', -10, $since);
     ;
     try load(&tmp, apply, 1);
-    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 0), "\"basalt.changes.feed.position\":\"timestamp\"") != null);
     try load(&tmp, apply, 1);
-    try testing.expectEqual(@as(usize, 0), try actions(a, &tmp, "t", 1, "metaData"));
-    try testing.expectEqualStrings("id\n1\n2\n", try rows(a, &tmp, "SELECT id FROM '$B/t/' ORDER BY id"));
-    try harness.expectRefusedAlike(gpa, &tmp, "LOAD INTO '$B/t/' UPSERT ON (id) USING changes (sequence_by = id, position = id, name = 'feed') AS SELECT id FROM '$B/c.csv';", "keeps the position of `feed` as timestamp, but this run's `position` is int");
-
-    try load(&tmp, "LOAD INTO '$B/p/' WITH (format = 'delta') AS SELECT id FROM '$B/c.csv';", 1);
-    try load(&tmp, "LOAD INTO '$B/p/' UPSERT ON (id) USING changes (sequence_by = id, position = id, name = 'n') AS SELECT id FROM '$B/c.csv';", 1);
-    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "p", 1), "\"basalt.changes.n.position\":\"int\"") != null);
+    try testing.expectEqualStrings("id,_stamp,_deleted\n1,2026-11-01 10:00:00,false\n2,2026-11-02 11:00:00,false\n", try rows(a, &tmp, "SELECT id, _stamp, _deleted FROM '$B/t/' ORDER BY id"));
+    try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "t", 1, "add"));
 }
 
 test "Delta write: what is refused, at check where it can be seen" {

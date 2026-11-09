@@ -372,44 +372,10 @@ row whose key is NULL matches nothing and stays. A row may move partition: a
 matched row is written where its new values put it. An UPSERT into a folder with
 `format = 'delta'` and no table creates it with the rows.
 
-`USING changes (...)` makes an UPSERT apply a change feed, the position it has
-read to kept in the table itself, so each run applies exactly what is new:
-
-```sql ignore
-LOAD INTO 's3://lake/silver/orders/' UPSERT ON (order_id)
-  USING changes (sequence_by = seq, delete_when = op = 'd', position = lsn, name = 'orders_cdc')
-AS SELECT * FROM 'landing/orders_changes/' WHERE lsn > coalesce($since, 0);
-```
-
-Each argument is an expression over the query's columns. Of a key's rows, the
-one of the highest `sequence_by` is the one applied, as the latest change; two
-of a key at one sequence fail the run, as which applies would otherwise depend
-on the run. The winner upserts its key, or, when `delete_when` holds for it,
-deletes the key's live row (a delete of a key the table lacks does nothing).
-The commit records the rows' largest `position` as the table's position for
-`name` (the target's path when unset) — Delta's `txn` action, which Spark and
-delta-rs keep for idempotent writes — in the same commit as the rows, so the
-rows and the position land together or not at all. `$since` is that position
-for the statement's query, NULL until a run records one, so `WHERE lsn > $since`
-reads only what is new and pushes down to the source like any `$param`; a run
-with nothing new commits nothing. A position behind the one the table holds
-fails the run, as the query then read changes already applied, and a writer
-committing a position for the same `name` concurrently fails it as a conflict,
-so a rerun after either applies from where the table stands. The position is a
-number Delta keeps, so `position` takes an INT, DATE or TIMESTAMP; its type is
-kept as the table property `basalt.changes.<name>.position` (`int`, `date` or
-`timestamp`), written with the first position, so `$since` reads back as that
-type before the query runs, whatever the source (a database's column types are
-not known until its query does). A run whose `position` is of another type is
-refused. A table written before basalt kept the type has it taken from the
-query where its source's types are known ahead (a file, a Delta table); where
-they are not, `$since` reads as NULL once, with a warning, so that run reads
-every change again (an UPSERT of the same rows) and records the type. The columns
-the arguments read are not written to a table that lacks them, so a feed's
-`op`, `seq` and `lsn` stay out of a table the write creates; a column wanted in
-the table as well is given twice (`SELECT *, at AS changed_at` with `position =
-changed_at`). `PARTIAL COLS` applies to the updates; a delete removes the whole
-row. A checkpoint carries the positions, as Delta's checkpoints keep `txn`.
+`USING changes (...)` applies a change feed to a Delta table as to any table
+that takes an UPSERT ([Change feeds](load-into.md#change-feeds)): the latest
+change per key is upserted, a delete kept as the row with `_deleted` true, and
+`$since` is the table's largest `position`, read as any query reads the table.
 
 Only the live files that may hold an incoming key are read: those whose
 partition value (for a key column that partitions the table) or statistics
@@ -447,8 +413,7 @@ that rewrites files also writes what it changed to change data files under
 so each touched partition gets one, each a `cdc` action of the commit), so a reader of the feed does not take every row of a rewritten file as
 deleted and inserted again: a matched row's old values as `update_preimage` and
 its new ones as `update_postimage` (under `PARTIAL COLS`, the columns it leaves
-as they were), an inserted row as `insert`, and a row a `USING changes` delete
-removes as `delete`. An UPSERT that rewrites no file, an append and a `REPLACE`
+as they were), and an inserted row as `insert`. An UPSERT that rewrites no file, an append and a `REPLACE`
 write none, as their added and removed files say what changed, and
 `delta_optimize` none either, as it changes no row.
 

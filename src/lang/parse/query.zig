@@ -123,7 +123,7 @@ pub fn parseLoadInto(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Erro
     var stages = std.array_list.Managed(ast.Stage).init(self.arena);
     self.top_names = .load;
     try self.parseQuery(out, &stages);
-    if (change_items) |items| try stages.append(.{ .node = .{ .select = items }, .hints = &.{}, .pos = pos });
+    if (change_items) |items| try self.changeStages(&stages, &write, items, pos);
     try stages.append(.{ .node = .{ .write = write }, .hints = try whints.toOwnedSlice(), .pos = pos });
     _ = try self.expect(.semi);
     try out.append(.{ .output = .{ .stages = try stages.toOwnedSlice(), .pos = pos } });
@@ -140,7 +140,7 @@ pub fn parseLoadUsing(self: *Parser, write: *ast.Write, items: *?[]const ast.Sel
     if (std.mem.eql(u8, name, "stream_load"))
         try self.notes.append(self.arena, .{ .pos = pos, .msg = "`USING stream_load` is deprecated and will be removed: a starrocks or doris table always loads by Stream Load, so leave it out; `USING` names how a load applies, as `USING changes (...)`" });
     if (!self.at(.lparen)) {
-        if (std.mem.eql(u8, name, "changes")) return self.fail(pos, "`USING changes` takes its arguments: `USING changes (sequence_by = <col>, position = <col>[, delete_when = <condition>][, name = '<app>'])`", .{});
+        if (std.mem.eql(u8, name, "changes")) return self.fail(pos, "`USING changes` takes its arguments: `USING changes (sequence_by = <col>, position = <col>[, delete_when = <condition>])`", .{});
         return;
     }
     if (!std.mem.eql(u8, name, "changes")) return self.fail(pos, "`USING {s}` takes no arguments; only `USING changes (...)` does", .{name});
@@ -148,38 +148,100 @@ pub fn parseLoadUsing(self: *Parser, write: *ast.Write, items: *?[]const ast.Sel
     var seq: ?*ast.Expr = null;
     var del: ?*ast.Expr = null;
     var at: ?*ast.Expr = null;
-    var ch = ast.Changes{ .pos = pos };
     var reads = std.array_list.Managed(ast.QualName).init(self.arena);
     while (!self.at(.rparen)) {
         const kpos = self.curPos();
         const key = try self.expectIdent();
         _ = try self.expect(.assign);
-        if (std.mem.eql(u8, key, "name")) {
-            if (!self.at(.string)) return self.fail(self.curPos(), "`name` in `USING changes` is a string, the application its position is kept under", .{});
-            if (ch.name != null) return self.fail(kpos, "`USING changes` names `name` twice", .{});
-            ch.name = self.advance().text;
-        } else {
-            const slot: *?*ast.Expr = if (std.mem.eql(u8, key, "sequence_by")) &seq else if (std.mem.eql(u8, key, "delete_when")) &del else if (std.mem.eql(u8, key, "position")) &at else return self.fail(kpos, "unknown `USING changes` argument `{s}` (it takes sequence_by, position, delete_when and name)", .{key});
-            if (slot.* != null) return self.fail(kpos, "`USING changes` names `{s}` twice", .{key});
-            slot.* = try self.parseExpr();
-            try self.collectFields(slot.*.?, &reads);
-        }
+        if (std.mem.eql(u8, key, "name"))
+            return self.fail(kpos, "`USING changes` takes no `name`: the table keeps no position of its own, `$since` is the largest `position` among its rows", .{});
+        const slot: *?*ast.Expr = if (std.mem.eql(u8, key, "sequence_by")) &seq else if (std.mem.eql(u8, key, "delete_when")) &del else if (std.mem.eql(u8, key, "position")) &at else return self.fail(kpos, "unknown `USING changes` argument `{s}` (it takes sequence_by, position and delete_when)", .{key});
+        if (slot.* != null) return self.fail(kpos, "`USING changes` names `{s}` twice", .{key});
+        slot.* = try self.parseExpr();
+        try self.collectFields(slot.*.?, &reads);
         if (!self.eat(.comma)) break;
     }
     _ = try self.expect(.rparen);
     const s = seq orelse return self.fail(pos, "`USING changes` needs `sequence_by`, which orders a key's changes", .{});
-    const p = at orelse return self.fail(pos, "`USING changes` needs `position`, whose largest value the table keeps as the feed's position", .{});
+    const p = at orelse return self.fail(pos, "`USING changes` needs `position`, the column whose largest value in the table is where the next run reads from", .{});
+    if (p.* != .field or p.field.parts.len != 1 or p.field.dollar)
+        return self.fail(pos, "`position` in `USING changes` is a column, kept in the table so the next run reads past its largest value; name the expression in the SELECT (`..., <expr> AS lsn`) and give `position = lsn`", .{});
+    const kept = p.field.parts[0];
     var drop = std.array_list.Managed([]const u8).init(self.arena);
-    for (reads.items) |q| if (!q.dollar and q.parts.len == 1) if (!ast.nameIn(drop.items, q.parts[0])) try drop.append(q.parts[0]);
-    ch.drop = try drop.toOwnedSlice();
-    ch.deletes = del != null;
-    write.changes = ch;
+    for (reads.items) |q| if (!q.dollar and q.parts.len == 1) if (!ast.nameIn(drop.items, q.parts[0]) and !std.mem.eql(u8, q.parts[0], kept)) try drop.append(q.parts[0]);
+    write.changes = .{ .position = kept, .drop = try drop.toOwnedSlice(), .pos = pos };
     const false_lit = try self.mk(.{ .bool_lit = false });
     items.* = try self.arena.dupe(ast.SelectItem, &.{
         .star,
-        .{ .computed = .{ .name = ast.Changes.seq_col, .expr = s } },
-        .{ .computed = .{ .name = ast.Changes.del_col, .expr = del orelse false_lit } },
-        .{ .computed = .{ .name = ast.Changes.pos_col, .expr = p } },
+        .{ .computed = .{ .name = ast.Changes.seq_col, .expr = try self.changeNeed(s, "sequence_by", write.target) } },
+        .{ .computed = .{ .name = ast.Changes.del_col, .expr = try self.changeNeed(del orelse false_lit, "delete_when", write.target) } },
+        .{ .computed = .{ .name = ast.Changes.pos_col, .expr = try self.changeNeed(p, "position", write.target) } },
+    });
+}
+
+/// `e` as `__change_need(e, what, target)`: a NULL `sequence_by` or `position`
+/// fails the run, a NULL `delete_when` is false.
+pub fn changeNeed(self: *Parser, e: *ast.Expr, what: []const u8, target: []const u8) Error!*ast.Expr {
+    const args = try self.arena.dupe(*ast.Expr, &.{ e, try self.mk(.{ .str_lit = what }), try self.mk(.{ .str_lit = target }) });
+    return self.mk(.{ .call = .{ .name = ast.Changes.need_fn, .args = args } });
+}
+
+/// The stages that resolve a change feed ahead of its write, whatever the target:
+/// `items` computes the hidden change columns; a window ranks each key's changes by
+/// `sequence_by`, latest first; a filter keeps the latest, failing on two at one
+/// sequence; and a select drops the rank, the sequence and the columns only the
+/// `USING changes` arguments read, leaving the target an ordinary UPSERT of the
+/// latest change per key, its delete as `_deleted`. Its `position` column is the
+/// largest of all the key's changes, not the latest's alone, so the largest in the
+/// table is the largest the query read, and the next run reads past every change
+/// this one did. Without
+/// `UPSERT ON (...)` keys there is nothing to rank by, so only `items`, for
+/// analysis to refuse the write with the reason. Under `PARTIAL COLS` a matched
+/// row takes the position and `_deleted` too, or the table would not move on.
+pub fn changeStages(self: *Parser, stages: *std.array_list.Managed(ast.Stage), write: *ast.Write, items: []const ast.SelectItem, pos: ast.Pos) Error!void {
+    if (write.mode != .upsert or write.mode.upsert.keys.len == 0)
+        return stages.append(.{ .node = .{ .select = items }, .hints = &.{}, .pos = pos });
+    const keys = write.mode.upsert.keys;
+    if (write.mode.upsert.partial) |cols| {
+        var with = std.array_list.Managed([]const u8).init(self.arena);
+        try with.appendSlice(cols);
+        for ([_][]const u8{ write.changes.?.position, ast.Changes.deleted_col }) |c| if (!ast.nameIn(with.items, c)) try with.append(c);
+        write.mode.upsert.partial = try with.toOwnedSlice();
+    }
+    const field = struct {
+        fn of(p: *Parser, n: []const u8) Error!*ast.Expr {
+            return p.mk(.{ .field = .{ .parts = try p.arena.dupe([]const u8, &.{n}) } });
+        }
+    }.of;
+    const seq = ast.QualName{ .parts = try self.arena.dupe([]const u8, &.{ast.Changes.seq_col}) };
+    const part = try self.arena.alloc(ast.QualName, keys.len);
+    for (part, keys) |*q, k| q.* = .{ .parts = try self.arena.dupe([]const u8, &.{k}) };
+    const whole = ast.WinFrame{ .unit = .rows, .start = .unbounded_preceding, .end = .unbounded_following };
+    const funcs = try self.arena.dupe(ast.WindowFunc, &.{
+        .{ .func = .{ .win = .row_number }, .out = ast.Changes.rank_col },
+        .{ .func = .{ .win = .lead }, .out = ast.Changes.next_col, .arg = seq },
+        .{ .func = .{ .agg = .max }, .out = ast.Changes.top_col, .arg = .{ .parts = try self.arena.dupe([]const u8, &.{ast.Changes.pos_col}) }, .frame = whole },
+    });
+    const order = try self.arena.dupe(ast.SortKey, &.{.{ .field = seq, .desc = true, .nulls_first = false }});
+    const args = try self.arena.alloc(*ast.Expr, 4 + keys.len);
+    args[0] = try field(self, ast.Changes.rank_col);
+    args[1] = try field(self, ast.Changes.seq_col);
+    args[2] = try field(self, ast.Changes.next_col);
+    args[3] = try self.mk(.{ .str_lit = try std.mem.join(self.arena, ", ", keys) });
+    for (args[4..], keys) |*a, k| a.* = try field(self, k);
+    var drop = std.array_list.Managed([]const u8).init(self.arena);
+    const ch = write.changes.?;
+    try drop.appendSlice(&.{ ast.Changes.seq_col, ast.Changes.del_col, ast.Changes.rank_col, ast.Changes.next_col, ast.Changes.pos_col, ast.Changes.top_col, ch.position, ast.Changes.deleted_col });
+    for (ch.drop) |d| if (!ast.nameIn(keys, d)) try drop.append(d);
+    try stages.appendSlice(&.{
+        .{ .node = .{ .select = items }, .hints = &.{}, .pos = pos },
+        .{ .node = .{ .window = .{ .funcs = funcs, .partition_by = part, .order_by = order } }, .hints = &.{}, .pos = pos },
+        .{ .node = .{ .filter = try self.mk(.{ .call = .{ .name = ast.Changes.last_fn, .args = args } }) }, .hints = &.{}, .pos = pos },
+        .{ .node = .{ .select = try self.arena.dupe(ast.SelectItem, &.{
+            .{ .star_except = try drop.toOwnedSlice() },
+            .{ .computed = .{ .name = ch.position, .expr = try field(self, ast.Changes.top_col) } },
+            .{ .computed = .{ .name = ast.Changes.deleted_col, .expr = try field(self, ast.Changes.del_col) } },
+        }) }, .hints = &.{}, .pos = pos },
     });
 }
 

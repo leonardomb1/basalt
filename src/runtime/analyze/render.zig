@@ -26,6 +26,24 @@ const parse = @import("../analyze.zig").parse;
 /// yields. The path is the one the run takes (`path.choose`); what only the source
 /// or the file can settle prints as the condition that would keep it serial.
 pub fn render(plan: Plan, w: anytype) !void {
+    var aw = std.Io.Writer.Allocating.init(std.heap.page_allocator);
+    defer aw.deinit();
+    try renderRaw(plan, &aw.writer);
+    try writeShown(w, aw.written());
+}
+
+/// `text` without the NUL that starts a hidden column's name (`Changes.seq_col`
+/// and the like), which a terminal shows as nothing or garbage.
+pub fn writeShown(w: anytype, text: []const u8) !void {
+    var rest = text;
+    while (std.mem.indexOfScalar(u8, rest, 0)) |i| {
+        try w.writeAll(rest[0..i]);
+        rest = rest[i + 1 ..];
+    }
+    try w.writeAll(rest);
+}
+
+fn renderRaw(plan: Plan, w: *std.Io.Writer) !void {
     for (plan.outputs) |o| {
         try w.writeAll("Summary\n  Sink: ");
         try w.writeAll(sinkKind(o.sink));

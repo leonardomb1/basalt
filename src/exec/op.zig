@@ -551,7 +551,8 @@ pub const Filter = struct {
     /// keeps every row passes through uncopied.
     fn filterInto(self: *Filter, out: std.mem.Allocator, scratch: ?std.mem.Allocator, b: Batch) anyerror!Batch {
         return applyFilter(out, scratch, b, self.pred) catch |e| {
-            if (self.err) |ec| ec.set("{s}: in filter predicate", .{failLabel(e)});
+            const own = self.pred.* == .call and std.mem.startsWith(u8, self.pred.call.name, "__change_");
+            if (self.err) |ec| if (own) ec.set("{s}", .{failLabel(e)}) else ec.set("{s}: in filter predicate", .{failLabel(e)});
             return e;
         };
     }
@@ -581,7 +582,8 @@ pub const Project = struct {
             outcols[i] = switch (c.source) {
                 .passthrough => |idx| b.columns[idx],
                 .expr => |e| eval.evalColumn(arena, e, b, c.ty) catch |err| {
-                    if (self.err) |ec| ec.set("{s}: computing column `{s}` in select", .{ failLabel(err), self.out_schema.fields[i].name });
+                    const name = self.out_schema.fields[i].name;
+                    if (self.err) |ec| if (name.len > 0 and name[0] == 0) ec.set("{s}", .{failLabel(err)}) else ec.set("{s}: computing column `{s}` in select", .{ failLabel(err), name });
                     return err;
                 },
             };

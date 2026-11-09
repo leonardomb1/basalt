@@ -160,6 +160,24 @@ pub const typing = struct {
         return Type.init(.bytes);
     }
 
+    pub fn changeNeed(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        const t = try self.typeOf(c.args[0]);
+        const what = c.args[1].str_lit;
+        if (std.mem.eql(u8, what, "delete_when")) {
+            if (!t.unknown and t.kind != .bool)
+                return self.err("`delete_when` in `USING changes` is {s}, not a condition; write it as one, e.g. `delete_when = op = 'd'`", .{t.name(self.arena) catch "?"});
+            return Type.init(.bool);
+        }
+        if (t.isNested())
+            return self.err("`{s}` in `USING changes` is {s}; it orders changes, so it takes a number, date, timestamp or text", .{ what, t.name(self.arena) catch "?" });
+        return t.withNull(false);
+    }
+
+    pub fn changeLast(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        for (c.args) |a| _ = try self.typeOf(a);
+        return Type.init(.bool);
+    }
+
     pub fn cardinality(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
         if (c.args.len != 1) return self.err("`cardinality` takes one argument, a list or a map", .{});
         const t = try self.argType(c, 0);

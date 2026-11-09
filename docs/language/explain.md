@@ -267,8 +267,8 @@ What runs for a statement but outside it has a tree of its own, printed as it en
 is not: a plain `LET x = (SELECT ...)` above an `EXPLAIN ANALYZE` runs normally and
 prints nothing, and `basalt run --explain` or an `EXPLAIN ANALYZE CALL` shows them
 all, each with a line for what the script chose: `CALL f(a=x)`, `CASE: arm 2 of 3`,
-`FOR EACH row 1 of 2: a=t`. The position `USING changes` reads from its target is the
-`log replay` that statement starts with.
+`FOR EACH row 1 of 2: a=t`. A `USING changes` statement's read of
+its target's largest `position` shows as a tree of its own beside its plan.
 
 `CALL delta_vacuum` and `CALL delta_optimize` under either form move no data either:
 they say what they would delete or compact, reading the log and the file times to

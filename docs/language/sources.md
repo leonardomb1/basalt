@@ -169,13 +169,14 @@ row has the table's columns, then `_change_type` (`insert`, `update_postimage`
 or `delete`), `_commit_version` (the commit's LSN as 20 hex digits),
 `_commit_timestamp` and `_change_seq`, the change's order in the read (commit
 order, then order within the commit). These are the names a Delta table's change
-feed reads with, so `USING changes` applies either alike, keeping the position in
-the target:
+feed reads with, so `USING changes` applies either alike, into any table that
+takes an UPSERT, `$since` the target's largest `_commit_version`
+([Change feeds](load-into.md#change-feeds)):
 
 ```sql ignore
 LOAD INTO 'lake/orders/' UPSERT ON (id)
   USING changes (sequence_by = _change_seq, delete_when = _change_type = 'delete',
-                 position = _commit_version, name = 'orders_cdc')
+                 position = _commit_version)
 AS SELECT * FROM erp.dbo.orders WITH (changes_from = $since);
 ```
 
@@ -184,9 +185,11 @@ AS SELECT * FROM erp.dbo.orders WITH (changes_from = $since);
 - With no position (`$since` NULL, a feed's first run) the whole table is read
   as inserts at that end. A change made during the read is read again by the next
   run and applied by key, leaving the same rows.
-- A position the CDC cleanup job has already passed fails the run rather than
-  skip changes; so does a database or table without CDC, with the statements that
-  enable it. CDC needs SQL Server Agent running.
+- A position the CDC cleanup job has already passed fails the read rather than
+  skip changes; under `USING changes` the table is read whole instead, and the
+  keys it no longer holds are kept as deleted. A database or table without CDC
+  fails the read, with the statements that enable it. CDC needs SQL Server Agent
+  running.
 - A table with two capture instances (during a schema change) is read through the
   newest; `capture_instance = '<name>'` picks one.
 - An option's value may be a `$param` or `LET`, resolved as the statement runs:

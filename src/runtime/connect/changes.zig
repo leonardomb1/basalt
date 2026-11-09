@@ -11,8 +11,9 @@
 //! which order as the LSNs do. The changes are read from the instance's change
 //! table, its update before-images left out; `_change_seq` numbers them in commit
 //! order, then order within the commit, which is all `sequence_by` compares. A
-//! position the cleanup job has already passed fails the run rather than skip
-//! changes, and so does a database or table without CDC, naming the statements
+//! position the cleanup job has already passed fails the read rather than skip
+//! changes (`USING changes` asks `cleanedPast` first and reads the table whole
+//! instead), and so does a database or table without CDC, naming the statements
 //! that enable it.
 //!
 //! With no position (`changes_from` NULL or empty, a feed's first run) the whole
@@ -49,7 +50,7 @@ pub fn read(env: *Env, rd: ast.Read, hints: []const ast.Hint, conn: ast.Connecti
     const to_given = try position(env, hints, "changes_to");
     const m = try metaOf(env, rd, hints, conn, info);
     if (from) |f| if (m.min.len > 0 and std.mem.order(u8, f, m.min) == .lt and !zeroes(m.min))
-        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "the change feed of {s} starts at {s}, after the position {s} this read continues from: the cleanup job has removed the changes between, so read the table whole again (a new feed `name`, or no position)", .{ try label(env, rd), m.min, f }));
+        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "the change feed of {s} starts at {s}, after the position {s} this read continues from: the cleanup job has removed the changes between, so read the table whole again (no position)", .{ try label(env, rd), m.min, f }));
     const to = to_given orelse m.max;
     const a = env.arena;
     var cols = std.array_list.Managed(u8).init(a);
@@ -65,6 +66,16 @@ pub fn read(env: *Env, rd: ast.Read, hints: []const ast.Hint, conn: ast.Connecti
         try msgfmt.allocPrint(a, "SELECT {s}, CAST(CASE __$operation WHEN 1 THEN 'delete' WHEN 2 THEN 'insert' ELSE 'update_postimage' END AS VARCHAR(16)) AS _change_type, CONVERT(CHAR(20), __$start_lsn, 2) AS _commit_version, sys.fn_cdc_map_lsn_to_time(__$start_lsn) AS _commit_timestamp, ROW_NUMBER() OVER (ORDER BY __$start_lsn, __$seqval, __$operation) AS _change_seq FROM cdc.{s} WHERE __$start_lsn > 0x{s} AND __$start_lsn <= 0x{s} AND __$operation <> 3", .{ cols.items, try sql.quoteName(a, .sqlserver, try std.mem.concat(a, u8, &.{ m.instance, "_CT" })), from.?, to });
     out.form = .{ .query = q };
     return out;
+}
+
+/// Whether the change feed `rd` reads starts after position `since`: the cleanup
+/// job has removed changes past it, so reading on from it could skip some. False
+/// for a read that is no SQL Server table's.
+pub fn cleanedPast(env: *Env, rd: ast.Read, hints: []const ast.Hint, conn: ast.Connection, info: SqlConnInfo, since: []const u8) !bool {
+    if (rd.form != .table or info.dialect != .sqlserver) return false;
+    const f = (try lsn(env, "changes_from", since)) orelse return false;
+    const m = try metaOf(env, rd, hints, conn, info);
+    return m.min.len > 0 and !zeroes(m.min) and std.mem.order(u8, f, m.min) == .lt;
 }
 
 fn zeroes(s: []const u8) bool {
@@ -85,17 +96,22 @@ fn position(env: *Env, hints: []const ast.Hint, key: []const u8) !?[]const u8 {
             .flag => return null,
             .int => return planErr(env.diag, try msgfmt.allocPrint(env.arena, "`{s}` on a SQL Server table is an LSN as text, 20 hex digits (`0000002B000004280003`), as `_commit_version` reads it", .{key})),
         };
-        const t = if (std.ascii.startsWithIgnoreCase(text, "0x")) text[2..] else text;
-        if (t.len == 0) return null;
-        if (t.len != 20) return planErr(env.diag, try msgfmt.allocPrint(env.arena, "`{s} = '{s}'` is not an LSN: it takes 20 hex digits, as `_commit_version` reads it", .{ key, text }));
-        const up = try env.arena.alloc(u8, 20);
-        for (t, up) |c, *o| {
-            if (!std.ascii.isHex(c)) return planErr(env.diag, try msgfmt.allocPrint(env.arena, "`{s} = '{s}'` is not an LSN: it takes 20 hex digits, as `_commit_version` reads it", .{ key, text }));
-            o.* = std.ascii.toUpper(c);
-        }
-        return up;
+        return lsn(env, key, text);
     };
     return null;
+}
+
+/// `text` as 20 uppercase hex digits (a leading `0x` dropped); null when empty.
+fn lsn(env: *Env, key: []const u8, text: []const u8) !?[]const u8 {
+    const t = if (std.ascii.startsWithIgnoreCase(text, "0x")) text[2..] else text;
+    if (t.len == 0) return null;
+    if (t.len != 20) return planErr(env.diag, try msgfmt.allocPrint(env.arena, "`{s} = '{s}'` is not an LSN: it takes 20 hex digits, as `_commit_version` reads it", .{ key, text }));
+    const up = try env.arena.alloc(u8, 20);
+    for (t, up) |c, *o| {
+        if (!std.ascii.isHex(c)) return planErr(env.diag, try msgfmt.allocPrint(env.arena, "`{s} = '{s}'` is not an LSN: it takes 20 hex digits, as `_commit_version` reads it", .{ key, text }));
+        o.* = std.ascii.toUpper(c);
+    }
+    return up;
 }
 
 /// The table's capture instance, its captured columns and its LSN range, asked of

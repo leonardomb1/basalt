@@ -6,14 +6,6 @@
 //! rows share, fails the UPSERT, naming it. A live row whose key is NULL matches
 //! nothing and stays.
 //!
-//! Under `USING changes` the rows are a change feed: of a key's rows the one of
-//! the highest `sequence_by` wins and the others are dropped (`dropped`, by row
-//! number, found by the same self-join that refuses repeated keys otherwise, and
-//! left out of every later replay); two winners of one sequence fail the run. A
-//! winner its `delete_when` marks removes the key's live row and inserts nothing.
-//! The batch's largest position (`top`) is what the commit records; one behind
-//! the position the table holds fails the run, as the query read applied changes.
-//!
 //! The incoming rows are spooled as they arrive, to the run's spill space (in
 //! memory up to `--op-memory` when there is none), each numbered, while every key
 //! column's smallest and largest value is kept. At `finish`:
@@ -70,7 +62,7 @@ const types = @import("../../lang/types.zig");
 const write = @import("delta_write.zig");
 const testing = std.testing;
 
-pub const Error = error{ DeltaNullKey, DeltaDuplicateKey, DeltaUpsertTooLarge, DeltaChangeOrder };
+pub const Error = error{ DeltaNullKey, DeltaDuplicateKey, DeltaUpsertTooLarge };
 
 pub const Opts = struct {
     space: ?Space = null,
@@ -182,10 +174,6 @@ pub const Merge = struct {
     held_bytes: usize = 0,
     /// Whether a join went to disk.
     spilled: bool = false,
-    dropped: std.DynamicBitSetUnmanaged = .{},
-    any_dropped: bool = false,
-    top: ?i64 = null,
-    pos_kind: ?types.TypeKind = null,
     feed: ?*write.Sink = null,
     dv: bool = false,
     hits: []std.ArrayListUnmanaged(u64) = &.{},
@@ -224,7 +212,6 @@ pub const Merge = struct {
     }
 
     pub fn deinit(self: *Merge) void {
-        self.dropped.deinit(self.gpa);
         if (self.writer) |*w| w.abort();
         if (self.run) |r| spill.discard(r);
         self.mem.deinit();
@@ -267,26 +254,6 @@ pub const Merge = struct {
         for (p.keys, 0..) |k, j| {
             const c = cols[p.cols[k].src];
             for (0..b.len) |r| try self.bounds.widen(a, j, c.getValue(r));
-        }
-        if (p.change) |ch| {
-            const pc = b.columns[ch.pos];
-            const sc = b.columns[ch.seq];
-            for (0..b.len) |r| {
-                if (!sc.validity.get(r)) return self.fail(Error.DeltaChangeOrder, "`sequence_by` of this UPSERT into {s} is NULL in a row; every change needs its place in the order", .{p.name});
-                const v = pc.getValue(r);
-                const x: i64 = switch (v) {
-                    .int, .timestamp => |n| n,
-                    .date => |d| d,
-                    .null => return self.fail(Error.DeltaChangeOrder, "`position` of this UPSERT into {s} is NULL in a row; every change needs the position it was read at", .{p.name}),
-                    else => unreachable,
-                };
-                if (self.top == null or x > self.top.?) self.top = x;
-                self.pos_kind = switch (v) {
-                    .int => .int,
-                    .timestamp => .timestamp,
-                    else => .date,
-                };
-            }
         }
         const nb = Batch{ .schema = &self.schema, .columns = cols, .len = b.len };
         if (self.opts.space) |sp| {
@@ -354,9 +321,6 @@ pub const Merge = struct {
         const p = self.plan;
         const a = self.mem.allocator();
         if (out.feed) self.feed = out;
-        if (p.change) |ch| if (ch.since) |was| if (self.top) |now| if (now < was)
-            return self.fail(Error.DeltaChangeOrder, "the changes applied to {s} reach position {d}, behind the {d} it holds for `{s}`; the query read changes already applied (filter them with `WHERE <position> > $since`)", .{ p.name, now, was, ch.app });
-        if (p.change != null) try self.dropped.resize(self.gpa, @intCast(self.rows), false);
         var cands = std.array_list.Managed(delta.Add).init(a);
         if (p.snap) |st| for (st.files.values()) |f| if (try self.bounds.mayHold(a, f.parts, f.stats)) try cands.append(f);
         const read_set = try a.alloc([]const u8, cands.items.len);
@@ -476,12 +440,11 @@ pub const Merge = struct {
         const nk = p.keys.len;
         const rn = p.in_fields.len;
         const int = types.Type.init(.int).asNullable();
-        const ns: usize = @intFromBool(p.change != null);
 
-        const pf = try a.alloc(types.Schema.Field, nk + 2 + ns);
-        const spool_outs = try a.alloc(fit.Fit.Out, nk + 2 + ns);
-        const bf = try a.alloc(types.Schema.Field, nk + 1 + ns);
-        const build_outs = try a.alloc(fit.Fit.Out, nk + 1 + ns);
+        const pf = try a.alloc(types.Schema.Field, nk + 2);
+        const spool_outs = try a.alloc(fit.Fit.Out, nk + 2);
+        const bf = try a.alloc(types.Schema.Field, nk + 1);
+        const build_outs = try a.alloc(fit.Fit.Out, nk + 1);
         const names = try a.alloc([]const u8, nk + 1);
         for (p.keys, 0..) |k, j| {
             const c = p.cols[k];
@@ -498,23 +461,15 @@ pub const Merge = struct {
         spool_outs[nk + 1] = .{ .column = rn };
         build_outs[nk] = .{ .column = rn };
         names[nk] = tag_name;
-        if (p.change) |ch| {
-            const st = p.in_fields[ch.seq].ty.asNullable();
-            pf[nk + 2] = .{ .name = ast.Changes.seq_col, .ty = st };
-            bf[nk + 1] = pf[nk + 2];
-            spool_outs[nk + 2] = .{ .column = ch.seq };
-            build_outs[nk + 1] = .{ .column = ch.seq };
-        }
 
         var parts = std.array_list.Managed(Feed.Part).init(a);
         const spooled = try self.replay(a, try fitOf(a, pf, spool_outs));
         try parts.append(.{ .src = spooled.source() });
         if (lay) |l| {
             const folder = try Folder.openLayout(a, l, names);
-            const file_outs = try a.alloc(fit.Fit.Out, nk + 2 + ns);
+            const file_outs = try a.alloc(fit.Fit.Out, nk + 2);
             for (names, 0..) |nm, j| file_outs[j] = .{ .column = folder.schema.indexOf(nm).? };
             file_outs[nk + 1] = .{ .value = .null };
-            if (ns == 1) file_outs[nk + 2] = .{ .value = .null };
             try parts.append(.{ .src = folder.source(), .fit = try fitOf(a, pf, file_outs) });
         }
         const feed = try a.create(Feed);
@@ -530,7 +485,6 @@ pub const Merge = struct {
         var bm = std.heap.ArenaAllocator.init(self.gpa);
         defer bm.deinit();
         const top = op.Op{ .join = jn };
-        var ties = std.array_list.Managed(struct { a: usize, b: usize, msg: []const u8 }).init(a);
         while (try top.next(bm.allocator())) |b| {
             const tags = b.columns[nk];
             for (0..b.len) |r| {
@@ -539,7 +493,7 @@ pub const Merge = struct {
                     hit[@intCast(tag)] = true;
                     continue;
                 }
-                const lw = nk + 2 + ns;
+                const lw = nk + 2;
                 const mine = b.columns[nk + 1].getValue(r).int;
                 const other = b.columns[lw + nk].getValue(r).int;
                 if (mine == other) continue;
@@ -548,26 +502,11 @@ pub const Merge = struct {
                     if (j > 0) try vals.appendSlice(", ");
                     try vals.appendSlice(try fmtnum.valueToString(a, b.columns[j].getValue(r)));
                 }
-                if (ns == 1) {
-                    const sm = b.columns[nk + 2].getValue(r);
-                    const so = b.columns[lw + nk + 1].getValue(r);
-                    const o = eval.compareValues(sm, so) orelse .eq;
-                    if (o == .lt) {
-                        self.dropped.set(@intCast(mine));
-                        continue;
-                    }
-                    if (o == .gt) continue;
-                    try ties.append(.{ .a = @intCast(mine), .b = @intCast(other), .msg = try msgfmt.allocPrint(a, "the changes hold key ({s}) = ({s}) twice at sequence {s}; `sequence_by` must order a key's changes, or which applies would depend on the run", .{ try std.mem.join(a, ", ", names[0..nk]), vals.items, try fmtnum.valueToString(a, sm) }) });
-                    continue;
-                }
                 return self.fail(Error.DeltaDuplicateKey, "the rows hold key ({s}) = ({s}) more than once; an UPSERT into {s} takes one row per key, as a primary key does", .{ try std.mem.join(a, ", ", names[0..nk]), vals.items, p.name });
             }
             _ = bm.reset(.retain_capacity);
         }
         self.spilled = self.spilled or jn.grace != null;
-        for (ties.items) |t| if (!self.dropped.isSet(t.a) and !self.dropped.isSet(t.b))
-            return self.fail(Error.DeltaChangeOrder, "{s}", .{t.msg});
-        if (p.change != null) self.any_dropped = self.dropped.count() > 0;
         return hit;
     }
 
@@ -646,15 +585,9 @@ pub const Merge = struct {
         const rn = nt + p.in_fields.len;
         const masks = [3][]bool{ try t.alloc(bool, b.len), try t.alloc(bool, b.len), try t.alloc(bool, b.len) };
         var counts = [3]usize{ 0, 0, 0 };
-        const gone = try t.alloc(bool, b.len);
-        var n_gone: usize = 0;
-        const del: ?column.Column = if (p.change) |ch| b.columns[nt + ch.del] else null;
         for (0..b.len) |r| {
             const exists = b.columns[tag_at].validity.get(r);
             var class: usize = if (!exists) 2 else if (b.columns[rn].validity.get(r)) 1 else 0;
-            if (class != 0) if (del) |d| if (deletes(d, r)) {
-                class = 3;
-            };
             if (self.dv and exists) {
                 if (class == 0) {
                     class = 4;
@@ -662,8 +595,6 @@ pub const Merge = struct {
             }
             for (masks, 0..) |m, i| m[r] = i == class;
             if (class < 3) counts[class] += 1;
-            gone[r] = class == 3 and exists;
-            n_gone += @intFromBool(gone[r]);
         }
         const kept = counts[0] + counts[1] + counts[2];
         const cols = try t.alloc(column.Column, nc + nr);
@@ -696,7 +627,7 @@ pub const Merge = struct {
             c.* = if (n == 0) try join.nullColumn(t, pc.carried(), 0) else if (n == 1) chunks[0] else try column.concat(t, chunks[0..n], kept);
         }
         if (self.feed == null) return .{ .schema = shape, .columns = cols, .len = kept };
-        const ch = try self.changes(t, b, masks, counts, gone, n_gone);
+        const ch = try self.changes(t, b, masks, counts);
         const all = try t.alloc(column.Column, nc + nr + 1);
         for (all[0 .. nc + nr], cols, ch.columns[0 .. nc + nr]) |*o, d, c| o.* = try column.concat(t, &.{ d, c }, kept + ch.len);
         const none = try join.nullColumn(t, types.Type.init(.string).asNullable(), kept);
@@ -729,7 +660,7 @@ pub const Merge = struct {
     /// their `_change_type` last: a merged row's old values (`update_preimage`)
     /// and new ones (`update_postimage`), an inserted row, and a live row a change
     /// deletes.
-    fn changes(self: *Merge, t: std.mem.Allocator, b: Batch, masks: [3][]bool, counts: [3]usize, gone: []bool, n_gone: usize) !Batch {
+    fn changes(self: *Merge, t: std.mem.Allocator, b: Batch, masks: [3][]bool, counts: [3]usize) !Batch {
         const p = self.plan;
         const nc = p.cols.len;
         const nr = self.rowCols();
@@ -739,7 +670,6 @@ pub const Merge = struct {
             .{ .mask = masks[1], .n = counts[1], .kind = "update_preimage", .side = .live },
             .{ .mask = masks[1], .n = counts[1], .kind = "update_postimage", .side = .merged },
             .{ .mask = masks[2], .n = counts[2], .kind = "insert", .side = .incoming },
-            .{ .mask = gone, .n = n_gone, .kind = "delete", .side = .live },
         };
         var total: usize = 0;
         for (parts) |part| total += part.n;
@@ -762,24 +692,8 @@ pub const Merge = struct {
         return .{ .schema = b.schema, .columns = cols, .len = total };
     }
 
-    /// Spooled rows `b` as the table's rows to insert, a column they lack as NULL;
-    /// a change that deletes inserts nothing.
-    fn inserts(self: *Merge, t: std.mem.Allocator, shape: *const types.Schema, b_in: Batch) !Batch {
-        var b = b_in;
-        if (self.plan.change) |ch| {
-            const d = b.columns[ch.del];
-            const keep = try t.alloc(bool, b.len);
-            var n: usize = 0;
-            for (keep, 0..) |*k, r| {
-                k.* = !deletes(d, r);
-                n += @intFromBool(k.*);
-            }
-            if (n < b.len) {
-                const cols = try t.alloc(column.Column, b.columns.len);
-                try column.gatherColumns(t, b.columns, cols, keep, n);
-                b = .{ .schema = b.schema, .columns = cols, .len = n };
-            }
-        }
+    /// Spooled rows `b` as the table's rows to insert, a column they lack as NULL.
+    fn inserts(self: *Merge, t: std.mem.Allocator, shape: *const types.Schema, b: Batch) !Batch {
         const nc = self.plan.cols.len;
         const nr = self.rowCols();
         const cols = try t.alloc(column.Column, nc + nr + @intFromBool(self.feed != null));
@@ -787,21 +701,6 @@ pub const Merge = struct {
         for (cols[nc .. nc + nr]) |*c| c.* = try join.nullColumn(t, types.Type.init(.int).asNullable(), b.len);
         if (self.feed != null) cols[nc + nr] = try join.nullColumn(t, types.Type.init(.string).asNullable(), b.len);
         return .{ .schema = shape, .columns = cols, .len = b.len };
-    }
-
-    /// Spooled rows `b` less the changes a later one of their key replaces.
-    fn winners(self: *Merge, t: std.mem.Allocator, b: Batch) !Batch {
-        const rc = b.columns[self.plan.in_fields.len];
-        const keep = try t.alloc(bool, b.len);
-        var n: usize = 0;
-        for (keep, 0..) |*k, r| {
-            k.* = !self.dropped.isSet(@intCast(rc.getValue(r).int));
-            n += @intFromBool(k.*);
-        }
-        if (n == b.len) return b;
-        const cols = try t.alloc(column.Column, b.columns.len);
-        try column.gatherColumns(t, b.columns, cols, keep, n);
-        return .{ .schema = b.schema, .columns = cols, .len = n };
     }
 
     /// A hash join of `probe` against `build` (the spool), spilling as the run's
@@ -850,12 +749,6 @@ fn fileRows(a: std.mem.Allocator, stats: ?[]const u8) ?u64 {
     };
 }
 
-/// Whether row `r` of a change's `delete_when` column deletes its key.
-fn deletes(d: column.Column, r: usize) bool {
-    const v = d.getValue(r);
-    return v == .bool and v.bool;
-}
-
 /// The rewrite's rows in the table's shape, a batch per batch of the join
 /// (`Merge.combine`); with no join, every spooled row inserted.
 const Merged = struct {
@@ -892,12 +785,11 @@ const Replay = struct {
     i: usize = 0,
 
     pub fn next(self: *Replay, arena: std.mem.Allocator) !?Batch {
-        var b = if (self.reader) |*r| (try r.next(arena)) orelse return null else blk: {
+        const b = if (self.reader) |*r| (try r.next(arena)) orelse return null else blk: {
             if (self.i >= self.m.held.items.len) return null;
             self.i += 1;
             break :blk self.m.held.items[self.i - 1];
         };
-        if (self.m.any_dropped) b = try self.m.winners(arena, b);
         if (self.fit) |f| return try f.apply(arena, b);
         var out = b;
         out.schema = &self.schema;

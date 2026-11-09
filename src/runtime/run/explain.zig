@@ -507,6 +507,12 @@ fn renderSteps(arena: std.mem.Allocator, prof: *Profile, w: *std.Io.Writer) !voi
 }
 
 pub fn renderProfile(arena: std.mem.Allocator, prof: *Profile, facts: RunFacts, color: bool, w: *std.Io.Writer) !void {
+    var aw = std.Io.Writer.Allocating.init(arena);
+    try renderProfileRaw(arena, prof, facts, color, &aw.writer);
+    try @import("../analyze/render.zig").writeShown(w, aw.written());
+}
+
+fn renderProfileRaw(arena: std.mem.Allocator, prof: *Profile, facts: RunFacts, color: bool, w: *std.Io.Writer) !void {
     try prof.settle();
     const o = try ordered(arena, prof);
     const lanes = @max(prof.laneCount(), 1);

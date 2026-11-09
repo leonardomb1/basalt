@@ -272,7 +272,7 @@ const report_cases = [_]ReportCase{
     .{ .script = "CREATE FUNCTION f(a) AS\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND;\nCALL f('x');", .explain = true, .says = &.{"CALL f(a=x)"} },
     .{ .script = "CASE WHEN 1 = 2 THEN PRINT 'no'; WHEN 1 = 1 THEN LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t; END CASE;", .explain = true, .says = &.{"CASE: arm 2 of 2"} },
     .{ .script = "LOAD INTO '$B/d/' WITH (format = 'delta') AS SELECT id, v FROM '$B/in.csv';\nEXPLAIN ANALYZE SELECT id FROM '$B/d/';", .says = &.{ "log replay (#", "live files: ", "└─ log read (#", "├─ list (#", "entries: " } },
-    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/d/' UPSERT ON (id) USING changes (sequence_by = id, position = id, name = 'feed') AS SELECT id, v FROM '$B/in.csv';", .says = &.{ "log replay (#", "Sink: delta " } },
+    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/d/' WITH (merge_schema = true) UPSERT ON (id) USING changes (sequence_by = id, position = id) AS SELECT id, v FROM '$B/in.csv';", .says = &.{ "log replay (#", "Sink: delta " } },
     .{ .script = "EXPLAIN ANALYZE SELECT g, SUM(v) AS s FROM '$B/pf/' GROUP BY g;", .threads = 4, .says = &.{ "list (#", "footer (#", "reads: " } },
     .{ .script = "EXPLAIN ANALYZE SELECT id FROM '$B/p.parquet' WHERE v > 2;", .threads = 4, .says = &.{"footer (#"} },
 };

@@ -120,6 +120,8 @@ const base = [_]Builtin{
     .{ .name = "coalesce", .type_fn = typing.coalesce, .eval_fn = per_row.coalesce, .vec_fn = vectorized.coalesce },
     .{ .name = "cardinality", .type_fn = typing.cardinality, .eval_fn = per_row.cardinality, .vec_fn = vectorized.cardinality },
     .{ .name = "__agg_args", .type_fn = typing.aggArgs, .eval_fn = per_row.aggArgs, .vec_fn = vectorized.aggArgs },
+    .{ .name = "__change_need", .type_fn = typing.changeNeed, .eval_fn = per_row.changeNeed },
+    .{ .name = "__change_last", .type_fn = typing.changeLast, .eval_fn = per_row.changeLast },
     .{ .name = "starts_with", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.starts_with)).eval, .vec_fn = S(f.Match(.starts_with)).vec },
     .{ .name = "ends_with", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.ends_with)).eval, .vec_fn = S(f.Match(.ends_with)).vec },
     .{ .name = "contains", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.contains)).eval, .vec_fn = S(f.Match(.contains)).vec },

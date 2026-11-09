@@ -21,10 +21,9 @@ AS
   `USING changes (...)` below; how they travel is the target's, and would be a
   `WITH` option if a target had a choice.
 - `UPSERT ON (k) USING changes (sequence_by = s, position = p[, delete_when =
-  <condition>][, name = 'app'])` on a Delta table applies a change feed: the
-  latest change per key upserts or deletes it, and the table keeps the largest
-  `position` applied, which the query reads as `$since`
-  ([Writing Delta](formats.md#writing-delta)).
+  <condition>])` applies a change feed to any table that takes an UPSERT:
+  the latest change per key, a delete kept as `_deleted`, each run reading on
+  from the table's largest `position` ([Change feeds](#change-feeds)).
 - A per-row dynamic target uses `IDENTIFIER(<string-expr>)` over loop vars
   ([FOR EACH](for-each.md)): `LOAD INTO sr.IDENTIFIER('crm_' || lower($name)) ...`. A file target
   built this way must end in a literal extension, which picks the writer.
@@ -101,3 +100,54 @@ AS
 **stdout is not syntax**: a terminal `SELECT ...;` statement prints the result
 as an aligned table — `basalt run -c "SELECT * FROM 'x.csv'"` works as a
 mini-DuckDB.
+
+## Change feeds
+
+`USING changes (...)` makes an UPSERT apply a change feed, a query whose rows are
+changes to keyed rows (a SQL Server table read `WITH (changes_from = $since)`,
+[Sources](sources.md), or any query of a change log):
+
+```sql ignore
+LOAD INTO sr.orders UPSERT ON (id)
+  USING changes (sequence_by = _change_seq, delete_when = _change_type = 'delete',
+                 position = _commit_version)
+AS SELECT * FROM erp.dbo.orders WITH (changes_from = $since);
+```
+
+- `sequence_by` orders a key's changes, `position` is where a change sits in the
+  feed, and `delete_when` says a change deletes its key. Each is an expression
+  over the query's columns, except `position`, which names one, as it is kept in
+  the table. A NULL `sequence_by` or `position` fails the run; a NULL
+  `delete_when` is no delete.
+- Of a key's changes the one of the highest `sequence_by` is applied. Two at that
+  sequence fail the run, as which applies would otherwise depend on the run. The
+  plan picks it before the write, as a window over the keys ranked by
+  `sequence_by` (spilling as any window does), so `EXPLAIN` shows it.
+- The write is the table's ordinary UPSERT, so any table that takes one takes a
+  change feed, a Delta table or a database's. A delete is kept as a row: the key's `_deleted` column is true, and its other
+  columns hold what the change carried (a SQL Server delete, the deleted row's
+  values). A reader of the table filters `WHERE NOT _deleted`. The
+  columns the arguments read are left out (a feed's `op` or `_change_seq`); the
+  `position` column is kept, holding the largest position of the key's changes,
+  so the table's largest is the largest the query read. `PARTIAL COLS` updates the
+  listed columns, `position` and `_deleted`.
+- `$since` is the table's largest `position`, NULL when the table or the column is
+  not there yet, read before the query runs as any query of the table reads it (a
+  database computes `SELECT MAX`). `WHERE lsn > $since`, or `changes_from = $since`,
+  reads only what is new, and a run with nothing new writes nothing. A position
+  compares as its type does: a text one (a SQL Server LSN) must keep a fixed width
+  to order as the source does. `$since` is reserved under `USING changes`.
+- A source whose change feed no longer reaches back to `$since` (SQL Server's
+  cleanup job removed the changes since, as on a table quiet for longer than its
+  retention) is read whole instead, with a warning. A read with `$since` NULL into
+  a table that exists (that one, or a table written without its `position`
+  column) is such a snapshot: the table's live rows join the changes ranked below
+  any, so a key the snapshot holds takes its row, and a key it lacks, deleted
+  meanwhile, is kept as deleted. The table is taken to hold what the statement's
+  query yields: a query that filters its source, or a second statement feeding
+  the same table, has the rows it does not yield marked deleted by a snapshot. A Delta table written without the `position` and
+  `_deleted` columns takes them under `WITH (merge_schema = true)`.
+- A file is no target for a change feed. The keys are named with `UPSERT ON (k)`:
+  a bare `UPSERT` infers them only as the run starts, after the plan that ranks
+  changes by them is made. A database table written before has to gain the
+  `position` and `_deleted` columns before its first change feed.

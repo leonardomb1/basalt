@@ -86,6 +86,7 @@ const targetLabel = @import("../run.zig").targetLabel;
 const topNStages = @import("../lanes.zig").topNStages;
 const types = @import("../../lang/types.zig");
 const lake = @import("../../format/lake/table.zig");
+const feed = @import("feed.zig");
 const delta = @import("../../format/lake/delta.zig");
 const delta_write = @import("../../format/lake/delta_write.zig");
 const mkLit = @import("../env.zig").mkLit;
@@ -98,51 +99,10 @@ const wholeAggStages = @import("../lanes.zig").wholeAggStages;
 
 /// Run one output pipeline: split it into key-range lanes or stream it serially. A
 /// fanned-out union reports per branch, so this outer call then counts nothing.
-/// `$since` for a `USING changes` statement: the position the target table keeps
-/// for the feed's application, as a value of the statement's `position` type;
-/// NULL when the table keeps none or is yet to be made. The type comes from
-/// analysing the statement as `check` does, `$since` NULL meanwhile.
-fn bindSince(env: *Env, out: ast.Pipeline) !void {
-    const w = out.stages[out.stages.len - 1].node.write;
-    const ch = w.changes.?;
-    const nul = try analyze.mk(env.arena, .null_lit);
-    try env.params.put(analyze.since_name, .null);
-    try env.params_expr.put(analyze.since_name, nul);
-    const found = (try lake.detect(env.arena, w.target)) orelse return;
-    if (found.kind != .delta) return;
-    const st = try delta.snapshot(env.arena, w.target, .{}, found.listed);
-    const app = ch.name orelse w.target;
-    const recorded = st.property(try delta_write.positionKey(env.arena, app));
-    const v = st.txns.get(app) orelse return;
-    var kind: ?types.TypeKind = if (recorded) |r| std.meta.stringToEnum(types.TypeKind, r) else null;
-    if (kind == null) {
-        _ = env.params.remove(analyze.since_name);
-        _ = env.params_expr.remove(analyze.since_name);
-        var adiag = analyze.Diag{};
-        const plan = try analyze.analyzeOne(env.arena, out, env.bindings, env.connections, env.params_expr, &adiag, env.tables, 1);
-        for (plan.outputs[0].stages) |sg| if (sg.out_schema) |sc| if (sc.indexOf(ast.Changes.pos_col)) |i| {
-            if (!sc.fields[i].ty.unknown) kind = sc.fields[i].ty.kind;
-        };
-    }
-    const known = kind orelse {
-        env.log.log(.warn, "{s} keeps no type for the position of `{s}` (it was written before basalt recorded one) and its source's types are not known before it runs, so $since reads as NULL and every change is read again; this run records the type", .{ w.target, app });
-        try env.params.put(analyze.since_name, .null);
-        try env.params_expr.put(analyze.since_name, nul);
-        return;
-    };
-    const val: Value = switch (known) {
-        .date => .{ .date = std.math.cast(i32, v) orelse return planErr(env.diag, "the position the Delta table keeps for this feed is not a date") },
-        .timestamp => .{ .timestamp = v },
-        else => .{ .int = v },
-    };
-    try env.params.put(analyze.since_name, val);
-    try env.params_expr.put(analyze.since_name, try mkLit(env.arena, val));
-}
-
 pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     errdefer env.diag.stamp(out.pos);
     const arena = env.arena;
-    const stages = out.stages;
+    var stages = out.stages;
     if (stages.len == 0) return planErr(env.diag, "empty pipeline");
     const last = stages[stages.len - 1].node;
     if (last != .write) return planErr(env.diag, "a top-level query must be a `LOAD INTO` or a terminal `SELECT`");
@@ -164,7 +124,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
         prof.deinit();
     };
     const t0 = std.time.Instant.now() catch null;
-    if (last.write.changes != null) try bindSince(env, out);
+    if (last.write.changes != null) stages = try feed.prepare(env, out, opts_in, lanes_used, batch_arena);
     defer if (last.write.changes != null) {
         _ = env.params.remove(analyze.since_name);
         _ = env.params_expr.remove(analyze.since_name);
@@ -258,6 +218,26 @@ fn materializeJoinSides(env: *Env, opts: RunOptions, stages: []const ast.Stage, 
         if (try materializeNamed(env, opts, name, lanes_used, batch_arena)) try names.append(name);
     }
     return names.toOwnedSlice();
+}
+
+/// `stages` run into memory, under `EXPLAIN ANALYZE` profiled in a scope of their
+/// own named `what`.
+pub fn runToMemory(env: *Env, opts: RunOptions, stages: []const ast.Stage, what: []const u8, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!env_mod.MemSink {
+    const inner = try env.arena.alloc(ast.Stage, stages.len + 1);
+    @memcpy(inner[0..stages.len], stages);
+    inner[stages.len] = .{ .node = .{ .write = .{ .connector = mem_connector, .form = null, .target = "", .mode = .overwrite } }, .hints = &.{}, .pos = stages[0].pos };
+    var ms = env_mod.MemSink{ .arena = env.arena, .batches = std.array_list.Managed(Batch).init(env.arena) };
+    const outer_sink = env.mem_sink;
+    const outer_name = env.sink_name;
+    env.mem_sink = &ms;
+    defer env.mem_sink = outer_sink;
+    defer env.sink_name = outer_name;
+    var scratch: Stats = .{};
+    var delegated = false;
+    const outer_scope = enterScope(env, what);
+    defer leaveScope(env, outer_scope);
+    try runOutputBody(env, opts, inner, inner[stages.len].node, &scratch, lanes_used, batch_arena, &delegated);
+    return ms;
 }
 
 /// Binding `name` run on lanes into memory when it aggregates a file or table and is

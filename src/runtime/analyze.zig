@@ -1560,7 +1560,7 @@ const Ctx = struct {
         if (!deltaTarget(w, hints) or std.mem.indexOf(u8, w.target, "://") != null or std.mem.indexOf(u8, w.target, "${") != null) return null;
         const opts = try writeOptions(self.arena, w, hints, self.diag);
         const create = (formatFromHints(hints, self.diag) catch null) == .delta;
-        const p = delta_write.planEvolving(self.arena, w.target, delta_write.writeModeOf(w), create, opts.delta.partition_by, opts.delta.codec, schema, opts.delta.evolve) catch |e| {
+        const p = delta_write.planEvolving(self.arena, w.target, delta_write.modeOf(w.mode), create, opts.delta.partition_by, opts.delta.codec, schema, opts.delta.evolve) catch |e| {
             if (e == lake.Error.LakeTableRefused) return fail(self.diag, "{s}", .{eval.takeFailure(e) orelse @errorName(e)});
             _ = eval.takeFailure(e);
             return null;
@@ -1683,7 +1683,7 @@ const Ctx = struct {
             try checkFileSink(w, hints, self.diag);
             try checkSinkForm(w, hints, w.connector, self.diag);
             if (deltaTarget(w, hints))
-                return .{ .connector = w.connector, .target = w.target, .mode = try delta_write.writeModeOf(w).label(self.arena), .format = "delta" };
+                return .{ .connector = w.connector, .target = w.target, .mode = try delta_write.modeOf(w.mode).label(self.arena), .format = "delta" };
             return .{ .connector = w.connector, .target = w.target, .mode = @tagName(w.mode) };
         }
         const conn = self.connections.get(w.connector) orelse
@@ -2002,8 +2002,8 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
     _ = try cutoverProblem(w, hints, diag);
     const form = w.form orelse return;
     if (std.mem.eql(u8, form, "changes")) {
-        if (!deltaTarget(w, hints)) return fail(diag, "`USING changes` applies a change feed to a Delta table; `{s}` is not one (a folder ending in `/`, or `WITH (format = 'delta')`)", .{w.target});
-        if (w.mode != .upsert) return fail(diag, "`USING changes` applies changes by key: write it with `UPSERT ON (<key>)`", .{});
+        if (file and !deltaTarget(w, hints)) return fail(diag, "`USING changes` applies a change feed as an UPSERT into a table; `{s}` is a file", .{w.target});
+        if (w.mode != .upsert or w.mode.upsert.keys.len == 0) return fail(diag, "`USING changes` applies changes by key: write it with `UPSERT ON (<key>)`", .{});
         return;
     }
     if (stream and std.mem.eql(u8, form, "stream_load")) return;
