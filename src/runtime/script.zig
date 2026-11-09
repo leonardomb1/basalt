@@ -666,7 +666,14 @@ fn readsOnlyParams(env: *Env, e: *const ast.Expr) !bool {
 
 /// Run the body once per discovered row; `mode` (sequential|parallel) and
 /// `on_error` (stop|continue) come from `@[...]`.
-pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, run_body: BodyFn, outer: *const LoopRow) !void {
+pub fn runForEach(env: *Env, fe: ast.ForEach, opts_in: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, run_body: BodyFn, outer: *const LoopRow) !void {
+    const was_explain = env.explain;
+    defer env.explain = was_explain;
+    var opts = opts_in;
+    if (fe.explain) {
+        env.explain = true;
+        opts.explain = true;
+    }
     const mode: ForMode = if (forHintIdent(fe.hints, "mode")) |m|
         (if (std.mem.eql(u8, m, "parallel")) ForMode.parallel else ForMode.sequential)
     else

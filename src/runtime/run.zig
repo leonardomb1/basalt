@@ -371,8 +371,21 @@ pub fn matchArmIndex(env: *Env, m: ast.StmtMatch, ns: []const []const u8, vs: []
     };
 }
 
+/// `opts`, explaining when `on` (an `EXPLAIN ANALYZE` written before the statement):
+/// what it runs moves no data, and `env.explain` says so until the caller restores it.
+fn explainedBy(env: *Env, on: bool, opts: RunOptions) RunOptions {
+    if (!on) return opts;
+    env.explain = true;
+    var o = opts;
+    o.explain = true;
+    return o;
+}
+
 /// No matching arm (and no `_`) is a no-op.
-fn runStmtMatch(env: *Env, m: ast.StmtMatch, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+fn runStmtMatch(env: *Env, m: ast.StmtMatch, opts_in: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+    const was_explain = env.explain;
+    defer env.explain = was_explain;
+    const opts = explainedBy(env, m.explain, opts_in);
     const sc = try (LoopRow{ .names = &.{}, .cells = &.{} }).scope(env.arena, env.params);
     const idx = (try matchArmIndex(env, m, sc.names, sc.values, "match")) orelse return;
     for (m.arms[idx].body) |*st| try runStmt(env, st, opts, stats, lanes_used, batch_arena);
@@ -650,7 +663,10 @@ fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stat
 
 /// The loop variables are bound over same-named params. Untyped ones bind as strings;
 /// a `name:type` one binds the coerced value, so `port >= 1000` compares numerically.
-fn runForMatch(env: *Env, m: ast.StmtMatch, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+fn runForMatch(env: *Env, m: ast.StmtMatch, lr: LoopRow, opts_in: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
+    const was_explain = env.explain;
+    defer env.explain = was_explain;
+    const opts = explainedBy(env, m.explain, opts_in);
     const sc = try lr.scope(env.arena, env.params);
     const idx = (try matchArmIndex(env, m, sc.names, sc.values, "for/match")) orelse return;
     try runForBody(env, m.arms[idx].body, lr, opts, stats, lanes_used, batch_arena);

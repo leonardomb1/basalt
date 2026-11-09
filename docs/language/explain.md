@@ -123,9 +123,10 @@ $ basalt run -c "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'db', databa
 
 `EXPLAIN ANALYZE CALL f(...)` does the same for a statement function: each
 statement its body runs is explained with actuals and moves no data, and the
-statements after the `CALL` run normally again. A `CALL` takes `ANALYZE` only, as
-its statements are rendered as it runs; `basalt run --explain` treats every
-statement of the run so.
+statements after the `CALL` run normally again. `EXPLAIN ANALYZE FOR EACH ...` and
+`EXPLAIN ANALYZE CASE ...` do the same for a loop's rows and a `CASE`'s arm, the
+discovery query included. These take `ANALYZE` only, as their statements are
+rendered as they run; `basalt run --explain` treats every statement of the run so.
 
 `EXPLAIN ANALYZE` moves no data. The pipeline runs — that is where the numbers
 come from — but every sink is discarded: a terminal `SELECT` prints its plan

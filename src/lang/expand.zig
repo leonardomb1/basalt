@@ -155,7 +155,7 @@ fn expandStmt(cx: *Ctx, s: ast.Stmt) Error!ast.Stmt {
                 .pipeline => |p| .{ .pipeline = try expandPipeline(cx, p) },
                 else => fe.source,
             };
-            break :blk .{ .for_each = .{ .var_names = fe.var_names, .var_types = fe.var_types, .source = source, .hints = fe.hints, .body = try body.toOwnedSlice(), .pos = fe.pos } };
+            break :blk .{ .for_each = .{ .var_names = fe.var_names, .var_types = fe.var_types, .source = source, .hints = fe.hints, .body = try body.toOwnedSlice(), .pos = fe.pos, .explain = fe.explain } };
         },
         .match => |m| .{ .match = try expandStmtMatch(cx, m) },
         .let_const => |l| .{ .let_const = .{
@@ -297,7 +297,7 @@ fn expandStmtMatch(cx: *Ctx, m: ast.StmtMatch) Error!ast.StmtMatch {
         }
         arms[i] = .{ .pats = pats, .guard = guard, .body = try body.toOwnedSlice(), .is_default = arm.is_default };
     }
-    return .{ .subject = subject, .arms = arms, .pos = m.pos };
+    return .{ .subject = subject, .arms = arms, .pos = m.pos, .explain = m.explain };
 }
 
 fn parseJsonArg(arena: std.mem.Allocator, name: []const u8, text: []const u8, msg: *[]const u8) Error!std.json.Value {

@@ -257,6 +257,42 @@ test "EXPLAIN ANALYZE CALL runs the function's statements moving no data, and th
     try std.testing.expect(std.mem.indexOf(u8, pd.msg, "EXPLAIN CALL needs ANALYZE") != null);
 }
 
+test "EXPLAIN ANALYZE FOR EACH and EXPLAIN ANALYZE CASE after other statements explain their bodies, moving no data" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n2\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "names.csv", .data = "name\na\nb\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc,
+        \\LET n = 1;
+        \\EXPLAIN ANALYZE FOR EACH ROW OF (SELECT name FROM '{s}/names.csv') AS (name)
+        \\  LOAD INTO IDENTIFIER('{s}/never_' || $name || '.csv') AS SELECT * FROM '{s}/in.csv';
+        \\END FOR;
+        \\EXPLAIN ANALYZE CASE WHEN $n = 1 THEN LOAD INTO '{s}/never_case.csv' AS SELECT * FROM '{s}/in.csv'; END CASE;
+        \\LOAD INTO '{s}/kept.csv' AS SELECT * FROM '{s}/in.csv';
+    , .{ base, base, base, base, base, base, base });
+    defer alloc.free(script);
+    var rdiag: Diag = .{};
+    var cap = try StderrCapture.begin(tmp.dir);
+    const res = exec(alloc, script, .{ .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+    const prof = try cap.end(alloc);
+    defer alloc.free(prof);
+    _ = try res;
+    errdefer std.debug.print("{s}\n", .{prof});
+    for ([_][]const u8{ "FOR EACH discovery (actuals)", "FOR EACH row 2 of 2: name=b", "CASE: arm 1 of 1", "would write 2 rows" }) |want|
+        try std.testing.expect(std.mem.indexOf(u8, prof, want) != null);
+    for ([_][]const u8{ "never_a.csv", "never_b.csv", "never_case.csv" }) |f| try std.testing.expectError(error.FileNotFound, tmp.dir.access(f, .{}));
+    try tmp.dir.access("kept.csv", .{});
+
+    var ar = std.heap.ArenaAllocator.init(alloc);
+    defer ar.deinit();
+    var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try std.testing.expectError(error.ParseFailed, parser.parseSource(ar.allocator(), "PRINT 1;\nEXPLAIN FOR EACH ROW OF (SELECT 1 AS x) AS (x) PRINT $x; END FOR;", &pd));
+    try std.testing.expect(std.mem.indexOf(u8, pd.msg, "EXPLAIN FOR EACH needs ANALYZE") != null);
+}
+
 test "EXPLAIN ANALYZE on lanes names the path, the in-memory or build-side scan, and the load's sink" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

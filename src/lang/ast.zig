@@ -754,6 +754,7 @@ pub const ForEach = struct {
     hints: []const Hint,
     body: []const Stmt,
     pos: Pos,
+    explain: bool = false,
 };
 
 /// The program's lead statement: every program starts with one, so the body is `stmts[1..]`.
@@ -763,6 +764,7 @@ pub const StmtMatch = struct {
     subject: ?*Expr,
     arms: []const StmtArm,
     pos: Pos,
+    explain: bool = false,
 };
 
 pub const StmtArm = struct {

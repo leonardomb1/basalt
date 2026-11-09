@@ -193,19 +193,32 @@ pub fn parseExplainStmt(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) E
     const mode = try explainMode(self);
 
     const base = out.items.len;
-    if (self.isKw("call")) {
+    if (self.isKw("call") or self.isKw("for") or (self.isKw("case") and self.atStmtCase())) {
+        const what = if (self.isKw("call")) "CALL" else if (self.isKw("for")) "FOR EACH" else "CASE";
         if (mode != .analyze)
-            return self.fail(self.curPos(), "EXPLAIN CALL needs ANALYZE: a CALL's statements are rendered as it runs, so `EXPLAIN ANALYZE CALL ...` runs each one, moving no data, and shows its plan with actuals", .{});
-        var c = try self.parseCallStmt();
-        c.explain = true;
-        return out.append(.{ .call = c });
+            return self.fail(self.curPos(), "EXPLAIN {s} needs ANALYZE: its statements are rendered as it runs, so `EXPLAIN ANALYZE {s} ...` runs each one, moving no data, and shows its plan with actuals", .{ what, what });
+        if (self.isKw("call")) {
+            var c = try self.parseCallStmt();
+            c.explain = true;
+            return out.append(.{ .call = c });
+        }
+        if (self.isKw("case")) {
+            var m = try self.parseCaseStmt();
+            m.explain = true;
+            return out.append(.{ .match = m });
+        }
+        var pre = std.array_list.Managed(ast.Stmt).init(self.arena);
+        var fe = try self.parseForEach(&pre);
+        fe.explain = true;
+        try out.appendSlice(pre.items);
+        return out.append(.{ .for_each = fe });
     }
     if (self.isKw("load")) {
         try self.parseLoadInto(out);
     } else if (self.isKw("with") or self.isKw("select")) {
         try self.parseTerminalQuery(out);
     } else {
-        return self.fail(self.curPos(), "expected SELECT, WITH or LOAD INTO after EXPLAIN, found {s}", .{self.curTag().describe()});
+        return self.fail(self.curPos(), "expected SELECT, WITH, LOAD INTO, CALL, FOR EACH or CASE after EXPLAIN, found {s}", .{self.curTag().describe()});
     }
 
     var i = out.items.len;
