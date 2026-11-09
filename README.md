@@ -202,30 +202,33 @@ for parallel lanes. Exit code `75` means a transient failure worth retrying,
 
 ## Performance
 
-Pipelines stream, fan out across cores, and spill to disk past `--op-memory`
-where a sort, join, `DISTINCT` or `GROUP BY` must hold rows. Against DuckDB on
-TPC-H scale factor 1 as Parquet (6 million `lineitem` rows), best of three, on
-one laptop (i5-1345U, 12 threads, under WSL), with basalt's answers matching
-DuckDB's on every query that returns rows:
+Against DuckDB, ClickHouse Local, Polars and DataFusion on TPC-H scale factor 1 as
+Parquet (6 million `lineitem` rows), each engine run as a process with the same
+12 threads, best of three, on one laptop (i5-1345U, under WSL); every engine's
+answers match DuckDB's. A query's time is its wall time less the engine's startup.
+The harness, its queries and the full results with memory are in
+[`bench/`](bench/README.md) ([this run](bench/results/2026-11-09-13th-gen-intel-r-core-tm-i5-1345u.md)).
 
-| query | basalt 0.13.3 | DuckDB 2.0 |
-|---|---|---|
-| `q01` aggregate | 118 ms | 45 ms |
-| `q03` join and top-N | 198 ms | 50 ms |
-| `q06` filter | 46 ms | 22 ms |
-| `q12` join with CASE | 88 ms | 31 ms |
-| `q13` outer join and NOT LIKE | 166 ms | 77 ms |
-| `q16` DISTINCT and NOT IN | 42 ms | 22 ms |
-| `q18` IN with HAVING | 206 ms | 84 ms |
-| `count(DISTINCT)` | 46 ms | 109 ms |
-| `LIKE` over strings | 99 ms | 118 ms |
-| top-k per partition (window) | 85 ms | 60 ms |
-| `lineitem` to Parquet | 1.36 s | 1.59 s |
-| `lineitem` to CSV | 0.78 s | 6.37 s |
+| | basalt 0.13.3 | DuckDB 2.0 | ClickHouse 26.10 | Polars 2.1 | DataFusion 55 |
+|---|---|---|---|---|---|
+| startup | **2 ms**, 16 MB | 33 ms, 40 MB | 49 ms, 190 MB | 138 ms, 61 MB | 102 ms, 114 MB |
+| `count(DISTINCT)` | **51 ms** | 144 ms | 175 ms | 129 ms | 120 ms |
+| `LIKE` over long strings | **75 ms** | 142 ms | 120 ms | 97 ms | 109 ms |
+| TPC-H Q6 (filter) | 43 ms | 41 ms | 72 ms | **29 ms** | 48 ms |
+| TPC-H Q1 (aggregate) | 140 ms | **80 ms** | 158 ms | 148 ms | 163 ms |
+| TPC-H Q3 (join, top-N) | 185 ms | 76 ms | 199 ms | **61 ms** | 94 ms |
+| TPC-H Q18 (IN, HAVING) | 226 ms | **108 ms** | 180 ms | 125 ms | 284 ms |
+| exact median | 148 ms | **98 ms** | 156 ms | 316 ms | 174 ms |
+| `lineitem` Parquet → CSV | **0.72 s** | 1.37 s | 0.79 s | 0.76 s | 1.61 s |
+| `lineitem` Parquet → Parquet | 1.25 s | **0.93 s** | 1.58 s | 1.05 s | 1.74 s |
+| `lineitem` CSV → Parquet | 2.08 s | 2.23 s | 2.43 s | **1.47 s** | 2.26 s |
+| `lineitem` NDJSON → Parquet | 4.99 s | 2.89 s | 3.84 s | **2.76 s** | 4.04 s |
+| `lineitem` CSV.gz → Parquet | 7.83 s | 3.60 s | **2.37 s** | 2.42 s | 4.34 s |
 
-basalt's times include starting the process; DuckDB's are in-process. On
-analytical queries DuckDB is about one and a half to four times faster; on moving
-rows out, basalt's job, basalt is as fast or faster.
+basalt starts in milliseconds and holds memory in line with DuckDB's; it is the
+fastest at distinct counts, string matching and writing CSV, and on joins and
+aggregates about one and a half to three times slower than the fastest engine.
+Reading gzipped CSV and NDJSON are its slowest paths today.
 
 ## basalt and DuckDB
 
@@ -249,7 +252,7 @@ are built for different jobs:
 | Change data capture | SQL Server CDC, applied to any table in batches | no |
 | A script checked before it runs | every statement typed and planned first; `basalt check` offline | each statement bound as it runs |
 | Scripting | `PARAM`, `LET`, `FOR EACH`, `CASE`, functions and pinned libraries | SQL macros |
-| Analytical speed | about 1.5–4× slower (above) | the reference |
+| Speed | starts in 2 ms; faster at distinct counts, `LIKE` and writing CSV, about 1.5–3× slower on joins and aggregates (above) | starts in 33 ms |
 
 Use DuckDB to keep and query data in one place, from a program or a notebook;
 use basalt to move data between the systems that hold it, on a schedule.
