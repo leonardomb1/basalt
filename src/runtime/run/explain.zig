@@ -115,7 +115,7 @@ pub fn openStep(env: *Env, explaining: bool, tree: []const u8) !?*Profile {
 /// A line of the report for what a script chose, a CASE's arm, a loop's row, a call's
 /// arguments, so the trees after it read in their context; nothing when not explaining.
 pub fn say(env: *Env, comptime fmt: []const u8, args: anytype) void {
-    if (!env.explain) return;
+    if (!env.explain or env.loop_report != null) return;
     var aw = std.Io.Writer.Allocating.init(env.gpa);
     defer aw.deinit();
     aw.writer.print(fmt ++ "\n", args) catch return;
@@ -126,9 +126,13 @@ pub fn say(env: *Env, comptime fmt: []const u8, args: anytype) void {
 /// step's report is what it did until then; printing it never fails the run.
 pub fn closeStep(env: *Env, step: ?*Profile) void {
     const p = step orelse return;
+    trace.current = null;
+    env.profile = null;
+    if (env.loop_report) |lr| {
+        lr.adopt(env.report_row, p, .{ .wall_ns = 0, .rows_read = 0, .rows_out = 0, .lanes = 1 }, true) catch {};
+        return;
+    }
     defer {
-        trace.current = null;
-        env.profile = null;
         p.deinit();
         env.gpa.destroy(p);
     }
@@ -298,6 +302,149 @@ pub const RunFacts = struct {
     sink: []const u8 = "",
 };
 
+/// An explained loop's reports, held until the loop ends and then printed once per
+/// plan: the rows whose statement ran the same plan (the same operators, in the same
+/// tree) are one report, its figures summed over them and a node whose text differed
+/// between them saying so. Reports are grouped in row order, so what prints is the
+/// same at any `-j`, a PARALLEL loop's rows included. A loop inside an explained loop
+/// reports into the outer one's.
+pub const LoopReport = struct {
+    gpa: std.mem.Allocator,
+    labels: []const []const u8,
+    text: std.heap.ArenaAllocator,
+    mtx: std.Thread.Mutex = .{},
+    entries: std.ArrayListUnmanaged(Entry) = .empty,
+
+    const Entry = struct { row: usize, seq: usize, prof: *Profile, facts: RunFacts, steps: bool };
+
+    /// Takes `prof`'s contents, leaving it empty for its owner to free.
+    pub fn take(self: *LoopReport, row: usize, prof: *Profile, facts: RunFacts) !void {
+        const p = try self.gpa.create(Profile);
+        p.* = prof.*;
+        prof.* = Profile.init(self.gpa);
+        try self.adopt(row, p, facts, false);
+    }
+
+    /// Takes `p`, a profile on the run's allocator. The text it and `facts` hold on
+    /// the row's arena is copied: a PARALLEL loop frees a row's arena with the row.
+    pub fn adopt(self: *LoopReport, row: usize, p: *Profile, facts_in: RunFacts, steps: bool) !void {
+        self.mtx.lock();
+        defer self.mtx.unlock();
+        const a = self.text.allocator();
+        var facts = facts_in;
+        facts.sink = try a.dupe(u8, facts.sink);
+        p.path = try a.dupe(u8, p.path);
+        p.tree = try a.dupe(u8, p.tree);
+        for (p.steps.items) |*s| s.tree = p.tree;
+        try self.entries.append(self.gpa, .{ .row = row, .seq = self.entries.items.len, .prof = p, .facts = facts, .steps = steps });
+    }
+
+    /// Prints the reports grouped by plan, and frees them.
+    pub fn finish(self: *LoopReport, arena: std.mem.Allocator) void {
+        defer {
+            for (self.entries.items) |e| {
+                e.prof.deinit();
+                self.gpa.destroy(e.prof);
+            }
+            self.entries.deinit(self.gpa);
+            self.text.deinit();
+        }
+        var aw = std.Io.Writer.Allocating.init(self.gpa);
+        defer aw.deinit();
+        self.render(arena, &aw.writer) catch return;
+        std.fs.File.stderr().writeAll(aw.writer.buffered()) catch {};
+    }
+
+    const Group = struct { shape: u64, lead: Entry, facts: RunFacts, rows: std.ArrayListUnmanaged(usize) = .empty, elsewhere: usize = 0 };
+
+    fn render(self: *LoopReport, arena: std.mem.Allocator, w: *std.Io.Writer) !void {
+        std.sort.block(Entry, self.entries.items, {}, struct {
+            fn lt(_: void, a: Entry, b: Entry) bool {
+                return a.row < b.row or (a.row == b.row and a.seq < b.seq);
+            }
+        }.lt);
+        var groups = std.array_list.Managed(Group).init(arena);
+        for (self.entries.items) |e| {
+            try e.prof.settle();
+            const shape = try shapeOf(arena, e.prof, e.steps);
+            const g = for (groups.items) |*g| {
+                if (g.shape == shape) break g;
+            } else blk: {
+                try groups.append(.{ .shape = shape, .lead = e, .facts = e.facts });
+                break :blk &groups.items[groups.items.len - 1];
+            };
+            if (g.rows.items.len == 0 or g.rows.items[g.rows.items.len - 1] != e.row) try g.rows.append(arena, e.row);
+            if (g.lead.prof == e.prof) continue;
+            try g.lead.prof.mergeFrom(e.prof);
+            g.facts = sumFacts(g.facts, e.facts);
+            if (!std.mem.eql(u8, e.facts.sink, g.lead.facts.sink)) g.elsewhere += 1;
+        }
+        for (groups.items) |*g| {
+            try self.header(w, g.rows.items);
+            const color = std.posix.isatty(std.fs.File.stderr().handle) and !std.process.hasEnvVarConstant("NO_COLOR");
+            if (g.elsewhere > 0) g.facts.sink = try msgfmt.allocPrint(arena, "{s} (the first row's; {d} of {d} write elsewhere)", .{ g.facts.sink, g.elsewhere, g.lead.prof.rows_merged });
+            if (g.lead.steps) {
+                try stepTrees(g.lead.prof, try ordered(arena, g.lead.prof), @max(g.lead.prof.laneCount(), 1), color, w);
+            } else try renderProfile(arena, g.lead.prof, g.facts, color, w);
+        }
+    }
+
+    fn header(self: *LoopReport, w: *std.Io.Writer, rows: []const usize) !void {
+        const total = self.labels.len;
+        if (rows.len == 1) return w.print("FOR EACH row {d} of {d}: {s}\n", .{ rows[0], total, self.label(rows[0]) });
+        try w.print("FOR EACH {d} rows of {d} share this plan, its figures summed over them: ", .{ rows.len, total });
+        const shown = @min(rows.len, 5);
+        for (rows[0..shown], 0..) |r, i| try w.print("{s}{s}", .{ if (i > 0) "; " else "", self.label(r) });
+        if (rows.len > shown) try w.print("; +{d} more", .{rows.len - shown});
+        try w.writeAll("\n");
+    }
+
+    fn label(self: *const LoopReport, row: usize) []const u8 {
+        return if (row >= 1 and row <= self.labels.len) self.labels[row - 1] else "?";
+    }
+};
+
+/// A report's plan as one number: its operators by name and place in the tree.
+fn shapeOf(arena: std.mem.Allocator, prof: *const Profile, steps: bool) !u64 {
+    var h = std.hash.Wyhash.init(@intFromBool(steps));
+    const o = try ordered(arena, prof);
+    for (o.ids) |id| {
+        hashId(&h, id);
+        const n = prof.nodes.getPtr(id) orelse continue;
+        h.update(std.mem.asBytes(&n.children.len));
+        for (n.children) |c| {
+            hashId(&h, c.id);
+            h.update(&.{@intFromEnum(c.role)});
+        }
+        if (n.request) |r| h.update(&.{@intFromEnum(r.purpose)});
+    }
+    h.update(std.mem.asBytes(&o.ids.len));
+    h.update(prof.path);
+    return h.final();
+}
+
+/// An id field by field: its struct carries padding no write sets.
+fn hashId(h: *std.hash.Wyhash, id: profile.Id) void {
+    h.update(std.mem.asBytes(&id.at));
+    h.update(&.{@intFromEnum(id.kind)});
+    h.update(std.mem.asBytes(&id.path));
+    h.update(std.mem.asBytes(&id.scope));
+}
+
+fn sumFacts(a: RunFacts, b: RunFacts) RunFacts {
+    var s = a;
+    s.wall_ns += b.wall_ns;
+    s.rows_read += b.rows_read;
+    s.rows_out += b.rows_out;
+    s.lanes = @max(a.lanes, b.lanes);
+    s.row_groups += b.row_groups;
+    s.row_groups_skipped += b.row_groups_skipped;
+    s.columns_read += b.columns_read;
+    s.columns_total += b.columns_total;
+    s.spill_peak = @max(a.spill_peak, b.spill_peak);
+    return s;
+}
+
 /// The report, written to stderr in one piece: stdout carries the data, and a
 /// writer opened on stderr mid-run overwrote the log when stderr was a file.
 pub fn printProfile(env: *Env, prof: *Profile, facts: RunFacts) !void {
@@ -440,6 +587,7 @@ fn node(prof: *const Profile, o: Ordered, id: profile.Id, role: profile.Role, pr
         defer sa.deinit();
         try w.print("{s}sent: {s}\n", .{ line, sentText(sa.allocator(), sent) catch sent });
     }
+    if (n.varies > 0) try w.print("{s}the first row's shown: {d} of {d} rows differ here\n", .{ line, n.varies, prof.rows_merged });
 
     try w.print("{s}time: {f} ({f})", .{ line, Dur{ .ns = own }, Pct{ .v = sh } });
     if (spread(n, prof, lanes, .time)) |s| try w.print(" [min={f}, max={f}]", .{ Dur{ .ns = s.min }, Dur{ .ns = s.max } });

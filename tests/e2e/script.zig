@@ -281,7 +281,7 @@ test "EXPLAIN ANALYZE FOR EACH and EXPLAIN ANALYZE CASE after other statements e
     defer alloc.free(prof);
     _ = try res;
     errdefer std.debug.print("{s}\n", .{prof});
-    for ([_][]const u8{ "FOR EACH discovery (actuals)", "FOR EACH row 2 of 2: name=b", "CASE: arm 1 of 1", "would write 2 rows" }) |want|
+    for ([_][]const u8{ "FOR EACH discovery (actuals)", "FOR EACH 2 rows of 2 share this plan, its figures summed over them: name=a; name=b", "would write 4 rows", "CASE: arm 1 of 1", "would write 2 rows" }) |want|
         try std.testing.expect(std.mem.indexOf(u8, prof, want) != null);
     for ([_][]const u8{ "never_a.csv", "never_b.csv", "never_case.csv" }) |f| try std.testing.expectError(error.FileNotFound, tmp.dir.access(f, .{}));
     try tmp.dir.access("kept.csv", .{});
@@ -291,6 +291,61 @@ test "EXPLAIN ANALYZE FOR EACH and EXPLAIN ANALYZE CASE after other statements e
     var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     try std.testing.expectError(error.ParseFailed, parser.parseSource(ar.allocator(), "PRINT 1;\nEXPLAIN FOR EACH ROW OF (SELECT 1 AS x) AS (x) PRINT $x; END FOR;", &pd));
     try std.testing.expect(std.mem.indexOf(u8, pd.msg, "EXPLAIN FOR EACH needs ANALYZE") != null);
+}
+
+/// `text` with every figure that is a time cut out, so two runs' reports compare.
+fn withoutTimes(a: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(a);
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |ln| {
+        if (std.mem.indexOf(u8, ln, "time:") != null or std.mem.indexOf(u8, ln, "Wall time") != null or
+            std.mem.indexOf(u8, ln, "us (") != null or std.mem.indexOf(u8, ln, "ms (") != null or
+            std.mem.indexOf(u8, ln, "ns (") != null or std.mem.indexOf(u8, ln, "plan and open") != null or
+            std.mem.indexOf(u8, ln, "Top operators") != null) continue;
+        try out.appendSlice(ln);
+        try out.append('\n');
+    }
+    return out.items;
+}
+
+test "an explained loop prints one report per plan, rows grouped in order, the same in a PARALLEL loop at -j 4" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id\n1\n2\n3\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "names.csv", .data = "name\na\nb\nc\nd\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    var ar = std.heap.ArenaAllocator.init(alloc);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var got: [2][]const u8 = undefined;
+    for ([_][]const u8{ "", " PARALLEL" }, [_]usize{ 1, 4 }, &got) |par, threads, *g| {
+        const script = try std.fmt.allocPrint(a,
+            \\LET n = 1;
+            \\EXPLAIN ANALYZE FOR EACH ROW OF (SELECT name FROM '{s}/names.csv') AS (name){s}
+            \\  LOAD INTO IDENTIFIER('{s}/never_' || $name || '.csv') AS SELECT * FROM '{s}/in.csv' WHERE CAST(id AS STRING) <> $name;
+            \\  CASE WHEN $name = 'c' THEN LOAD INTO '{s}/never_c2.csv' AS SELECT id FROM '{s}/in.csv'; END CASE;
+            \\END FOR;
+        , .{ base, par, base, base, base, base });
+        var rdiag: Diag = .{};
+        var cap = try StderrCapture.begin(tmp.dir);
+        const res = exec(alloc, script, .{ .threads = threads, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+        const prof = try cap.end(alloc);
+        defer alloc.free(prof);
+        _ = try res;
+        g.* = try withoutTimes(a, prof);
+    }
+    errdefer std.debug.print("{s}\n----\n{s}\n", .{ got[0], got[1] });
+    try std.testing.expectEqualStrings(got[0], got[1]);
+    const r = got[0];
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r, "FOR EACH 4 rows of 4 share this plan, its figures summed over them: name=a; name=b; name=c; name=d"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, r, "FOR EACH row 3 of 4: name=c"));
+    try std.testing.expect(std.mem.indexOf(u8, r, "would write 12 rows") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "never_a.csv (the first row's; 3 of 4 write elsewhere), would write 12 rows") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "3 of 4 rows differ here") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "CASE: arm") == null);
+    for ([_][]const u8{ "never_a.csv", "never_c.csv", "never_c2.csv" }) |f| try std.testing.expectError(error.FileNotFound, tmp.dir.access(f, .{}));
 }
 
 test "EXPLAIN ANALYZE on lanes names the path, the in-memory or build-side scan, and the load's sink" {

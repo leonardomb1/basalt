@@ -2,7 +2,6 @@
 
 ```sql ignore
 LOAD INTO sr.silver.pedidos            -- conn[.schema].table, or a quoted path
-  USING stream_load                    -- load path; optional, starrocks/doris only
   UPSERT ON (empresa, num_pedido)      -- disposition (below)
   SPLIT BY (num_pedido) JOBS 4         -- key-range parallel load
   WITH (label_prefix = 'noturno')      -- overrides the connection's label_prefix
@@ -16,8 +15,11 @@ AS
   `.arrows` for the stream format, local paths only), or an object-store
   path `LOAD INTO 'az://account/container/bronze/x.parquet'` or
   `LOAD INTO 's3://bucket/bronze/x.parquet'`.
-- `USING stream_load` names the one load path StarRocks and Doris have, and
-  may be left out; on any other target, or with another name, it is an error.
+- A StarRocks or Doris table loads by Stream Load. `USING stream_load`, which
+  named that, is deprecated: it still loads the same, with a warning where it is
+  written, and will be removed. `USING` names how a load's rows apply, as
+  `USING changes (...)` below; how they travel is the target's, and would be a
+  `WITH` option if a target had a choice.
 - `UPSERT ON (k) USING changes (sequence_by = s, position = p[, delete_when =
   <condition>][, name = 'app'])` on a Delta table applies a change feed: the
   latest change per key upserts or deletes it, and the table keeps the largest

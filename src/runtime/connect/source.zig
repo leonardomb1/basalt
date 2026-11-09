@@ -50,6 +50,7 @@ const stream = @import("../../format/stream.zig");
 const observe = @import("observe.zig");
 const op = @import("../../exec/op.zig");
 const readLabel = @import("../connect.zig").readLabel;
+const changes = @import("changes.zig");
 const trace = @import("../../connect/trace.zig");
 const scheme = @import("../../store/scheme.zig");
 
@@ -111,11 +112,12 @@ pub fn openSourceProjected(
 fn openSourceOf(
     env: *Env,
     rd_in: ast.Read,
-    hints: []const ast.Hint,
+    hints_in: []const ast.Hint,
     project: ?[][]const u8,
     bounds: []const pqdecode.Bound,
 ) !driver.Source {
     env.last_request = null;
+    const hints = try paramHints(env, hints_in);
     const rd = try localRead(env, rd_in);
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (try resolveFolder(env, rd.form.path, hints)) |fr| if (fr.kind == .parquet) {
@@ -476,9 +478,11 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
     }
     if (sqlConnInfo(conn)) |info| {
         const cfg = try resolveDbConfig(env, conn, info.port);
+        const shown = rd_eff;
+        if (changes.asked(hints)) rd_eff = try changes.read(env, rd_eff, hints, conn, info);
         const query = try readSql(env, rd_eff);
         env.log.log(.debug, "sql read ({s}): {s}", .{ rd.connector, query });
-        const req = try noteRequest(env, rd_eff, hints, query);
+        const req = try noteRequest(env, shown, hints, query);
         const clock = observe.Clock.start();
         switch (info.kind) {
             inline else => |k| {
@@ -495,6 +499,26 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         }
     }
     return planErr(env.diag, try options.unsupportedSourceMsg(env.arena, conn.connector));
+}
+
+/// Read options `hints` with each `$name` value the run's PARAM or LET of that name,
+/// as `changes_from = $since` reads: known only once the statement runs.
+fn paramHints(env: *Env, hints: []const ast.Hint) ![]const ast.Hint {
+    var out: ?[]ast.Hint = null;
+    for (hints, 0..) |h, i| {
+        if (h.value != .ident or !std.mem.startsWith(u8, h.value.ident, "$")) continue;
+        const name = h.value.ident[1..];
+        const v = env.params.get(name) orelse
+            return planErr(env.diag, try msgfmt.allocPrint(env.arena, "read option `{s}` names `${s}`, which no PARAM or LET declares", .{ h.key, name }));
+        const o = out orelse try env.arena.dupe(ast.Hint, hints);
+        o[i].value = switch (v) {
+            .null => .{ .str = "" },
+            .int => |n| .{ .int = n },
+            else => .{ .str = try @import("../../exec/eval/format.zig").valueToString(env.arena, v) },
+        };
+        out = o;
+    }
+    return out orelse hints;
 }
 
 /// Records what `rd` is about to send, for the scan built over it to claim.

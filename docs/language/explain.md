@@ -128,6 +128,14 @@ statements after the `CALL` run normally again. `EXPLAIN ANALYZE FOR EACH ...` a
 discovery query included. These take `ANALYZE` only, as their statements are
 rendered as they run; `basalt run --explain` treats every statement of the run so.
 
+An explained loop prints once it ends, one report per plan its rows ran: rows whose
+statement ran the same operators are one report, headed `FOR EACH 3 rows of 3 share
+this plan` and the rows' values, its figures summed over them. A node whose text
+differed between them, a row's own table or query, shows the first row's and says how
+many rows differ there; a sink written per row says how many write elsewhere. A row
+that took another plan, a `CASE` arm the others did not, has its own report. The
+rows are grouped in order, so a `PARALLEL` loop at any `-j` prints the same.
+
 `EXPLAIN ANALYZE` moves no data. The pipeline runs — that is where the numbers
 come from — but every sink is discarded: a terminal `SELECT` prints its plan
 instead of its rows, and a `LOAD` writes nothing, creates no table and commits

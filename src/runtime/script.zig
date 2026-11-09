@@ -336,6 +336,7 @@ fn renderSelect(arena: std.mem.Allocator, items: []const ast.SelectItem, lr: Loo
 }
 
 const ForCtx = struct {
+    owns_report: bool = false,
     fe: ast.ForEach,
     needles: []const []const u8,
     rows: []const Row,
@@ -443,6 +444,7 @@ fn forWorker(ctx: *ForCtx, _: usize) void {
         w_env.errctx = &w_errctx;
         w_env.loop_row = i + 1;
         w_env.loop_rows = ctx.rows.len;
+        if (ctx.owns_report) w_env.report_row = i + 1;
         var w_rows = obs.RowCounter{ .up = ctx.base.rows_read };
         w_env.rows_read = &w_rows;
         var w_bindings = ctx.base.bindings.cloneWithAllocator(w_arena.allocator()) catch {
@@ -694,6 +696,18 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts_in: RunOptions, stats: *Stats
     };
     env.log.log(.debug, "for-each {s}: {d} row(s) [{s}, on_error={s}]", .{ fe.var_names[0], rows.len, @tagName(mode), if (on_error == .continue_) "continue" else "stop" });
     if (rows.len == 0) return;
+    var report: explain.LoopReport = undefined;
+    const owns_report = env.explain and env.loop_report == null;
+    if (owns_report) {
+        const labels = try env.arena.alloc([]const u8, rows.len);
+        for (rows, labels) |row, *l| l.* = rowLabel(env.arena, fe.var_names, row);
+        report = .{ .gpa = env.gpa, .labels = labels, .text = .init(env.gpa) };
+        env.loop_report = &report;
+    }
+    defer if (owns_report) {
+        env.loop_report = null;
+        report.finish(env.arena);
+    };
     const needles = fe.var_names;
     const counted = if (env.progress) |p| p.loopBegin(rows.len) else false;
     defer if (env.progress) |p| p.loopEnd();
@@ -712,6 +726,7 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts_in: RunOptions, stats: *Stats
                 if (aborting()) return error.Aborted;
                 env.loop_row = ri + 1;
                 env.loop_rows = rows.len;
+                if (owns_report) env.report_row = ri + 1;
                 if (ri > 0) if (env.progress) |p| p.loopTick(counted);
                 explain.say(env, "FOR EACH row {d} of {d}: {s}", .{ ri + 1, rows.len, rowLabel(env.arena, needles, row) });
                 const base = env.sources.items.len;
@@ -764,7 +779,7 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts_in: RunOptions, stats: *Stats
             var wopts = opts;
             wopts.threads = 1;
             const nworkers = @min(@max(opts.lanes(), @as(usize, 1)), rows.len);
-            var ctx = ForCtx{ .fe = fe, .needles = needles, .rows = rows, .base = env, .body = run_body, .worker_opts = wopts, .on_error = on_error, .outcomes = opts.outcomes, .outer = outer, .counted = counted };
+            var ctx = ForCtx{ .owns_report = owns_report, .fe = fe, .needles = needles, .rows = rows, .base = env, .body = run_body, .worker_opts = wopts, .on_error = on_error, .outcomes = opts.outcomes, .outer = outer, .counted = counted };
             const lanes = try parallel.spawnJoin(env.arena, nworkers, forWorker, &ctx);
             if (aborting()) return error.Aborted;
             stats.rows_out += ctx.rows_out.load(.monotonic);

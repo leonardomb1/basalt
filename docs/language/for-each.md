@@ -7,7 +7,7 @@ A catalog of tables, each read and loaded under a per-row name:
 FOR EACH ROW OF ($tables) AS (name, since)
   PARALLEL ON ERROR CONTINUE           -- or SEQUENTIAL / ON ERROR STOP
   LOAD INTO sr.IDENTIFIER('fluig_' || lower($name))
-    USING stream_load UPSERT AS        -- bare UPSERT: PK inferred from source
+    UPSERT AS                          -- bare UPSERT: PK inferred from source
   SELECT *, now() AS extraction_timestamp
   FROM fluig.dbo.IDENTIFIER($name)     -- a per-row TABLE read
   WHERE updated_at >= $since;          -- the row's value, translated into the query

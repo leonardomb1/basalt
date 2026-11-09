@@ -92,6 +92,7 @@ pub fn lakeAt(hints: []const ast.Hint, diag: *Diag) Error!lake.At {
     var at = lake.At{};
     var to: ?lake.At.Point = null;
     for (hints) |h| {
+        if (h.value == .ident and std.mem.startsWith(u8, h.value.ident, "$")) continue;
         const which: ?[]const u8 = if (std.mem.eql(u8, h.key, "changes_from")) "changes_from" else if (std.mem.eql(u8, h.key, "changes_to")) "changes_to" else null;
         if (which) |k| {
             const p = try changePoint(h.value, k, diag);

@@ -112,8 +112,8 @@ fn bindSince(env: *Env, out: ast.Pipeline) !void {
     if (found.kind != .delta) return;
     const st = try delta.snapshot(env.arena, w.target, .{}, found.listed);
     const app = ch.name orelse w.target;
-    const v = st.txns.get(app) orelse return;
     const recorded = st.property(try delta_write.positionKey(env.arena, app));
+    const v = st.txns.get(app) orelse return;
     var kind: ?types.TypeKind = if (recorded) |r| std.meta.stringToEnum(types.TypeKind, r) else null;
     if (kind == null) {
         _ = env.params.remove(analyze.since_name);
@@ -197,7 +197,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     };
     if (own_profile) {
         const scan1 = scanCounts(env);
-        try printProfile(env, &prof, .{
+        const facts: @import("explain.zig").RunFacts = .{
             .wall_ns = if (t0) |s| if (std.time.Instant.now()) |now| now.since(s) else |_| 0 else 0,
             .rows_read = env.rows_read.load(.monotonic) - read0,
             .rows_out = stats.rows_out - load_rows0,
@@ -208,7 +208,8 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
             .columns_total = scan1[3] - scan0[3],
             .spill_peak = if (env.space) |sp| sp.peak() -| held0 else 0,
             .sink = std.mem.trimRight(u8, try msgfmt.allocPrint(arena, "{s} {s}", .{ try sinkKind(env, stages[stages.len - 1]), try targetLabel(arena, last.write) }), " "),
-        });
+        };
+        if (env.loop_report) |lr| try lr.take(env.report_row, &prof, facts) else try printProfile(env, &prof, facts);
     }
     if (!is_load and !env.explain) if (env.max_rows) |cap| {
         stats.rows_out = load_rows0 + @min(stats.rows_out - load_rows0, cap);

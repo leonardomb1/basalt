@@ -137,6 +137,8 @@ pub fn parseLoadUsing(self: *Parser, write: *ast.Write, items: *?[]const ast.Sel
     const pos = self.curPos();
     const name = try self.expectIdent();
     write.form = name;
+    if (std.mem.eql(u8, name, "stream_load"))
+        try self.notes.append(self.arena, .{ .pos = pos, .msg = "`USING stream_load` is deprecated and will be removed: a starrocks or doris table always loads by Stream Load, so leave it out; `USING` names how a load applies, as `USING changes (...)`" });
     if (!self.at(.lparen)) {
         if (std.mem.eql(u8, name, "changes")) return self.fail(pos, "`USING changes` takes its arguments: `USING changes (sequence_by = <col>, position = <col>[, delete_when = <condition>][, name = '<app>'])`", .{});
         return;
@@ -210,6 +212,8 @@ pub fn parseWithHints(self: *Parser, hints: *std.array_list.Managed(ast.Hint)) E
                     return self.fail(pos, "bad number `{s}`", .{t.text}) };
             } else if (self.at(.ident)) {
                 val = .{ .ident = self.advance().text };
+            } else if (self.at(.dollar_ident)) {
+                val = .{ .ident = try std.mem.concat(self.arena, u8, &.{ "$", self.advance().text }) };
             } else {
                 return self.fail(self.curPos(), "expected a hint value, found {s}", .{self.curTag().describe()});
             }

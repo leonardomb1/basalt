@@ -338,6 +338,7 @@ pub const FolderRead = struct {
 pub const FolderMemo = struct { path: []const u8, want: ?analyze.FileFormat, at: lake.At, read: FolderRead };
 
 pub const Probed = struct { key: []const u8, schema: types.Schema };
+pub const ChangeMeta = struct { key: []const u8, meta: @import("connect/changes.zig").Meta };
 
 pub const Env = struct {
     arena: std.mem.Allocator,
@@ -395,6 +396,9 @@ pub const Env = struct {
     /// so a plain run folds nothing.
     profile: ?*Profile = null,
     probes: std.ArrayListUnmanaged(Probed) = .empty,
+    change_meta: std.ArrayListUnmanaged(ChangeMeta) = .empty,
+    loop_report: ?*@import("run/explain.zig").LoopReport = null,
+    report_row: usize = 0,
     last_request: ?*op.Request = null,
     request_purpose: op.Request.Purpose = .read,
     result: arrow.ResultInfo = .{},
@@ -433,6 +437,7 @@ pub const Env = struct {
     pub fn endStatement(self: *Env, wrote: bool) void {
         if (self.tables) |m| m.endStatement(wrote);
         self.probes = .empty;
+        self.change_meta = .empty;
     }
 
     pub fn takeResult(self: *Env) arrow.ResultInfo {

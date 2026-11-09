@@ -88,6 +88,7 @@ pub const Node = struct {
     label: []const u8 = "",
     request: ?*Request = null,
     chains: u64 = 0,
+    varies: u32 = 0,
 
     /// The node's own time, its inputs' taken out: a pull pipeline nests a child's
     /// `next` inside its parent's.
@@ -141,6 +142,7 @@ pub const Profile = struct {
     steps: std.ArrayListUnmanaged(Step) = .empty,
     tree: []const u8 = outside_plan,
     settled: bool = false,
+    rows_merged: usize = 1,
     sink_bytes: std.atomic.Value(u64) = .init(0),
     sent_at: std.AutoHashMapUnmanaged(Said, []const u8) = .empty,
     /// The stage an operator with no position of its own was built for, by kind: a
@@ -295,6 +297,36 @@ pub const Profile = struct {
         if (self.sent_at.get(.{ .at = n.id.at, .kind = n.id.kind, .scope = n.id.scope })) |t| return t;
         const r = n.request orelse return "";
         return if (r.purpose.verb() == null) r.text else "";
+    }
+
+    /// What node `n` shows as its own besides figures: its label or stage text, then
+    /// what it sent.
+    fn shown(self: *const Profile, n: *const Node) [2][]const u8 {
+        return .{ if (n.label.len > 0) n.label else self.detail(n.id), self.sentOf(n) };
+    }
+
+    /// Another run of the same plan added into this one, both settled: each node's
+    /// figures summed, and a node counted as varying where the run showed other text
+    /// (a loop row's own table or values). This one's text is the one kept.
+    pub fn mergeFrom(self: *Profile, other: *const Profile) !void {
+        var it = other.nodes.iterator();
+        while (it.next()) |e| {
+            const n = self.nodes.getPtr(e.key_ptr.*) orelse continue;
+            const o = e.value_ptr;
+            n.total.add(o.total);
+            n.chains += o.chains;
+            for (o.lanes.items, 0..) |t, i| {
+                while (n.lanes.items.len <= i) try n.lanes.append(self.gpa, .{});
+                n.lanes.items[i].add(t);
+            }
+            for (o.facts.items) |f| try addFact(self.gpa, &n.facts, f);
+            const mine = self.shown(n);
+            const theirs = other.shown(o);
+            if (!std.mem.eql(u8, mine[0], theirs[0]) or !std.mem.eql(u8, mine[1], theirs[1])) n.varies += 1;
+        }
+        for (other.phases.items) |ph| try self.phase(ph.name, ph.ns);
+        _ = self.sink_bytes.fetchAdd(other.sink_bytes.load(.monotonic), .monotonic);
+        self.rows_merged += other.rows_merged;
     }
 
     /// Each request no scan claimed made a node, in the order they ran, one a span

@@ -161,6 +161,39 @@ rather than cut, a division by zero is an error rather than NULL, a `varchar`
 keeps its trailing spaces, a column created without `NULL` / `NOT NULL` allows
 nulls, and a table with a filtered index or an indexed view can be written.
 
+### A table's change feed
+
+`WITH (changes_from = <position>)` reads what changed in a SQL Server table
+since a position, through its change data capture, instead of the table: each
+row has the table's columns, then `_change_type` (`insert`, `update_postimage`
+or `delete`), `_commit_version` (the commit's LSN as 20 hex digits),
+`_commit_timestamp` and `_change_seq`, the change's order in the read (commit
+order, then order within the commit). These are the names a Delta table's change
+feed reads with, so `USING changes` applies either alike, keeping the position in
+the target:
+
+```sql ignore
+LOAD INTO 'lake/orders/' UPSERT ON (id)
+  USING changes (sequence_by = _change_seq, delete_when = _change_type = 'delete',
+                 position = _commit_version, name = 'orders_cdc')
+AS SELECT * FROM erp.dbo.orders WITH (changes_from = $since);
+```
+
+- The read ends where the log stood when the run started (or at `changes_to`),
+  so a rerun reads the same changes.
+- With no position (`$since` NULL, a feed's first run) the whole table is read
+  as inserts at that end. A change made during the read is read again by the next
+  run and applied by key, leaving the same rows.
+- A position the CDC cleanup job has already passed fails the run rather than
+  skip changes; so does a database or table without CDC, with the statements that
+  enable it. CDC needs SQL Server Agent running.
+- A table with two capture instances (during a schema change) is read through the
+  newest; `capture_instance = '<name>'` picks one.
+- An option's value may be a `$param` or `LET`, resolved as the statement runs:
+  `changes_from = $since`.
+
+Postgres tables are not read this way yet.
+
 ## Source clauses
 
 These follow the source, in any order. The rules for what a SQL source is asked

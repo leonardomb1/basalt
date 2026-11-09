@@ -236,6 +236,31 @@ test "check warns where PUSHDOWN is written, without failing" {
     try std.testing.expectEqual(@as(u32, 1), issues[0].pos.?.line);
 }
 
+test "check warns where USING stream_load is written, and takes the load without it silently" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const conn = "CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', fe_port = 9030, be_url = 'http://h:8040', database = 'db', user = 'u', password = 'p');\n";
+    const old = try checkText(a, try std.mem.concat(a, u8, &.{ conn, "LOAD INTO sr.db.t USING stream_load AS SELECT 1 AS a;" }), "t.sql", ".", .{ .declarations_only = true });
+    try std.testing.expectEqual(@as(usize, 1), old.len);
+    try std.testing.expect(old[0].warning and std.mem.indexOf(u8, old[0].msg, "`USING stream_load` is deprecated") != null);
+    try std.testing.expectEqual(@as(u32, 2), old[0].pos.?.line);
+    const new = try checkText(a, try std.mem.concat(a, u8, &.{ conn, "LOAD INTO sr.db.t AS SELECT 1 AS a;" }), "t.sql", ".", .{ .declarations_only = true });
+    try std.testing.expectEqual(@as(usize, 0), new.len);
+}
+
+test "check takes a SQL table's change feed options, a $param as the position, and refuses an unknown one" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const conn = "CREATE CONNECTION db TYPE sqlserver OPTIONS (host = 'h', database = 'd', user = 'u', password = 'p');\nPARAM since STRING DEFAULT '';\n";
+    const ok = try checkText(a, try std.mem.concat(a, u8, &.{ conn, "SELECT * FROM db.dbo.orders WITH (changes_from = $since, changes_to = '0000002B000004300004', capture_instance = 'dbo_orders');" }), "t.sql", ".", .{ .declarations_only = true });
+    try std.testing.expectEqual(@as(usize, 0), ok.len);
+    const bad = try checkText(a, try std.mem.concat(a, u8, &.{ conn, "SELECT * FROM db.dbo.orders WITH (changes_since = $since);" }), "t.sql", ".", .{ .declarations_only = true });
+    try std.testing.expectEqual(@as(usize, 1), bad.len);
+    try std.testing.expect(std.mem.indexOf(u8, bad[0].msg, "unknown read option `changes_since`") != null);
+}
+
 test "check warns where ANCHOR SCHEMA is written, and takes schema_from silently" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();

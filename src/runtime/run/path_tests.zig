@@ -262,7 +262,7 @@ const report_cases = [_]ReportCase{
     .{ .script = "EXPLAIN ANALYZE SELECT id FROM '$B/in.csv' WHERE v = (SELECT MAX(v) AS m FROM pg.public.t);", .says = &.{"scalar subquery (actuals)"} },
     .{ .script = "LET top = (SELECT MAX(v) AS m FROM pg.public.t);\nLOAD INTO '$B/never.csv' AS SELECT id FROM '$B/in.csv' WHERE v = $top;", .explain = true, .says = &.{"LET `top` (actuals)"} },
     .{ .script = "FOR EACH ROW OF (SELECT tname, tag FROM pg.public.catalog) AS (a, b)\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND FOR;", .explain = true, .says = &.{"FOR EACH discovery (actuals)"} },
-    .{ .script = "FOR EACH ROW OF (pg.QUERY($$SELECT \"tname\", \"tag\" FROM catalog$$)) AS (a, b)\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND FOR;", .explain = true, .says = &.{ "FOR EACH discovery (actuals)", "postgres query, discovery", "FOR EACH row 2 of 2: a=t2, b=b" } },
+    .{ .script = "FOR EACH ROW OF (pg.QUERY($$SELECT \"tname\", \"tag\" FROM catalog$$)) AS (a, b)\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND FOR;", .explain = true, .says = &.{ "FOR EACH discovery (actuals)", "postgres query, discovery", "FOR EACH 2 rows of 2 share this plan, its figures summed over them: a=t, b=a; a=t2, b=b" } },
     .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.xlsx' AS SELECT a.id FROM '$B/in.csv' a JOIN '$B/twice.csv' b ON a.g = b.g;", .says = &.{ "Sink: xlsx ", "(2.0x)", "project (#1)  id\n" } },
     .{ .script = "EXPLAIN ANALYZE SELECT g, string_agg(id, ',') AS s FROM pg.public.t GROUP BY g;", .threads = 4 },
     .{ .script = "EXPLAIN ANALYZE SELECT * FROM pg.public.t PIVOT (SUM(v) FOR g IN ('a'));", .threads = 4, .says = &.{"by the other columns"} },
@@ -283,7 +283,7 @@ fn count(hay: []const u8, needle: []const u8) usize {
 
 /// Whether the server got no query `printed` does not show: each on a `sent:` line of
 /// its own as many times as it went out, a key range's holding the query shown once
-/// for them all.
+/// for them all, and an explained loop's rows that share a plan showing it once.
 fn reportShowsAll(a: std.mem.Allocator, printed: []const u8, got: []const []const u8) !bool {
     var ranges = std.array_list.Managed([]const u8).init(a);
     var lines = std.mem.splitScalar(u8, printed, '\n');
@@ -299,6 +299,7 @@ fn reportShowsAll(a: std.mem.Allocator, printed: []const u8, got: []const []cons
     while (it.next()) |e| {
         const shown = count(printed, try msgfmt.allocPrint(a, "sent: {s}\n", .{e.key_ptr.*}));
         if (shown == e.value_ptr.*) continue;
+        if (shown >= 1 and std.mem.indexOf(u8, printed, "share this plan") != null) continue;
         const in_range = shown == 0 and for (ranges.items) |r| {
             if (std.mem.indexOf(u8, e.key_ptr.*, r) != null) break true;
         } else false;
