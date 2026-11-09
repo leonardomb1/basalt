@@ -392,6 +392,8 @@ pub const Env = struct {
     /// The actuals `EXPLAIN ANALYZE` collects for the pipeline it runs; null otherwise,
     /// so a plain run folds nothing.
     profile: ?*Profile = null,
+    last_request: ?*op.Request = null,
+    request_purpose: op.Request.Purpose = .read,
     result: arrow.ResultInfo = .{},
     results_printed: u32 = 0,
     line_base: u32 = 0,
@@ -405,6 +407,12 @@ pub const Env = struct {
     space: ?Space = null,
     op_memory: usize = 2 << 30,
     stdin_free: bool = false,
+
+    /// The request the source just opened sent, for the scan built over it to hold.
+    pub fn takeRequest(self: *Env) ?*op.Request {
+        defer self.last_request = null;
+        return self.last_request;
+    }
 
     /// Forgets `path`'s resolutions as its source opens, so a later read of it, after
     /// a statement may have written there, lists it again.

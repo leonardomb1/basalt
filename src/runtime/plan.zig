@@ -693,7 +693,7 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
             try env.sources.append(src);
             if (env.src_name.len == 0) env.src_name = sourceLabel(env, rd, stages[0].hints);
             const scan = try env.arena.create(op.Scan);
-            scan.* = .{ .src = src };
+            scan.* = .{ .src = src, .request = env.takeRequest() };
             current = .{ .scan = scan };
             schema = src.schema();
         },

@@ -279,6 +279,16 @@ pub const Op = union(enum) {
         };
     }
 
+    /// What this one operator stands for, when its stage cannot say: a union's branch
+    /// shares the stage of every other branch.
+    pub fn label(self: Op) []const u8 {
+        return switch (self) {
+            .scan => |s| s.label,
+            .union_ => |u| u.label,
+            else => "",
+        };
+    }
+
     /// Frees what spilling operators in this tree still hold (files, their mappings,
     /// their disk charge and memory) once the consumer is done pulling, whether the
     /// tree ran to its end or not. Idempotent.
@@ -352,6 +362,7 @@ pub const Union = struct {
     stats: Stats = .{},
     children: []const Op,
     idx: usize = 0,
+    label: []const u8 = "",
 
     pub fn next(self: *Union, arena: std.mem.Allocator) anyerror!?Batch {
         while (self.idx < self.children.len) {
@@ -441,9 +452,71 @@ pub const default_prefetch_rows = @import("op/join.zig").default_prefetch_rows;
 pub const default_prefetch_bytes = @import("op/join.zig").default_prefetch_bytes;
 pub const default_push_cap = @import("op/join.zig").default_push_cap;
 
+pub const Request = struct {
+    purpose: Purpose,
+    label: []const u8,
+    text: []const u8,
+    ns: u64 = 0,
+    rows: u64 = 0,
+    calls: u64 = 0,
+    claimed: bool = false,
+    parent: ?*Request = null,
+    pages: u64 = 0,
+
+    pub const Purpose = enum {
+        read,
+        probe,
+        discovery,
+        lookup,
+        list,
+        replay,
+        log_read,
+        footer,
+        stat,
+        download,
+        login,
+
+        /// The node's name when it is no scan of a source's rows: work on a store.
+        pub fn verb(self: Purpose) ?[]const u8 {
+            return switch (self) {
+                .read, .probe, .discovery, .lookup => null,
+                .list => "list",
+                .replay => "log replay",
+                .log_read => "log read",
+                .footer => "footer",
+                .stat => "stat",
+                .download => "download",
+                .login => "login",
+            };
+        }
+
+        /// What a store operation's count counts.
+        pub fn word(self: Purpose) []const u8 {
+            return switch (self) {
+                .list => "entries",
+                .replay => "live files",
+                .log_read, .footer => "reads",
+                .download => "files",
+                else => "calls",
+            };
+        }
+
+        /// Whether calls of this kind under one parent are one node: a folder's
+        /// thousand footers read as a count, not a thousand lines.
+        pub fn merges(self: Purpose) bool {
+            return switch (self) {
+                .log_read, .footer, .stat => true,
+                else => false,
+            };
+        }
+    };
+};
+
 pub const Scan = struct {
     stats: Stats = .{},
     src: driver.Source,
+    request: ?*Request = null,
+    label: []const u8 = "",
 
     pub fn next(self: *Scan, arena: std.mem.Allocator) anyerror!?Batch {
         return self.src.next(arena);

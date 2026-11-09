@@ -360,7 +360,7 @@ fn mapDrive(env: *Env, m_in: *const Morsels, recs: []const analyze.Resolved, lan
     if (env.profile) |p| {
         if (lane_join) |lj| if (lj.build_root) |b| try p.graftBuild(lj.at, b);
         p.path = try msgfmt.allocPrint(arena, "{s} {s} {s}, {d} {s}", .{ m.label(), how, what, m.count(), m.unitName() });
-        if (m.* == .sql) try p.noteSent("{s}, once per key range: {s}", .{ m.label(), m.sql.split.base_sql });
+        if (m.* == .sql) try p.sentOnLanes(0, try msgfmt.allocPrint(arena, "once per key range: {s}", .{m.sql.split.base_sql}));
     }
 
     stats.rows_out += g.rows_out.load(.monotonic);

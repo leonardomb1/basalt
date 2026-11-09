@@ -47,6 +47,11 @@ const xmlread = @import("../../format/xml/read.zig");
 const formats = @import("../../format/formats.zig");
 const lake = @import("../../format/lake/table.zig");
 const stream = @import("../../format/stream.zig");
+const observe = @import("observe.zig");
+const op = @import("../../exec/op.zig");
+const readLabel = @import("../connect.zig").readLabel;
+const trace = @import("../../connect/trace.zig");
+const scheme = @import("../../store/scheme.zig");
 
 pub const ConstSource = struct {
     batch: Batch,
@@ -75,6 +80,8 @@ pub const ConstSource = struct {
 pub fn localRead(env: *Env, rd: ast.Read) !ast.Read {
     if (rd.form != .path or !ftp.isUrl(rd.form.path)) return rd;
     var out = rd;
+    const span = trace.begin(.download, rd.form.path);
+    defer span.finish();
     out.form = .{ .path = ftp.localize(env.arena, rd.form.path) catch |e|
         return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not download `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) })) };
     return out;
@@ -108,6 +115,7 @@ fn openSourceOf(
     project: ?[][]const u8,
     bounds: []const pqdecode.Bound,
 ) !driver.Source {
+    env.last_request = null;
     const rd = try localRead(env, rd_in);
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (try resolveFolder(env, rd.form.path, hints)) |fr| if (fr.kind == .parquet) {
@@ -369,9 +377,12 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         if (try http_client.optionProblem(env.arena, hints, false, true)) |p| return planErr(env.diag, p.msg);
         var hopts = try http_client.optsFromHints(env.arena, hints);
         hopts.logger = env.log;
+        const req = if (env.profile != null) try noteRequest(env, rd, hints, try msgfmt.allocPrint(env.arena, "{f}", .{scheme.fmtShown(rd.form.path)})) else null;
+        if (req) |r| hopts.page_count = &r.pages;
+        const clock = observe.Clock.start();
         const s = http_client.HttpSource.open(env.arena, env.gpa, rd.form.path, hopts) catch |e|
             return httpOpenFailed(env, e, rd.form.path);
-        return s.source();
+        return observe.source(env.arena, s.source(), req, clock.ns());
     }
     if (std.mem.eql(u8, rd.connector, "unit")) {
         const s = gen.UnitSource.open(env.gpa) catch return error.OutOfMemory;
@@ -456,16 +467,19 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         var hopts = try http_client.optsFromHints(env.arena, all);
         hopts.logger = env.log;
         const path = try http_client.withQuery(env.arena, rd.form.path, try queryParams(env.arena, all));
-        if (env.profile) |p| try p.noteSent("{s}: {s}", .{ rd.connector, path });
+        const req = if (env.profile != null) try noteRequest(env, rd_eff, hints, try msgfmt.allocPrint(env.arena, "{f}", .{scheme.fmtShown(path)})) else null;
+        if (req) |r| hopts.page_count = &r.pages;
+        const clock = observe.Clock.start();
         const s = http_client.HttpSource.openConn(env.arena, env.gpa, cc, path, hopts) catch |e|
             return httpOpenFailed(env, e, path);
-        return s.source();
+        return observe.source(env.arena, s.source(), req, clock.ns());
     }
     if (sqlConnInfo(conn)) |info| {
         const cfg = try resolveDbConfig(env, conn, info.port);
         const query = try readSql(env, rd_eff);
         env.log.log(.debug, "sql read ({s}): {s}", .{ rd.connector, query });
-        if (env.profile) |p| try p.noteSent("{s}: {s}", .{ rd.connector, query });
+        const req = try noteRequest(env, rd_eff, hints, query);
+        const clock = observe.Clock.start();
         switch (info.kind) {
             inline else => |k| {
                 const c = SqlDriver(k).connect(env.gpa, cfg) catch |e|
@@ -476,11 +490,22 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
                 };
                 s.report = try readReport(env, conn.connector);
                 env.pipe.sql_desc = try sqlDescFor(env, info.kind, info.dialect, cfg, query, rd_eff);
-                return s.source();
+                return observe.source(env.arena, s.source(), req, clock.ns());
             },
         }
     }
     return planErr(env.diag, try options.unsupportedSourceMsg(env.arena, conn.connector));
+}
+
+/// Records what `rd` is about to send, for the scan built over it to claim.
+fn noteRequest(env: *Env, rd: ast.Read, hints: []const ast.Hint, text: []const u8) !?*op.Request {
+    const p = env.profile orelse return null;
+    const purpose: op.Request.Purpose = if (env.request_purpose != .read)
+        env.request_purpose
+    else if (std.mem.eql(u8, rd.where, "1 = 0")) .probe else .read;
+    const r = try p.request(purpose, try readLabel(env, rd, hints), text);
+    env.last_request = r;
+    return r;
 }
 
 /// A failed first fetch as a plan error naming the URL and status; a cancel stays

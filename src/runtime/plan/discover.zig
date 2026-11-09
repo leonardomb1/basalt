@@ -15,6 +15,7 @@ const planErr = @import("../env.zig").planErr;
 const planErrT = @import("../env.zig").planErrT;
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
+const noteStep = @import("../run/explain.zig").noteStep;
 
 /// Append a discovery batch's first `ncols` columns as text (null → ""), shared by
 /// every discovery form so all agree on coercion and the column-count error.
@@ -38,6 +39,8 @@ fn appendDiscoveryRows(env: *Env, rows: *std.array_list.Managed(Row), b: Batch, 
 /// The discovery source's first `ncols` columns as text rows, fully materialized
 /// (a table catalog is small). Keeps `openSource`'s own error message.
 pub fn discoverRows(env: *Env, src_read: ast.Read, ncols: usize) ![]const Row {
+    env.request_purpose = .discovery;
+    defer env.request_purpose = .read;
     const src = openSource(env, src_read, &.{}) catch |e| {
         const why = if (env.diag.msg.len > 0) env.diag.msg else @errorName(e);
         return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "for-each discovery failed: {s}", .{why}));
@@ -68,7 +71,16 @@ pub fn discoverRowsPipeline(env: *Env, pipe: ast.Pipeline, ncols: usize) anyerro
         env.pipe = saved_pipe;
     }
 
-    const res = buildPipeline(env, try ownClock(env, pipe.stages)) catch |e| {
+    const stages = try ownClock(env, pipe.stages);
+    const outer_scope = if (env.profile) |p| p.scope else 0;
+    defer if (env.profile) |p| {
+        p.scope = outer_scope;
+    };
+    if (env.profile) |p| {
+        p.scope = std.hash.Wyhash.hash(outer_scope, "discovery");
+        try noteStep(env, p, stages);
+    }
+    const res = buildPipeline(env, stages) catch |e| {
         const why = if (env.diag.msg.len > 0) env.diag.msg else @errorName(e);
         return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "for-each discovery failed: {s}", .{why}));
     };
@@ -82,6 +94,7 @@ pub fn discoverRowsPipeline(env: *Env, pipe: ast.Pipeline, ncols: usize) anyerro
         const b = (try res.op.next(da.allocator())) orelse break;
         try appendDiscoveryRows(env, &rows, b, ncols);
     }
+    if (env.profile) |p| try p.absorbStep(res.op);
     return rows.toOwnedSlice();
 }
 

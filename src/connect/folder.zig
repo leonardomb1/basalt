@@ -15,6 +15,7 @@ const http_client = @import("../net/http_client.zig");
 const objstore = @import("../store/objstore.zig");
 const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
+const trace = @import("trace.zig");
 
 pub fn isFolder(path: []const u8) bool {
     return path.len > 0 and path[path.len - 1] == '/';
@@ -35,6 +36,9 @@ pub fn list(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
 /// what a table's log (`_delta_log/`) is read from. An SFTP or SMB listing still
 /// leaves out subfolders starting `_` or `.`.
 pub fn listRaw(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
+    var span = trace.begin(.list, path);
+    defer span.finish();
+    span.items = 0;
     var out = std.array_list.Managed([]const u8).init(arena);
     if (sftp.isUrl(path) or smb.isUrl(path)) {
         const names = if (sftp.isUrl(path)) try sftp.listPrefix(arena, path) else try smb.listPrefix(arena, path);
@@ -53,6 +57,7 @@ pub fn listRaw(arena: std.mem.Allocator, path: []const u8) ![]const []const u8 {
             try out.append(try msgfmt.allocPrint(arena, "{s}{s}", .{ path, en.path }));
         }
     }
+    span.items = out.items.len;
     return out.items;
 }
 

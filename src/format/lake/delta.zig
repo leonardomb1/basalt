@@ -42,6 +42,7 @@ const dvs = @import("delta_dv.zig");
 const eval = @import("../../exec/eval.zig");
 const folder = @import("../../connect/folder.zig");
 const table = @import("table.zig");
+const trace = @import("../../connect/trace.zig");
 const types = @import("../../lang/types.zig");
 const uuid = @import("../uuid.zig");
 const vcol = @import("variant_col.zig");
@@ -1048,6 +1049,9 @@ pub fn listLog(arena: std.mem.Allocator, root: []const u8, listed_in: ?[]const [
 
 fn replay(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?[]const []const u8, whole: ?*State.Whole) !*State {
     _ = replays.fetchAdd(1, .monotonic);
+    var span = trace.begin(.replay, root);
+    defer span.finish();
+    span.items = 0;
     const ls = try listLog(arena, root, listed_in);
     const name = ls.name;
     const log_path = ls.log_path;
@@ -1090,6 +1094,7 @@ fn replay(arena: std.mem.Allocator, root: []const u8, at: table.At, listed_in: ?
         }
     }
     st.version = target;
+    span.items = st.files.count();
     const out = try arena.create(State);
     out.* = st;
     return out;

@@ -5,6 +5,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const Bound = @import("stats.zig").Bound;
 const KeyBound = @import("stats.zig").KeyBound;
 const Bytes = @import("../bytes.zig").Bytes;
+const trace = @import("../../connect/trace.zig");
 const Error = @import("read.zig").Error;
 const Layout = @import("fit.zig").Layout;
 const View = @import("fit.zig").View;
@@ -136,7 +137,14 @@ pub fn chunkBoundaries(arena: std.mem.Allocator, md: parquet.FileMetaData, foote
 /// Over a network the file's last `tail_guess` bytes are read in one request, which
 /// usually holds the trailer and the whole footer: one round trip, not three. The
 /// trailing magic is checked either way; the leading one only where it is cheap.
-pub fn parseFooterOf(arena: std.mem.Allocator, src: Bytes, footer_start: *u64) !parquet.FileMetaData {
+pub fn parseFooterOf(arena: std.mem.Allocator, src: Bytes, path: []const u8, footer_start: *u64) !parquet.FileMetaData {
+    const t0 = std.time.Instant.now() catch null;
+    const md = try readFooter(arena, src, footer_start);
+    trace.record(.footer, path, if (t0) |s| (std.time.Instant.now() catch s).since(s) else 0, 1);
+    return md;
+}
+
+fn readFooter(arena: std.mem.Allocator, src: Bytes, footer_start: *u64) !parquet.FileMetaData {
     const total = src.size();
     if (total < parquet.trailer_len + parquet.magic.len) return parquet.Error.NotParquet;
     if (src.coalesces()) {

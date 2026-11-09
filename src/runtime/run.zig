@@ -263,7 +263,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     defer if (opts.summary_out) |so| {
         so.* = runSummary(&env, run_id, stats.rows_out, rows_read.load(.monotonic), @intCast(@max(0, std.time.milliTimestamp() - t0)), lanes_used, &loads, &scan, runnable == 1);
     };
-    for (program.stmts[1..]) |s| {
+    for (program.stmts[1..], 2..) |s, after| {
         switch (s) {
             .binding => |b| try bindings.put(b.name, try renderScriptScope(&env, b.pipeline)),
             .output => |p| {
@@ -279,7 +279,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
             .print => |p| try runPrint(&env, p, no_loop_vars),
             .call => |c| try runCall(&env, c, no_loop_vars, opts, &stats, &lanes_used, &batch_arena, runForBody),
             .throw => |t| try runThrow(&env, t, no_loop_vars),
-            .let_const => |l| if (l.query != null) try runScalarLet(&env, l),
+            .let_const => |l| if (l.query != null) try runScalarLet(&env, l, partOfExplain(l, program.stmts[after..])),
             else => {},
         }
         env.endStatement(env.wrote_sink);
@@ -359,7 +359,10 @@ fn runSummary(env: *const Env, run_id: u64, rows_written: u64, rows_read: u64, e
 /// null. Shared by `runStmtMatch` and `runForMatch`; `ctx` prefixes eval errors.
 pub fn matchArmIndex(env: *Env, m: ast.StmtMatch, ns: []const []const u8, vs: []const Value, ctx: []const u8) anyerror!?usize {
     return switch (try analyze.matchArm(env.arena, m, .{ .names = ns, .values = vs }, ctx)) {
-        .arm => |i| i,
+        .arm => |i| {
+            if (i) |at| explainStep.say(env, "CASE: arm {d} of {d}", .{ at + 1, m.arms.len }) else explainStep.say(env, "CASE: no arm matched", .{});
+            return i;
+        },
         .problem => |why| {
             const e = planErr(env.diag, why);
             env.diag.pos = m.pos;
@@ -409,10 +412,14 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
 /// `LET x = (SELECT ...);`: run the query now and keep its single cell as `$x`. Also
 /// the desugared form of a WHERE scalar subquery, which becomes a literal that rides
 /// filter pushdown. One column required, zero rows is NULL, more than one an error.
-fn runScalarLet(env: *Env, l: ast.LetConst) !void {
+fn runScalarLet(env: *Env, l: ast.LetConst, of_explain: bool) !void {
     defer env.endStatement(false);
     const what = try analyze.queryLetLabel(env.arena, l.name);
-    const pipe = try buildPipeline(env, try ownClock(env, l.query.?.stages));
+    const step = try explainStep.openStep(env, env.explain or of_explain, what);
+    defer explainStep.closeStep(env, step);
+    const stages = try ownClock(env, l.query.?.stages);
+    if (step) |p| try explainStep.noteStep(env, p, stages);
+    const pipe = try buildPipeline(env, stages);
     defer pipe.op.release();
     if (try analyze.queryLetColumnsProblem(env.arena, l.name, pipe.schema.fields.len)) |why| {
         const e = planErr(env.diag, why);
@@ -435,6 +442,7 @@ fn runScalarLet(env: *Env, l: ast.LetConst) !void {
             return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s}: returned more than one row", .{what}));
         _ = scratch.reset(.retain_capacity);
     }
+    if (step) |p| try p.absorbStep(pipe.op);
 
     try env.params.put(l.name, v);
     try env.params_expr.put(l.name, try mkLit(env.arena, v));
@@ -442,6 +450,20 @@ fn runScalarLet(env: *Env, l: ast.LetConst) !void {
     env.log.log(.debug, "LET {s} = scalar query result ({s})", .{ l.name, @tagName(std.meta.activeTag(v)) });
 }
 
+/// Whether scalar subquery `l` was lifted out of an `EXPLAIN ANALYZE` among `rest`,
+/// the statements after it: the report owes its request then.
+fn partOfExplain(l: ast.LetConst, rest: []const ast.Stmt) bool {
+    if (!std.mem.startsWith(u8, l.name, "__scalar")) return false;
+    for (rest) |s| switch (s) {
+        .let_const => |o| if (!std.mem.startsWith(u8, o.name, "__scalar")) return false,
+        .binding => {},
+        .explain => |e| return e.mode == .analyze,
+        else => return false,
+    };
+    return false;
+}
+
+const explainStep = @import("run/explain.zig");
 pub const runOutput = @import("run/output.zig").runOutput;
 pub const runExplain = @import("run/explain.zig").runExplain;
 pub const defaultLanes = @import("parallel.zig").defaultLanes;
@@ -472,6 +494,8 @@ pub fn describeRows(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 
 /// ordinary stdout sink, so `--format json|csv` shape it like any result.
 pub fn runDescribe(env: *Env, pipe: ast.Pipeline, stats: *Stats) anyerror!void {
     errdefer env.diag.stamp(pipe.pos);
+    const step = try explainStep.openStep(env, env.explain, "DESCRIBE");
+    defer explainStep.closeStep(env, step);
     const arena = env.arena;
     const stages = pipe.stages[0 .. pipe.stages.len - 1];
     var ddiag = analyze.Diag{};

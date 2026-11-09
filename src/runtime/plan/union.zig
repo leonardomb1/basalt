@@ -8,6 +8,7 @@ const buildPipeline = @import("../plan.zig").buildPipeline;
 const buildProject = @import("../plan.zig").buildProject;
 const buildStage = @import("../plan.zig").buildStage;
 const conform = @import("../../lang/conform.zig");
+const readLabel = @import("../connect.zig").readLabel;
 const discoverRows = @import("discover.zig").discoverRows;
 const discoverRowsPipeline = @import("discover.zig").discoverRowsPipeline;
 const dupeSchema = @import("../connect.zig").dupeSchema;
@@ -353,7 +354,7 @@ pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, after: []con
         try env.sources.append(src);
         if (env.src_name.len == 0) env.src_name = sourceLabel(env, s.read, hints);
         const scan = try arena.create(op.Scan);
-        scan.* = .{ .src = src };
+        scan.* = .{ .src = src, .request = env.takeRequest(), .label = if (env.profile != null) try readLabel(env, s.read, hints) else "" };
         children[i] = .{ .scan = scan };
         schemas[i] = src.schema();
     }
@@ -380,6 +381,7 @@ pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, after: []con
     const out_schema: types.Schema = .{ .fields = out_fields };
     const un = try arena.create(op.Union);
     un.* = .{ .children = children };
+    if (env.profile != null) un.label = try msgfmt.allocPrint(arena, "{d} branches{s}", .{ specs.len, if (u.branches.len == 0) ", from discovery" else "" });
     if (u.set == .union_all) return .{ .op = .{ .union_ = un }, .schema = out_schema };
     return buildSetOp(env, u.set, canon, .{ .union_ = un }, out_schema);
 }

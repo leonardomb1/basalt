@@ -109,6 +109,7 @@ const eval = @import("../exec/eval.zig");
 const ChainCapture = @import("tls_client.zig").ChainCapture;
 const init = @import("tls_client.zig").init;
 const obs = @import("../runtime/obs.zig");
+const trace = @import("../connect/trace.zig");
 const percent = @import("percent.zig");
 const scheme = @import("../store/scheme.zig");
 const http_fake = @import("../testing/http_fake.zig");
@@ -520,6 +521,7 @@ pub const Options = struct {
     /// Null: in the body when the method sends one, else in the query string.
     paging_in: ?PagingIn = null,
     paginate: Mode = .none,
+    page_count: ?*u64 = null,
     page_param: []const u8 = "page",
     start_page: i64 = 1,
     start_offset: i64 = 0,
@@ -1073,6 +1075,7 @@ pub const HttpSource = struct {
     const PageReq = struct { url: []const u8, body: ?[]const u8 };
 
     fn pageReq(self: *HttpSource, arena: std.mem.Allocator) !PageReq {
+        if (self.opts.page_count) |n| n.* += 1;
         switch (self.opts.paginate) {
             .none => return .{ .url = self.base_url, .body = self.opts.body },
             .page, .offset => {
@@ -1193,6 +1196,8 @@ pub const HttpSource = struct {
     /// and the same retries, so a black-holed token endpoint is ConnectionTimedOut.
     fn login(self: *HttpSource, a: *AuthState) anyerror!void {
         const req = try a.loginRequest();
+        const span = trace.begin(.login, req.url);
+        defer span.finish();
         const slot = try self.spawnSlotFor(.{ .url = req.url, .body = req.payload }, .post, req.content_type, false);
         var red_buf: [512]u8 = undefined;
         self.awaitSlot(slot) catch |e| {

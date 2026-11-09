@@ -442,6 +442,8 @@ test "delta_vacuum deletes the files no version within the retention reads; delt
     defer tmp.cleanup();
     try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta', partition_by = 'grp') AS SELECT id, grp, amt FROM '$B/a.csv';", 1);
     for (0..3) |i| try load(&tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/t/' AS SELECT id + {d} AS id, grp, amt FROM '$B/a.csv';", .{(i + 1) * 10}), 1);
+    try load(&tmp, "LET n = 1;\nEXPLAIN ANALYZE CALL delta_optimize('$B/t/');", 1);
+    try testing.expect(!exists(&tmp, "t/_delta_log/00000000000000000004.json"));
     try load(&tmp, "CALL delta_optimize('$B/t/', 'grp = ''a''');", 1);
     const v4 = try logFile(a, &tmp, "t", 4);
     try testing.expect(std.mem.indexOf(u8, v4, "\"operation\":\"OPTIMIZE\"") != null);
@@ -472,6 +474,10 @@ test "delta_vacuum deletes the files no version within the retention reads; delt
     try tmp.dir.writeFile(.{ .sub_path = "t/stray.parquet", .data = "x" });
     try tmp.dir.makePath("t/_scratch");
     try tmp.dir.writeFile(.{ .sub_path = "t/_scratch/x.parquet", .data = "x" });
+    const before = try dataFiles(a, &tmp);
+    try load(&tmp, "LET n = 1;\nEXPLAIN ANALYZE CALL delta_vacuum('$B/t/');", 1);
+    try testing.expectEqual(before, try dataFiles(a, &tmp));
+    try testing.expect(exists(&tmp, "t/stray.parquet"));
     try load(&tmp, "CALL delta_vacuum('$B/t/');", 1);
     try testing.expectEqual(@as(usize, 2), try dataFiles(a, &tmp));
     try testing.expect(exists(&tmp, "t/_scratch/x.parquet"));

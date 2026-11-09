@@ -24,6 +24,7 @@ const formats = @import("../formats.zig");
 const s3 = @import("../../store/s3.zig");
 const scheme = @import("../../store/scheme.zig");
 const stream = @import("../stream.zig");
+const trace = @import("../../connect/trace.zig");
 const types = @import("../../lang/types.zig");
 const objstore = @import("../../store/objstore.zig");
 const http_client = @import("../../net/http_client.zig");
@@ -117,6 +118,8 @@ fn isIcebergMetadata(name: []const u8) bool {
 /// file's from the file system, an object's from its `Last-Modified` (`client`
 /// made on first use); null when it is gone or the store gives no time.
 pub fn modifiedMs(arena: std.mem.Allocator, url: []const u8, client: *?std.http.Client) !?i64 {
+    const span = trace.begin(.stat, url);
+    defer span.finish();
     if (objstore.isUrl(url)) {
         if (client.* == null) client.* = http_client.initClient(arena);
         return (try objstore.parse(arena, url)).modifiedMs(arena, &client.*.?);
@@ -198,6 +201,7 @@ pub const Memo = struct {
         table: *const Resolved,
         arena: *std.heap.ArenaAllocator,
         state: State,
+        ns: u64 = 0,
     };
 
     pub fn init(gpa: std.mem.Allocator) Memo {
@@ -214,7 +218,10 @@ pub const Memo = struct {
         for (self.entries.items) |*e| {
             if (e.state == .retired or !e.at.eql(at) or !std.mem.eql(u8, e.root, root)) continue;
             if (kind) |k| if (e.kind != k) continue;
-            if (self.running) e.state = .used;
+            if (self.running) {
+                if (e.state == .unused) trace.record(.replay, e.root, e.ns, e.table.layout.files.len);
+                e.state = .used;
+            }
             return e.table;
         }
         return null;
@@ -230,10 +237,12 @@ pub const Memo = struct {
         errdefer self.free(ar);
         const a = ar.allocator();
         const own = try a.dupe(u8, root);
+        const t0 = std.time.Instant.now() catch null;
         const t = switch (kind) {
             .delta => try delta.resolve(a, own, at, listed),
         };
-        self.entries.appendAssumeCapacity(.{ .root = own, .kind = kind, .at = at, .table = t, .arena = ar, .state = if (self.running) .used else .unused });
+        const ns = if (t0) |s| (std.time.Instant.now() catch s).since(s) else 0;
+        self.entries.appendAssumeCapacity(.{ .root = own, .kind = kind, .at = at, .table = t, .arena = ar, .state = if (self.running) .used else .unused, .ns = ns });
         return t;
     }
 
@@ -272,6 +281,8 @@ pub inline fn refuse(comptime fmt: []const u8, args: anytype) anyerror {
 
 /// A whole file of a table's log, wherever it lives.
 pub fn readWhole(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const span = trace.begin(.log_read, path);
+    defer span.finish();
     const src = try Bytes.open(arena, path);
     defer src.close();
     const n = std.math.cast(usize, src.size()) orelse return error.FileTooBig;

@@ -271,6 +271,7 @@ fn indexInParallel(env: *Env, split: *Morsels, read_at: u64, recs: []const analy
     var g = BuildSink{ .parts = parts, .cap = cap, .prof = env.profile };
     const pl: Pipeline = .{ .m = split, .recs = recs, .errctx = env.errctx, .rows_read = env.rows_read, .read_at = read_at, .slots = slots, .slots_note = note.items };
     _ = try drive(arena, pl, g.parallelSink(), env.pipe.threads);
+    if (env.profile) |p| if (split.* == .sql) try p.sentOnLanes(read_at, try msgfmt.allocPrint(arena, "once per key range: {s}", .{split.sql.split.base_sql}));
     root.* = g.root;
     var chunks = std.array_list.Managed(Batch).init(arena);
     for (parts) |*p| try chunks.appendSlice(p.batches.items);

@@ -63,7 +63,7 @@ pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
     if (w.mode != .upsert or w.mode.upsert.keys.len > 0) return w;
     const desc = env.pipe.sql_desc orelse return planErr(env.diag, options.bare_upsert_source_msg);
     const table = desc.table orelse return planErr(env.diag, options.bare_upsert_query_msg);
-    var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)) };
+    var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)), .prof = env.profile };
     const prober = split.Prober{ .ctx = &pctx, .openFn = proberOpen };
     const keys = split.introspectPkCols(env.arena, prober, desc.dialect, desc.read.form.table.parts) catch |e|
         return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read primary key of `{s}`: {s}", .{ table, @errorName(e) }));
@@ -183,7 +183,7 @@ pub fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         return env.mem_sink.?.sink();
     }
     if (env.union_sink) |s| return s;
-    if (env.explain) return DiscardSink.sink();
+    if (env.explain) return if (env.profile) |p| DiscardSink.counting(&p.sink_bytes) else DiscardSink.sink();
     if (std.mem.eql(u8, w.connector, "stdout")) {
         var info = env.takeResult();
         var cap: ?*driver.RowCap = null;

@@ -245,7 +245,8 @@ test "EXPLAIN ANALYZE CALL runs the function's statements moving no data, and th
     defer alloc.free(prof);
     _ = try res;
     errdefer std.debug.print("{s}\n", .{prof});
-    try std.testing.expect(std.mem.indexOf(u8, prof, "not written: EXPLAIN ANALYZE moves no data") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prof, "/never.csv, would write 2 rows, ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prof, " before encoding\n") != null);
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("never.csv", .{}));
     try tmp.dir.access("kept.csv", .{});
 
@@ -289,7 +290,7 @@ test "EXPLAIN ANALYZE on lanes names the path, the in-memory or build-side scan,
         },
     };
     try tmp.dir.writeFile(.{ .sub_path = "k.csv", .data = "g,label\na,A\nb,B\nc,C\n" });
-    const sink_line = try std.fmt.allocPrint(alloc, "  Sink: csv {s}/never.csv, not written: EXPLAIN ANALYZE moves no data\n", .{base});
+    const sink_line = try std.fmt.allocPrint(alloc, "  Sink: csv {s}/never.csv, would write ", .{base});
     defer alloc.free(sink_line);
     for (cases) |c| {
         const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);

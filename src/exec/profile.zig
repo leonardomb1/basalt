@@ -13,8 +13,18 @@
 //! done (`absorb`, under a mutex), from the counters `Op.next` keeps anyway, and a
 //! run without `EXPLAIN ANALYZE` has no profile at all, so it pays nothing. A lane is
 //! the thread that folded the chain, numbered as first seen.
+//!
+//! Every request a source is sent is recorded as it goes out (`request`). A scan holds
+//! its read's request and claims it when its chain is folded, so the query prints on
+//! that scan. A request no scan claimed, a discovery, a schema probe, a lookup, a read
+//! opened and let go, becomes a node of its own in a tree outside the plan (`settle`),
+//! in the order it ran, so each request the run made shows once. A chain run for what
+//! the plan needs, a discovery query or a query LET, is a step of the same tree, and so
+//! is what the layers below the run report through `tracer`: a listing, a table log's
+//! replay with what it read as its children, a Parquet footer.
 
 const std = @import("std");
+const trace = @import("../connect/trace.zig");
 const ast = @import("../lang/ast.zig");
 const op = @import("op.zig");
 const print = @import("../lang/print.zig");
@@ -61,6 +71,12 @@ pub const Tally = struct {
 
 pub const Unit = op.Unit;
 pub const Fact = op.Fact;
+pub const Request = op.Request;
+
+const outside_plan = "outside the plan";
+const request_scope: u64 = std.math.maxInt(u64);
+
+const Step = struct { tree: []const u8, id: ?Id = null, request: ?*Request = null };
 
 pub const Node = struct {
     id: Id,
@@ -69,6 +85,8 @@ pub const Node = struct {
     lanes: std.ArrayListUnmanaged(Tally) = .empty,
     facts: std.ArrayListUnmanaged(Fact) = .empty,
     note: []const u8 = "",
+    label: []const u8 = "",
+    request: ?*Request = null,
     chains: u64 = 0,
 
     /// The node's own time, its inputs' taken out: a pull pipeline nests a child's
@@ -120,9 +138,11 @@ pub const Profile = struct {
     threads: std.AutoArrayHashMapUnmanaged(std.Thread.Id, void) = .empty,
     details: std.AutoHashMapUnmanaged(Said, []const u8) = .empty,
     phases: std.ArrayListUnmanaged(Phase) = .empty,
-    /// What the run asked its sources for, as sent: a SQL read's query, an HTTP
-    /// read's URL. Pushdown is only visible here.
-    sent: std.ArrayListUnmanaged([]const u8) = .empty,
+    steps: std.ArrayListUnmanaged(Step) = .empty,
+    tree: []const u8 = outside_plan,
+    settled: bool = false,
+    sink_bytes: std.atomic.Value(u64) = .init(0),
+    sent_at: std.AutoHashMapUnmanaged(Said, []const u8) = .empty,
     /// The stage an operator with no position of its own was built for, by kind: a
     /// lane's scan opens over a morsel of the pipeline's read, and its aggregate,
     /// top-N, distinct or join are built outside the planner, from the one stage of
@@ -146,6 +166,7 @@ pub const Profile = struct {
             e.value_ptr.facts.deinit(self.gpa);
             self.gpa.free(e.value_ptr.children);
             self.gpa.free(e.value_ptr.note);
+            self.gpa.free(e.value_ptr.label);
         }
         self.nodes.deinit(self.gpa);
         self.roots.deinit(self.gpa);
@@ -154,20 +175,161 @@ pub const Profile = struct {
         while (dt.next()) |d| self.gpa.free(d.*);
         self.details.deinit(self.gpa);
         self.phases.deinit(self.gpa);
-        for (self.sent.items) |s| self.gpa.free(s);
-        self.sent.deinit(self.gpa);
+        for (self.steps.items) |s| if (s.request) |r| {
+            self.gpa.free(r.label);
+            self.gpa.free(r.text);
+            self.gpa.destroy(r);
+        };
+        self.steps.deinit(self.gpa);
+        var st = self.sent_at.valueIterator();
+        while (st.next()) |t| self.gpa.free(t.*);
+        self.sent_at.deinit(self.gpa);
     }
 
-    /// Records a request made of a source, once however many lanes made it.
-    pub fn noteSent(self: *Profile, comptime fmt: []const u8, args: anytype) !void {
-        const text = try std.fmt.allocPrint(self.gpa, fmt, args);
+    /// Records a request as it goes out, in the order the run makes them.
+    pub fn request(self: *Profile, purpose: Request.Purpose, label: []const u8, text: []const u8) !*Request {
         self.mtx.lock();
         defer self.mtx.unlock();
-        for (self.sent.items) |s| if (std.mem.eql(u8, s, text)) {
-            self.gpa.free(text);
-            return;
+        return self.addRequest(purpose, label, text, null);
+    }
+
+    fn addRequest(self: *Profile, purpose: Request.Purpose, label: []const u8, text: []const u8, parent: ?*Request) !*Request {
+        const r = try self.gpa.create(Request);
+        errdefer self.gpa.destroy(r);
+        const l = try self.gpa.dupe(u8, label);
+        errdefer self.gpa.free(l);
+        const t = try self.gpa.dupe(u8, text);
+        errdefer self.gpa.free(t);
+        r.* = .{ .purpose = purpose, .label = l, .text = t, .parent = parent };
+        try self.steps.append(self.gpa, .{ .tree = self.tree, .request = r });
+        return r;
+    }
+
+    /// Where the layers below the run report what they do while this profile collects.
+    pub fn tracer(self: *Profile) trace.Tracer {
+        return .{ .ptr = self, .begin = traceBegin, .end = traceEnd };
+    }
+
+    fn traceBegin(ptr: *anyopaque, kind: trace.Kind, what: []const u8, parent: ?*anyopaque) ?*anyopaque {
+        const self: *Profile = @ptrCast(@alignCast(ptr));
+        self.mtx.lock();
+        defer self.mtx.unlock();
+        const up: ?*Request = if (parent) |x| @ptrCast(@alignCast(x)) else null;
+        const purpose: Request.Purpose = switch (kind) {
+            inline else => |k| @field(Request.Purpose, @tagName(k)),
         };
-        try self.sent.append(self.gpa, text);
+        if (purpose.merges()) for (self.steps.items) |s| if (s.request) |r| if (r.purpose == purpose and r.parent == up) {
+            self.widen(r, what) catch return null;
+            return r;
+        };
+        return self.addRequest(purpose, "", what, up) catch null;
+    }
+
+    fn traceEnd(ptr: *anyopaque, token: *anyopaque, ns: u64, items: u64) void {
+        const self: *Profile = @ptrCast(@alignCast(ptr));
+        const r: *Request = @ptrCast(@alignCast(token));
+        self.mtx.lock();
+        defer self.mtx.unlock();
+        r.ns += ns;
+        r.rows += items;
+        r.calls += 1;
+    }
+
+    /// A merged node's text covering `what` too: the folder both are under.
+    fn widen(self: *Profile, r: *Request, what: []const u8) !void {
+        if (std.mem.eql(u8, r.text, what)) return;
+        const same = r.text[0 .. std.mem.indexOfDiff(u8, r.text, what) orelse r.text.len];
+        const slash = std.mem.lastIndexOfScalar(u8, same, '/') orelse return;
+        const t = try self.gpa.dupe(u8, same[0 .. slash + 1]);
+        self.gpa.free(r.text);
+        r.text = t;
+    }
+
+    /// Hands what `from` sent to `into`, reserved earlier by a read that opens late,
+    /// so the query shows where the read's scan claims it.
+    pub fn adoptRequest(self: *Profile, from: *Request, into: *Request) void {
+        self.mtx.lock();
+        defer self.mtx.unlock();
+        std.mem.swap([]const u8, &from.text, &into.text);
+        from.claimed = true;
+    }
+
+    /// Folds a chain run for what the plan needs as a step of the tree before it.
+    pub fn absorbStep(self: *Profile, root: op.Op) !void {
+        self.mtx.lock();
+        defer self.mtx.unlock();
+        const lane = try self.laneOfCaller();
+        const id = try self.walk(root, lane, root_path, true);
+        for (self.steps.items) |s| if (s.id) |have| if (std.meta.eql(have, id)) return;
+        try self.steps.append(self.gpa, .{ .tree = self.tree, .id = id });
+    }
+
+    /// Node `id` reads through key ranges from here on, shown as `text`: the read
+    /// opened to plan them goes back to being a request of its own.
+    pub fn splitRead(self: *Profile, id: Id, text: []const u8) !void {
+        self.mtx.lock();
+        const n = self.nodes.getPtr(id);
+        if (n) |node| if (node.request) |r| {
+            r.claimed = false;
+            node.request = null;
+        };
+        self.mtx.unlock();
+        try self.sentOn(id.at, text);
+    }
+
+    /// What the lanes' scans of the stage at `read_at` send, 0 being the pipeline's
+    /// read; they open outside the planner, so no scan holds a request.
+    pub fn sentOnLanes(self: *Profile, read_at: u64, text: []const u8) !void {
+        try self.sentOn(if (read_at == 0) self.fallback.get(.scan) else read_at, text);
+    }
+
+    fn sentOn(self: *Profile, at: u64, text: []const u8) !void {
+        self.mtx.lock();
+        defer self.mtx.unlock();
+        const e = try self.sent_at.getOrPut(self.gpa, .{ .at = at, .kind = .scan, .scope = self.scope });
+        if (!e.found_existing) e.value_ptr.* = try self.gpa.dupe(u8, text);
+    }
+
+    /// What node `n` sent, as sent; empty for a node that sent nothing.
+    pub fn sentOf(self: *const Profile, n: *const Node) []const u8 {
+        if (self.sent_at.get(.{ .at = n.id.at, .kind = n.id.kind, .scope = n.id.scope })) |t| return t;
+        const r = n.request orelse return "";
+        return if (r.purpose.verb() == null) r.text else "";
+    }
+
+    /// Each request no scan claimed made a node, in the order they ran, one a span
+    /// opened inside another under that one's.
+    pub fn settle(self: *Profile) !void {
+        if (self.settled) return;
+        self.settled = true;
+        for (self.steps.items, 1..) |*s, i| {
+            const r = s.request orelse continue;
+            if (r.claimed or r.text.len == 0) continue;
+            const id = Id{ .at = i, .kind = .scan, .scope = request_scope };
+            const label = switch (r.purpose) {
+                .read => if (r.calls == 0) try std.fmt.allocPrint(self.gpa, "{s}, opened and not read", .{r.label}) else try self.gpa.dupe(u8, r.label),
+                .probe => try std.fmt.allocPrint(self.gpa, "{s}, schema probe", .{r.label}),
+                .discovery => try std.fmt.allocPrint(self.gpa, "{s}, discovery", .{r.label}),
+                .lookup => try self.gpa.dupe(u8, r.label),
+                else => try self.gpa.dupe(u8, r.text),
+            };
+            errdefer self.gpa.free(label);
+            try self.nodes.put(self.gpa, id, .{ .id = id, .label = label, .request = r, .total = .{ .ns = r.ns, .rows = r.rows, .calls = r.calls }, .chains = 1 });
+            if (r.parent == null) s.id = id else try self.underParent(r.parent.?, id);
+        }
+    }
+
+    fn underParent(self: *Profile, parent: *Request, id: Id) !void {
+        for (self.steps.items, 1..) |s, i| {
+            if (s.request != parent) continue;
+            const n = self.nodes.getPtr(.{ .at = i, .kind = .scan, .scope = request_scope }) orelse return;
+            const kids = try self.gpa.alloc(Child, n.children.len + 1);
+            @memcpy(kids[0..n.children.len], n.children);
+            kids[n.children.len] = .{ .id = id, .role = .input };
+            self.gpa.free(n.children);
+            n.children = kids;
+            return;
+        }
     }
 
     /// Fold a finished chain into the profile, on the lane of the calling thread, and
@@ -294,10 +456,16 @@ pub const Profile = struct {
             errdefer self.gpa.free(kids);
             const note = try self.gpa.dupe(u8, node.note());
             errdefer self.gpa.free(note);
-            try self.nodes.put(self.gpa, id, .{ .id = id, .children = kids, .note = note });
+            const label = try self.gpa.dupe(u8, node.label());
+            errdefer self.gpa.free(label);
+            try self.nodes.put(self.gpa, id, .{ .id = id, .children = kids, .note = note, .label = label });
         }
-        if (!count) return id;
         const n = self.nodes.getPtr(id).?;
+        if (node == .scan) if (node.scan.request) |r| {
+            r.claimed = true;
+            if (n.request == null) n.request = r;
+        };
+        if (!count) return id;
         try addTally(self.gpa, n, lane, .{ .ns = st.ns, .rows = st.rows, .calls = st.calls });
         var facts_buf: [16]Fact = undefined;
         for (node.facts(&facts_buf)) |f| try addFact(self.gpa, &n.facts, f);

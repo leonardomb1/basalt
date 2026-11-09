@@ -283,7 +283,7 @@ pub const Layout = struct {
         const src = try Bytes.openSized(arena, file.path, file.size);
         errdefer src.close();
         var footer_start: u64 = 0;
-        var md = try parseFooterOf(arena, src, &footer_start);
+        var md = try parseFooterOf(arena, src, file.path, &footer_start);
         if (self.mapping) |m| md.schema = try m.rename(arena, md.schema);
         if (self.variant_types.len > 0) {
             const t = try arena.create(vcol.SNode);

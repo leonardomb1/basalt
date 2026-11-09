@@ -193,7 +193,7 @@ pub const Reader = struct {
     pub fn openProjectedOn(arena: std.mem.Allocator, src: Bytes, path: []const u8, want: ?[]const []const u8) !*Reader {
         errdefer src.close();
         var footer_start: u64 = 0;
-        const md = try parseFooterOf(arena, src, &footer_start);
+        const md = try parseFooterOf(arena, src, path, &footer_start);
         return openParsed(arena, src, md, footer_start, path, want);
     }
 

@@ -33,8 +33,10 @@ pub fn arityProblem(arena: std.mem.Allocator, p: *const Proc, c: ast.CallStmt) !
     return try msgfmt.allocPrint(arena, "`{s}` takes {d} to {d} arguments, not {d}: {s}", .{ p.name, p.min, p.max, c.args.len, p.usage });
 }
 
-/// Runs procedure `p` for `c`, its arguments evaluated in scope `sc`.
-pub fn run(env: *Env, p: *const Proc, c: ast.CallStmt, sc: analyze.Scope) !void {
+/// Runs procedure `p` for `c`, its arguments evaluated in scope `sc`; `dry` under
+/// `EXPLAIN ANALYZE`, which moves no data: it works out and says what it would do,
+/// deleting and committing nothing.
+pub fn run(env: *Env, p: *const Proc, c: ast.CallStmt, sc: analyze.Scope, dry: bool) !void {
     errdefer env.diag.stamp(c.pos);
     if (try arityProblem(env.arena, p, c)) |why| return planErr(env.diag, why);
     const args = try env.arena.alloc(Value, c.args.len);
@@ -49,8 +51,8 @@ pub fn run(env: *Env, p: *const Proc, c: ast.CallStmt, sc: analyze.Scope) !void 
             .int => |n| if (n >= 0) n else return planErr(env.diag, "`delta_vacuum`'s retention is a number of hours, at least 0"),
             else => return planErr(env.diag, "`delta_vacuum`'s retention is a whole number of hours"),
         } else null;
-        const got = maint.vacuum(env.arena, root, if (hours) |h| h * 3_600_000 else null, std.time.milliTimestamp()) catch |e| return explain(env, e);
-        env.log.script(try msgfmt.allocPrint(env.arena, "delta_vacuum {s}: deleted {d} file{s}, kept {d} the table still reads", .{ root, got.deleted, if (got.deleted == 1) "" else "s", got.kept }));
+        const got = maint.vacuum(env.arena, root, if (hours) |h| h * 3_600_000 else null, std.time.milliTimestamp(), dry) catch |e| return explain(env, e);
+        env.log.script(try msgfmt.allocPrint(env.arena, "delta_vacuum {s}: {s} {d} file{s}, {s} {d} the table still reads", .{ root, if (dry) "would delete" else "deleted", got.deleted, if (got.deleted == 1) "" else "s", if (dry) "would keep" else "kept", got.kept }));
         return;
     }
     if (std.mem.eql(u8, p.name, "delta_optimize")) {
@@ -59,7 +61,11 @@ pub fn run(env: *Env, p: *const Proc, c: ast.CallStmt, sc: analyze.Scope) !void 
             .string => |t| t,
             else => return planErr(env.diag, "`delta_optimize`'s predicate is SQL text, e.g. 'region = ''eu'''"),
         } else null;
-        const got = maint.optimize(env.gpa, env.arena, root, where, .{ .space = env.space, .op_memory = env.op_memory, .threads = env.pipe.threads, .err = env.errctx }) catch |e| return explain(env, e);
+        const got = maint.optimize(env.gpa, env.arena, root, where, .{ .space = env.space, .op_memory = env.op_memory, .threads = env.pipe.threads, .err = env.errctx }, dry) catch |e| return explain(env, e);
+        if (dry) {
+            env.log.script(try msgfmt.allocPrint(env.arena, "delta_optimize {s}: would compact {d} file{s} across {d} partition{s}", .{ root, got.removed, if (got.removed == 1) "" else "s", got.partitions, if (got.partitions == 1) "" else "s" }));
+            return;
+        }
         env.log.script(try msgfmt.allocPrint(env.arena, "delta_optimize {s}: compacted {d} file{s} into {d} across {d} partition{s}", .{ root, got.removed, if (got.removed == 1) "" else "s", got.added, got.partitions, if (got.partitions == 1) "" else "s" }));
         return;
     }

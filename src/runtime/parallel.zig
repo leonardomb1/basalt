@@ -26,6 +26,7 @@ const obs = @import("obs.zig");
 const driver = @import("../connect/driver.zig");
 const op = @import("../exec/op.zig");
 const profile = @import("../exec/profile.zig");
+const spans = @import("../connect/trace.zig");
 const Profile = profile.Profile;
 const Batch = @import("../exec/batch.zig").Batch;
 const eval = @import("../exec/eval.zig");
@@ -215,9 +216,15 @@ pub fn spawnJoin(alloc: std.mem.Allocator, n: usize, comptime worker: anytype, c
     }
     const threads = try alloc.alloc(std.Thread, n);
     defer alloc.free(threads);
+    const Lane = struct {
+        fn go(c: @TypeOf(ctx), i: usize, t: ?spans.Tracer) void {
+            spans.current = t;
+            worker(c, i);
+        }
+    };
     var spawned: usize = 0;
     while (spawned < n) : (spawned += 1) {
-        threads[spawned] = std.Thread.spawn(.{}, worker, .{ ctx, spawned }) catch break;
+        threads[spawned] = std.Thread.spawn(.{}, Lane.go, .{ ctx, spawned, spans.current }) catch break;
     }
     if (spawned == 0) worker(ctx, 0) else for (threads[0..spawned]) |t| t.join();
     return @max(spawned, 1);

@@ -65,6 +65,18 @@ pub const DiscardSink = struct {
     pub fn sink() driver.Sink {
         return .{ .ptr = &unit, .vtable = &vtable };
     }
+
+    fn countBatch(ptr: *anyopaque, _: std.mem.Allocator, b: Batch) anyerror!void {
+        const bytes: *std.atomic.Value(u64) = @ptrCast(@alignCast(ptr));
+        _ = bytes.fetchAdd(b.heapBytes(), .monotonic);
+    }
+    const counting_vtable = driver.Sink.VTable{ .writeBatch = countBatch, .close = close, .abort = abort };
+
+    /// A sink adding what it is handed to `bytes`, the rows' size before any encoding,
+    /// for a report of what a run would have written.
+    pub fn counting(bytes: *std.atomic.Value(u64)) driver.Sink {
+        return .{ .ptr = bytes, .vtable = &counting_vtable };
+    }
 };
 
 pub const SplitCtx = struct {
@@ -76,6 +88,7 @@ pub const SplitCtx = struct {
     where_extra: ?[]const u8 = null,
     report: ?sql.Report = null,
     want: ?*const types.Schema = null,
+    prof: ?*@import("../exec/profile.zig").Profile = null,
 };
 
 const ReadReport = struct {
@@ -239,6 +252,24 @@ pub fn sourceLabel(env: *Env, rd: ast.Read, hints: []const ast.Hint) []const u8 
         .path => |p| analyze.formatLabel(p, hints),
         else => connectorType(env, rd.connector),
     };
+}
+
+/// A read as a report names it: the connector and what it reads.
+pub fn readLabel(env: *Env, rd: ast.Read, hints: []const ast.Hint) ![]const u8 {
+    var out = std.Io.Writer.Allocating.init(env.arena);
+    const w = &out.writer;
+    try w.writeAll(sourceLabel(env, rd, hints));
+    switch (rd.form) {
+        .path => |p| try w.print(" {f}", .{@import("../store/scheme.zig").fmtShown(p)}),
+        .table => |q| {
+            try w.writeAll(" table ");
+            try @import("../lang/print.zig").name(w, q);
+        },
+        .query => try w.writeAll(" query"),
+        .builtin => |b| try w.print(" {s}()", .{b.name}),
+        .unit => {},
+    }
+    return out.written();
 }
 
 pub fn connectorType(env: *Env, name: []const u8) []const u8 {

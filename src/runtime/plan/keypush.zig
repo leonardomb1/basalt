@@ -377,6 +377,7 @@ pub const LateSql = struct {
     /// its `WHERE` when the query goes out.
     extras: std.ArrayListUnmanaged([]const u8) = .empty,
     inner: ?driver.Source = null,
+    slot: ?*op.Request = null,
 
     /// One join's hold on the read: its keys' expressions over the read's columns.
     const Bound = struct { late: *LateSql, exprs: []const ?*ast.Expr };
@@ -390,6 +391,8 @@ pub const LateSql = struct {
         env.pipe.sql_desc = try connect.sqlDescForStage(env, .{ .node = .{ .read = rd }, .hints = hints, .pos = .{ .line = 0, .col = 0 } });
         const self = try env.arena.create(LateSql);
         self.* = .{ .env = env, .rd = rd, .hints = hints, .schema_ = sch, .dialect = dialect };
+        if (env.profile) |p| self.slot = try p.request(.read, try connect.readLabel(env, rd, hints), "");
+        env.last_request = self.slot;
         return self;
     }
 
@@ -435,6 +438,7 @@ pub const LateSql = struct {
                 if (self.env.diag.msg.len > 0) self.env.errctx.set("{s}", .{self.env.diag.msg});
                 return e;
             };
+            if (self.env.profile) |p| if (self.slot) |into| if (self.env.takeRequest()) |sent| p.adoptRequest(sent, into);
         }
         return self.inner.?.next(arena);
     }

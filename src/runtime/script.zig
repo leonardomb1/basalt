@@ -47,6 +47,7 @@ const Row = @import("env.zig").Row;
 const RunOptions = @import("env.zig").RunOptions;
 const Stats = @import("env.zig").Stats;
 
+const explain = @import("run/explain.zig");
 const discoverRows = @import("plan.zig").discoverRows;
 const discoverRowsJson = @import("plan.zig").discoverRowsJson;
 const discoverRowsPipeline = @import("plan.zig").discoverRowsPipeline;
@@ -559,7 +560,10 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
     const fd = env.fns.get(c.name) orelse {
         const p = procedures.lookup(c.name) orelse unreachable;
         const sc = try outer.scope(env.arena, env.params);
-        return procedures.run(env, p, c, .{ .names = sc.names, .values = sc.values });
+        const dry = env.explain or c.explain;
+        const step = try explain.openStep(env, dry, c.name);
+        defer explain.closeStep(env, step);
+        return procedures.run(env, p, c, .{ .names = sc.names, .values = sc.values }, dry);
     };
     const body = switch (fd.body) {
         .stmts => |b| b,
@@ -599,6 +603,7 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
         body_opts.explain = true;
     }
     defer env.explain = was_explain;
+    explain.say(env, "CALL {s}({s})", .{ c.name, rowLabel(env.arena, pnames, cells) });
     try run_body(env, body, .{ .names = pnames, .types = ptypes, .cells = cells, .outer = &env.script_scope }, body_opts, stats, lanes_used, batch_arena);
 }
 
@@ -671,10 +676,14 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
     else
         .stop;
 
-    const rows = switch (fe.source) {
-        .read => |rd| try discoverRows(env, rd, fe.var_names.len),
-        .json_path => |p| try discoverRowsJson(env, p, fe.var_names),
-        .pipeline => |p| try discoverRowsPipeline(env, p, fe.var_names.len),
+    const rows = blk: {
+        const step = try explain.openStep(env, env.explain, "FOR EACH discovery");
+        defer explain.closeStep(env, step);
+        break :blk switch (fe.source) {
+            .read => |rd| try discoverRows(env, rd, fe.var_names.len),
+            .json_path => |p| try discoverRowsJson(env, p, fe.var_names),
+            .pipeline => |p| try discoverRowsPipeline(env, p, fe.var_names.len),
+        };
     };
     env.log.log(.debug, "for-each {s}: {d} row(s) [{s}, on_error={s}]", .{ fe.var_names[0], rows.len, @tagName(mode), if (on_error == .continue_) "continue" else "stop" });
     if (rows.len == 0) return;
@@ -697,6 +706,7 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts: RunOptions, stats: *Stats, l
                 env.loop_row = ri + 1;
                 env.loop_rows = rows.len;
                 if (ri > 0) if (env.progress) |p| p.loopTick(counted);
+                explain.say(env, "FOR EACH row {d} of {d}: {s}", .{ ri + 1, rows.len, rowLabel(env.arena, needles, row) });
                 const base = env.sources.items.len;
                 env.diag.retryable = false;
                 env.diag.msg = "";

@@ -41,7 +41,7 @@ $ basalt run -j 4 -c "EXPLAIN ANALYZE SELECT g, COUNT(*) AS c FROM 'x.parquet' W
 Summary
   Wall time: 21.40ms   Operator time: 38.62ms (summed over 4 lanes)
   Rows read: 500.0K (500000)   Rows out: 601   Path: parquet parallel aggregate, 6 row groups
-  Sink: stdout, not written: EXPLAIN ANALYZE moves no data
+  Sink: stdout, would write 601 rows, 9.4 KB before encoding
   Row groups: 6 read, 0 skipped
   Columns read: 2 of 2
   fold on the lanes: 19.87ms
@@ -152,12 +152,11 @@ The **summary** comes first:
   divided (`parquet parallel aggregate, 6 row groups`, `postgres split-parallel,
   8 key ranges`), or that the source ran the aggregate or the `ORDER BY ...
   LIMIT` itself.
+- **Sink** is where the rows would have gone and how much would have moved: the
+  rows, and their size in memory before the target's encoding, so a Parquet file or
+  a Stream Load's body comes out at another size.
 - **Row groups** read and skipped by their statistics, **Columns read** of
   those the files and tables offer, and how much **spilled to disk** at most.
-- **Sent to** is each request a source was given, as sent: a SQL read's query
-  with the `WHERE` that descended into it, an HTTP read's URL. A split path's
-  query is shown once, before its key ranges are added. This is where pushdown
-  shows.
 - The **phases** outside any operator: opening the sources, a parallel path's
   merge and the writing of its result.
 - **Top operators by own time**, with each one's share of the operator time.
@@ -168,7 +167,12 @@ stands above a scan of *the lanes' partial results, merged*, the lanes'
 operators below it. Each node shows:
 
 - its kind, its number, and what it does in SQL: the predicate, the keys, the
-  columns, the file or table and the `WHERE` it pushed down;
+  columns, the file or table;
+- `sent:` on a scan that asked a source for its rows, the request as sent: a SQL
+  read's query with the `WHERE` that descended into it, in full, a long column list
+  cut to its first columns, or an HTTP read's URL. This is where pushdown shows. A
+  split path's reads say `once per key range:` and the query before its ranges are
+  added;
 - `time:` its own time and share. Past 30% of the operator time a node is red,
   past 15% yellow, on a terminal without `NO_COLOR`. With lanes,
   `[min=…, max=…]` is the least and most a lane spent on it, and `skew 2.3x`
@@ -184,5 +188,80 @@ operators below it. Each node shows:
 
 Row counts are exact. Times are what the run cost under the profile; reading the
 clock per batch adds little, but a run of many tiny batches pays for it.
+
+### Trees outside the plan
+
+Every request the run sends a source appears once, in the order it ran, and so does
+what it does on a store. What is not the reading of a scan comes before the plan, in
+a tree of its own:
+
+```console
+outside the plan (actuals)
+├─ scan (#1)  postgres query, discovery
+│     sent: SELECT name, SUBSTRING(name, 3, 2) FROM pg_tables WHERE name LIKE 'orders%'
+│     time: 4.12ms (0.1%)
+│     rows: 3   batches: 2
+├─ scan (#2)  postgres table orders_01, schema probe
+│     sent: SELECT * FROM "orders_01" WHERE 1 = 0
+│     time: 1.80ms (0.0%)
+│     rows: 0   batches: 0
+└─ scan (#3)  postgres lookup
+      sent: SELECT CAST(c.reltuples AS BIGINT) FROM pg_class c WHERE c.oid = to_regclass('orders_01')
+      time: 900.0us (0.0%)
+      rows: 1   batches: 2
+plan (actuals)
+└─ union (#4)  3 branches, from discovery
+   ├─ project (#5)
+   │  └─ scan (#6)  postgres table orders_01
+   │        sent: SELECT * FROM "orders_01" WHERE ("updated_at" >= '2026-01-01')
+```
+
+A `discovery` lists what a union or a loop reads, a `schema probe` asks a table for
+its columns and no rows, a `lookup` asks the catalog or the table for what a plan is
+chosen on (a table's size, its key, a key's range), and `opened and not read` is a
+read opened to learn its columns, then let go as the path chose another form of it.
+These count in the operator time, so a plan that spends its run on them shows it. A
+discovery written as a query is its operators, as any other pipeline.
+
+The work on a store is named for what it does, with what it counted in place of rows:
+
+```console
+outside the plan (actuals)
+├─ log replay (#1)  az://account/lake/orders/
+│  │  time: 12.40ms (3.1%)
+│  │  live files: 42
+│  ├─ list (#2)  az://account/lake/orders/_delta_log/
+│  │     time: 38.10ms (9.5%)
+│  │     entries: 18
+│  └─ log read (#3)  az://account/lake/orders/_delta_log/
+│        time: 91.22ms (22.8%)
+│        reads: 9
+└─ footer (#4)  az://account/lake/orders/
+      time: 210.75ms (52.6%)
+      reads: 84
+```
+
+`log replay` is a Delta table's log read into its state, with the `list` and the
+`log read` of its files below it; a table resolved before the run started reports
+the replay it took. `list` is a folder or prefix listed, `footer` the Parquet footers
+read, on any lane, one node under the folder they share rather than a line per file;
+a file read at planning and again on a lane counts twice, as it cost twice.
+`stat` is the modification times asked for, `download` an `ftp://` file fetched to
+read it, and `login` an HTTP read's session opened. An HTTP read that took more than
+one page says `pages:` on its scan. A URL shows its query's names, not their values.
+The bytes of a scan's data are that scan's time and no node of their own.
+
+What runs for a statement but outside it has a tree of its own, printed as it ends:
+`FOR EACH discovery`, `LET x`, `DESCRIBE`, a procedure, and the `scalar subquery` an
+`EXPLAIN ANALYZE` lifted out of its query. A `LET` or a loop outside what is explained
+is not: a plain `LET x = (SELECT ...)` above an `EXPLAIN ANALYZE` runs normally and
+prints nothing, and `basalt run --explain` or an `EXPLAIN ANALYZE CALL` shows them
+all, each with a line for what the script chose: `CALL f(a=x)`, `CASE: arm 2 of 3`,
+`FOR EACH row 1 of 2: a=t`. The position `USING changes` reads from its target is the
+`log replay` that statement starts with.
+
+`CALL delta_vacuum` and `CALL delta_optimize` under either form move no data either:
+they say what they would delete or compact, reading the log and the file times to
+work it out, and neither delete nor commit.
 
 `EXPLAIN COSTS` is rejected at parse time — there is no cost model to report.

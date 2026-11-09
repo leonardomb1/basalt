@@ -48,8 +48,8 @@ const refuse = table.refuse;
 pub const Vacuumed = struct { deleted: usize, kept: usize };
 
 /// VACUUM of `root`'s table: the retention `retain_ms` (null: the table's), the
-/// clock `now_ms`.
-pub fn vacuum(arena: std.mem.Allocator, root: []const u8, retain_ms: ?i64, now_ms: i64) !Vacuumed {
+/// clock `now_ms`. `dry` counts what it would delete and deletes nothing.
+pub fn vacuum(arena: std.mem.Allocator, root: []const u8, retain_ms: ?i64, now_ms: i64, dry: bool) !Vacuumed {
     if (write.storeProblem(root)) |why| return refuse("cannot vacuum Delta table `{s}`: {s}", .{ root, why });
     const st = try delta.snapshotWholeAt(arena, root, .{});
     try st.checkProtocol();
@@ -82,6 +82,10 @@ pub fn vacuum(arena: std.mem.Allocator, root: []const u8, retain_ms: ?i64, now_m
         }
         const made = (try table.modifiedMs(arena, u, &client)) orelse continue;
         if (made > cutoff) continue;
+        if (dry) {
+            out.deleted += 1;
+            continue;
+        }
         if (objstore.isUrl(u)) try (try objstore.parse(arena, u)).delete(arena, &client.?) else std.fs.cwd().deleteFile(u) catch |e| if (e != error.FileNotFound) return e;
         out.deleted += 1;
     }
@@ -91,8 +95,9 @@ pub fn vacuum(arena: std.mem.Allocator, root: []const u8, retain_ms: ?i64, now_m
 pub const Optimized = struct { removed: usize, added: usize, partitions: usize };
 
 /// OPTIMIZE of `root`'s table, its files kept by `where` (SQL over the partition
-/// columns; null: every file), written through a sink on `gpa` taking `opts`.
-pub fn optimize(gpa: std.mem.Allocator, arena: std.mem.Allocator, root: []const u8, where: ?[]const u8, opts: merge.Opts) !Optimized {
+/// columns; null: every file), written through a sink on `gpa` taking `opts`. `dry`
+/// picks the files and rewrites and commits nothing, so `added` stays 0.
+pub fn optimize(gpa: std.mem.Allocator, arena: std.mem.Allocator, root: []const u8, where: ?[]const u8, opts: merge.Opts, dry: bool) !Optimized {
     if (write.storeProblem(root)) |why| return refuse("cannot optimize Delta table `{s}`: {s}", .{ root, why });
     const st = try delta.snapshot(arena, root, .{}, null);
     try st.checkProtocol();
@@ -136,6 +141,7 @@ pub fn optimize(gpa: std.mem.Allocator, arena: std.mem.Allocator, root: []const 
         for (g.items) |i| try picks.append(all[i]);
     }
     if (picks.items.len == 0) return .{ .removed = 0, .added = 0, .partitions = 0 };
+    if (dry) return .{ .removed = picks.items.len, .added = 0, .partitions = parts };
 
     const keeps_rows = keepsRows(st);
     const read_lay = blk: {

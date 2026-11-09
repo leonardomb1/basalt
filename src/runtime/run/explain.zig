@@ -20,11 +20,12 @@ const arrow = @import("../../format/arrow/write.zig");
 const ast = @import("../../lang/ast.zig");
 const column = @import("../../exec/column.zig");
 const jsontext = @import("../../exec/jsontext.zig");
-const print = @import("../../lang/print.zig");
+const msgfmt = @import("../../format/msgfmt.zig");
 const profile = @import("../../exec/profile.zig");
+const readLabel = @import("../connect.zig").readLabel;
+const trace = @import("../../connect/trace.zig");
 const runDescribe = @import("../run.zig").runDescribe;
 const runOutput = @import("output.zig").runOutput;
-const sourceLabel = @import("../connect.zig").sourceLabel;
 const resolveFolder = @import("../connect.zig").resolveFolder;
 const isFolderRead = @import("../connect.zig").isFolderRead;
 const std = @import("std");
@@ -93,6 +94,50 @@ pub fn notePlan(env: *Env, prof: *Profile, stages: []const ast.Stage) !void {
     try noteStages(env, prof, stages, 0);
 }
 
+/// `notePlan` for a chain run for what the plan needs: no stage of it stands for an
+/// operator a lane builds.
+pub fn noteStep(env: *Env, prof: *Profile, stages: []const ast.Stage) !void {
+    try noteStages(env, prof, stages, 0);
+}
+
+/// A profile of its own for work outside any statement's, a FOR EACH discovery or a
+/// query LET, when the run is explaining it; null when not, or when inside a report.
+pub fn openStep(env: *Env, explaining: bool, tree: []const u8) !?*Profile {
+    if (!explaining or env.profile != null) return null;
+    const p = try env.gpa.create(Profile);
+    p.* = Profile.init(env.gpa);
+    p.tree = tree;
+    env.profile = p;
+    trace.current = p.tracer();
+    return p;
+}
+
+/// A line of the report for what a script chose, a CASE's arm, a loop's row, a call's
+/// arguments, so the trees after it read in their context; nothing when not explaining.
+pub fn say(env: *Env, comptime fmt: []const u8, args: anytype) void {
+    if (!env.explain) return;
+    var aw = std.Io.Writer.Allocating.init(env.gpa);
+    defer aw.deinit();
+    aw.writer.print(fmt ++ "\n", args) catch return;
+    std.fs.File.stderr().writeAll(aw.writer.buffered()) catch {};
+}
+
+/// Prints what `openStep`'s profile saw, if it saw anything, and ends it. A failed
+/// step's report is what it did until then; printing it never fails the run.
+pub fn closeStep(env: *Env, step: ?*Profile) void {
+    const p = step orelse return;
+    defer {
+        trace.current = null;
+        env.profile = null;
+        p.deinit();
+        env.gpa.destroy(p);
+    }
+    var aw = std.Io.Writer.Allocating.init(env.gpa);
+    defer aw.deinit();
+    renderSteps(env.arena, p, &aw.writer) catch return;
+    std.fs.File.stderr().writeAll(aw.writer.buffered()) catch {};
+}
+
 fn noteStages(env: *Env, prof: *Profile, stages: []const ast.Stage, depth: usize) !void {
     if (depth > 16) return;
     for (stages, 0..) |st, i| {
@@ -114,28 +159,73 @@ fn noteStages(env: *Env, prof: *Profile, stages: []const ast.Stage, depth: usize
     }
 }
 
-/// A read as the tree names it: the connector, what it reads, and the WHERE it sends.
-/// A lake table is resolved here, as its run reuses: its kind and the version read.
+/// A read as the tree names it: the connector and what it reads; its `sent:` line says
+/// the rest. A lake table is resolved here, as its run reuses: its kind and the version
+/// read.
 fn readText(env: *Env, rd: ast.Read, hints: []const ast.Hint) ![]const u8 {
-    var out = std.Io.Writer.Allocating.init(env.arena);
-    const w = &out.writer;
-    if (isFolderRead(rd)) if (try resolveFolder(env, rd.form.path, hints)) |fr| if (fr.table) |t| {
-        try w.print("{s} {s} ({s})", .{ @tagName(t.kind), rd.form.path, t.label });
-        return out.written();
-    };
-    try w.writeAll(sourceLabel(env, rd, hints));
-    switch (rd.form) {
-        .path => |p| try w.print(" {s}", .{p}),
-        .table => |q| {
-            try w.writeAll(" table ");
-            try print.name(w, q);
-        },
-        .query => try w.writeAll(" query"),
-        .builtin => |b| try w.print(" {s}()", .{b.name}),
-        .unit => {},
+    if (isFolderRead(rd)) if (try resolveFolder(env, rd.form.path, hints)) |fr| if (fr.table) |t|
+        return msgfmt.allocPrint(env.arena, "{s} {s} ({s})", .{ @tagName(t.kind), rd.form.path, t.label });
+    return readLabel(env, rd, hints);
+}
+
+/// A request as the `sent:` line prints it: on one line, the first columns of a long
+/// list, every `WHERE` in full, up to a length no terminal is served by.
+pub fn sentText(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    const flat = try arena.alloc(u8, text.len);
+    var n: usize = 0;
+    for (text) |c| {
+        if (std.ascii.isWhitespace(c)) {
+            if (n > 0 and flat[n - 1] != ' ') {
+                flat[n] = ' ';
+                n += 1;
+            }
+            continue;
+        }
+        flat[n] = c;
+        n += 1;
     }
-    if (rd.where.len > 0) try w.print(" [pushdown: {s}]", .{rd.where});
-    return out.written();
+    const s = try shortColumns(arena, std.mem.trimRight(u8, flat[0..n], " "));
+    const max = 4000;
+    if (s.len <= max) return s;
+    const kept = jsontext.clipUtf8(s, max);
+    return msgfmt.allocPrint(arena, "{s} ... (+{d} bytes)", .{ kept, s.len - kept.len });
+}
+
+/// `s` with a top-level SELECT list past `max_list` bytes cut to its first columns and
+/// a count of the rest.
+fn shortColumns(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const head = "SELECT ";
+    const shown = 6;
+    const max_list = 120;
+    if (s.len < head.len or !std.ascii.eqlIgnoreCase(s[0..head.len], head)) return s;
+    var depth: usize = 0;
+    var quote: u8 = 0;
+    var commas: usize = 0;
+    var cut: usize = 0;
+    var i: usize = head.len;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (quote != 0) {
+            if (c == quote) quote = 0;
+            continue;
+        }
+        switch (c) {
+            '\'', '"', '`' => quote = c,
+            '[' => quote = ']',
+            '(' => depth += 1,
+            ')' => depth -|= 1,
+            ',' => if (depth == 0) {
+                commas += 1;
+                if (commas == shown) cut = i;
+            },
+            ' ' => if (depth == 0 and std.ascii.startsWithIgnoreCase(s[i..], " FROM ")) {
+                if (cut == 0 or i - head.len <= max_list) return s;
+                return msgfmt.allocPrint(arena, "{s}, ... (+{d}){s}", .{ s[0..cut], commas + 1 - shown, s[i..] });
+            },
+            else => {},
+        }
+    }
+    return s;
 }
 
 /// What the run around the operators came to, for the summary. The read counts are
@@ -156,7 +246,7 @@ pub const RunFacts = struct {
 
 /// The report, written to stderr in one piece: stdout carries the data, and a
 /// writer opened on stderr mid-run overwrote the log when stderr was a file.
-pub fn printProfile(env: *Env, prof: *const Profile, facts: RunFacts) !void {
+pub fn printProfile(env: *Env, prof: *Profile, facts: RunFacts) !void {
     var aw = std.Io.Writer.Allocating.init(env.gpa);
     defer aw.deinit();
     const color = std.posix.isatty(std.fs.File.stderr().handle) and !std.process.hasEnvVarConstant("NO_COLOR");
@@ -166,11 +256,12 @@ pub fn printProfile(env: *Env, prof: *const Profile, facts: RunFacts) !void {
 
 const Ordered = struct { ids: []const profile.Id, total_own: u64 };
 
-/// Every node once, root first and inputs after, as the tree prints them; a node's
-/// number is its place here.
+/// Every node once, the trees before the plan first, root first and inputs after, as
+/// the trees print them; a node's number is its place here.
 fn ordered(arena: std.mem.Allocator, prof: *const Profile) !Ordered {
     var ids = std.array_list.Managed(profile.Id).init(arena);
     var seen = std.AutoHashMap(profile.Id, void).init(arena);
+    for (prof.steps.items) |s| if (s.id) |r| try visit(prof, r, &ids, &seen);
     for (prof.roots.items) |r| try visit(prof, r, &ids, &seen);
     var total: u64 = 0;
     for (ids.items) |id| total += prof.nodes.getPtr(id).?.exclusive(prof);
@@ -189,7 +280,33 @@ fn numberOf(o: Ordered, id: profile.Id) usize {
     return 0;
 }
 
-pub fn renderProfile(arena: std.mem.Allocator, prof: *const Profile, facts: RunFacts, color: bool, w: *std.Io.Writer) !void {
+/// The trees of what ran besides the plan, each named once, in the order they ran.
+fn stepTrees(prof: *const Profile, o: Ordered, lanes: usize, color: bool, w: *std.Io.Writer) !void {
+    const steps = prof.steps.items;
+    var i: usize = 0;
+    var open: ?[]const u8 = null;
+    while (i < steps.len) : (i += 1) {
+        const id = steps[i].id orelse continue;
+        var next = i + 1;
+        while (next < steps.len and steps[next].id == null) next += 1;
+        const last = next == steps.len or !std.mem.eql(u8, steps[next].tree, steps[i].tree);
+        if (open == null or !std.mem.eql(u8, open.?, steps[i].tree)) {
+            try w.print("{s} (actuals)\n", .{steps[i].tree});
+            open = steps[i].tree;
+        }
+        try node(prof, o, id, .input, "", last, lanes, color, w);
+    }
+}
+
+/// `openStep`'s report: its trees alone, as no statement's summary stands over them.
+fn renderSteps(arena: std.mem.Allocator, prof: *Profile, w: *std.Io.Writer) !void {
+    try prof.settle();
+    const color = std.posix.isatty(std.fs.File.stderr().handle) and !std.process.hasEnvVarConstant("NO_COLOR");
+    try stepTrees(prof, try ordered(arena, prof), @max(prof.laneCount(), 1), color, w);
+}
+
+pub fn renderProfile(arena: std.mem.Allocator, prof: *Profile, facts: RunFacts, color: bool, w: *std.Io.Writer) !void {
+    try prof.settle();
     const o = try ordered(arena, prof);
     const lanes = @max(prof.laneCount(), 1);
 
@@ -198,12 +315,11 @@ pub fn renderProfile(arena: std.mem.Allocator, prof: *const Profile, facts: RunF
     if (facts.lanes > 1) try w.print(" (summed over {d} lanes)", .{facts.lanes});
     try w.writeAll("\n");
     try w.print("  Rows read: {f}   Rows out: {f}   Path: {s}\n", .{ Count{ .n = facts.rows_read }, Count{ .n = facts.rows_out }, prof.path });
-    if (facts.sink.len > 0) try w.print("  Sink: {s}, not written: EXPLAIN ANALYZE moves no data\n", .{facts.sink});
+    if (facts.sink.len > 0) try w.print("  Sink: {s}, would write {f} row{s}, {f} before encoding\n", .{ facts.sink, Count{ .n = facts.rows_out }, if (facts.rows_out == 1) "" else "s", Bytes{ .n = prof.sink_bytes.load(.monotonic) } });
     if (facts.row_groups + facts.row_groups_skipped > 0)
         try w.print("  Row groups: {d} read, {d} skipped\n", .{ facts.row_groups, facts.row_groups_skipped });
     if (facts.columns_total > 0) try w.print("  Columns read: {d} of {d}\n", .{ facts.columns_read, facts.columns_total });
     if (facts.spill_peak > 0) try w.print("  Spilled to disk, at most: {f}\n", .{Bytes{ .n = facts.spill_peak }});
-    for (prof.sent.items) |s| try w.print("  Sent to {s}\n", .{jsontext.clipUtf8(s, 400)});
     for (prof.phases.items) |ph| try w.print("  {s}: {f}\n", .{ ph.name, Dur{ .ns = ph.ns } });
 
     const top = try hottest(arena, prof, o, 5);
@@ -215,12 +331,13 @@ pub fn renderProfile(arena: std.mem.Allocator, prof: *const Profile, facts: RunF
             const sh = share(own, o.total_own);
             try w.writeAll("    ");
             try paint(w, color, sh, true);
-            try w.print("{d}. {s} (#{d}): {f} ({f})", .{ rank, kindName(id.kind), numberOf(o, id), Dur{ .ns = own }, Pct{ .v = sh } });
+            try w.print("{d}. {s} (#{d}): {f} ({f})", .{ rank, nodeName(n), numberOf(o, id), Dur{ .ns = own }, Pct{ .v = sh } });
             try paint(w, color, 0, false);
             try w.writeAll("\n");
         }
     }
 
+    try stepTrees(prof, o, lanes, color, w);
     try w.writeAll("plan (actuals)\n");
     for (prof.roots.items, 0..) |r, i| try node(prof, o, r, .input, "", i + 1 == prof.roots.items.len, lanes, color, w);
 }
@@ -251,9 +368,10 @@ fn node(prof: *const Profile, o: Ordered, id: profile.Id, role: profile.Role, pr
         .probe => try w.writeAll("<probe> "),
         .build => try w.writeAll("<build> "),
     }
-    try w.print("{s} (#{d})", .{ kindName(id.kind), numberOf(o, id) });
-    const text = prof.detail(id);
-    if (text.len > 0) try w.print("  {s}", .{jsontext.clipUtf8(text, 160)});
+    try w.print("{s} (#{d})", .{ nodeName(n), numberOf(o, id) });
+    const text = if (n.label.len > 0) n.label else prof.detail(id);
+    const named = if (text.len > 0) text else if (n.request) |r| r.label else "";
+    if (named.len > 0) try w.print("  {s}", .{jsontext.clipUtf8(named, 160)});
     try paint(w, color, 0, false);
     try w.writeAll("\n");
 
@@ -261,6 +379,13 @@ fn node(prof: *const Profile, o: Ordered, id: profile.Id, role: profile.Role, pr
     const kid_prefix = std.fmt.bufPrint(&kid_prefix_buf, "{s}{s}", .{ prefix, if (last) "   " else "│  " }) catch prefix;
     var line_buf: [520]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf, "{s}{s}", .{ kid_prefix, if (n.children.len > 0) "│  " else "   " }) catch kid_prefix;
+
+    const sent = prof.sentOf(n);
+    if (sent.len > 0) {
+        var sa = std.heap.ArenaAllocator.init(prof.gpa);
+        defer sa.deinit();
+        try w.print("{s}sent: {s}\n", .{ line, sentText(sa.allocator(), sent) catch sent });
+    }
 
     try w.print("{s}time: {f} ({f})", .{ line, Dur{ .ns = own }, Pct{ .v = sh } });
     if (spread(n, prof, lanes, .time)) |s| try w.print(" [min={f}, max={f}]", .{ Dur{ .ns = s.min }, Dur{ .ns = s.max } });
@@ -271,15 +396,21 @@ fn node(prof: *const Profile, o: Ordered, id: profile.Id, role: profile.Role, pr
     }
     try w.writeAll("\n");
 
-    try w.print("{s}rows: ", .{line});
-    if (n.children.len > 0) {
-        const in = n.rowsIn(prof);
-        try w.print("{f} -> {f}", .{ Count{ .n = in }, Count{ .n = n.total.rows } });
-        if (in > 0 and keepsRows(id.kind)) try w.print(" ({f} kept)", .{Pct{ .v = @as(f64, @floatFromInt(n.total.rows)) / @as(f64, @floatFromInt(in)) }});
-    } else try w.print("{f}", .{Count{ .n = n.total.rows }});
-    try w.print("   batches: {d}", .{n.total.calls});
-    if (spread(n, prof, lanes, .rows)) |s| try w.print("   rows per lane [min={f}, max={f}]", .{ Count{ .n = s.min }, Count{ .n = s.max } });
-    try w.writeAll("\n");
+    const store: ?op.Request.Purpose = if (n.request) |r| (if (r.purpose.verb() != null) r.purpose else null) else null;
+    if (store) |purpose| {
+        try w.print("{s}{s}: {f}\n", .{ line, purpose.word(), Count{ .n = n.total.rows } });
+    } else {
+        try w.print("{s}rows: ", .{line});
+        if (n.children.len > 0) {
+            const in = n.rowsIn(prof);
+            try w.print("{f} -> {f}", .{ Count{ .n = in }, Count{ .n = n.total.rows } });
+            if (in > 0 and keepsRows(id.kind)) try w.print(" ({f} kept)", .{Pct{ .v = @as(f64, @floatFromInt(n.total.rows)) / @as(f64, @floatFromInt(in)) }});
+        } else try w.print("{f}", .{Count{ .n = n.total.rows }});
+        try w.print("   batches: {d}", .{n.total.calls});
+        if (n.request) |r| if (r.pages > 1) try w.print("   pages: {d}", .{r.pages});
+        if (spread(n, prof, lanes, .rows)) |s| try w.print("   rows per lane [min={f}, max={f}]", .{ Count{ .n = s.min }, Count{ .n = s.max } });
+        try w.writeAll("\n");
+    }
 
     if (n.facts.items.len > 0) {
         try w.writeAll(line);
@@ -357,6 +488,11 @@ fn paint(w: *std.Io.Writer, on: bool, sh: f64, start: bool) !void {
     if (!on) return;
     if (!start) return w.writeAll("\x1b[0m");
     if (sh >= 0.30) try w.writeAll("\x1b[1;31m") else if (sh >= 0.15) try w.writeAll("\x1b[1;33m");
+}
+
+fn nodeName(n: *const profile.Node) []const u8 {
+    if (n.request) |r| if (r.purpose.verb()) |v| return v;
+    return kindName(n.id.kind);
 }
 
 fn kindName(k: profile.Kind) []const u8 {
@@ -445,6 +581,96 @@ test "explain: the report ranks operators by own time and draws the tree with ea
         \\         rows: 2.0K (2000)   batches: 2
         \\
     , out.written());
+}
+
+test "explain: a request no scan claimed prints before the plan in order, a claimed one on its scan" {
+    var p = Profile.init(testing.allocator);
+    defer p.deinit();
+    const disc = try p.request(.discovery, "db query", "SELECT name\n  FROM tables");
+    disc.rows = 2;
+    disc.calls = 2;
+    _ = try p.request(.probe, "db table orders", "SELECT * FROM orders WHERE 1 = 0");
+    var scan = op.Scan{ .src = undefined, .request = try p.request(.read, "db table orders", "SELECT * FROM orders WHERE (a > 1)") };
+    scan.stats = .{ .at = 1, .rows = 5, .calls = 1 };
+    _ = try p.absorb(.{ .scan = &scan });
+
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+    try renderProfile(ar.allocator(), &p, .{ .wall_ns = 0, .rows_read = 5, .rows_out = 5, .lanes = 1 }, false, &out.writer);
+    const printed = out.written();
+    try testing.expectEqualStrings(
+        \\outside the plan (actuals)
+        \\├─ scan (#1)  db query, discovery
+        \\│     sent: SELECT name FROM tables
+        \\│     time: 0ns (0.0%)
+        \\│     rows: 2   batches: 2
+        \\└─ scan (#2)  db table orders, schema probe
+        \\      sent: SELECT * FROM orders WHERE 1 = 0
+        \\      time: 0ns (0.0%)
+        \\      rows: 0   batches: 0
+        \\plan (actuals)
+        \\└─ scan (#3)  db table orders
+        \\      sent: SELECT * FROM orders WHERE (a > 1)
+        \\      time: 0ns (0.0%)
+        \\      rows: 5   batches: 1
+        \\
+    , printed[std.mem.indexOf(u8, printed, "outside the plan").?..]);
+}
+
+test "explain: a span's children hang under it, its own time theirs taken out, and a folder's footers are one node" {
+    var p = Profile.init(testing.allocator);
+    defer p.deinit();
+    trace.current = p.tracer();
+    defer trace.current = null;
+    {
+        var replay = trace.begin(.replay, "s3://bucket/t/");
+        defer replay.finish();
+        replay.items = 2;
+        var list = trace.begin(.list, "s3://bucket/t/_delta_log/");
+        list.items = 3;
+        list.finish();
+        const one = trace.begin(.log_read, "s3://bucket/t/_delta_log/0.json");
+        one.finish();
+        const two = trace.begin(.log_read, "s3://bucket/t/_delta_log/1.json");
+        two.finish();
+    }
+    trace.record(.footer, "s3://bucket/t/a/1.parquet?sig=secret", 10, 1);
+    trace.record(.footer, "s3://bucket/t/b/2.parquet?sig=secret", 10, 1);
+
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+    try renderProfile(ar.allocator(), &p, .{ .wall_ns = 0, .rows_read = 0, .rows_out = 0, .lanes = 1 }, false, &out.writer);
+    const printed = out.written();
+    for ([_][]const u8{
+        "├─ log replay (#1)  s3://bucket/t/\n",
+        "live files: 2\n",
+        "├─ list (#2)  s3://bucket/t/_delta_log/\n",
+        "entries: 3\n",
+        "└─ log read (#3)  s3://bucket/t/_delta_log/\n",
+        "reads: 2\n",
+        "└─ footer (#4)  s3://bucket/t/\n",
+    }) |want| {
+        testing.expect(std.mem.indexOf(u8, printed, want) != null) catch |e| {
+            std.debug.print("{s}\nmissing: {s}\n", .{ printed, want });
+            return e;
+        };
+    }
+    try testing.expect(std.mem.indexOf(u8, printed, "secret") == null);
+    try testing.expect(p.nodes.count() == 4);
+}
+
+test "explain: the sent line cuts a long column list, never the WHERE, and stays on one line" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try testing.expectEqualStrings("SELECT a, b FROM t WHERE x > 1", try sentText(a, "SELECT a,  b\n FROM t\n WHERE x > 1 "));
+    const long = "SELECT [column_number_one], [column_number_two], [column_number_three], [column_number_four], [column_number_five], [column_number_six], [column, seven], f(a, b) FROM [t] WHERE ([k] >= 1)";
+    try testing.expectEqualStrings("SELECT [column_number_one], [column_number_two], [column_number_three], [column_number_four], [column_number_five], [column_number_six], ... (+2) FROM [t] WHERE ([k] >= 1)", try sentText(a, long));
+    try testing.expectEqualStrings("https://host/items?page=1", try sentText(a, "https://host/items?page=1"));
 }
 
 test "explain: lanes show their spread, and a lane far above the mean is called out" {

@@ -21,6 +21,7 @@ const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
+const observe = @import("observe.zig");
 
 pub fn readSql(env: *Env, rd: ast.Read) ![]const u8 {
     const base = switch (rd.form) {
@@ -301,7 +302,7 @@ pub fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: a
     if (!splitMayCut(lead, isPostgresCopySink(env, w))) return null;
     const m: usize = hints.count orelse @min(@as(usize, 64), threads * 4);
 
-    var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)) };
+    var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)), .prof = env.profile };
     const prober = split.Prober{ .ctx = &pctx, .openFn = proberOpen };
 
     var key: split.Key = undefined;
@@ -337,7 +338,17 @@ pub fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: a
 
 pub fn proberOpen(ctx_ptr: *anyopaque) anyerror!sql.Conn {
     const ctx: *SplitCtx = @ptrCast(@alignCast(ctx_ptr));
-    return connectSql(ctx.gpa, ctx.kind, ctx.cfg);
+    const clock = observe.Clock.start();
+    const conn = try connectSql(ctx.gpa, ctx.kind, ctx.cfg);
+    const p = ctx.prof orelse return conn;
+    return observe.lookups(p, conn, lookupLabel(ctx.kind), clock.ns());
+}
+
+/// A lookup's name in the report; static, as a connection wrapper keeps it.
+pub fn lookupLabel(kind: SqlKind) []const u8 {
+    return switch (kind) {
+        inline else => |k| @tagName(k) ++ " lookup",
+    };
 }
 
 test "sqlWithWhere: table appends WHERE, query wraps, empty is a no-op" {

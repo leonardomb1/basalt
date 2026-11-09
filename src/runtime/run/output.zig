@@ -44,6 +44,7 @@ const aErr = @import("../env.zig").aErr;
 const planErr = @import("../env.zig").planErr;
 const planSplit = @import("../connect.zig").planSplit;
 const printProfile = @import("explain.zig").printProfile;
+const trace = @import("../../connect/trace.zig");
 const Profile = @import("../../exec/profile.zig").Profile;
 const profile = @import("../../exec/profile.zig");
 const projectSqlRead = @import("../connect.zig").projectSqlRead;
@@ -150,6 +151,19 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     const is_load = !env.explain and !std.mem.eql(u8, last.write.connector, "stdout");
     if (is_load) env.last_target = try targetLabel(arena, last.write);
     defer env.endStatement(is_load);
+    var prof: Profile = undefined;
+    const own_profile = opts_in.explain and env.profile == null;
+    if (own_profile) {
+        prof = Profile.init(env.gpa);
+        env.profile = &prof;
+        trace.current = prof.tracer();
+    }
+    defer if (own_profile) {
+        trace.current = null;
+        env.profile = null;
+        prof.deinit();
+    };
+    const t0 = std.time.Instant.now() catch null;
     if (last.write.changes != null) try bindSince(env, out);
     defer if (last.write.changes != null) {
         _ = env.params.remove(analyze.since_name);
@@ -175,17 +189,6 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
             .lanes = lanes,
         });
     }
-    var prof: Profile = undefined;
-    const own_profile = opts_in.explain and env.profile == null;
-    if (own_profile) {
-        prof = Profile.init(env.gpa);
-        env.profile = &prof;
-    }
-    defer if (own_profile) {
-        env.profile = null;
-        prof.deinit();
-    };
-    const t0 = std.time.Instant.now() catch null;
     const scan0 = scanCounts(env);
     const held0: u64 = if (own_profile) if (env.space) |sp| sp.restartPeak() else 0 else 0;
     runOutputBody(env, opts_in, stages, last, stats, lanes_used, batch_arena, &delegated) catch |e| {
@@ -745,8 +748,9 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
                     const root = if (lane_stages.len > 0) lane_stages[lane_stages.len - 1].asOp() else res.op;
                     const ids = try arena.alloc(profile.Id, lane_stages.len + 1);
                     p.path = try msgfmt.allocPrint(arena, "{s} split-parallel, {d} key ranges", .{ @tagName(pipe.sql_desc.?.kind), sp.predicates.len });
-                    try p.noteSent("{s}, once per key range: {s}", .{ @tagName(pipe.sql_desc.?.kind), sp.base_sql });
-                    break :blk .{ .prof = p, .ids = p.chainIds(try p.shape(root), ids) };
+                    const chain = p.chainIds(try p.shape(root), ids);
+                    try p.splitRead(chain[chain.len - 1], try msgfmt.allocPrint(arena, "once per key range: {s}", .{sp.base_sql}));
+                    break :blk .{ .prof = p, .ids = chain };
                 } else null;
                 const mode = (try buildParallelSink(env, wr, schema)) orelse parallel.SinkMode{ .shared = try openSink(env, wr, schema) };
                 var guard = parallel.ModeGuard.init(mode);

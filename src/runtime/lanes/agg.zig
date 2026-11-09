@@ -696,7 +696,7 @@ pub fn runParallelAgg(env: *Env, m_in: ?*const Morsels, head: ?ast.Stage, shape:
         for (joins) |lj| if (lj.build_root) |b| try pr.graftBuild(lj.at, b);
         if (m.* == .sql) {
             pr.path = try msgfmt.allocPrint(env.arena, "{s} split-parallel aggregate, {d} key ranges", .{ m.label(), m.count() });
-            try pr.noteSent("{s}, once per key range: {s}", .{ m.label(), m.sql.split.base_sql });
+            try pr.sentOnLanes(p.read_at, try msgfmt.allocPrint(env.arena, "once per key range: {s}", .{m.sql.split.base_sql}));
         } else pr.path = try msgfmt.allocPrint(env.arena, "{s} parallel aggregate{s}, {d} {s}", .{ m.label(), if (joins.len > 0) " over joins" else "", mm.count(), m.unitName() });
     }
     return true;

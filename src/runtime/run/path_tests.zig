@@ -143,20 +143,26 @@ const Capture = struct {
     }
 };
 
-/// The `Path:` text `script` prints, run with `threads` lanes.
-fn pathOf(a: std.mem.Allocator, dir: std.fs.Dir, script: []const u8, threads: usize) ![]const u8 {
+/// What `script` prints on stderr, run with `threads` lanes.
+fn printedBy(a: std.mem.Allocator, dir: std.fs.Dir, script: []const u8, threads: usize, explain: bool) ![]const u8 {
     var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const prog = try parser.parseSource(a, script, &pd);
     var diag = env_mod.Diag{};
     var out = try Capture.begin(dir, std.posix.STDOUT_FILENO, "stdout.txt");
     var err = try Capture.begin(dir, std.posix.STDERR_FILENO, "stderr.txt");
-    const res = run(testing.allocator, prog, .{ .threads = threads, .log = .{ .quiet = true, .summary = .none } }, &diag);
+    const res = run(testing.allocator, prog, .{ .threads = threads, .explain = explain, .log = .{ .quiet = true, .summary = .none } }, &diag);
     const printed = try err.end(a);
     _ = try out.end(a);
     _ = res catch |e| {
         std.debug.print("{s}\n{s}\n{s}\n", .{ script, diag.msg, printed });
         return e;
     };
+    return printed;
+}
+
+/// The `Path:` text `script` prints, run with `threads` lanes.
+fn pathOf(a: std.mem.Allocator, dir: std.fs.Dir, script: []const u8, threads: usize) ![]const u8 {
+    const printed = try printedBy(a, dir, script, threads, false);
     const at = std.mem.indexOf(u8, printed, "Path: ") orelse {
         std.debug.print("{s}\n{s}\n", .{ script, printed });
         return error.TestUnexpectedResult;
@@ -227,6 +233,135 @@ test "path oracle: EXPLAIN names the path EXPLAIN ANALYZE takes" {
     for (split_cases) |c| held = try caseHolds(a, &tmp, base, srv.port(), c, true) and held;
     for (select_cases) |c| held = try caseHolds(a, &tmp, base, srv.port(), c, false) and held;
     try testing.expect(held);
+}
+
+const ReportCase = struct {
+    script: []const u8,
+    threads: usize = 1,
+    explain: bool = false,
+    says: []const []const u8 = &.{},
+};
+
+const report_cases = [_]ReportCase{
+    .{ .script = "EXPLAIN ANALYZE SELECT id, v FROM pg.public.t WHERE v > 1;", .says = &.{"scan (#3)  postgres table public.t\n            sent: SELECT \"v\", \"id\" FROM \"public\".\"t\" WHERE (\"v\" > 1)\n"} },
+    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.csv' AS SELECT id, v FROM pg.public.t WHERE v > 1;", .threads = 4, .says = &.{ "outside the plan (actuals)", "postgres lookup", "opened and not read", "sent: once per key range: SELECT" } },
+    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.csv' SPLIT BY (id) AS SELECT g, COUNT(*) AS n FROM pg.public.t GROUP BY g;", .threads = 4, .says = &.{ "outside the plan (actuals)", "sent: once per key range: SELECT" } },
+    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.csv' SPLIT BY (id) AS SELECT t.id, k.g FROM pg.public.t t JOIN '$B/in.csv' k ON t.g = k.g;", .threads = 4, .says = &.{"sent: once per key range: SELECT"} },
+    .{ .script = "EXPLAIN ANALYZE SELECT id FROM pg.public.t ORDER BY id LIMIT 3;", .threads = 4, .says = &.{"opened and not read"} },
+    .{ .script = "EXPLAIN ANALYZE SELECT s.v, c.g FROM '$B/in.csv' s JOIN pg.public.t c ON c.id = s.id;", .says = &.{"schema probe"} },
+    .{ .script = "EXPLAIN ANALYZE SELECT s.v, c.g FROM '$B/in.csv' s JOIN pg.public.t c ON c.id = s.id;", .threads = 4 },
+    .{ .script = "EXPLAIN ANALYZE SELECT * FROM EACH TABLE OF (pg.QUERY($$SELECT \"tname\", \"tag\" FROM catalog$$));", .says = &.{ "postgres query, discovery", "union (#", "2 branches, from discovery", "postgres table t\n", "postgres table t2\n" } },
+    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.csv' AS SELECT * FROM EACH TABLE OF (pg.QUERY($$SELECT \"tname\", \"tag\" FROM catalog$$));", .threads = 4, .says = &.{"postgres query, discovery"} },
+    .{ .script = "EXPLAIN ANALYZE SELECT * FROM EACH TABLE OF (SELECT tname, tag FROM pg.public.catalog);", .says = &.{"2 branches, from discovery"} },
+    .{ .script = "EXPLAIN ANALYZE SELECT id FROM '$B/in.csv' WHERE v = (SELECT MAX(v) AS m FROM pg.public.t);", .says = &.{"scalar subquery (actuals)"} },
+    .{ .script = "LET top = (SELECT MAX(v) AS m FROM pg.public.t);\nLOAD INTO '$B/never.csv' AS SELECT id FROM '$B/in.csv' WHERE v = $top;", .explain = true, .says = &.{"LET `top` (actuals)"} },
+    .{ .script = "FOR EACH ROW OF (SELECT tname, tag FROM pg.public.catalog) AS (a, b)\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND FOR;", .explain = true, .says = &.{"FOR EACH discovery (actuals)"} },
+    .{ .script = "FOR EACH ROW OF (pg.QUERY($$SELECT \"tname\", \"tag\" FROM catalog$$)) AS (a, b)\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND FOR;", .explain = true, .says = &.{ "FOR EACH discovery (actuals)", "postgres query, discovery", "FOR EACH row 2 of 2: a=t2, b=b" } },
+    .{ .script = "DESCRIBE pg.public.t;", .explain = true, .says = &.{"DESCRIBE (actuals)"} },
+    .{ .script = "CREATE FUNCTION f(a) AS\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND;\nCALL f('x');", .explain = true, .says = &.{"CALL f(a=x)"} },
+    .{ .script = "CASE WHEN 1 = 2 THEN PRINT 'no'; WHEN 1 = 1 THEN LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t; END CASE;", .explain = true, .says = &.{"CASE: arm 2 of 2"} },
+    .{ .script = "LOAD INTO '$B/d/' WITH (format = 'delta') AS SELECT id, v FROM '$B/in.csv';\nEXPLAIN ANALYZE SELECT id FROM '$B/d/';", .says = &.{ "log replay (#", "live files: ", "└─ log read (#", "├─ list (#", "entries: " } },
+    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/d/' UPSERT ON (id) USING changes (sequence_by = id, position = id, name = 'feed') AS SELECT id, v FROM '$B/in.csv';", .says = &.{"log replay (#"} },
+    .{ .script = "EXPLAIN ANALYZE SELECT g, SUM(v) AS s FROM '$B/pf/' GROUP BY g;", .threads = 4, .says = &.{ "list (#", "footer (#", "reads: " } },
+    .{ .script = "EXPLAIN ANALYZE SELECT id FROM '$B/p.parquet' WHERE v > 2;", .threads = 4, .says = &.{"footer (#"} },
+};
+
+fn count(hay: []const u8, needle: []const u8) usize {
+    return std.mem.count(u8, hay, needle);
+}
+
+/// Whether the server got no query `printed` does not show: each on a `sent:` line of
+/// its own as many times as it went out, a key range's holding the query shown once
+/// for them all.
+fn reportShowsAll(a: std.mem.Allocator, printed: []const u8, got: []const []const u8) !bool {
+    var ranges = std.array_list.Managed([]const u8).init(a);
+    var lines = std.mem.splitScalar(u8, printed, '\n');
+    while (lines.next()) |ln| {
+        const mark = "sent: once per key range: ";
+        const at = std.mem.indexOf(u8, ln, mark) orelse continue;
+        try ranges.append(ln[at + mark.len ..]);
+    }
+    var seen = std.StringHashMap(usize).init(a);
+    for (got) |q| (try seen.getOrPutValue(try @import("explain.zig").sentText(a, q), 0)).value_ptr.* += 1;
+    var held = true;
+    var it = seen.iterator();
+    while (it.next()) |e| {
+        const shown = count(printed, try msgfmt.allocPrint(a, "sent: {s}\n", .{e.key_ptr.*}));
+        if (shown == e.value_ptr.*) continue;
+        const in_range = shown == 0 and for (ranges.items) |r| {
+            if (std.mem.indexOf(u8, e.key_ptr.*, r) != null) break true;
+        } else false;
+        if (in_range) continue;
+        std.debug.print("sent {d}x, shown {d}x: {s}\n", .{ e.value_ptr.*, shown, e.key_ptr.* });
+        held = false;
+    }
+    return held;
+}
+
+test "the report shows every query the server got, once, on its scan or in a tree of its own" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,g,v\n1,a,1\n2,b,2\n3,c,3\n" });
+    try writeParquet(a, try std.fs.path.join(a, &.{ base, "p.parquet" }), 1000, 100);
+    try tmp.dir.makeDir("pf");
+    try writeParquet(a, try std.fs.path.join(a, &.{ base, "pf", "a.parquet" }), 100, 50);
+    try writeParquet(a, try std.fs.path.join(a, &.{ base, "pf", "b.parquet" }), 100, 50);
+
+    const Col = @import("../../testing/postgres_fake.zig").Col;
+    const cols = [_]Col{ .{ .name = "id", .oid = 20 }, .{ .name = "g" }, .{ .name = "v", .oid = 20 } };
+    const rows = try pgRows(a);
+    const cat_cols = [_]Col{ .{ .name = "tname" }, .{ .name = "tag" } };
+    const cat_rows = [_][]const ?[]const u8{ &.{ "t", "a" }, &.{ "t2", "b" } };
+    const tables = [_]Table{
+        .{ .name = "t", .cols = &cols, .rows = rows, .key = "id", .est_rows = 3_000_000 },
+        .{ .name = "t2", .cols = &cols, .rows = rows, .key = "id", .est_rows = 3_000_000 },
+        .{ .name = "catalog", .cols = &cat_cols, .rows = &cat_rows },
+    };
+    const srv = try FakePg.start(testing.allocator, &tables);
+    defer srv.finish();
+    const conn = try msgfmt.allocPrint(a, "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', port = {d}, database = 'd', user = 'u', password = 'p');\n", .{srv.port()});
+
+    var held = true;
+    for (report_cases) |c| {
+        const before = (try srv.received(a)).len;
+        const script = try msgfmt.allocPrint(a, "{s}{s}", .{ conn, try std.mem.replaceOwned(u8, a, c.script, "$B", base) });
+        const printed = try printedBy(a, tmp.dir, script, c.threads, c.explain);
+        const got = (try srv.received(a))[before..];
+        var ok = try reportShowsAll(a, printed, got);
+        for (c.says) |s| if (std.mem.indexOf(u8, printed, s) == null) {
+            std.debug.print("missing: {s}\n", .{s});
+            ok = false;
+        };
+        if (!ok) std.debug.print("{s}\n{s}\n", .{ c.script, printed });
+        held = ok and held;
+    }
+    try testing.expect(held);
+}
+
+test "the report counts an HTTP read's pages on its scan, and shows no query value" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const http_fake = @import("../../testing/http_fake.zig");
+    var srv: http_fake.FakeServer = undefined;
+    try srv.start(&.{
+        http_fake.FakeServer.reply("200 OK", "", "[{\"id\":1}]"),
+        http_fake.FakeServer.reply("200 OK", "", "[{\"id\":2}]"),
+        http_fake.FakeServer.reply("200 OK", "", "[]"),
+    });
+    defer srv.stop();
+    const url = try srv.url(a, "/items?token=hidden");
+    const printed = try printedBy(a, tmp.dir, try msgfmt.allocPrint(a, "LET n = 1;\nEXPLAIN ANALYZE SELECT * FROM HTTP('{s}') WITH (paginate = 'page');", .{url}), 1, false);
+    errdefer std.debug.print("{s}\n", .{printed});
+    try testing.expect(std.mem.indexOf(u8, printed, "pages: 3") != null);
+    try testing.expect(std.mem.indexOf(u8, printed, "token=...") != null);
+    try testing.expect(std.mem.indexOf(u8, printed, "hidden") == null);
 }
 
 test "a key range typed otherwise than the probe fails its lane, on every split path" {

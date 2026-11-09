@@ -25,6 +25,8 @@ const SqlConnInfo = @import("../connect.zig").SqlConnInfo;
 const Value = @import("../../exec/value.zig").Value;
 const ast = @import("../../lang/ast.zig");
 const connectSql = @import("../connect.zig").connectSql;
+const lookupLabel = @import("../connect/sql_read.zig").lookupLabel;
+const observe = @import("../connect/observe.zig");
 const footerOf = @import("../../format/parquet/folder.zig").parseFooterOf;
 const inlineHeadBindings = @import("../plan.zig").inlineHeadBindings;
 const pqread = @import("../../format/parquet/read.zig");
@@ -117,7 +119,7 @@ fn parquetRows(path: []const u8) ?u64 {
     const src = pqread.Bytes.open(ar.allocator(), path) catch return null;
     defer src.close();
     var footer_start: u64 = 0;
-    const md = footerOf(ar.allocator(), src, &footer_start) catch return null;
+    const md = footerOf(ar.allocator(), src, path, &footer_start) catch return null;
     return std.math.cast(u64, md.num_rows);
 }
 
@@ -173,7 +175,9 @@ pub fn catalogQuery(env: *Env, conn: ast.Connection, info: SqlConnInfo, q: []con
     const saved = env.diag.*;
     defer env.diag.* = saved;
     const cfg = try resolveDbConfig(env, conn, info.port);
-    const c = try connectSql(env.gpa, info.kind, cfg);
+    const clock = observe.Clock.start();
+    var c = try connectSql(env.gpa, info.kind, cfg);
+    if (env.profile) |p| c = try observe.lookups(p, c, lookupLabel(info.kind), clock.ns());
     var cur = c.queryCursor(q) catch |e| {
         c.close();
         return e;
