@@ -873,6 +873,7 @@ pub const Parser = struct {
     pub const parseLoadInto = @import("parse/query.zig").parseLoadInto;
     pub const parseLoadUsing = @import("parse/query.zig").parseLoadUsing;
     pub const changeStages = @import("parse/query.zig").changeStages;
+    pub const unnestCol = @import("parse/query.zig").unnestCol;
     pub const changeNeed = @import("parse/query.zig").changeNeed;
     pub const parseTerminalQuery = @import("parse/query.zig").parseTerminalQuery;
     pub const parseWithHints = @import("parse/query.zig").parseWithHints;

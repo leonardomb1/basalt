@@ -110,6 +110,12 @@ pub fn applyFilter(self: *Parser, name: []const u8, args: []*ast.Expr, c: *ast.E
         return .{ .name = "count_if", .args = one };
     }
     const out = try self.arena.dupe(*ast.Expr, args);
+    if (args[0].* == .call and std.mem.eql(u8, args[0].call.name, aggregates.percentile_fn)) {
+        const inner = try self.arena.dupe(*ast.Expr, args[0].call.args);
+        inner[0] = try self.mk(.{ .cond = .{ .cond = c, .then = inner[0], .els = try self.mk(.null_lit) } });
+        out[0] = try self.mk(.{ .call = .{ .name = aggregates.percentile_fn, .args = inner } });
+        return .{ .name = name, .args = out };
+    }
     out[0] = try self.mk(.{ .cond = .{ .cond = c, .then = args[0], .els = try self.mk(.null_lit) } });
     return .{ .name = name, .args = out };
 }
@@ -273,6 +279,7 @@ pub fn parseOrderKeys(self: *Parser) Error![]const OrderExpr {
 /// riding along.
 pub fn packAggArgs(self: *Parser, f: aggregates.AggFunc, name: []const u8, args: []const *ast.Expr, order: []const OrderExpr, pos: Pos) Error![]*ast.Expr {
     const percentile = f == .percentile_cont or f == .percentile_disc;
+    if (percentile) return percentileArg(self, name, args, order, pos);
     const want: usize = switch (f) {
         .string_agg, .arg_max, .arg_min => 2,
         else => 1,
@@ -295,6 +302,25 @@ pub fn packAggArgs(self: *Parser, f: aggregates.AggFunc, name: []const u8, args:
     for (order, out[1 + leading ..]) |k, *o| o.* = k.e;
     const one = try self.arena.alloc(*ast.Expr, 1);
     one[0] = try self.mk(.{ .call = .{ .name = aggregates.packed_fn, .args = out } });
+    return one;
+}
+
+/// `percentile_*(p) WITHIN GROUP (ORDER BY x)`'s one argument,
+/// `__percentile(x, p, desc)`: the values are `x`'s, and `p`, a constant, is read by
+/// the aggregate once rather than carried by every row.
+fn percentileArg(self: *Parser, name: []const u8, args: []const *ast.Expr, order: []const OrderExpr, pos: Pos) Error![]*ast.Expr {
+    if (args.len != 1) return self.fail(pos, "`{s}` takes 1 argument, not {d}", .{ name, args.len });
+    if (order.len != 1) return self.fail(pos, "`{s}(fraction)` needs WITHIN GROUP (ORDER BY one expression)", .{name});
+    const p: f64 = switch (args[0].*) {
+        .int_lit => |x| @floatFromInt(x),
+        .float_lit => |x| x,
+        .dec_lit => |d| @as(f64, @floatFromInt(d.unscaled)) / std.math.pow(f64, 10, @floatFromInt(d.scale)),
+        else => return self.fail(pos, "`{s}`'s fraction is a constant between 0 and 1, e.g. `{s}(0.9)`", .{ name, name }),
+    };
+    if (!(p >= 0 and p <= 1)) return self.fail(pos, "`{s}`'s fraction is a constant between 0 and 1, not {d}", .{ name, p });
+    const call = try self.arena.dupe(*ast.Expr, &.{ order[0].e, try self.mk(.{ .float_lit = p }), try self.mk(.{ .bool_lit = order[0].desc }) });
+    const one = try self.arena.alloc(*ast.Expr, 1);
+    one[0] = try self.mk(.{ .call = .{ .name = aggregates.percentile_fn, .args = call } });
     return one;
 }
 

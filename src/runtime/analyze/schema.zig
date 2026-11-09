@@ -501,8 +501,12 @@ fn exprHasDollar(arena: std.mem.Allocator, e: *const ast.Expr) Error!bool {
 pub const ExplodePlan = struct { idx: usize, schema: types.Schema };
 
 pub fn explodePlan(arena: std.mem.Allocator, in: types.Schema, ex: ast.Explode, diag: *Diag) Error!ExplodePlan {
-    if (in.ambiguous(ex.field)) return fail(diag, "column reference `{s}` is ambiguous", .{ex.field});
-    const idx = in.indexOf(ex.field) orelse return fail(diag, "unknown field `{s}`", .{ex.field});
+    const idx = if (ex.rel.len > 0)
+        in.resolve(&.{ ex.rel, ex.field }) orelse return fail(diag, "unknown column `{s}.{s}`", .{ ex.rel, ex.field })
+    else blk: {
+        if (in.ambiguous(ex.field)) return fail(diag, "column reference `{s}` is ambiguous", .{ex.field});
+        break :blk in.indexOf(ex.field) orelse return fail(diag, "unknown field `{s}`", .{ex.field});
+    };
     const fty = in.fields[idx].ty;
     const listed = fty.kind == .array or fty.kind == .map;
     if (listed and (ex.json or ex.delim != null))

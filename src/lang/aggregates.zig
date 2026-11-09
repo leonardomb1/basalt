@@ -101,8 +101,8 @@ pub const specs = [_]Spec{
     .{ .func = .arg_min, .names = &.{ "arg_min", "min_by" }, .arg = .any, .result = .same, .max_args = 2, .packs = true, .input_ordered = true, .windowed = false },
     .{ .func = .array_agg, .names = &.{ "array_agg", "list_agg" }, .arg = .any, .result = .list, .packs = true, .input_ordered = true, .windowed = false },
     .{ .func = .string_agg, .names = &.{"string_agg"}, .arg = .any, .result = .string, .max_args = 2, .packs = true, .input_ordered = true, .windowed = false },
-    .{ .func = .percentile_cont, .names = &.{"percentile_cont"}, .arg = .numeric, .result = .float, .packs = true, .windowed = false },
-    .{ .func = .percentile_disc, .names = &.{"percentile_disc"}, .arg = .any, .result = .same, .packs = true, .windowed = false },
+    .{ .func = .percentile_cont, .names = &.{"percentile_cont"}, .arg = .numeric, .result = .float, .windowed = false },
+    .{ .func = .percentile_disc, .names = &.{"percentile_disc"}, .arg = .any, .result = .same, .windowed = false },
 };
 
 /// The argument a packed aggregate is typed by, `e` itself when it does not pack: the
@@ -119,6 +119,10 @@ pub fn typedArg(e: *const ast.Expr) *const ast.Expr {
 }
 
 pub const packed_fn = "__agg_args";
+
+/// A percentile's argument: `__percentile(x, fraction, descending)`, `x` as it is
+/// read, the two constants for the aggregate to read off the call.
+pub const percentile_fn = "__percentile";
 
 comptime {
     const fields = @typeInfo(AggFunc).@"enum".fields;

@@ -122,6 +122,7 @@ const base = [_]Builtin{
     .{ .name = "__agg_args", .type_fn = typing.aggArgs, .eval_fn = per_row.aggArgs, .vec_fn = vectorized.aggArgs },
     .{ .name = "__change_need", .type_fn = typing.changeNeed, .eval_fn = per_row.changeNeed },
     .{ .name = "__change_last", .type_fn = typing.changeLast, .eval_fn = per_row.changeLast },
+    .{ .name = "__percentile", .type_fn = typing.percentile, .eval_fn = per_row.percentile, .vec_fn = vectorized.percentile },
     .{ .name = "starts_with", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.starts_with)).eval, .vec_fn = S(f.Match(.starts_with)).vec },
     .{ .name = "ends_with", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.ends_with)).eval, .vec_fn = S(f.Match(.ends_with)).vec },
     .{ .name = "contains", .type_fn = typing.strPredicate, .eval_fn = S(f.Match(.contains)).eval, .vec_fn = S(f.Match(.contains)).vec },

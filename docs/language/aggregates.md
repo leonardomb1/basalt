@@ -81,9 +81,12 @@ they go by input order, ties too.
 The answer of `string_agg`, `array_agg`, `any_value`, `arg_max` and `arg_min` can
 depend on the order rows arrive in, so a query holding one reads its input on one
 lane, whatever `-j` says, and gives the same answer at every `-j` and when it spills.
-`string_agg`, `array_agg` and the percentiles hold each group's values until the end,
-counted against `--op-memory`. None of these takes `OVER (...)`, and none descends to
-a SQL source: the source's rows are read and folded here.
+`string_agg`, `array_agg`, `median` and the percentiles hold each group's values until
+the end, a number in 8 bytes. A `GROUP BY` counts them against `--op-memory` and,
+past it, sends groups not yet seen to disk; the values of one group, and of a query
+with no `GROUP BY`, are held whole whatever the limit. A percentile's fraction is a
+constant. None of these takes `OVER (...)`, and none descends to a SQL source: the
+source's rows are read and folded here.
 
 ## ROLLUP, CUBE and GROUPING SETS
 

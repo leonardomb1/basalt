@@ -160,6 +160,12 @@ pub const typing = struct {
         return Type.init(.bytes);
     }
 
+    pub fn percentile(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
+        const t = try self.typeOf(c.args[0]);
+        if (t.isNested()) return self.err("a percentile orders its values, so they take a number, date, timestamp or text, not {s}", .{t.name(self.arena) catch "?"});
+        return t;
+    }
+
     pub fn changeNeed(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
         const t = try self.typeOf(c.args[0]);
         const what = c.args[1].str_lit;

@@ -317,7 +317,9 @@ pub const SelectItem = union(enum) {
     pub const StarOf = struct { rel: []const u8 = "", rights: []const []const u8 = &.{}, drop: []const []const u8 = &.{}, copies: []const Rename = &.{} };
 };
 
-pub const Explode = struct { field: []const u8, as_name: ?[]const u8, delim: ?[]const u8 = null, json: bool = false };
+/// `UNNEST(col)`: `field` is the column's name, `rel` the table it was qualified
+/// with (`UNNEST(t.col)`), empty when bare.
+pub const Explode = struct { field: []const u8, as_name: ?[]const u8, delim: ?[]const u8 = null, json: bool = false, rel: []const u8 = "" };
 
 /// `count_expr` and `offset_expr` are a LIMIT or OFFSET written as an expression of
 /// `$name`s and literals, evaluated into `count` and `offset` once the script's values

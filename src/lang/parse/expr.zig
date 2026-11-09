@@ -506,7 +506,7 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                 try self.moreNullTreatment(&nulls);
                 const tpos: Pos = .{ .line = t.line, .col = t.col, .file = t.file };
                 var lower: []const u8 = try std.ascii.allocLowerString(self.arena, t.text);
-                const packing: ?aggregates.AggFunc = if (aggregates.lookup(lower)) |f| (if (aggregates.spec(f).packs) f else null) else null;
+                const packing: ?aggregates.AggFunc = if (aggregates.lookup(lower)) |f| (if (aggregates.spec(f).packs or f == .percentile_cont or f == .percentile_disc) f else null) else null;
                 var agg_order: []const Window.OrderExpr = &.{};
                 if (packing != null and self.eatKw("order")) {
                     try self.expectKw("by");

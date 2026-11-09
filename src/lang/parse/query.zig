@@ -179,6 +179,13 @@ pub fn parseLoadUsing(self: *Parser, write: *ast.Write, items: *?[]const ast.Sel
     });
 }
 
+/// The column `UNNEST` takes: `col`, or `t.col` qualified by its table's name or alias.
+pub fn unnestCol(self: *Parser) Error!ast.QualName {
+    const first = try self.expectIdent();
+    if (!self.eat(.dot)) return ast.QualName.one(self.arena, first);
+    return .{ .parts = try self.arena.dupe([]const u8, &.{ first, try self.expectIdent() }) };
+}
+
 /// `e` as `__change_need(e, what, target)`: a NULL `sequence_by` or `position`
 /// fails the run, a NULL `delete_when` is false.
 pub fn changeNeed(self: *Parser, e: *ast.Expr, what: []const u8, target: []const u8) Error!*ast.Expr {
@@ -1041,19 +1048,19 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         if (kind == .cross and self.isKw("unnest")) {
             _ = self.advance();
             _ = try self.expect(.lparen);
-            var field: []const u8 = undefined;
+            var col: ast.QualName = undefined;
             var delim: ?[]const u8 = null;
             var json = false;
             if (self.isKw("json_each") and self.peekTag() == .lparen) {
                 _ = self.advance();
                 _ = try self.expect(.lparen);
-                field = try self.expectIdent();
+                col = try self.unnestCol();
                 _ = try self.expect(.rparen);
                 json = true;
             } else if (self.isKw("split") and self.peekTag() == .lparen) {
                 _ = self.advance();
                 _ = try self.expect(.lparen);
-                field = try self.expectIdent();
+                col = try self.unnestCol();
                 _ = try self.expect(.comma);
                 const dpos = self.curPos();
                 const dt = try self.expect(.string);
@@ -1061,14 +1068,15 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 delim = dt.text;
                 _ = try self.expect(.rparen);
             } else {
-                field = try self.expectIdent();
+                col = try self.unnestCol();
             }
-            if (self.col_uses) |u| try u.bareUse(self.arena, try self.singleName(field));
+            col = stripQual(col, &aliases);
+            if (self.col_uses) |u| try u.bareUse(self.arena, col);
             _ = try self.expect(.rparen);
             var as_name: ?[]const u8 = null;
             if (self.eatKw("as")) as_name = try self.expectIdent();
             try stages.append(.{
-                .node = .{ .explode = .{ .field = field, .as_name = as_name, .delim = delim, .json = json } },
+                .node = .{ .explode = .{ .field = col.parts[col.parts.len - 1], .rel = if (col.parts.len > 1) col.parts[col.parts.len - 2] else "", .as_name = as_name, .delim = delim, .json = json } },
                 .hints = &.{},
                 .pos = jpos,
             });

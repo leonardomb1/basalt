@@ -82,6 +82,7 @@ test "string_agg and array_agg: input order or their ORDER BY, FILTER, DISTINCT,
         .{ .q = "SELECT g, cardinality(array_agg(v)) AS n FROM '$IN' WHERE g = 'b' GROUP BY g", .want = "g,n\nb,2\n" },
         .{ .q = "SELECT g, cardinality(array_agg(id) FILTER (WHERE r = 'y')) AS n FROM '$IN' GROUP BY g ORDER BY g", .want = "g,n\na,1\nb,2\nc,\n" },
         .{ .q = "SELECT x FROM (SELECT array_agg(id ORDER BY id) AS l FROM '$IN' WHERE g = 'a') t CROSS JOIN UNNEST(l) AS x", .want = "x\n1\n2\n3\n" },
+        .{ .q = "SELECT x FROM (SELECT array_agg(id ORDER BY id) AS l FROM '$IN' WHERE g = 'a') t CROSS JOIN UNNEST(t.l) AS x", .want = "x\n1\n2\n3\n" },
     });
 }
 
@@ -102,6 +103,9 @@ test "percentile_cont interpolates, percentile_disc picks a row, either way roun
         .{ .q = "SELECT percentile_disc(0.5) WITHIN GROUP (ORDER BY CAST(id AS INT)) AS m FROM '$IN'", .want = "m\n3\n" },
         .{ .q = "SELECT percentile_disc(0) WITHIN GROUP (ORDER BY r) AS lo, percentile_disc(1) WITHIN GROUP (ORDER BY r) AS hi FROM '$IN'", .want = "lo,hi\nx,y\n" },
         .{ .q = "SELECT g, percentile_cont(0.5) WITHIN GROUP (ORDER BY CAST(v AS INT)) FILTER (WHERE r = 'x') AS m FROM '$IN' GROUP BY g ORDER BY g", .want = "g,m\na,15\nb,\nc,7\n" },
+        .{ .q = "SELECT percentile_cont(0.9) WITHIN GROUP (ORDER BY CAST(id AS INT)) FILTER (WHERE r = 'x') AS m FROM '$IN'", .want = "m\n5.4\n" },
+        .{ .q = "SELECT percentile_disc(0.25) WITHIN GROUP (ORDER BY CAST(id AS INT) DESC) AS m FROM '$IN'", .want = "m\n5\n" },
+        .{ .q = "SELECT median(CAST(id AS INT)) AS a, percentile_cont(0.5) WITHIN GROUP (ORDER BY CAST(id AS INT)) AS b FROM '$IN'", .want = "a,b\n3.5,3.5\n" },
     });
 }
 
@@ -111,6 +115,8 @@ test "the new aggregates' arguments and window use are refused where they are wr
         .{ .q = "SELECT arg_max(id) AS s FROM 'a.csv'", .says = "takes 2 arguments, not 1" },
         .{ .q = "SELECT arg_max(id, v ORDER BY v) AS s FROM 'a.csv'", .says = "takes no ORDER BY" },
         .{ .q = "SELECT percentile_cont(0.5) AS s FROM 'a.csv'", .says = "needs WITHIN GROUP" },
+        .{ .q = "SELECT percentile_cont(1.5) WITHIN GROUP (ORDER BY id) AS s FROM 'a.csv'", .says = "a constant between 0 and 1, not 1.5" },
+        .{ .q = "SELECT percentile_disc(id) WITHIN GROUP (ORDER BY id) AS s FROM 'a.csv'", .says = "fraction is a constant between 0 and 1" },
         .{ .q = "SELECT string_agg(id, ',') OVER (PARTITION BY g) AS s FROM 'a.csv'", .says = "not available over a window" },
         .{ .q = "SELECT any_value(id) OVER (PARTITION BY g) AS s FROM 'a.csv'", .says = "not available over a window" },
     };

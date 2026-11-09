@@ -45,6 +45,9 @@ pub const Ctx = struct {
     ty: types.Type,
     alloc: std.mem.Allocator,
     scratch: std.mem.Allocator,
+    /// A percentile's fraction, and whether its WITHIN GROUP order is descending.
+    frac: f64 = 0.5,
+    desc: bool = false,
 };
 
 pub const Count = struct {
@@ -314,44 +317,148 @@ pub fn ExtremeValue(comptime want: std.math.Order) type {
     };
 }
 
-/// The values kept whole and selected from at the end; with an even count the mean
-/// of the two middle values, as Postgres's percentile_cont(0.5) has it.
-pub const Median = struct {
+/// Values a group keeps whole, in blocks that never move: an arena keeps every
+/// buffer a growing list outgrows, so a list in one cost up to four times its
+/// values. Blocks start small, for a group of few values, and double up to
+/// `max_block`; `gather` lays them out in one slice for the selection.
+fn Held(comptime T: type) type {
+    return struct {
+        blocks: std.ArrayListUnmanaged([]T) = .empty,
+        last: usize = 0,
+        n: usize = 0,
+
+        const Self = @This();
+        const max_block = 8192;
+
+        fn append(self: *Self, a: std.mem.Allocator, x: T) !void {
+            if (self.blocks.items.len == 0 or self.last == self.blocks.items[self.blocks.items.len - 1].len) {
+                try self.blocks.append(a, try a.alloc(T, std.math.clamp(self.n, 16, max_block)));
+                self.last = 0;
+            }
+            self.blocks.items[self.blocks.items.len - 1][self.last] = x;
+            self.last += 1;
+            self.n += 1;
+        }
+
+        fn gather(self: *const Self, a: std.mem.Allocator) ![]T {
+            const out = try a.alloc(T, self.n);
+            var at: usize = 0;
+            for (self.blocks.items, 0..) |b, i| {
+                const len = if (i + 1 == self.blocks.items.len) self.last else b.len;
+                @memcpy(out[at .. at + len], b[0..len]);
+                at += len;
+            }
+            return out;
+        }
+
+        fn each(self: *const Self, comptime f: anytype, ctx: anytype) !void {
+            for (self.blocks.items, 0..) |b, i| {
+                const len = if (i + 1 == self.blocks.items.len) self.last else b.len;
+                for (b[0..len]) |x| try f(ctx, x);
+            }
+        }
+    };
+}
+
+/// The state of an aggregate that keeps a group's values whole (`Held`), `keep`
+/// copying a value out of its batch.
+fn Holding(comptime T: type, comptime keep: fn (T, Ctx) anyerror!T) type {
+    return struct {
+        pub const State = struct { vals: ?*Held(T) = null };
+        pub fn add(s: *State, x: T, cx: Ctx) !void {
+            const h = s.vals orelse blk: {
+                const p = try cx.alloc.create(Held(T));
+                p.* = .{};
+                s.vals = p;
+                break :blk p;
+            };
+            try h.append(cx.alloc, try keep(x, cx));
+        }
+        const Into = struct { s: *State, cx: Ctx };
+        fn put(i: Into, x: T) !void {
+            try add(i.s, x, i.cx);
+        }
+        pub fn merge(d: *State, s: *const State, cx: Ctx) !void {
+            if (s.vals) |h| try h.each(put, Into{ .s = d, .cx = cx });
+        }
+        pub fn own(s: *State, cx: Ctx) !void {
+            const src = s.vals orelse return;
+            s.vals = null;
+            try src.each(put, Into{ .s = s, .cx = cx });
+        }
+    };
+}
+
+fn asIs(x: f64, _: Ctx) anyerror!f64 {
+    return x;
+}
+
+/// MEDIAN and PERCENTILE_CONT (`Ctx.frac`, 0.5 for the median): the values kept
+/// whole as numbers and selected from at the end, between two the value
+/// interpolated, as Postgres's percentile_cont has it; at 0.5 the mean of the two.
+pub const Quantile = struct {
     pub const In = f64;
     pub const needs_alloc = true;
-    const List = std.array_list.Managed(f64);
-    pub const State = struct { vals: ?*List = null };
-    pub fn add(s: *State, x: f64, cx: Ctx) !void {
-        const l = s.vals orelse blk: {
-            const p = try cx.alloc.create(List);
-            p.* = List.init(cx.alloc);
-            s.vals = p;
-            break :blk p;
-        };
-        try l.append(x);
-    }
-    pub fn merge(d: *State, s: *const State, cx: Ctx) !void {
-        if (s.vals) |l| for (l.items) |x| try add(d, x, cx);
-    }
-    pub fn own(s: *State, cx: Ctx) !void {
-        const src = s.vals orelse return;
-        const l = try cx.alloc.create(List);
-        l.* = try .initCapacity(cx.alloc, src.items.len);
-        l.appendSliceAssumeCapacity(src.items);
-        s.vals = l;
-    }
-    pub fn finish(s: *const State, _: Ctx) !Value {
-        const l = s.vals orelse return .null;
-        const xs = l.items;
-        if (xs.len == 0) return .null;
-        const mid = xs.len / 2;
-        const hi = selectNth(xs, mid);
-        if (xs.len % 2 == 1) return .{ .float = hi };
+    const H = Holding(f64, asIs);
+    pub const State = H.State;
+    pub const add = H.add;
+    pub const merge = H.merge;
+    pub const own = H.own;
+    pub fn finish(s: *const State, cx: Ctx) !Value {
+        const h = s.vals orelse return .null;
+        if (h.n == 0) return .null;
+        const xs = try h.gather(cx.scratch);
+        const t = if (cx.desc) 1 - cx.frac else cx.frac;
+        const at = t * @as(f64, @floatFromInt(xs.len - 1));
+        const lo_at: usize = @intFromFloat(@floor(at));
+        const hi_at: usize = @intFromFloat(@ceil(at));
+        const hi = selectNth(xs, hi_at);
+        if (lo_at == hi_at) return .{ .float = hi };
         var lo = xs[0];
-        for (xs[1..mid]) |x| lo = @max(lo, x);
-        return .{ .float = (lo + hi) / 2 };
+        for (xs[1..hi_at]) |x| lo = @max(lo, x);
+        const w = at - @floor(at);
+        return .{ .float = if (w == 0.5) (lo + hi) / 2 else lo + (hi - lo) * w };
     }
 };
+
+/// PERCENTILE_DISC (`Ctx.frac`): the values kept whole in their own type, the
+/// first whose place in the WITHIN GROUP order is at or past the fraction.
+pub fn Disc(comptime T: type) type {
+    return struct {
+        pub const In = T;
+        pub const needs_alloc = true;
+        const H = Holding(T, keepOf(T));
+        pub const State = H.State;
+        pub const add = H.add;
+        pub const merge = H.merge;
+        pub const own = H.own;
+        pub fn finish(s: *const State, cx: Ctx) !Value {
+            const h = s.vals orelse return .null;
+            if (h.n == 0) return .null;
+            const xs = try h.gather(cx.scratch);
+            const place = @ceil(cx.frac * @as(f64, @floatFromInt(xs.len)));
+            const i: usize = if (place < 1) 0 else @intFromFloat(place - 1);
+            return toValue(T, selectBy(T, xs, if (cx.desc) xs.len - 1 - i else i), cx.out);
+        }
+    };
+}
+
+/// How a percentile keeps a value of `T`: text, bytes and nested values copied out
+/// of the batch, the rest as they are.
+fn keepOf(comptime T: type) fn (T, Ctx) anyerror!T {
+    return struct {
+        fn keep(x: T, cx: Ctx) anyerror!T {
+            if (T == []const u8) return cx.alloc.dupe(u8, x);
+            if (T != Value) return x;
+            return switch (x) {
+                .string => |b| .{ .string = try cx.alloc.dupe(u8, b) },
+                .bytes => |b| .{ .bytes = try cx.alloc.dupe(u8, b) },
+                .nested => |r| .{ .nested = try @import("../../nested.zig").own(cx.alloc, r) },
+                else => x,
+            };
+        }
+    }.keep;
+}
 
 /// ANY_VALUE: the first value that is not NULL, in input order.
 pub const AnyValue = struct {
@@ -484,53 +591,6 @@ pub fn finishString(rows: []const []const u8, cx: Ctx) anyerror!Value {
         any = true;
     }
     return if (any) .{ .string = out.items } else .null;
-}
-
-/// The rows a percentile reads, in its order, NULLs gone, and its fraction.
-fn percentileRows(rows: []const []const u8, cx: Ctx) !struct { rows: []agg_args.Row, p: f64 } {
-    const all = try sortedRows(rows, cx.scratch);
-    var n: usize = 0;
-    for (all) |r| if (r.vals[0] != .null) {
-        all[n] = r;
-        n += 1;
-    };
-    if (n == 0) return .{ .rows = all[0..0], .p = 0 };
-    const p = toF64(cx.scratch, all[0].vals[1]) catch return eval.explain(error.CastFailed, "a percentile's fraction must be a number between 0 and 1");
-    if (!(p >= 0 and p <= 1)) return eval.explain(error.CastFailed, "a percentile's fraction must be a number between 0 and 1");
-    return .{ .rows = all[0..n], .p = p };
-}
-
-fn toF64(a: std.mem.Allocator, v: Value) !f64 {
-    return switch (v) {
-        .int => |x| @floatFromInt(x),
-        .float => |x| x,
-        .decimal => |d| d.toF64(),
-        .string => (try eval.castValueTyped(a, v, types.Type.init(.float))).float,
-        else => error.CastFailed,
-    };
-}
-
-/// PERCENTILE_CONT: the value at the fraction of the way along, between two rows
-/// interpolated.
-pub fn finishCont(rows: []const []const u8, cx: Ctx) anyerror!Value {
-    const got = try percentileRows(rows, cx);
-    if (got.rows.len == 0) return .null;
-    const at = got.p * @as(f64, @floatFromInt(got.rows.len - 1));
-    const lo: usize = @intFromFloat(@floor(at));
-    const hi: usize = @intFromFloat(@ceil(at));
-    const x = try toF64(cx.scratch, got.rows[lo].vals[0]);
-    if (lo == hi) return .{ .float = x };
-    const y = try toF64(cx.scratch, got.rows[hi].vals[0]);
-    return .{ .float = x + (y - x) * (at - @floor(at)) };
-}
-
-/// PERCENTILE_DISC: the first value whose place is at or past the fraction.
-pub fn finishDisc(rows: []const []const u8, cx: Ctx) anyerror!Value {
-    const got = try percentileRows(rows, cx);
-    if (got.rows.len == 0) return .null;
-    const place = @ceil(got.p * @as(f64, @floatFromInt(got.rows.len)));
-    const i: usize = if (place < 1) 0 else @intFromFloat(place - 1);
-    return got.rows[i].firstAs(cx.scratch, cx.out);
 }
 
 /// BOOL_AND (`all`) or BOOL_OR; NULL over no values.
@@ -718,22 +778,31 @@ pub fn selectNth(xs_all: []f64, k: usize) f64 {
     }
     @memset(xs_all[m..], std.math.nan(f64));
     if (k >= m) return std.math.nan(f64);
-    const xs = xs_all[0..m];
+    return selectBy(f64, xs_all[0..m], k);
+}
+
+/// Quickselect over values of `T` in `order`'s order (no NaN among floats).
+pub fn selectBy(comptime T: type, xs: []T, k: usize) T {
+    const L = struct {
+        inline fn lt(a: T, b: T) bool {
+            return if (T == f64) a < b else order(T, a, b) == .lt;
+        }
+    };
     var lo: usize = 0;
     var hi: usize = xs.len - 1;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        if (xs[mid] < xs[lo]) std.mem.swap(f64, &xs[mid], &xs[lo]);
-        if (xs[hi] < xs[lo]) std.mem.swap(f64, &xs[hi], &xs[lo]);
-        if (xs[hi] < xs[mid]) std.mem.swap(f64, &xs[hi], &xs[mid]);
+        if (L.lt(xs[mid], xs[lo])) std.mem.swap(T, &xs[mid], &xs[lo]);
+        if (L.lt(xs[hi], xs[lo])) std.mem.swap(T, &xs[hi], &xs[lo]);
+        if (L.lt(xs[hi], xs[mid])) std.mem.swap(T, &xs[hi], &xs[mid]);
         const p = xs[mid];
         var i = lo;
         var j = hi;
         while (i <= j) {
-            while (xs[i] < p) i += 1;
-            while (p < xs[j]) j -= 1;
+            while (L.lt(xs[i], p)) i += 1;
+            while (L.lt(p, xs[j])) j -= 1;
             if (i <= j) {
-                std.mem.swap(f64, &xs[i], &xs[j]);
+                std.mem.swap(T, &xs[i], &xs[j]);
                 i += 1;
                 if (j == 0) break;
                 j -= 1;

@@ -39,6 +39,11 @@ pub const vectorized = struct {
         return .{ .scalar = .{ .date = @intCast(civil.dayOf(clockOf(c))) } };
     }
 
+    /// A percentile's values: its first argument's, as they are.
+    pub fn percentile(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch) VecError!Vec {
+        return evalVec(arena, c.args[0], batch);
+    }
+
     /// Packing has no kernel: it reads values of any kind, row by row.
     pub fn aggArgs(_: std.mem.Allocator, _: ast.Expr.Call, _: Batch) VecError!Vec {
         return error.Unsupported;

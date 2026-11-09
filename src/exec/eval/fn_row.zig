@@ -97,6 +97,11 @@ pub const per_row = struct {
         return .{ .bytes = try @import("../agg_args.zig").encode(arena, c.args[0].str_lit, vals) };
     }
 
+    /// A percentile's values (`__percentile(x, fraction, desc)`): `x`, as it is.
+    pub fn percentile(arena: std.mem.Allocator, c: ast.Expr.Call, batch: Batch, row: usize) EvalError!Value {
+        return evalRow(arena, c.args[0], batch, row);
+    }
+
     /// `USING changes`' `sequence_by`, `position` or `delete_when`
     /// (`__change_need(v, what, target)`): the value; a NULL `delete_when` is false,
     /// any other NULL fails the run, as no change can be placed without it.

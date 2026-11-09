@@ -18,6 +18,7 @@ const Agg = @import("../aggregate.zig").Aggregate.Agg;
 const Batch = @import("../../batch.zig").Batch;
 const Decimal = @import("../../value.zig").Decimal;
 const Value = @import("../../value.zig").Value;
+const aggregates = @import("../../../lang/aggregates.zig");
 const ast = @import("../../../lang/ast.zig");
 const column = @import("../../column.zig");
 const eval = @import("../../eval.zig");
@@ -238,7 +239,7 @@ pub fn kernelFor(agg: Agg) struct { k: *const Kernel, ty: types.Type } {
         },
         .min => .{ .k = if (agg.ty.unknown) kernelOf(funcs.ExtremeValue(.lt)) else extreme(.lt, agg.ty.kind), .ty = agg.ty },
         .max => .{ .k = if (agg.ty.unknown) kernelOf(funcs.ExtremeValue(.gt)) else extreme(.gt, agg.ty.kind), .ty = agg.ty },
-        .median => .{ .k = kernelOf(funcs.Median), .ty = float },
+        .median, .percentile_cont => .{ .k = kernelOf(funcs.Quantile), .ty = float },
         .count_if => .{ .k = kernelOf(funcs.CountIf), .ty = types.Type.init(.bool) },
         .bool_and => .{ .k = kernelOf(funcs.BoolFold(true)), .ty = types.Type.init(.bool) },
         .bool_or => .{ .k = kernelOf(funcs.BoolFold(false)), .ty = types.Type.init(.bool) },
@@ -254,9 +255,23 @@ pub fn kernelFor(agg: Agg) struct { k: *const Kernel, ty: types.Type } {
         .arg_min => .{ .k = kernelOf(funcs.ArgBest(.lt)), .ty = packed_ty },
         .array_agg => .{ .k = kernelOf(funcs.Collect(funcs.finishList)), .ty = packed_ty },
         .string_agg => .{ .k = kernelOf(funcs.Collect(funcs.finishString)), .ty = packed_ty },
-        .percentile_cont => .{ .k = kernelOf(funcs.Collect(funcs.finishCont)), .ty = packed_ty },
-        .percentile_disc => .{ .k = kernelOf(funcs.Collect(funcs.finishDisc)), .ty = packed_ty },
+        .percentile_disc => .{ .k = switch (agg.ty.kind) {
+            inline else => |k| if (agg.ty.unknown) kernelOf(funcs.Disc(Value)) else if (comptime read.Phys(k)) |T| kernelOf(funcs.Disc(T)) else kernelOf(funcs.Disc(Value)),
+        }, .ty = agg.ty },
     };
+}
+
+/// The fraction and order of a percentile's argument, `__percentile(x, frac, desc)`.
+fn percentileOf(arg: ?*const ast.Expr) ?struct { frac: f64, desc: bool } {
+    const e = arg orelse return null;
+    if (e.* != .call or !std.mem.eql(u8, e.call.name, aggregates.percentile_fn)) return null;
+    const f = e.call.args[1];
+    const frac: f64 = switch (f.*) {
+        .float_lit => |x| x,
+        .int_lit => |x| @floatFromInt(x),
+        else => return null,
+    };
+    return .{ .frac = frac, .desc = e.call.args[2].* == .bool_lit and e.call.args[2].bool_lit };
 }
 
 pub const Layout = struct {
@@ -277,6 +292,10 @@ pub const Layout = struct {
             const kf = kernelFor(agg);
             k.* = kf.k;
             cx.* = .{ .out = agg.ty, .ty = kf.ty, .alloc = a, .scratch = a };
+            if (percentileOf(agg.arg)) |pc| {
+                cx.frac = pc.frac;
+                cx.desc = pc.desc;
+            }
             o.* = at;
             at += kf.k.size;
         }
