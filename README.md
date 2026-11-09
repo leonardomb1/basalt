@@ -230,45 +230,39 @@ fastest at distinct counts, string matching and writing CSV, and on joins and
 aggregates about one and a half to three times slower than the fastest engine.
 Reading gzipped CSV and NDJSON are its slowest paths today.
 
-## basalt and DuckDB
+## What sets it apart
 
-Both read files with SQL from a single binary, so they are often compared. They
-are built for different jobs:
+DuckDB, ClickHouse, Polars and DataFusion are query engines: fast at answering a
+question about data they can read. basalt is built around the rest of a pipeline,
+getting data out of the systems that hold it and into the ones that need it:
 
-| | basalt | DuckDB |
-|---|---|---|
-| What it is | a script runner that moves data between systems | an embedded analytical database |
-| Storage of its own | none: it reads and writes other systems | a database file, with transactions and indexes |
-| Used from | the command line, a REPL, a notebook kernel | a library in Python, R, Java, Node, Wasm and more, and a CLI |
-| CSV, Parquet, JSON, Excel | read and write | read and write (Excel through an extension) |
-| XML, Avro | read and write | community extension for XML; Avro read through an extension |
-| Delta Lake | read, time travel, change feed; append, replace, upsert | read, time travel, create and append (extension) |
-| Iceberg | no | read and write through a catalog (extension) |
-| S3, Azure | read and write | read and write (extensions) |
-| SFTP, FTP, SMB shares | read; write but FTP | no |
-| PostgreSQL, MySQL | read and write, filters run by the database, split reads in parallel, UPSERT | read and write by attaching (extensions) |
-| SQL Server, StarRocks, Doris | read and write | SQL Server through an experimental community extension |
-| REST APIs | paging, retries, bearer, basic, OAuth2 and login flows | files over HTTP(S) |
-| Change data capture | SQL Server CDC, applied to any table in batches | no |
-| A script checked before it runs | every statement typed and planned first; `basalt check` offline | each statement bound as it runs |
-| Scripting | `PARAM`, `LET`, `FOR EACH`, `CASE`, functions and pinned libraries | SQL macros |
-| Speed | starts in 2 ms; faster at distinct counts, `LIKE` and writing CSV, about 1.5–3× slower on joins and aggregates (above) | starts in 33 ms |
-
-Use DuckDB to keep and query data in one place, from a program or a notebook;
-use basalt to move data between the systems that hold it, on a schedule.
-
-## When to use something else
-
-- **Streaming replication.** basalt reads change feeds in batches: each run
-  takes what is new since the target's last position and stops. It does not hold
-  a connection open following a log; schedule it with cron, Airflow or the like.
-- **One group far larger than memory.** A sort, a join's build side, `DISTINCT`
-  and a `GROUP BY` spill to disk past `--op-memory`, a parallel `GROUP BY` staying
-  parallel; but an ungrouped `count(DISTINCT)`, and the values `median`, the
-  percentiles, `string_agg` and `array_agg` hold for one group, stay in memory.
-- **Interactive analytics where milliseconds matter.** DuckDB is faster on
-  analytical queries (above); basalt's edge is everything around the query:
-  sources, sinks, scripts and checks.
+- **One script across systems.** A join can take a SQL Server table, a Postgres
+  table and a CSV on a Windows share, and write the result to a lake or another
+  database. Each `WHERE` runs in the database it filters, and a large SQL read is
+  split into key ranges read in parallel.
+- **The systems pipelines actually touch.** SFTP, FTP and SMB shares (NTLMv2 or
+  Kerberos); SQL Server, StarRocks and Doris as well as Postgres and MySQL; REST
+  APIs with paging, retries and OAuth2; Excel and XML written as well as read;
+  fixed-width record files; Latin-1 and CP1252 text; a file inside a `.zip`.
+- **Writes the way a target wants them.** `UPSERT` into every database it writes,
+  StarRocks and Doris through Stream Load; a `REPLACE` into PostgreSQL, MySQL or
+  SQL Server loads a staging table and swaps the rows in one transaction, so readers
+  never see an empty table and grants, views and indexes stay.
+- **A lake it can maintain.** Delta tables read at any version and written by
+  append, replace or upsert (copy-on-write, deletion vectors, row tracking, the
+  change data feed), compacted and vacuumed.
+- **Change data capture without a server.** `UPSERT ... USING changes` applies a
+  change feed, a SQL Server table's CDC or a Delta table's, to any table it writes,
+  each run taking what is new since the target's last position.
+- **Checked before it runs.** A whole script is parsed, typed and planned before a
+  row is read; `basalt check` does it without connecting. Exit code `75` tells a
+  scheduler a failure is worth retrying.
+- **Scripts, not just queries.** `PARAM`, `LET`, `FOR EACH` (a load per row, to a
+  target named per row), `CASE`, functions and table functions, libraries pinned
+  by hash.
+- **Easy to run anywhere.** One static 7.6 MB binary, no runtime, starting in 2 ms;
+  logins from environment variables; `EXPLAIN ANALYZE` shows every request each
+  source was sent.
 
 ## Development
 
