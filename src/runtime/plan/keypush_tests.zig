@@ -53,12 +53,12 @@ fn runPg(a: std.mem.Allocator, tmp: *std.testing.TmpDir, srv_port: u16, body: []
     return ran;
 }
 
-/// The queries the server got that read `items`.
+/// The queries the server got that read `items`, its catalog's about it left out.
 fn itemQueries(a: std.mem.Allocator, srv: *FakePg) ![]const []const u8 {
     const all = try srv.received(testing.allocator);
     defer testing.allocator.free(all);
     var out = std.array_list.Managed([]const u8).init(a);
-    for (all) |q| if (std.mem.indexOf(u8, q, "\"public\".\"items\"") != null) try out.append(try a.dupe(u8, q));
+    for (all) |q| if (std.mem.indexOf(u8, q, "\"public\".\"items\"") != null and std.mem.indexOf(u8, q, "pg_attribute") == null) try out.append(try a.dupe(u8, q));
     return out.toOwnedSlice();
 }
 

@@ -107,6 +107,12 @@ crosses the wire. The answer never changes, only where the work happens;
   table getting its share. The filter stays above the union too, so a part that
   did not descend still holds. A union by position is not narrowed, as a
   branch's column there may go by another name.
+- **Columns through a union** — when what follows `EACH TABLE OF` or a
+  `UNION ALL BY NAME` names its columns, each branch asks only for those it holds,
+  a table's learnt from its catalog (or a zero-row read where the catalog does not
+  answer), a file's from its header or footer. A column a branch lacks is NULL as
+  ever. A `SELECT *` after the union, a union by position and a `UNION DISTINCT`
+  read every column.
 - **Whole-aggregate pushdown** — `read <sql> | filters | GROUP BY` descends as
   one grouped query when every filter translates, the group keys are bare
   columns, and the aggregates are `COUNT SUM AVG MIN MAX` of bare columns,

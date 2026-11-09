@@ -9,6 +9,7 @@ const buildProject = @import("../plan.zig").buildProject;
 const buildStage = @import("../plan.zig").buildStage;
 const conform = @import("../../lang/conform.zig");
 const readLabel = @import("../connect.zig").readLabel;
+const projectedColumns = @import("../plan.zig").projectedColumns;
 const discoverRows = @import("discover.zig").discoverRows;
 const discoverRowsPipeline = @import("discover.zig").discoverRowsPipeline;
 const dupeSchema = @import("../connect.zig").dupeSchema;
@@ -321,6 +322,40 @@ pub fn unionExceptNames(after: []const ast.Stage) []const []const u8 {
     return &.{};
 }
 
+/// Each branch of a union by name asks only for the columns `after` takes that it
+/// holds: a table's from its catalog or a probe, a file's from its header or footer
+/// when that is known without opening it. A branch left unsure reads everything, a
+/// column it lacks is filled with NULL as ever. A position's meaning needs every
+/// column, and so does a DISTINCT set operation's comparison.
+pub fn narrowBranches(env: *Env, u: ast.Union, specs: []UnionSpec, hints: []const ast.Hint, after: []const ast.Stage) !void {
+    if (u.positional or u.set != .union_all) return;
+    const cols = (try projectedColumns(env, after)) orelse return;
+    if (cols.len == 0) return;
+    const names = try sql_read.plainNames(env.arena, cols);
+    for (specs) |*s| {
+        if (s.pipeline != null or s.read.cols.len > 0) continue;
+        const own: ?[]const []const u8 = switch (s.read.form) {
+            .table => try sql_read.tableColumnsAmong(env, s.read, hints, names),
+            .path => try fileColumnsAmong(env, s.read, hints, names),
+            else => null,
+        };
+        if (own) |o| if (o.len > 0) {
+            s.read.cols = o;
+        };
+    }
+}
+
+fn fileColumnsAmong(env: *Env, rd: ast.Read, hints: []const ast.Hint, names: []const []const u8) !?[]const []const u8 {
+    if (!std.mem.eql(u8, rd.connector, "csv")) return null;
+    const schema = @import("../analyze/targets.zig").offlineSchema(env.arena, rd, hints, env.tables) orelse return null;
+    var out = std.array_list.Managed([]const u8).init(env.arena);
+    for (schema.fields) |f| for (names) |n| if (std.ascii.eqlIgnoreCase(n, f.name)) {
+        try out.append(f.name);
+        break;
+    };
+    return try out.toOwnedSlice();
+}
+
 /// The serial union: every branch opened, reconciled to the canon and drained in
 /// order; used when splitting does not apply. Positional unions leave EXCEPT downstream.
 pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, after: []const ast.Stage) anyerror!PipeRes {
@@ -334,7 +369,8 @@ pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, after: []con
 
     const children = try arena.alloc(op.Op, specs.len);
     const schemas = try arena.alloc(types.Schema, specs.len);
-    for (specs) |*s| if (except.len > 0 and s.pipeline == null) {
+    try narrowBranches(env, u, specs, hints, after);
+    for (specs) |*s| if (except.len > 0 and s.pipeline == null and s.read.cols.len == 0) {
         if (try exceptColumns(env, s.read, hints, except)) |cols| s.read.cols = cols;
     };
     if (!u.positional) for (specs) |*s| if (s.pipeline == null) {

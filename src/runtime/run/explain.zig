@@ -168,8 +168,62 @@ fn readText(env: *Env, rd: ast.Read, hints: []const ast.Hint) ![]const u8 {
     return readLabel(env, rd, hints);
 }
 
+/// A long `IN` list's first values and a count of the rest, so what follows a key
+/// pushdown's thousand values still shows.
+fn shortLists(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const mark = " IN (";
+    const shown = 8;
+    var out = std.array_list.Managed(u8).init(arena);
+    var quote: u8 = 0;
+    var i: usize = 0;
+    while (i < s.len) {
+        const c = s[i];
+        if (quote != 0) {
+            if (c == quote) quote = 0;
+        } else if (c == '\'' or c == '"' or c == '`') {
+            quote = c;
+        } else if (c == '[') {
+            quote = ']';
+        } else if (std.ascii.startsWithIgnoreCase(s[i..], mark)) {
+            var depth: usize = 1;
+            var q: u8 = 0;
+            var commas: usize = 0;
+            var cut: usize = 0;
+            var j = i + mark.len;
+            while (j < s.len and depth > 0) : (j += 1) {
+                const d = s[j];
+                if (q != 0) {
+                    if (d == q) q = 0;
+                    continue;
+                }
+                switch (d) {
+                    '\'', '"', '`' => q = d,
+                    '[' => q = ']',
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    ',' => if (depth == 1) {
+                        commas += 1;
+                        if (commas == shown) cut = j;
+                    },
+                    else => {},
+                }
+            }
+            if (depth == 0 and cut > 0) {
+                try out.appendSlice(s[i..cut]);
+                try out.writer().print(", ... (+{d} values))", .{commas + 1 - shown});
+                i = j;
+                continue;
+            }
+        }
+        try out.append(c);
+        i += 1;
+    }
+    return out.items;
+}
+
 /// A request as the `sent:` line prints it: on one line, the first columns of a long
-/// list, every `WHERE` in full, up to a length no terminal is served by.
+/// list and the first values of a long `IN`, the rest of the query in full, up to a
+/// length no terminal is served by.
 pub fn sentText(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
     const flat = try arena.alloc(u8, text.len);
     var n: usize = 0;
@@ -184,7 +238,7 @@ pub fn sentText(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
         flat[n] = c;
         n += 1;
     }
-    const s = try shortColumns(arena, std.mem.trimRight(u8, flat[0..n], " "));
+    const s = try shortLists(arena, try shortColumns(arena, std.mem.trimRight(u8, flat[0..n], " ")));
     const max = 4000;
     if (s.len <= max) return s;
     const kept = jsontext.clipUtf8(s, max);
@@ -404,7 +458,10 @@ fn node(prof: *const Profile, o: Ordered, id: profile.Id, role: profile.Role, pr
         if (n.children.len > 0) {
             const in = n.rowsIn(prof);
             try w.print("{f} -> {f}", .{ Count{ .n = in }, Count{ .n = n.total.rows } });
-            if (in > 0 and keepsRows(id.kind)) try w.print(" ({f} kept)", .{Pct{ .v = @as(f64, @floatFromInt(n.total.rows)) / @as(f64, @floatFromInt(in)) }});
+            if (in > 0 and keepsRows(id.kind)) {
+                const ratio = @as(f64, @floatFromInt(n.total.rows)) / @as(f64, @floatFromInt(in));
+                if (n.total.rows > in) try w.print(" ({d:.1}x)", .{ratio}) else try w.print(" ({f} kept)", .{Pct{ .v = ratio }});
+            }
         } else try w.print("{f}", .{Count{ .n = n.total.rows }});
         try w.print("   batches: {d}", .{n.total.calls});
         if (n.request) |r| if (r.pages > 1) try w.print("   pages: {d}", .{r.pages});
@@ -671,6 +728,10 @@ test "explain: the sent line cuts a long column list, never the WHERE, and stays
     const long = "SELECT [column_number_one], [column_number_two], [column_number_three], [column_number_four], [column_number_five], [column_number_six], [column, seven], f(a, b) FROM [t] WHERE ([k] >= 1)";
     try testing.expectEqualStrings("SELECT [column_number_one], [column_number_two], [column_number_three], [column_number_four], [column_number_five], [column_number_six], ... (+2) FROM [t] WHERE ([k] >= 1)", try sentText(a, long));
     try testing.expectEqualStrings("https://host/items?page=1", try sentText(a, "https://host/items?page=1"));
+    try testing.expectEqualStrings(
+        "SELECT a FROM t WHERE (x IN ('1', '2', '3', '4', '5', '6', '7', '8', ... (+2 values))) AND y IN ('a,b', 'c') AND z = 'IN (1)'",
+        try sentText(a, "SELECT a FROM t WHERE (x IN ('1', '2', '3', '4', '5', '6', '7', '8', '9', '10')) AND y IN ('a,b', 'c') AND z = 'IN (1)'"),
+    );
 }
 
 test "explain: lanes show their spread, and a lane far above the mean is called out" {

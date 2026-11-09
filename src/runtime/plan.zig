@@ -755,6 +755,7 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
         current = r.op;
         schema = r.schema;
         current.stampNew(profile.keyOf(stage.pos));
+        if (env.profile != null and stage.node == .select and current == .project) current.project.label = try profile.stageText(env.arena, stage);
     }
     try runtime_filters.wire(env.arena, &current);
     return .{ .op = current, .schema = schema };
@@ -1066,10 +1067,9 @@ fn projectJoinedFileRead(env: *Env, stages: []const ast.Stage, needs: []const []
     for (stages[1..]) |st| if (st.node != .filter) return stages;
     const cols = (try projectedColumns(env, try std.mem.concat(env.arena, ast.Stage, &.{ stages[1..], try needsTail(env.arena, needs) }))) orelse return stages;
     if (cols.len == 0) return stages;
-    for (cols) |c| if (std.mem.indexOfScalar(u8, c, '.') != null) return stages;
     const out = try env.arena.dupe(ast.Stage, stages);
     var nrd = rd;
-    nrd.cols = cols;
+    nrd.cols = try @import("connect/sql_read.zig").plainNames(env.arena, cols);
     out[0].node = .{ .read = nrd };
     return out;
 }

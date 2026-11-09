@@ -169,8 +169,9 @@ operators below it. Each node shows:
 - its kind, its number, and what it does in SQL: the predicate, the keys, the
   columns, the file or table;
 - `sent:` on a scan that asked a source for its rows, the request as sent: a SQL
-  read's query with the `WHERE` that descended into it, in full, a long column list
-  cut to its first columns, or an HTTP read's URL. This is where pushdown shows. A
+  read's query with the `WHERE` that descended into it, a long column list or `IN`
+  list cut to its first items and a count of the rest, or an HTTP read's URL. This
+  is where pushdown shows. A
   split path's reads say `once per key range:` and the query before its ranges are
   added;
 - `time:` its own time and share. Past 30% of the operator time a node is red,

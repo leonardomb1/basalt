@@ -194,6 +194,7 @@ const tdsConnect = @import("connect/dbconfig.zig").tdsConnect;
 pub const selectListFor = @import("connect/sql_read.zig").selectListFor;
 pub const projectSqlRead = @import("connect/sql_read.zig").projectSqlRead;
 pub const exceptColumns = @import("connect/sql_read.zig").exceptColumns;
+pub const probedSchema = @import("connect/sql_read.zig").probedSchema;
 pub const sqlWithWhere = @import("connect/sql_read.zig").sqlWithWhere;
 pub const sqlDescForStage = @import("connect/sql_read.zig").sqlDescForStage;
 pub const planSplit = @import("connect/sql_read.zig").planSplit;
@@ -244,6 +245,7 @@ pub fn sinkLabel(env: *Env, w: ast.Write) []const u8 {
     if (std.mem.eql(u8, w.connector, mem_connector)) return "memory";
     if (std.mem.eql(u8, w.connector, "csv") and pqwrite.Writer.isPath(w.target)) return "parquet";
     if (std.mem.eql(u8, w.connector, "csv") and arrowread.isPath(w.target)) return "arrow";
+    if (std.mem.eql(u8, w.connector, "csv")) if (analyze.formatOfPath(w.target)) |f| return @tagName(f);
     return connectorType(env, w.connector);
 }
 

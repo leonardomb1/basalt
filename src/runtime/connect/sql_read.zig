@@ -22,6 +22,9 @@ const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
 const observe = @import("observe.zig");
+const columnFacts = @import("facts.zig").columnFacts;
+const dupeSchema = @import("../connect.zig").dupeSchema;
+const types = @import("../../lang/types.zig");
 
 pub fn readSql(env: *Env, rd: ast.Read) ![]const u8 {
     const base = switch (rd.form) {
@@ -167,8 +170,7 @@ pub fn projectJoinedSqlRead(env: *Env, stages: []const ast.Stage, needs: []const
     const tail = [_]ast.Stage{.{ .node = .{ .select = items }, .hints = &.{}, .pos = stages[0].pos }};
     const cols = (try projectedColumns(env, try std.mem.concat(env.arena, ast.Stage, &.{ stages[1..], &tail }))) orelse return stages;
     if (cols.len == 0) return stages;
-    for (cols) |c| if (std.mem.indexOfScalar(u8, c, '.') != null) return stages;
-    const own = (try tableColumnsAmong(env, rd, stages[0].hints, cols)) orelse return stages;
+    const own = (try tableColumnsAmong(env, rd, stages[0].hints, try plainNames(env.arena, cols))) orelse return stages;
     if (own.len == 0) return stages;
     const out = try env.arena.dupe(ast.Stage, stages);
     var nrd = rd;
@@ -177,20 +179,65 @@ pub fn projectJoinedSqlRead(env: *Env, stages: []const ast.Stage, needs: []const
     return out;
 }
 
-fn tableColumnsAmong(env: *Env, rd: ast.Read, hints: []const ast.Hint, names: []const []const u8) !?[]const []const u8 {
+/// `cols` as plain names a read can be asked for. A dotted one may be a column of an
+/// earlier join's side (`e.nome`, which no stage rewrote) or a path into a column of
+/// this read, so it stands for its head and its last part: at worst a like-named
+/// column is read for nothing, and whoever filters these against the read's own
+/// columns drops the rest.
+pub fn plainNames(arena: std.mem.Allocator, cols: []const []const u8) ![]const []const u8 {
+    var out = std.array_list.Managed([]const u8).init(arena);
+    for (cols) |c| {
+        const dot = std.mem.indexOfScalar(u8, c, '.') orelse {
+            try out.append(c);
+            continue;
+        };
+        try out.append(c[0..dot]);
+        try out.append(c[std.mem.lastIndexOfScalar(u8, c, '.').? + 1 ..]);
+    }
+    return out.toOwnedSlice();
+}
+
+/// Those of `names` that are table `rd`'s columns, spelled as the table does: from
+/// its catalog when the run has asked or can ask it, as the run keeps that answer,
+/// else from a zero-row probe. Null when neither answers.
+pub fn tableColumnsAmong(env: *Env, rd: ast.Read, hints: []const ast.Hint, names: []const []const u8) !?[]const []const u8 {
+    var out = std.array_list.Managed([]const u8).init(env.arena);
+    if (try columnFacts(env, rd)) |facts| if (facts.count() > 0) {
+        var it = facts.keyIterator();
+        while (it.next()) |k| for (names) |n| if (std.ascii.eqlIgnoreCase(n, k.*)) {
+            try out.append(try env.arena.dupe(u8, k.*));
+            break;
+        };
+        std.sort.pdq([]const u8, out.items, {}, struct {
+            fn lt(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lt);
+        return try out.toOwnedSlice();
+    };
     var probe = rd;
     probe.where = "1 = 0";
     probe.cols = &.{};
-    const src = openSourceProjected(env, probe, hints, null, &.{}) catch return null;
-    defer src.close();
-    var out = std.array_list.Managed([]const u8).init(env.arena);
-    for (src.schema().fields) |f| {
+    const schema = probedSchema(env, probe, hints) catch return null;
+    for (schema.fields) |f| {
         for (names) |n| if (std.ascii.eqlIgnoreCase(n, f.name)) {
             try out.append(try env.arena.dupe(u8, f.name));
             break;
         };
     }
     return try out.toOwnedSlice();
+}
+
+/// The schema zero-row read `probe` gets back, asked of a table once per statement: a
+/// table joined twice asks the same question, each a round trip.
+pub fn probedSchema(env: *Env, probe: ast.Read, hints: []const ast.Hint) !types.Schema {
+    const key = if (probe.form == .table) try msgfmt.allocPrint(env.arena, "{s}\x00{s}", .{ probe.connector, try readSql(env, probe) }) else "";
+    if (key.len > 0) for (env.probes.items) |p| if (std.mem.eql(u8, p.key, key)) return p.schema;
+    const src = try openSourceProjected(env, probe, hints, null, &.{});
+    defer src.close();
+    const schema = try dupeSchema(env.arena, src.schema());
+    if (key.len > 0) try env.probes.append(env.arena, .{ .key = key, .schema = schema });
+    return schema;
 }
 
 /// The names a `SELECT * EXCEPT (...)` right after the read leaves out, when that
@@ -210,9 +257,7 @@ pub fn exceptColumns(env: *Env, rd: ast.Read, hints: []const ast.Hint, except: [
     var probe = rd;
     probe.where = "1 = 0";
     probe.cols = &.{};
-    const src = openSourceProjected(env, probe, hints, null, &.{}) catch return null;
-    defer src.close();
-    const schema = src.schema();
+    const schema = probedSchema(env, probe, hints) catch return null;
     var out = std.array_list.Managed([]const u8).init(env.arena);
     for (schema.fields) |f| {
         var drop = false;

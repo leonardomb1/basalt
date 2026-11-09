@@ -280,11 +280,13 @@ pub const Op = union(enum) {
     }
 
     /// What this one operator stands for, when its stage cannot say: a union's branch
-    /// shares the stage of every other branch.
+    /// shares the stage of every other branch, and the selects one query plans into
+    /// share its position.
     pub fn label(self: Op) []const u8 {
         return switch (self) {
             .scan => |s| s.label,
             .union_ => |u| u.label,
+            .project => |p| p.label,
             else => "",
         };
     }
@@ -561,6 +563,7 @@ pub const Project = struct {
     cols: []const Col,
     out_schema: *const types.Schema,
     err: ?*ErrCtx = null,
+    label: []const u8 = "",
 
     pub const Col = struct {
         source: union(enum) { passthrough: usize, expr: *const ast.Expr },

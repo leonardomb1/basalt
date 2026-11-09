@@ -257,11 +257,12 @@ const report_cases = [_]ReportCase{
     .{ .script = "LET top = (SELECT MAX(v) AS m FROM pg.public.t);\nLOAD INTO '$B/never.csv' AS SELECT id FROM '$B/in.csv' WHERE v = $top;", .explain = true, .says = &.{"LET `top` (actuals)"} },
     .{ .script = "FOR EACH ROW OF (SELECT tname, tag FROM pg.public.catalog) AS (a, b)\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND FOR;", .explain = true, .says = &.{"FOR EACH discovery (actuals)"} },
     .{ .script = "FOR EACH ROW OF (pg.QUERY($$SELECT \"tname\", \"tag\" FROM catalog$$)) AS (a, b)\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND FOR;", .explain = true, .says = &.{ "FOR EACH discovery (actuals)", "postgres query, discovery", "FOR EACH row 2 of 2: a=t2, b=b" } },
+    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.xlsx' AS SELECT a.id FROM '$B/in.csv' a JOIN '$B/twice.csv' b ON a.g = b.g;", .says = &.{ "Sink: xlsx ", "(2.0x)", "project (#1)  id\n" } },
     .{ .script = "DESCRIBE pg.public.t;", .explain = true, .says = &.{"DESCRIBE (actuals)"} },
     .{ .script = "CREATE FUNCTION f(a) AS\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND;\nCALL f('x');", .explain = true, .says = &.{"CALL f(a=x)"} },
     .{ .script = "CASE WHEN 1 = 2 THEN PRINT 'no'; WHEN 1 = 1 THEN LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t; END CASE;", .explain = true, .says = &.{"CASE: arm 2 of 2"} },
     .{ .script = "LOAD INTO '$B/d/' WITH (format = 'delta') AS SELECT id, v FROM '$B/in.csv';\nEXPLAIN ANALYZE SELECT id FROM '$B/d/';", .says = &.{ "log replay (#", "live files: ", "└─ log read (#", "├─ list (#", "entries: " } },
-    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/d/' UPSERT ON (id) USING changes (sequence_by = id, position = id, name = 'feed') AS SELECT id, v FROM '$B/in.csv';", .says = &.{"log replay (#"} },
+    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/d/' UPSERT ON (id) USING changes (sequence_by = id, position = id, name = 'feed') AS SELECT id, v FROM '$B/in.csv';", .says = &.{ "log replay (#", "Sink: delta " } },
     .{ .script = "EXPLAIN ANALYZE SELECT g, SUM(v) AS s FROM '$B/pf/' GROUP BY g;", .threads = 4, .says = &.{ "list (#", "footer (#", "reads: " } },
     .{ .script = "EXPLAIN ANALYZE SELECT id FROM '$B/p.parquet' WHERE v > 2;", .threads = 4, .says = &.{"footer (#"} },
 };
@@ -306,6 +307,7 @@ test "the report shows every query the server got, once, on its scan or in a tre
     defer tmp.cleanup();
     const base = try tmp.dir.realpathAlloc(a, ".");
     try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,g,v\n1,a,1\n2,b,2\n3,c,3\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "twice.csv", .data = "g\na\na\nb\nb\nc\nc\n" });
     try writeParquet(a, try std.fs.path.join(a, &.{ base, "p.parquet" }), 1000, 100);
     try tmp.dir.makeDir("pf");
     try writeParquet(a, try std.fs.path.join(a, &.{ base, "pf", "a.parquet" }), 100, 50);
@@ -340,6 +342,92 @@ test "the report shows every query the server got, once, on its scan or in a tre
         held = ok and held;
     }
     try testing.expect(held);
+}
+
+test "a union and each join after it ask their tables only for the columns the query takes" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+
+    const Col = @import("../../testing/postgres_fake.zig").Col;
+    const head_cols = [_]Col{ .{ .name = "resp" }, .{ .name = "dept" }, .{ .name = "unused_h" }, .{ .name = "deleted" } };
+    const head_rows = [_][]const ?[]const u8{&.{ "1", "d", "x", "" }};
+    const emp_cols = [_]Col{ .{ .name = "mat" }, .{ .name = "nome" }, .{ .name = "depto" }, .{ .name = "unused_e" }, .{ .name = "deleted" } };
+    const emp_rows = [_][]const ?[]const u8{&.{ "1", "n", "d", "x", "" }};
+    const cat_cols = [_]Col{ .{ .name = "tname" }, .{ .name = "tag" } };
+    const cat_rows = [_][]const ?[]const u8{ &.{ "h1", "a" }, &.{ "h2", "b" } };
+    const tables = [_]Table{
+        .{ .name = "h1", .cols = &head_cols, .rows = &head_rows },
+        .{ .name = "h2", .cols = &head_cols, .rows = &head_rows },
+        .{ .name = "emp", .cols = &emp_cols, .rows = &emp_rows },
+        .{ .name = "catalog", .cols = &cat_cols, .rows = &cat_rows },
+    };
+    const srv = try FakePg.start(testing.allocator, &tables);
+    defer srv.finish();
+    const script = try msgfmt.allocPrint(a,
+        \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', port = {d}, database = 'd', user = 'u', password = 'p');
+        \\LOAD INTO '{s}/out.csv' AS
+        \\WITH h AS (
+        \\  SELECT resp, dept, grp FROM EACH TABLE OF (pg.QUERY($$SELECT "tname", "tag" FROM catalog$$)) AS (tname, grp)
+        \\  WITH (schema_from = 'h1')
+        \\  WHERE trim(resp) <> '' AND deleted <> '*'
+        \\),
+        \\s AS (
+        \\  SELECT h.grp, e.mat, e.nome, m.nome AS boss
+        \\  FROM h
+        \\  INNER JOIN pg.public.emp AS e ON trim(e.depto) = trim(h.dept) AND e.deleted <> '*'
+        \\  LEFT JOIN pg.public.emp AS m ON trim(m.mat) = trim(h.resp) AND m.deleted <> '*'
+        \\)
+        \\SELECT * FROM s;
+    , .{ srv.port(), base });
+    const printed = try printedBy(a, tmp.dir, script, 1, false);
+    errdefer std.debug.print("{s}\n", .{printed});
+    const got = try srv.received(a);
+    var bad = false;
+    var late_reads: usize = 0;
+    for (got) |q| {
+        if (std.mem.indexOf(u8, q, "1 = 0") != null or std.mem.indexOf(u8, q, "catalog") != null or std.mem.indexOf(u8, q, "pg_attribute") != null) continue;
+        late_reads += 1;
+        if (std.mem.indexOf(u8, q, "SELECT *") == null and std.mem.indexOf(u8, q, "unused_") == null) continue;
+        std.debug.print("reads more than it takes: {s}\n", .{q});
+        bad = true;
+    }
+    try testing.expect(!bad);
+    try testing.expectEqual(@as(usize, 4), late_reads);
+    var seen = std.StringHashMap(void).init(a);
+    for (got) |q| if (std.mem.indexOf(u8, q, "1 = 0") != null) {
+        if ((try seen.getOrPut(q)).found_existing) {
+            std.debug.print("asked twice: {s}\n", .{q});
+            bad = true;
+        }
+    };
+    try testing.expect(!bad);
+    try testing.expectEqualStrings("grp,mat,nome,boss\nb,1,n,n\na,1,n,n\n", try sortedOut(a, tmp.dir));
+}
+
+/// `out.csv`'s header and its rows in reverse order, the order of the rows being a
+/// union's, so a test reads one spelling of them.
+fn sortedOut(a: std.mem.Allocator, dir: std.fs.Dir) ![]const u8 {
+    const text = try dir.readFileAlloc(a, "out.csv", 1 << 20);
+    const nl = std.mem.indexOfScalar(u8, text, '\n').?;
+    var rows = std.array_list.Managed([]const u8).init(a);
+    var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, text[nl + 1 ..], "\n"), '\n');
+    while (it.next()) |r| try rows.append(r);
+    std.sort.pdq([]const u8, rows.items, {}, struct {
+        fn gt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.lessThan(u8, y, x);
+        }
+    }.gt);
+    var out = std.array_list.Managed(u8).init(a);
+    try out.appendSlice(text[0 .. nl + 1]);
+    for (rows.items) |r| {
+        try out.appendSlice(r);
+        try out.append('\n');
+    }
+    return out.items;
 }
 
 test "the report counts an HTTP read's pages on its scan, and shows no query value" {

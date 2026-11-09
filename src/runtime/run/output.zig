@@ -207,12 +207,23 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
             .columns_read = scan1[2] - scan0[2],
             .columns_total = scan1[3] - scan0[3],
             .spill_peak = if (env.space) |sp| sp.peak() -| held0 else 0,
-            .sink = std.mem.trimRight(u8, try msgfmt.allocPrint(arena, "{s} {s}", .{ env.sink_name, try targetLabel(arena, last.write) }), " "),
+            .sink = std.mem.trimRight(u8, try msgfmt.allocPrint(arena, "{s} {s}", .{ try sinkKind(env, stages[stages.len - 1]), try targetLabel(arena, last.write) }), " "),
         });
     }
     if (!is_load and !env.explain) if (env.max_rows) |cap| {
         stats.rows_out = load_rows0 + @min(stats.rows_out - load_rows0, cap);
     };
+}
+
+/// What write stage `st` would write as, for a report: the format it names, else the
+/// one its path says, else a folder's table, as the sink would find it.
+fn sinkKind(env: *Env, st: ast.Stage) ![]const u8 {
+    const w = st.node.write;
+    if (!std.mem.eql(u8, w.connector, "csv")) return sinkLabel(env, w);
+    var d = analyze.Diag{};
+    if (analyze.formatFromHints(st.hints, &d) catch null) |f| return @tagName(f);
+    if (std.mem.endsWith(u8, w.target, "/")) if (lake.detect(env.arena, w.target) catch null) |found| return @tagName(found.kind);
+    return sinkLabel(env, w);
 }
 
 /// The run's read counts so far: row groups read and skipped, columns read and offered.
@@ -830,8 +841,9 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
     const probes = try arena.alloc(driver.Source, specs.len);
     var opened: usize = 0;
     defer for (probes[0..opened]) |p| p.close();
+    try @import("../plan/union.zig").narrowBranches(env, u, specs, hints, downstream);
     for (specs, schemas, probes) |*s, *sch, *p| {
-        if (except.len > 0) {
+        if (except.len > 0 and s.read.cols.len == 0) {
             if (try exceptColumns(env, s.read, hints, except)) |cols| s.read.cols = cols;
         }
         var probe = s.read;
