@@ -33,24 +33,6 @@ const msgfmt = @import("../../format/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const writeTail = @import("agg.zig").writeTail;
 
-pub const DistinctShape = struct { prefix: []const ast.Stage, dist: ast.Stage, tail: []const ast.Stage };
-
-pub fn classifyDistinctPipeline(stages: []const ast.Stage) ?DistinctShape {
-    const middle = stages[1 .. stages.len - 1];
-    var di: ?usize = null;
-    for (middle, 0..) |st, i| switch (st.node) {
-        .filter, .select => {},
-        .distinct => {
-            if (di != null) return null;
-            di = i;
-        },
-        .sort, .limit, .aggregate, .window => if (di == null) return null,
-        else => return null,
-    };
-    const d = di orelse return null;
-    return .{ .prefix = middle[0..d], .dist = middle[d], .tail = middle[d + 1 ..] };
-}
-
 /// The key columns of the DISTINCT and how they are keyed: encoded fixed-width words
 /// when every key has a fixed encoding, else boxed values.
 const Keys = struct {

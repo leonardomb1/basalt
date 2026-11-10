@@ -80,7 +80,7 @@ pub fn choose(arena: std.mem.Allocator, stages: []const ast.Stage, head: []const
             .none
         else if (sqlAgg(stages)) |s|
             .{ .agg = s }
-        else if (lanes.classifyMapJoinPipeline(stages)) |s|
+        else if (mapJoin(stages)) |s|
             .{ .map_join = s }
         else if (streamsOnly(middle)) .map else .none,
     } };
@@ -125,8 +125,15 @@ pub fn oneLaneTurn(head: []const ast.Stage, f: Facts) ?lanes.SinkShape {
 
 /// A SQL read's aggregate with no join ahead of it, which its key ranges can fold.
 fn sqlAgg(stages: []const ast.Stage) ?lanes.SinkShape {
-    const s = lanes.classifySinkPipeline(stages) orelse return null;
-    return if (s.joins.len == 0) s else null;
+    const shape = lanes.classifyLaneShape(stages) orelse return null;
+    if (shape != .sink) return null;
+    return if (shape.sink.joins.len == 0) shape.sink else null;
+}
+
+/// A SQL read's single map and join, which its key ranges can probe.
+fn mapJoin(stages: []const ast.Stage) ?lanes.MapJoinShape {
+    const shape = lanes.classifyLaneShape(stages) orelse return null;
+    return if (shape == .map_join) shape.map_join else null;
 }
 
 /// Preconditions every lane path shares. A hinted read is left to the paths that honour

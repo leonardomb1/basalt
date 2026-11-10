@@ -99,18 +99,6 @@ fn pqTopNOne(ctx: *PqTopNCtx, p: usize) !void {
     ctx.sel[p] = idx[0..@min(idx.len, ctx.n)];
 }
 
-pub const TopNShape = struct { prefix: []const ast.Stage, srt: ast.Stage, lim: ast.Limit };
-
-pub fn classifyTopNPipeline(stages: []const ast.Stage) ?TopNShape {
-    const middle = stages[1 .. stages.len - 1];
-    if (middle.len < 2) return null;
-    if (middle[middle.len - 1].node != .limit or middle[middle.len - 2].node != .sort) return null;
-    if (!op.TopN.fits(middle[middle.len - 1].node.limit)) return null;
-    const prefix = middle[0 .. middle.len - 2];
-    for (prefix) |st| if (!analyze.isMap(st.node, false)) return null;
-    return .{ .prefix = prefix, .srt = middle[middle.len - 2], .lim = middle[middle.len - 1].node.limit };
-}
-
 /// Top-N as a parallel sink: a worker keeps its best rows over every morsel it claims,
 /// each row placed by its morsel and position there so ties keep the rows a serial
 /// run keeps; finalize combines the workers' rows into the final N.

@@ -766,7 +766,7 @@ pub const Resolved = struct {
 pub const Chain = struct { recs: []const Resolved, out: *const types.Schema };
 
 /// A filter or select, and an explode when `explode`: a stage that maps each batch
-/// on its own. File lanes take no explode yet (`lanes.classifyMapPipeline`).
+/// on its own. File lanes take an explode only on a plain map (`lanes/shape.zig`).
 pub fn isMap(node: ast.Stage.Node, explode: bool) bool {
     return switch (node) {
         .filter, .select => true,

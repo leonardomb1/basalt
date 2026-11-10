@@ -2,7 +2,7 @@
 //! can fan out, and the per-shape drivers (map, aggregate, top-N, distinct,
 //! sort, SQL split) over a source cut into morsels (`lanes/morsels.zig`).
 //!
-//! Shapes. `classifyLaneShape` picks one `LaneShape` per pipeline and `runShape`
+//! Shapes. `lanes/shape.zig` `classify` picks one `LaneShape` per pipeline and `runShape`
 //! switches exhaustively over it, so a new shape does not compile until it decides
 //! what to do with every source; a source that cannot fan a shape out returns false
 //! and falls back to the serial driver explicitly. Every shape reads `Morsels`:
@@ -70,25 +70,6 @@ const dupeSchema = @import("connect.zig").dupeSchema;
 
 const projectedColumns = @import("plan.zig").projectedColumns;
 
-pub const LaneShape = union(enum) {
-    sink: SinkShape,
-    distinct: DistinctShape,
-    top_n: TopNShape,
-    map: []const ast.Stage,
-    map_join: MapJoinShape,
-    sort: SortShape,
-};
-
-pub fn classifyLaneShape(stages: []const ast.Stage) ?LaneShape {
-    if (classifySinkPipeline(stages)) |x| return .{ .sink = x };
-    if (classifyDistinctPipeline(stages)) |x| return .{ .distinct = x };
-    if (classifyTopNPipeline(stages)) |x| return .{ .top_n = x };
-    if (classifyMapPipeline(stages)) |x| return .{ .map = x };
-    if (classifyMapJoinPipeline(stages)) |x| return .{ .map_join = x };
-    if (classifySortPipeline(stages)) |x| return .{ .sort = x };
-    return null;
-}
-
 pub fn runParquetLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const split = (try parquetSplit(env, stages[0].node.read, stages[0].hints, pushStages(stages, shape), w, opts)) orelse return false;
     return runShape(env, split, stages[0], shape, w, opts, stats, lanes_used);
@@ -128,37 +109,6 @@ fn runShape(env: *Env, split: Morsels, head: ast.Stage, shape: LaneShape, w: ast
         .map_join => |x| runParallelMap(env, split, head, x.prefix, x, w, opts, stats, lanes_used),
         .sort => |x| runParallelSort(env, &split, x, w, opts, stats, lanes_used),
     };
-}
-
-/// A pipeline whose breaker is a parallel sink, the aggregate: map stages, then
-/// lane-safe keyed joins, the aggregate, and a tail its finalize writes through.
-pub const SinkShape = struct { prefix: []const ast.Stage, joins: []const ast.Stage, agg: ast.Stage, tail: []const ast.Stage };
-
-/// Recognize `read … | (filter|select)* | join* | aggregate | tail | write`. A
-/// `select` or `filter` after the aggregate (a reordering projection, HAVING) is
-/// applied by the tail; refusing them sent such queries serial (TPC-H q01's shape:
-/// 379ms vs 88ms). A distinct or window in the tail is taken only without joins.
-pub fn classifySinkPipeline(stages: []const ast.Stage) ?SinkShape {
-    const middle = stages[1 .. stages.len - 1];
-    var ji: ?usize = null;
-    var ai: ?usize = null;
-    for (middle, 0..) |st, i| switch (st.node) {
-        .filter, .select => {},
-        .join => |j| {
-            if (ai != null or !joinKindLaneSafe(j.kind) or j.keyless()) return null;
-            if (ji == null) ji = i;
-        },
-        .aggregate => {
-            if (ai != null) return null;
-            ai = i;
-        },
-        .sort, .limit => if (ai == null) return null,
-        .distinct, .window => if (ai == null or ji != null) return null,
-        else => return null,
-    };
-    const a = ai orelse return null;
-    const j = ji orelse a;
-    return .{ .prefix = middle[0..j], .joins = middle[j..a], .agg = middle[a], .tail = middle[a + 1 ..] };
 }
 
 /// Recognize the shape a whole aggregate can descend into one grouped source query:
@@ -244,24 +194,22 @@ pub fn topNStages(env: *Env, stages: []const ast.Stage, src_base: usize, why: *[
     return out;
 }
 
+pub const LaneShape = @import("lanes/shape.zig").LaneShape;
+pub const SinkShape = @import("lanes/shape.zig").SinkShape;
+pub const MapJoinShape = @import("lanes/shape.zig").MapJoinShape;
+pub const DistinctShape = @import("lanes/shape.zig").DistinctShape;
+pub const TopNShape = @import("lanes/shape.zig").TopNShape;
+pub const SortShape = @import("lanes/shape.zig").SortShape;
+pub const classifyLaneShape = @import("lanes/shape.zig").classify;
 pub const agg_combine_parallel_min = @import("lanes/agg.zig").agg_combine_parallel_min;
 const runParallelAgg = @import("lanes/agg.zig").runParallelAgg;
 pub const runParallelSqlAgg = @import("lanes/agg.zig").runParallelSqlAgg;
-const classifyMapPipeline = @import("lanes/map.zig").classifyMapPipeline;
-pub const MapJoinShape = @import("lanes/map.zig").MapJoinShape;
-pub const classifyMapJoinPipeline = @import("lanes/map.zig").classifyMapJoinPipeline;
 pub const joinKindLaneSafe = @import("lanes/map.zig").joinKindLaneSafe;
 const mapJoinKindLaneSafe = @import("lanes/map.zig").mapJoinKindLaneSafe;
 pub const runParallelSqlMapJoin = @import("lanes/map.zig").runParallelSqlMapJoin;
 const runParallelMap = @import("lanes/map.zig").runParallelMap;
-const TopNShape = @import("lanes/topn.zig").TopNShape;
-const classifyTopNPipeline = @import("lanes/topn.zig").classifyTopNPipeline;
 const runParallelTopN = @import("lanes/topn.zig").runParallelTopN;
-const DistinctShape = @import("lanes/distinct.zig").DistinctShape;
-const classifyDistinctPipeline = @import("lanes/distinct.zig").classifyDistinctPipeline;
 const runParallelDistinct = @import("lanes/distinct.zig").runParallelDistinct;
-const SortShape = @import("lanes/sort.zig").SortShape;
-const classifySortPipeline = @import("lanes/sort.zig").classifySortPipeline;
 const runParallelSort = @import("lanes/sort.zig").runParallelSort;
 const Morsels = @import("lanes/morsels.zig").Morsels;
 const parquetSplit = @import("lanes/sources.zig").parquetSplit;
@@ -295,7 +243,7 @@ test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
     const s2 = classifyWholeAgg(&having).?;
     try std.testing.expectEqual(@as(usize, 0), s2.prefix.len);
     try std.testing.expectEqual(@as(usize, 2), s2.tail.len);
-    const lane = classifySinkPipeline(&having).?;
+    const lane = classifyLaneShape(&having).?.sink;
     try std.testing.expectEqual(@as(usize, 0), lane.prefix.len);
     try std.testing.expectEqual(@as(usize, 2), lane.tail.len);
 
@@ -321,7 +269,7 @@ test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
     try std.testing.expect(classifyWholeAgg(&hinted) == null);
 }
 
-test "classifySinkPipeline takes a HAVING tail over joins, and a distinct tail only without them" {
+test "an aggregate's lane shape takes a HAVING tail over joins, and a distinct tail only without them" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -330,15 +278,15 @@ test "classifySinkPipeline takes a HAVING tail over joins, and a distinct tail o
         \\LOAD INTO 'o.csv' AS WITH d AS (SELECT id AS did FROM 'x.parquet')
         \\SELECT g, COUNT(*) AS n FROM 'x.parquet' JOIN d ON id = did GROUP BY g HAVING COUNT(*) > 1;
     );
-    const shape = classifySinkPipeline(having) orelse return error.TestExpectedLanes;
+    const shape = (classifyLaneShape(having) orelse return error.TestExpectedLanes).sink;
     try std.testing.expect(shape.joins.len == 1 and shape.tail[0].node == .filter);
     const plain = try testStages(a, "LOAD INTO 'o.csv' AS SELECT DISTINCT COUNT(*) AS n FROM 'x.parquet' GROUP BY g;");
-    try std.testing.expect(classifySinkPipeline(plain).?.joins.len == 0);
+    try std.testing.expect(classifyLaneShape(plain).?.sink.joins.len == 0);
     const joined = try testStages(a,
         \\LOAD INTO 'o.csv' AS WITH d AS (SELECT id AS did FROM 'x.parquet')
         \\SELECT DISTINCT COUNT(*) AS n FROM 'x.parquet' JOIN d ON id = did GROUP BY g;
     );
-    try std.testing.expect(classifySinkPipeline(joined) == null);
+    try std.testing.expect(classifyLaneShape(joined) == null);
 }
 
 test {
@@ -347,6 +295,7 @@ test {
     _ = @import("lanes/join.zig");
     _ = @import("lanes/map.zig");
     _ = @import("lanes/morsels.zig");
+    _ = @import("lanes/shape.zig");
     _ = @import("lanes/sources.zig");
     _ = @import("lanes/topn.zig");
     _ = @import("lanes/testing_util.zig");

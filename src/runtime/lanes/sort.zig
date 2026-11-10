@@ -30,30 +30,7 @@ const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
 const writeTailOver = @import("agg.zig").writeTailOver;
 
-pub const SortShape = struct { prefix: []const ast.Stage, srt: ast.Stage, tail: []const ast.Stage };
-
-/// Recognize `read … | map* | ORDER BY or window | tail | write`, but not a sort a
-/// `LIMIT` the top-N takes follows, nor a window a filter follows (`WHERE rn <= k`
-/// keeps only `k` rows a partition as they stream), which keep only their rows.
-pub fn classifySortPipeline(stages: []const ast.Stage) ?SortShape {
-    const middle = stages[1 .. stages.len - 1];
-    for (middle, 0..) |st, i| {
-        const tail = middle[i + 1 ..];
-        switch (st.node) {
-            .sort => {
-                if (tail.len > 0 and tail[0].node == .limit and op.TopN.fits(tail[0].node.limit)) return null;
-                return .{ .prefix = middle[0..i], .srt = st, .tail = tail };
-            },
-            .window => |wd| {
-                if (wd.top_k != null) return null;
-                for (tail) |t| if (t.node == .filter) return null;
-                return .{ .prefix = middle[0..i], .srt = st, .tail = tail };
-            },
-            else => if (!analyze.isMap(st.node, false)) return null,
-        }
-    }
-    return null;
-}
+const SortShape = @import("shape.zig").SortShape;
 
 /// The sort's Global: the shared sort, and every worker's part, freed once the rows
 /// are written. A Local is the worker's part.

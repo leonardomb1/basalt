@@ -31,6 +31,7 @@ const parallel = @import("../parallel.zig");
 const pqdecode = @import("../../format/parquet/read.zig");
 const planSplit = @import("../connect.zig").planSplit;
 const resolveLaneJoin = @import("join.zig").resolveLaneJoin;
+const MapJoinShape = @import("shape.zig").MapJoinShape;
 const flipFirstJoin = @import("join.zig").flipFirstJoin;
 const narrowHead = @import("join.zig").narrowHead;
 const keyExprs = @import("../plan.zig").keyExprs;
@@ -418,33 +419,6 @@ fn narrowingKeyExprs(arena: std.mem.Allocator, js: MapJoinShape, lane: LaneJoin,
     @memcpy(stages[0..map_stages.len], map_stages);
     for (lane.probe_prep, stages[map_stages.len..]) |r, *st| st.* = r.stage;
     return keyExprs(arena, stages, lane.left_key_names);
-}
-
-/// A row group per item for parquet; a CSV is cut into about `ordered_chunk_bytes`
-pub fn classifyMapPipeline(stages: []const ast.Stage) ?[]const ast.Stage {
-    const middle = stages[1 .. stages.len - 1];
-    for (middle) |st| if (!analyze.isMap(st.node, true)) return null;
-    return middle;
-}
-
-pub const MapJoinShape = struct { prefix: []const ast.Stage, join: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage, stage: ast.Stage };
-
-pub fn classifyMapJoinPipeline(stages: []const ast.Stage) ?MapJoinShape {
-    if (stages.len < 3) return null;
-    if (stages[stages.len - 1].node != .write) return null;
-    const middle = stages[1 .. stages.len - 1];
-    var ji: ?usize = null;
-    for (middle, 0..) |st, i| switch (st.node) {
-        .filter, .select => {},
-        .join => {
-            if (ji != null) return null;
-            ji = i;
-        },
-        else => return null,
-    };
-    const j = ji orelse return null;
-    if (middle[j].node.join.keyless()) return null;
-    return .{ .prefix = middle[0..j], .join = middle[j].node.join, .join_hints = middle[j].hints, .suffix = middle[j + 1 ..], .stage = middle[j] };
 }
 
 /// Join kinds whose probe is a pure lookup into a shared read-only index. Matched by tag
