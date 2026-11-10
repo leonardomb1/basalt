@@ -440,7 +440,7 @@ test "a parallel map and join reads from its head file only the columns the stag
     try testing.expectEqualStrings("n,s,t\n549,356400,1650\n", try tmp.dir.readFileAlloc(a, "out.csv", 1 << 10));
 }
 
-test "the joins held before a turned last join choose their sides by the rule every join takes, as EXPLAIN ANALYZE shows" {
+test "the joins held before a turned last join choose their sides by the rule every join takes, and turn their own last join, as EXPLAIN ANALYZE shows" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -449,13 +449,18 @@ test "the joins held before a turned last join choose their sides by the rule ev
     const base = try tmp.dir.realpathAlloc(a, ".");
     try writeParquet(a, try std.fs.path.join(a, &.{ base, "big.parquet" }), 300_000, 10_000);
     try writeParquet(a, try std.fs.path.join(a, &.{ base, "mid.parquet" }), 40_000, 1000);
-    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "cv,seg\n0,x\n1,y\n2,x\n3,y\n4,x\n5,y\n6,x\n7,y\n8,x\n9,y\n" });
+    try writeParquet(a, try std.fs.path.join(a, &.{ base, "wide.parquet" }), 300_000, 10_000);
+    try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "cv,seg,nk\n0,x,0\n1,y,1\n2,x,1\n3,y,1\n4,x,1\n5,y,1\n6,x,1\n7,y,1\n8,x,1\n9,y,1\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "n.csv", .data = "nk,name\n0,n0\n1,n1\n" });
 
     const q3 = "SELECT o.g, COUNT(*) AS n, SUM(b.v) AS t FROM '$B/c.csv' c JOIN '$B/mid.parquet' o ON o.v = c.cv$W JOIN '$B/big.parquet' b ON b.id = o.id WHERE c.seg = 'x' GROUP BY o.g";
+    const four = "SELECT o.g, COUNT(*) AS n, SUM(b.v) AS t FROM '$B/n.csv' n JOIN '$B/c.csv' c ON c.nk = n.nk WITH (join_order = 'written') JOIN '$B/wide.parquet' o ON o.v = c.cv$W JOIN '$B/big.parquet' b ON b.id = o.id WHERE n.name = 'n0' GROUP BY o.g";
     const Want = struct { q: []const u8, w: []const u8, held: usize };
     for ([_]Want{
         .{ .q = q3, .w = "", .held = 2 },
         .{ .q = q3, .w = " WITH (join_order = 'written')", .held = 1 },
+        .{ .q = four, .w = "", .held = 2 },
+        .{ .q = four, .w = " WITH (join_order = 'written')", .held = 1 },
     }) |c| {
         const q = try std.mem.replaceOwned(u8, a, try std.mem.replaceOwned(u8, a, c.q, "$W", c.w), "$B", base);
         const printed = try printedBy(a, tmp.dir, try msgfmt.allocPrint(a, "EXPLAIN ANALYZE LOAD INTO '{s}/never.csv' AS {s};", .{ base, q }), 4, true);
@@ -463,6 +468,14 @@ test "the joins held before a turned last join choose their sides by the rule ev
         try testing.expect(std.mem.indexOf(u8, printed, "read into memory first") != null);
         try testing.expectEqual(c.held, std.mem.count(u8, printed, "build: left"));
     }
+    var want: ?[]const u8 = null;
+    for ([_][]const u8{ " WITH (join_order = 'written')", "" }) |w| for ([_]usize{ 1, 4 }) |threads| {
+        const q = try std.mem.replaceOwned(u8, a, try std.mem.replaceOwned(u8, a, four, "$W", w), "$B", base);
+        _ = try printedBy(a, tmp.dir, try msgfmt.allocPrint(a, "LOAD INTO '{s}/out.csv' AS {s} ORDER BY o.g;", .{ base, q }), threads, false);
+        const got = try tmp.dir.readFileAlloc(a, "out.csv", 1 << 16);
+        if (want) |x| try testing.expectEqualStrings(x, got) else want = got;
+    };
+    try testing.expect(std.mem.count(u8, want.?, "\n") == 2);
 }
 
 /// `out.csv`'s header and its rows in reverse order, the order of the rows being a

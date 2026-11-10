@@ -152,7 +152,9 @@ quarter of its right side's estimate they are indexed and the lanes read that
 side (TPC-H Q3: customers and orders indexed, lineitem streamed). The joins run
 into memory first choose their own sides by the same rule, as nothing sees the order
 of the rows they hold: Q3's filtered customers are indexed and its orders read on
-the lanes. Past that many
+the lanes. Their own last join is decided the same way, at any depth: with nation
+and customer before orders and lineitem, nation and customer are held, orders is
+read on the lanes into memory, then lineitem on the lanes. Past that many
 rows the held rows are dropped and the pipeline runs as planned; a join after it,
 such as an `IN`, would lose its [runtime filter](#runtime-filters), so only the
 last join is taken. A single join whose head is filtered is decided the same way:

@@ -313,8 +313,10 @@ const MapSink = struct {
 
 /// A file's map, or map and one join, on lanes. The join runs the other way round
 /// when `joinorder.choose` holds its left side (`flipFirstJoin`): only where nothing
-/// sees the rows' order, so a query's own rows keep their head file's order.
-pub fn runParallelMap(env: *Env, m_in: Morsels, head: ast.Stage, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+/// sees the rows' order, so a query's own rows keep their head file's order. Without
+/// `m_in` the head is held in memory (`run/output.zig` `flipLaterJoin`) and the join
+/// must turn; false when it does not.
+pub fn runParallelMap(env: *Env, m_in: ?Morsels, head: ast.Stage, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     if (jshape) |js| {
         const left = try std.mem.concat(env.arena, ast.Stage, &.{ &.{try narrowHead(env, head, try std.mem.concat(env.arena, ast.Stage, &.{ map_stages, &.{js.stage}, js.suffix }))}, map_stages });
         if (try flipFirstJoin(env, left, js.stage, js.suffix, js.suffix, w, opts)) |f| {
@@ -324,7 +326,7 @@ pub fn runParallelMap(env: *Env, m_in: Morsels, head: ast.Stage, map_stages: []c
             return true;
         }
     }
-    var m = m_in;
+    var m = m_in orelse return false;
     const map = try chainAt(env, m.schema().*, map_stages);
     env.src_name = m.label();
     env.sink_name = sinkLabel(env, w);

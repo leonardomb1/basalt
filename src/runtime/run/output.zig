@@ -75,6 +75,8 @@ const csvSplitFile = @import("../lanes/sources.zig").csvSplitFile;
 const passingRows = @import("../lanes/sources.zig").passingRows;
 const connect = @import("../connect.zig");
 const SinkShape = @import("../lanes.zig").SinkShape;
+const MapJoinShape = @import("../lanes.zig").MapJoinShape;
+const runParallelMap = @import("../lanes/map.zig").runParallelMap;
 const runParallelAgg = @import("../lanes/agg.zig").runParallelAgg;
 const rightStagesFor = @import("../plan.zig").rightStagesFor;
 const joinorder = @import("../plan/joinorder.zig");
@@ -347,6 +349,57 @@ fn windowTopKLanes(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, la
 
 const flip_left = "__flip_left";
 const min_flip_rows: u64 = 1 << 16;
+const max_flip_depth = 8;
+
+/// A run whose last join `flipLaterJoin` may turn: map stages, then the span from its
+/// first join on (the joins and the map stages between and after them), then what
+/// takes its rows: a lane aggregate (`agg`), or, for a run held in memory to be
+/// indexed (`heldTurn`), the memory write, the span's last map stages ahead of it.
+const Turn = struct {
+    prefix: []const ast.Stage,
+    joins: []const ast.Stage,
+    agg: ?SinkShape = null,
+
+    fn ofAgg(shape: SinkShape) Turn {
+        return .{ .prefix = shape.prefix, .joins = shape.joins, .agg = shape };
+    }
+
+    /// The stages after the span: the aggregate and its tail, or none.
+    fn consumer(self: Turn, arena: std.mem.Allocator) ![]const ast.Stage {
+        const a = self.agg orelse return &.{};
+        return std.mem.concat(arena, ast.Stage, &.{ &.{a.agg}, a.tail });
+    }
+};
+
+/// A run held in memory to be indexed (`Env.out_order_free`, the memory write last)
+/// that reads a file and joins: its last join turns as a lane aggregate's does, so the
+/// joins held before a turned join turn too, at any depth (`max_flip_depth`).
+fn heldTurn(env: *const Env, stages: []const ast.Stage) ?Turn {
+    if (!env.out_order_free or stages.len < 3 or stages[0].node != .read) return null;
+    const w = stages[stages.len - 1];
+    if (w.node != .write or !std.mem.eql(u8, w.node.write.connector, mem_connector)) return null;
+    const middle = stages[1 .. stages.len - 1];
+    var first: ?usize = null;
+    for (middle, 0..) |st, i| switch (st.node) {
+        .filter, .select => {},
+        .join => if (first == null) {
+            first = i;
+        },
+        else => return null,
+    };
+    const f = first orelse return null;
+    return .{ .prefix = middle[0..f], .joins = middle[f..] };
+}
+
+/// The name a held run is bound under at the first depth free, null past the last.
+fn flipName(env: *Env) !?[]const u8 {
+    if (!env.materialized.contains(flip_left)) return flip_left;
+    for (1..max_flip_depth) |d| {
+        const name = try msgfmt.allocPrint(env.arena, "{s}{d}", .{ flip_left, d });
+        if (!env.materialized.contains(name)) return name;
+    }
+    return null;
+}
 
 /// A lane aggregate's last join run the other way round, decided on the sizes the
 /// run meets: the joins before it can leave few rows (q03's customers and orders,
@@ -361,9 +414,12 @@ const min_flip_rows: u64 = 1 << 16;
 /// goes as planned, having spent at most that many; so does one where the turn is
 /// declined. A first join is taken the same way when a filter on the head can leave
 /// few rows (q12: 31K of 6M lineitem rows against 1.5M orders), and its first rows'
-/// pass rate does not put it past the cap (`passingRows`).
-fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!bool {
-    if (env.materialized.contains(flip_left)) return false;
+/// pass rate does not put it past the cap (`passingRows`). The run held in memory
+/// goes through here too (`heldTurn`), so its own last join turns, its rows going to
+/// memory through `runParallelMap`: nation and customer held, orders read on the
+/// lanes into memory, then lineitem read on the lanes into the aggregate.
+fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: Turn, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!bool {
+    const held_name = (try flipName(env)) orelse return false;
     var last: ?usize = null;
     for (shape.joins, 0..) |st, i| if (st.node == .join) {
         last = i;
@@ -371,7 +427,7 @@ fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: ast.
     const ji = last orelse return false;
     const st = shape.joins[ji];
     if (!joinorder.flippable(st)) return false;
-    const after = try std.mem.concat(env.arena, ast.Stage, &.{ shape.joins[ji + 1 ..], &.{shape.agg}, shape.tail });
+    const after = try std.mem.concat(env.arena, ast.Stage, &.{ shape.joins[ji + 1 ..], try shape.consumer(env.arena) });
     const rst = try rightStagesFor(env, st.node.join, after);
     if (rst.len == 0 or rst[0].node != .read or rst[0].hints.len > 0) return false;
     const rd = rst[0].node.read;
@@ -412,7 +468,7 @@ fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: ast.
         defer env.sink_name = outer_name;
         var scratch: Stats = .{};
         var delegated = false;
-        const outer_scope = enterScope(env, flip_left);
+        const outer_scope = enterScope(env, held_name);
         defer leaveScope(env, outer_scope);
         runOutputBody(env, opts, inner, inner[pre_len + 1].node, &scratch, lanes_used, batch_arena, &delegated) catch |e| {
             if (e != error.PastMemCap) return e;
@@ -420,13 +476,19 @@ fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: ast.
             return false;
         };
     }
-    try env.materialized.put(env.arena, flip_left, .{ .schema = ms.schema, .batches = ms.batches.items });
-    defer _ = env.materialized.remove(flip_left);
-    const head = ast.Stage{ .node = .{ .ref = flip_left }, .hints = &.{}, .pos = pos };
+    try env.materialized.put(env.arena, held_name, .{ .schema = ms.schema, .batches = ms.batches.items });
+    defer _ = env.materialized.remove(held_name);
+    const head = ast.Stage{ .node = .{ .ref = held_name }, .hints = &.{}, .pos = pos };
     const joins = try env.arena.dupe(ast.Stage, shape.joins[ji..]);
     joins[0].node.join.own_cols = &.{};
-    const rest = SinkShape{ .prefix = &.{}, .joins = joins, .agg = shape.agg, .tail = shape.tail };
-    if (!try runParallelAgg(env, null, head, rest, w, opts, stats, lanes_used)) return false;
+    if (shape.agg) |a| {
+        const rest = SinkShape{ .prefix = &.{}, .joins = joins, .agg = a.agg, .tail = a.tail };
+        if (!try runParallelAgg(env, null, head, rest, w, opts, stats, lanes_used)) return false;
+    } else {
+        const j = joins[0];
+        const js = MapJoinShape{ .prefix = &.{}, .join = j.node.join, .join_hints = j.hints, .suffix = joins[1..], .stage = j };
+        if (!try runParallelMap(env, null, head, &.{}, js, w, opts, stats, lanes_used)) return false;
+    }
     if (env.profile) |p| {
         const what = try msgfmt.allocPrint(env.arena, "{s} `{s}` ({d} rows)", .{ before, side, ms.rows });
         p.path = try msgfmt.allocPrint(env.arena, "{s} read into memory first, then {s}, that join turned around", .{ what, p.path });
@@ -647,12 +709,13 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     }
     if (chosen == .lanes and !try keysPreferSerial(env, head_stages)) {
         const ln = chosen.lanes;
-        if (ln.shape == .sink) if (try flipLaterJoin(env, head_stages, ln.shape.sink, last.write, opts, stats, lanes_used, batch_arena)) return;
+        if (ln.shape == .sink) if (try flipLaterJoin(env, head_stages, .ofAgg(ln.shape.sink), last.write, opts, stats, lanes_used, batch_arena)) return;
         if (ln.source == .parquet) {
             if (try runParquetLane(env, head_stages, ln.shape, last.write, opts, stats, lanes_used)) return;
         } else if (try runCsvLane(env, head_stages, ln.shape, last.write, opts, stats, lanes_used)) return;
     }
-    if (chosen == .serial) if (path.oneLaneTurn(head_stages, path_facts)) |sh| if (try flipLaterJoin(env, head_stages, sh, last.write, opts, stats, lanes_used, batch_arena)) return;
+    if (chosen == .serial) if (path.oneLaneTurn(head_stages, path_facts)) |sh| if (try flipLaterJoin(env, head_stages, .ofAgg(sh), last.write, opts, stats, lanes_used, batch_arena)) return;
+    if (chosen == .serial) if (heldTurn(env, head_stages)) |t| if (try flipLaterJoin(env, head_stages, t, last.write, opts, stats, lanes_used, batch_arena)) return;
     const sql: ?path.Sql = if (chosen == .sql) chosen.sql else null;
 
     pipe.sql_desc = null;
