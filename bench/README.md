@@ -60,3 +60,27 @@ $B run --sf 1 --data <data>/tpch-sf1 --basalt zig-out/bin/basalt -n 3
 `gen` lays the data out as `parquet/`, `csv/` and `ndjson/`, about 3.7 GB at SF1,
 and keeps what is already there; it refuses SF10 and above without `--big`.
 `--engine` and `--filter` narrow a run; `-v` shows a differing answer.
+
+## Comparing two builds, and scaling
+
+```sh
+python3 bench/bench.py ab --a <baseline basalt> --b <candidate basalt> --data <data>/tpch-sf1 -n 10
+python3 bench/bench.py ab --a <basalt> --data <data>/tpch-sf1 -n 10            # the noise floor
+python3 bench/bench.py scale --basalt <basalt> --data <data>/tpch-sf1 --threads-list 1,2,4,8,16
+```
+
+`ab` runs two basalt builds in the order A B B A on every task, so drift favours
+neither, and prints each one's median wall time, CPU time (user and system) and
+page faults, with the ratio of B's median wall time to A's and a 95% bootstrap
+interval: a change is real only when the interval leaves 1. Running it with one
+build gives the machine's noise floor; measure it before trusting a difference.
+`scale` runs one build at each thread count, printing the median wall time, the
+speedup over the first count and the total CPU time against the first's, which
+separates work a wider run adds from cores it waits on. Neither samples memory, so
+nothing wakes beside the process measured. Both need only Python's standard
+library.
+
+Prefer a bare-metal machine with identical cores for numbers that decide a change:
+a laptop's mixed performance and efficiency cores, its thermal limits and a VM's
+missing hardware counters spread the same run by a third or more.
+

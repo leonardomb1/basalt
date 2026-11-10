@@ -90,6 +90,8 @@ def command(engine, text, data, out, threads, tools, check):
     """The process that runs `text` on `engine`, with its environment; under
     `check` it prints the result as CSV with a header."""
     env = dict(os.environ)
+    for k in ["AI_AGENT", "CLAUDECODE"]:
+        env.pop(k, None)
     if engine == "basalt":
         cmd = [tools["basalt"], "run", "-j", str(threads)]
         if check:
@@ -140,16 +142,19 @@ def child(engine, data, threads, check, text):
 
 
 class Run:
-    """One process's wall time (s), peak and average resident memory (MB), the
-    number of memory samples, its exit code and what it printed."""
+    """One process's wall time (s), CPU time (user and system, s), minor page
+    faults, peak and average resident memory (MB), the number of memory samples,
+    its exit code and what it printed."""
 
-    def __init__(self, wall, peak, avg, samples, code, out, err):
-        self.wall, self.peak, self.avg, self.samples = wall, peak, avg, samples
+    def __init__(self, wall, cpu, faults, peak, avg, samples, code, out, err):
+        self.wall, self.cpu, self.faults = wall, cpu, faults
+        self.peak, self.avg, self.samples = peak, avg, samples
         self.code, self.out, self.err = code, out, err
 
 
-def measure(cmd, env, capture):
-    """Runs `cmd`, sampling its resident memory every millisecond until it exits."""
+def measure(cmd, env, capture, sample=True):
+    """Runs `cmd`, sampling its resident memory every millisecond until it exits;
+    without `sample` it only waits, so the measuring wakes nothing beside it."""
     so = tempfile.TemporaryFile() if capture else subprocess.DEVNULL
     se = tempfile.TemporaryFile()
     t0 = time.perf_counter()
@@ -158,7 +163,7 @@ def measure(cmd, env, capture):
     total = 0
     n = 0
     while True:
-        pid, status, ru = os.wait4(p.pid, os.WNOHANG)
+        pid, status, ru = os.wait4(p.pid, 0 if not sample else os.WNOHANG)
         if pid != 0:
             break
         try:
@@ -176,7 +181,8 @@ def measure(cmd, env, capture):
         out = so.read()
     se.seek(0)
     err = se.read().decode(errors="replace")
-    return Run(wall, ru.ru_maxrss / 1024, (total / n / 1024) if n else ru.ru_maxrss / 1024, n, p.returncode, out, err)
+    cpu = ru.ru_utime + ru.ru_stime
+    return Run(wall, cpu, ru.ru_minflt, ru.ru_maxrss / 1024, (total / n / 1024) if n else ru.ru_maxrss / 1024, n, p.returncode, out, err)
 
 
 def version(engine, tools):
@@ -432,12 +438,101 @@ def write_results(args, d, threads, tools, engines, startup, results):
     print(f"wrote {path}")
 
 
+def median(xs):
+    ys = sorted(xs)
+    n = len(ys)
+    return ys[n // 2] if n % 2 else (ys[n // 2 - 1] + ys[n // 2]) / 2
+
+
+def ratio_ci(a, b, rounds=2000):
+    """The ratio of `b`'s median to `a`'s, with a 95% bootstrap interval."""
+    import random
+    rng = random.Random(7)
+    rs = []
+    for _ in range(rounds):
+        ra = [rng.choice(a) for _ in a]
+        rb = [rng.choice(b) for _ in b]
+        rs.append(median(rb) / median(ra))
+    rs.sort()
+    return median(b) / median(a), rs[int(0.025 * rounds)], rs[int(0.975 * rounds)]
+
+
+def basalt_tasks(args):
+    return [t for t in tasks() if (not args.filter or args.filter in t["name"]) and (args.suite == "all" or t["suite"] == args.suite)]
+
+
+def ab(args):
+    """Two basalt binaries, `--a` and `--b` (the same one for the noise floor),
+    on every task, `-n` runs each in the order A B B A ..., so drift favours
+    neither: the median wall and CPU time of each, the ratio of B's median wall
+    time to A's with a 95% bootstrap interval, and whether it leaves the noise."""
+    d = data_dir(args, args.sf)
+    threads = args.threads or os.cpu_count()
+    out = tempfile.mkdtemp(prefix="basalt-bench-")
+    bins = {"A": args.a, "B": args.b or args.a}
+    print(f"A = {bins['A']}\nB = {bins['B']}\n{threads} threads, {args.n} runs each, SF{args.sf:g}\n")
+    print(f"{'task':22} {'A wall':>8} {'B wall':>8} {'B/A':>6} {'95% interval':>15} {'A cpu':>8} {'B cpu':>8} {'A flt':>8} {'B flt':>8}")
+    for t in basalt_tasks(args):
+        runs = {"A": [], "B": []}
+        order = ["A", "B", "B", "A"]
+        for k in range(args.n * 2 + 2):
+            who = order[k % 4]
+            text = render("basalt", t["per"]["basalt"], d, out)
+            shutil.rmtree(out, ignore_errors=True)
+            os.makedirs(out)
+            cmd, env = command("basalt", text, d, out, threads, {"basalt": bins[who]}, False)
+            r = measure(cmd, env, False, sample=False)
+            if r.code != 0:
+                sys.exit(f"{t['name']} failed on {who}: {r.err.strip()[-300:]}")
+            if k >= 2:
+                runs[who].append(r)
+        wa = [r.wall for r in runs["A"]]
+        wb = [r.wall for r in runs["B"]]
+        q, lo, hi = ratio_ci(wa, wb)
+        verdict = "within noise" if lo <= 1 <= hi else ("B faster" if hi < 1 else "B slower")
+        print(f"{t['name']:22} {median(wa) * 1000:7.0f}ms {median(wb) * 1000:7.0f}ms {q:6.3f} [{lo:.3f}, {hi:.3f}] {median([r.cpu for r in runs['A']]) * 1000:7.0f}ms {median([r.cpu for r in runs['B']]) * 1000:7.0f}ms {median([r.faults for r in runs['A']]):8.0f} {median([r.faults for r in runs['B']]):8.0f}  {verdict}", flush=True)
+    shutil.rmtree(out, ignore_errors=True)
+
+
+def scale(args):
+    """One basalt binary on every task at each of `--threads-list`: median wall
+    time, its speedup over the first, and total CPU time against the first's (1.0
+    is no work added by running wider)."""
+    d = data_dir(args, args.sf)
+    counts = [int(x) for x in args.threads_list.split(",")]
+    out = tempfile.mkdtemp(prefix="basalt-bench-")
+    tools = {"basalt": args.basalt or find_tools(args)["basalt"]}
+    print(f"{tools['basalt']}, {args.n} runs each, SF{args.sf:g}; per thread count: wall ms, speedup, CPU ms, CPU / CPU at {counts[0]}\n")
+    for t in basalt_tasks(args):
+        base = None
+        cells = []
+        for j in counts:
+            rs = []
+            for k in range(args.n + 1):
+                text = render("basalt", t["per"]["basalt"], d, out)
+                shutil.rmtree(out, ignore_errors=True)
+                os.makedirs(out)
+                cmd, env = command("basalt", text, d, out, j, tools, False)
+                r = measure(cmd, env, False, sample=False)
+                if r.code != 0:
+                    sys.exit(f"{t['name']} failed at {j} threads: {r.err.strip()[-300:]}")
+                if k > 0:
+                    rs.append(r)
+            w = median([r.wall for r in rs])
+            c = median([r.cpu for r in rs])
+            if base is None:
+                base = (w, c)
+            cells.append(f"{j}: {w * 1000:.0f} {base[0] / w:.1f}x {c * 1000:.0f} {c / base[1]:.1f}")
+        print(f"{t['name']:22} " + "  |  ".join(cells), flush=True)
+    shutil.rmtree(out, ignore_errors=True)
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "child":
         child(sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5] == "1", sys.argv[6])
         return
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("cmd", choices=["gen", "check", "run"])
+    ap.add_argument("cmd", choices=["gen", "check", "run", "ab", "scale"])
     ap.add_argument("--sf", type=float, default=1)
     ap.add_argument("--big", action="store_true", help="allow SF10 and above")
     ap.add_argument("--data", default="", help="the data folder (default ~/.local/share/basalt-bench/data/sf<N>)")
@@ -449,8 +544,12 @@ def main():
     ap.add_argument("--duckdb", default="")
     ap.add_argument("--clickhouse", default="")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--a", default="", help="ab: the baseline basalt")
+    ap.add_argument("--b", default="", help="ab: the candidate (default: --a, the noise floor)")
+    ap.add_argument("--suite", default="analytics", choices=["analytics", "movement", "all"], help="ab and scale: which tasks")
+    ap.add_argument("--threads-list", default="1,2,4,8,16", help="scale: the thread counts")
     args = ap.parse_args()
-    {"gen": gen, "check": check, "run": run}[args.cmd](args)
+    {"gen": gen, "check": check, "run": run, "ab": ab, "scale": scale}[args.cmd](args)
 
 
 if __name__ == "__main__":
