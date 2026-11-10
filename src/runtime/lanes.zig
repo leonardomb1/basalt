@@ -102,12 +102,12 @@ pub fn runCsvLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast
     return runShape(env, .ofCsv(mapped, &mapped.schema, opts.morsel_bytes), stages[0], shape, w, opts, stats, lanes_used);
 }
 
-/// The stages a read may push down: a map path stops before its join, whose names are the join's.
+/// The stages a read may push down: a map path's own, or every stage, joins included,
+/// whose names `projectedColumns` sorts by side.
 fn pushStages(stages: []const ast.Stage, shape: LaneShape) []const ast.Stage {
     const middle = stages[1 .. stages.len - 1];
     return switch (shape) {
         .map => |x| middle[0..x.len],
-        .map_join => |x| middle[0..x.prefix.len],
         else => middle,
     };
 }

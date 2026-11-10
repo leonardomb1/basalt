@@ -419,6 +419,27 @@ test "a union and each join after it ask their tables only for the columns the q
     try testing.expectEqualStrings("grp,mat,nome,boss\nb,1,n,n\na,1,n,n\n", try sortedOut(a, tmp.dir));
 }
 
+test "a parallel map and join reads from its head file only the columns the stages after the join take" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try writeParquet(a, try std.fs.path.join(a, &.{ base, "p.parquet" }), 1000, 100);
+    try writeParquet(a, try std.fs.path.join(a, &.{ base, "k.parquet" }), 10, 100);
+
+    const q = try msgfmt.allocPrint(a, "SELECT p.id, k.v FROM '{s}/p.parquet' p JOIN '{s}/k.parquet' k ON p.v = k.id AND p.id > k.v * 100", .{ base, base });
+    const printed = try printedBy(a, tmp.dir, try msgfmt.allocPrint(a, "EXPLAIN ANALYZE LOAD INTO '{s}/never.csv' AS {s};", .{ base, q }), 4, true);
+    errdefer std.debug.print("{s}\n", .{printed});
+    const at = std.mem.indexOf(u8, printed, "Path: ").? + "Path: ".len;
+    try testing.expectEqualStrings("parquet parallel map+join", try head(a, printed[at .. at + std.mem.indexOfScalar(u8, printed[at..], '\n').?]));
+    try testing.expect(std.mem.indexOf(u8, printed, "Columns read: 4 of 6") != null);
+
+    _ = try printedBy(a, tmp.dir, try msgfmt.allocPrint(a, "LOAD INTO '{s}/out.csv' AS SELECT COUNT(*) AS n, SUM(id) AS s, SUM(v) AS t FROM ({s}) j;", .{ base, q }), 4, false);
+    try testing.expectEqualStrings("n,s,t\n549,356400,1650\n", try tmp.dir.readFileAlloc(a, "out.csv", 1 << 10));
+}
+
 /// `out.csv`'s header and its rows in reverse order, the order of the rows being a
 /// union's, so a test reads one spelling of them.
 fn sortedOut(a: std.mem.Allocator, dir: std.fs.Dir) ![]const u8 {
