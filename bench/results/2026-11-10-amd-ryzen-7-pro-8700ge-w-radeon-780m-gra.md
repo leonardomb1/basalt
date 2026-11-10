@@ -2,7 +2,7 @@
 
 Machine: AMD Ryzen 7 PRO 8700GE w/ Radeon 780M Graphics, Linux 6.12.113+deb13-amd64. Data: TPC-H SF1 as Parquet (`bench.py gen`).
 
-Versions: basalt 0.13.3, duckdb v2.0.0, clickhouse 26.10.2.103, polars 2.1.0, datafusion 55.0.0.
+Versions: basalt 0.13.4 (7c4954d), duckdb v2.0.0, clickhouse 26.10.2.103, polars 2.1.0, datafusion 55.0.0.
 
 Every engine runs as a process; a query's time is its wall time less the engine's
 startup (a `SELECT 1`). Memory is the process's resident memory in MB, peak / average
@@ -13,67 +13,67 @@ startup (a `SELECT 1`). Memory is the process's resident memory in MB, peak / av
 | engine | wall | peak memory (MB) |
 |---|---|---|
 | basalt | 1 ms | 15 |
-| duckdb | 27 ms | 50 |
-| clickhouse | 45 ms | 232 |
-| polars | 105 ms | 135 |
-| datafusion | 81 ms | 116 |
+| duckdb | 28 ms | 51 |
+| clickhouse | 45 ms | 239 |
+| polars | 106 ms | 137 |
+| datafusion | 80 ms | 116 |
 
 ## Analytics: time
 
 | task | basalt | duckdb | clickhouse | polars | datafusion |
 |---|---|---|---|---|---|
-| distinct_count | 22 ms | 68 ms | 83 ms | 60 ms | 67 ms |
-| median | 95 ms | 59 ms | 102 ms | 165 ms | 92 ms |
-| q01_agg | 61 ms | 41 ms | 100 ms | 70 ms | 69 ms |
-| q03_join_topn | 102 ms | 41 ms | 117 ms | 30 ms | 47 ms |
-| q06_filter | 23 ms | 25 ms | 68 ms | 19 ms | 28 ms |
-| q12_join_case | 46 ms | 32 ms | 78 ms | 21 ms | 40 ms |
-| q13_outer_like | 84 ms | 57 ms | 95 ms | 42 ms | 46 ms |
-| q16_distinct_notin | 21 ms | 21 ms | 57 ms | 17 ms | 19 ms |
-| q18_in_having | 105 ms | 58 ms | 132 ms | 66 ms | 147 ms |
-| star_join | 51 ms | 47 ms | 103 ms | 28 ms | 73 ms |
-| string_group | 25 ms | 21 ms | 86 ms | 42 ms | 29 ms |
-| string_like | 49 ms | 79 ms | 99 ms | 64 ms | 75 ms |
-| topn_sort | 21 ms | 23 ms | 54 ms | 29 ms | 18 ms |
-| window_topk | 44 ms | 47 ms | 83 ms | 37 ms | 58 ms |
+| distinct_count | 22 ms | 66 ms | 88 ms | 56 ms | 68 ms |
+| median | 97 ms | 58 ms | 120 ms | 160 ms | 96 ms |
+| q01_agg | 59 ms | 42 ms | 105 ms | 55 ms | 74 ms |
+| q03_join_topn | 55 ms | 38 ms | 109 ms | 29 ms | 49 ms |
+| q06_filter | 23 ms | 22 ms | 60 ms | 17 ms | 29 ms |
+| q12_join_case | 47 ms | 31 ms | 87 ms | 20 ms | 41 ms |
+| q13_outer_like | 82 ms | 56 ms | 99 ms | 41 ms | 46 ms |
+| q16_distinct_notin | 21 ms | 20 ms | 50 ms | 15 ms | 21 ms |
+| q18_in_having | 103 ms | 55 ms | 135 ms | 58 ms | 148 ms |
+| star_join | 51 ms | 45 ms | 103 ms | 28 ms | 75 ms |
+| string_group | 26 ms | 19 ms | 90 ms | 41 ms | 30 ms |
+| string_like | 49 ms | 78 ms | 96 ms | 63 ms | 72 ms |
+| topn_sort | 21 ms | 22 ms | 37 ms | 33 ms | 21 ms |
+| window_topk | 44 ms | 40 ms | 83 ms | 37 ms | 56 ms |
 
 ## Analytics: memory, peak / average MB
 
 | task | basalt | duckdb | clickhouse | polars | datafusion |
 |---|---|---|---|---|---|
-| distinct_count | 101 / 64 | 422 / 224 | 595 / 277 | 383 / 163 | 331 / 155 |
-| median | 201 / 143 | 313 / 171 | 657 / 322 | 1078 / 546 | 828 / 316 |
-| q01_agg | 219 / 167 | 238 / 116 | 505 / 256 | 793 / 275 | 304 / 151 |
-| q03_join_topn | 228 / 148 | 314 / 132 | 657 / 329 | 236 / 89 | 408 / 153 |
-| q06_filter | 127 / 85 | 217 / 86 | 402 / 208 | 236 / 80 | 273 / 101 |
-| q12_join_case | 139 / 87 | 248 / 107 | 428 / 234 | 219 / 77 | 307 / 120 |
-| q13_outer_like | 268 / 164 | 371 / 194 | 658 / 338 | 385 / 137 | 368 / 149 |
-| q16_distinct_notin | 89 / 48 | 187 / 75 | 345 / 197 | 226 / 74 | 290 / 88 |
-| q18_in_having | 277 / 133 | 282 / 152 | 619 / 383 | 461 / 190 | 755 / 372 |
-| star_join | 194 / 114 | 384 / 157 | 560 / 269 | 244 / 95 | 499 / 205 |
-| string_group | 175 / 115 | 146 / 67 | 486 / 257 | 496 / 162 | 203 / 89 |
-| string_like | 137 / 106 | 367 / 208 | 627 / 279 | 272 / 130 | 292 / 144 |
-| topn_sort | 113 / 71 | 218 / 84 | 383 / 197 | 324 / 107 | 242 / 82 |
-| window_topk | 129 / 86 | 308 / 160 | 389 / 224 | 323 / 122 | 352 / 162 |
+| distinct_count | 95 / 59 | 418 / 216 | 596 / 275 | 364 / 145 | 329 / 149 |
+| median | 197 / 143 | 317 / 173 | 618 / 297 | 1092 / 567 | 870 / 326 |
+| q01_agg | 241 / 185 | 238 / 121 | 523 / 263 | 500 / 186 | 308 / 155 |
+| q03_join_topn | 182 / 107 | 313 / 129 | 654 / 323 | 238 / 91 | 402 / 153 |
+| q06_filter | 123 / 87 | 213 / 85 | 395 / 208 | 238 / 81 | 277 / 100 |
+| q12_join_case | 143 / 86 | 245 / 108 | 425 / 245 | 219 / 78 | 321 / 119 |
+| q13_outer_like | 271 / 161 | 368 / 198 | 663 / 329 | 375 / 135 | 395 / 151 |
+| q16_distinct_notin | 87 / 48 | 176 / 69 | 338 / 184 | 208 / 73 | 280 / 85 |
+| q18_in_having | 279 / 130 | 293 / 158 | 669 / 423 | 421 / 170 | 778 / 389 |
+| star_join | 195 / 114 | 383 / 164 | 552 / 268 | 239 / 93 | 507 / 215 |
+| string_group | 175 / 112 | 143 / 66 | 494 / 248 | 507 / 169 | 205 / 88 |
+| string_like | 138 / 110 | 361 / 207 | 685 / 272 | 276 / 134 | 280 / 145 |
+| topn_sort | 113 / 79 | 224 / 89 | 392 / 182 | 384 / 122 | 241 / 84 |
+| window_topk | 132 / 90 | 308 / 151 | 380 / 235 | 307 / 115 | 344 / 152 |
 
 ## Movement: time
 
 | task | basalt | duckdb | clickhouse | polars | datafusion |
 |---|---|---|---|---|---|
-| parquet_to_csv | 417 ms | 657 ms | 486 ms | 489 ms | 718 ms |
-| parquet_to_parquet | 689 ms | 447 ms | 779 ms | 469 ms | 1085 ms |
-| csv_to_parquet | 1055 ms | 884 ms | 1127 ms | 768 ms | 1154 ms |
-| csvgz_to_parquet | 5896 ms | 2013 ms | 1296 ms | 1254 ms | 3252 ms |
-| ndjson_to_parquet | 3083 ms | 1110 ms | 1897 ms | 1363 ms | 1674 ms |
-| orders_transform | 45 ms | 39 ms | 84 ms | 33 ms | 73 ms |
+| parquet_to_csv | 405 ms | 636 ms | 457 ms | 472 ms | 712 ms |
+| parquet_to_parquet | 688 ms | 447 ms | 802 ms | 464 ms | 1096 ms |
+| csv_to_parquet | 1039 ms | 965 ms | 1147 ms | 792 ms | 1165 ms |
+| csvgz_to_parquet | 5929 ms | 1986 ms | 1303 ms | 1242 ms | 3253 ms |
+| ndjson_to_parquet | 3111 ms | 1097 ms | 1863 ms | 1351 ms | 1656 ms |
+| orders_transform | 46 ms | 37 ms | 83 ms | 32 ms | 79 ms |
 
 ## Movement: memory, peak / average MB
 
 | task | basalt | duckdb | clickhouse | polars | datafusion |
 |---|---|---|---|---|---|
-| parquet_to_csv | 716 / 562 | 1657 / 1316 | 1855 / 1433 | 1078 / 782 | 1102 / 741 |
-| parquet_to_parquet | 1222 / 932 | 1424 / 1135 | 2544 / 2018 | 997 / 729 | 821 / 629 |
-| csv_to_parquet | 1509 / 1078 | 1688 / 1212 | 2914 / 1835 | 1273 / 1053 | 559 / 457 |
-| csvgz_to_parquet | 86 / 85 | 1381 / 812 | 2316 / 1487 | 1910 / 1252 | 392 / 335 |
-| ndjson_to_parquet | 293 / 272 | 1937 / 1128 | 3856 / 2229 | 2394 / 1250 | 552 / 467 |
-| orders_transform | 224 / 157 | 230 / 120 | 493 / 304 | 275 / 104 | 318 / 162 |
+| parquet_to_csv | 748 / 587 | 1683 / 1328 | 1762 / 1341 | 1187 / 846 | 1075 / 725 |
+| parquet_to_parquet | 1223 / 941 | 1332 / 1056 | 2409 / 1850 | 1061 / 740 | 756 / 603 |
+| csv_to_parquet | 1525 / 1070 | 2082 / 1456 | 2825 / 1747 | 1271 / 1048 | 546 / 442 |
+| csvgz_to_parquet | 86 / 86 | 1335 / 880 | 2207 / 1437 | 1920 / 1252 | 415 / 345 |
+| ndjson_to_parquet | 293 / 271 | 1709 / 1080 | 4302 / 2374 | 2396 / 1239 | 554 / 469 |
+| orders_transform | 221 / 147 | 226 / 118 | 504 / 305 | 278 / 106 | 313 / 164 |

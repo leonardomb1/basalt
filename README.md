@@ -209,25 +209,25 @@ answers match DuckDB's. A query's time is its wall time less the engine's startu
 The harness, its queries and the full results with memory are in
 [`bench/`](bench/README.md) ([this run](bench/results/2026-11-10-amd-ryzen-7-pro-8700ge-w-radeon-780m-gra.md)).
 
-| | basalt 0.13.3 | DuckDB 2.0 | ClickHouse 26.10 | Polars 2.1 | DataFusion 55 |
+| | basalt 0.13.4 | DuckDB 2.0 | ClickHouse 26.10 | Polars 2.1 | DataFusion 55 |
 |---|---|---|---|---|---|
-| startup | **1 ms**, 15 MB | 27 ms, 50 MB | 45 ms, 232 MB | 105 ms, 135 MB | 81 ms, 116 MB |
-| `count(DISTINCT)` | **22 ms** | 68 ms | 83 ms | 60 ms | 67 ms |
-| `LIKE` over long strings | **49 ms** | 79 ms | 99 ms | 64 ms | 75 ms |
-| TPC-H Q6 (filter) | 23 ms | 25 ms | 68 ms | **19 ms** | 28 ms |
-| TPC-H Q1 (aggregate) | 61 ms | **41 ms** | 100 ms | 70 ms | 69 ms |
-| TPC-H Q3 (join, top-N) | 102 ms | 41 ms | 117 ms | **30 ms** | 47 ms |
-| TPC-H Q18 (IN, HAVING) | 105 ms | **58 ms** | 132 ms | 66 ms | 147 ms |
-| exact median | 95 ms | **59 ms** | 102 ms | 165 ms | 92 ms |
-| `lineitem` Parquet → CSV | **0.42 s** | 0.66 s | 0.49 s | 0.49 s | 0.72 s |
-| `lineitem` Parquet → Parquet | 0.69 s | **0.45 s** | 0.78 s | 0.47 s | 1.09 s |
-| `lineitem` CSV → Parquet | 1.06 s | 0.88 s | 1.13 s | **0.77 s** | 1.15 s |
-| `lineitem` NDJSON → Parquet | 3.08 s | **1.11 s** | 1.90 s | 1.36 s | 1.67 s |
-| `lineitem` CSV.gz → Parquet | 5.90 s | 2.01 s | 1.30 s | **1.25 s** | 3.25 s |
+| startup | **1 ms**, 15 MB | 28 ms, 51 MB | 45 ms, 239 MB | 106 ms, 137 MB | 80 ms, 116 MB |
+| `count(DISTINCT)` | **22 ms** | 66 ms | 88 ms | 56 ms | 68 ms |
+| `LIKE` over long strings | **49 ms** | 78 ms | 96 ms | 63 ms | 72 ms |
+| TPC-H Q6 (filter) | 23 ms | 22 ms | 60 ms | **17 ms** | 29 ms |
+| TPC-H Q1 (aggregate) | 59 ms | **42 ms** | 105 ms | 55 ms | 74 ms |
+| TPC-H Q3 (join, top-N) | 55 ms | 38 ms | 109 ms | **29 ms** | 49 ms |
+| TPC-H Q18 (IN, HAVING) | 103 ms | **55 ms** | 135 ms | 58 ms | 148 ms |
+| exact median | 97 ms | **58 ms** | 120 ms | 160 ms | 96 ms |
+| `lineitem` Parquet → CSV | **0.41 s** | 0.64 s | 0.46 s | 0.47 s | 0.71 s |
+| `lineitem` Parquet → Parquet | 0.69 s | **0.45 s** | 0.80 s | 0.46 s | 1.10 s |
+| `lineitem` CSV → Parquet | 1.04 s | 0.97 s | 1.15 s | **0.79 s** | 1.17 s |
+| `lineitem` NDJSON → Parquet | 3.11 s | **1.10 s** | 1.86 s | 1.35 s | 1.66 s |
+| `lineitem` CSV.gz → Parquet | 5.93 s | 1.99 s | 1.30 s | **1.24 s** | 3.25 s |
 
 basalt starts in a millisecond and holds the least memory on most queries; it is the
 fastest at distinct counts, string matching and writing CSV, and on joins and
-aggregates one and a half to three times slower than the fastest engine. Reading
+aggregates one and a half to two and a half times slower than the fastest engine. Reading
 gzipped CSV and NDJSON are its slowest paths today.
 
 ## What sets it apart
