@@ -31,6 +31,8 @@ const parallel = @import("../parallel.zig");
 const pqdecode = @import("../../format/parquet/read.zig");
 const planSplit = @import("../connect.zig").planSplit;
 const resolveLaneJoin = @import("join.zig").resolveLaneJoin;
+const flipFirstJoin = @import("join.zig").flipFirstJoin;
+const narrowHead = @import("join.zig").narrowHead;
 const keyExprs = @import("../plan.zig").keyExprs;
 const keypush = @import("../plan/keypush.zig");
 const resolveUpsertKeys = @import("../connect.zig").resolveUpsertKeys;
@@ -309,8 +311,19 @@ const MapSink = struct {
     const vtable = ParallelSink.VTable{ .initLocal = initLocal, .sink = sink, .combine = combine, .finalize = finalize, .abort = abort };
 };
 
-/// A file's map, or map and one join, on lanes.
-pub fn runParallelMap(env: *Env, m_in: Morsels, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+/// A file's map, or map and one join, on lanes. The join runs the other way round
+/// when `joinorder.choose` holds its left side (`flipFirstJoin`): only where nothing
+/// sees the rows' order, so a query's own rows keep their head file's order.
+pub fn runParallelMap(env: *Env, m_in: Morsels, head: ast.Stage, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    if (jshape) |js| {
+        const left = try std.mem.concat(env.arena, ast.Stage, &.{ &.{try narrowHead(env, head, try std.mem.concat(env.arena, ast.Stage, &.{ map_stages, &.{js.stage}, js.suffix }))}, map_stages });
+        if (try flipFirstJoin(env, left, js.stage, js.suffix, js.suffix, w, opts)) |f| {
+            defer if (f.mapped) |mc| mc.close();
+            env.log.log(.info, "join with `{s}`: the left side is held in memory and the right side read on the lanes, {s}", .{ js.join.alias, f.note["build: left ".len..] });
+            try mapDrive(env, &f.m, f.pre, f.lane, f.out_schema, try resolveUpsertKeys(env, w), opts, stats, lanes_used, f.read_at);
+            return true;
+        }
+    }
     var m = m_in;
     const map = try chainAt(env, m.schema().*, map_stages);
     env.src_name = m.label();
@@ -323,7 +336,7 @@ pub fn runParallelMap(env: *Env, m_in: Morsels, map_stages: []const ast.Stage, j
         out_schema = lp.out_schema;
         if (m == .parquet) m.parquet.keys = try laneParquetKeys(env, js, lp.lane, map_stages);
     }
-    try mapDrive(env, &m, map.recs, lane_join, out_schema, try resolveUpsertKeys(env, w), opts, stats, lanes_used);
+    try mapDrive(env, &m, map.recs, lane_join, out_schema, try resolveUpsertKeys(env, w), opts, stats, lanes_used, 0);
     return true;
 }
 
@@ -332,7 +345,7 @@ pub fn runParallelMap(env: *Env, m_in: Morsels, map_stages: []const ast.Stage, j
 /// A shared sink that encodes each unit on its lane (Parquet) takes a file cut
 /// `coarser`: a 4 MB CSV range held under the encoder's half row group, so every
 /// unit went to the writer's one thread to be encoded.
-fn mapDrive(env: *Env, m_in: *const Morsels, recs: []const analyze.Resolved, lane_join: ?LaneJoin, out_schema: types.Schema, wr: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) !void {
+fn mapDrive(env: *Env, m_in: *const Morsels, recs: []const analyze.Resolved, lane_join: ?LaneJoin, out_schema: types.Schema, wr: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, read_at: u64) !void {
     const arena = env.arena;
     const sink_mode = (try buildParallelSink(env, wr, out_schema)) orelse
         parallel.SinkMode{ .shared = try openSink(env, wr, out_schema) };
@@ -351,7 +364,7 @@ fn mapDrive(env: *Env, m_in: *const Morsels, recs: []const analyze.Resolved, lan
     defer if (g.ordered) |o| o.freeRest();
 
     const joins: []const LaneJoin = if (lane_join) |lj| try arena.dupe(LaneJoin, &.{lj}) else &.{};
-    const pl: Pipeline = .{ .m = m, .recs = recs, .joins = joins, .errctx = env.errctx, .rows_read = env.rows_read, .per_lane = g.ordered == null };
+    const pl: Pipeline = .{ .m = m, .recs = recs, .joins = joins, .errctx = env.errctx, .rows_read = env.rows_read, .per_lane = g.ordered == null, .read_at = read_at };
     const lanes = try drive(arena, pl, g.parallelSink(), opts.lanes());
     lanes_used.* = @max(lanes_used.*, lanes);
     const how = if (m.* == .sql) "split-parallel" else "parallel";
@@ -412,7 +425,7 @@ pub fn classifyMapPipeline(stages: []const ast.Stage) ?[]const ast.Stage {
     return middle;
 }
 
-pub const MapJoinShape = struct { prefix: []const ast.Stage, join: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage };
+pub const MapJoinShape = struct { prefix: []const ast.Stage, join: ast.Join, join_hints: []const ast.Hint, suffix: []const ast.Stage, stage: ast.Stage };
 
 pub fn classifyMapJoinPipeline(stages: []const ast.Stage) ?MapJoinShape {
     if (stages.len < 3) return null;
@@ -429,7 +442,7 @@ pub fn classifyMapJoinPipeline(stages: []const ast.Stage) ?MapJoinShape {
     };
     const j = ji orelse return null;
     if (middle[j].node.join.keyless()) return null;
-    return .{ .prefix = middle[0..j], .join = middle[j].node.join, .join_hints = middle[j].hints, .suffix = middle[j + 1 ..] };
+    return .{ .prefix = middle[0..j], .join = middle[j].node.join, .join_hints = middle[j].hints, .suffix = middle[j + 1 ..], .stage = middle[j] };
 }
 
 /// Join kinds whose probe is a pure lookup into a shared read-only index. Matched by tag
@@ -481,7 +494,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     const split = try arena.create(SplitCtx);
     split.* = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .where_extra = where_extra, .report = try connect_mod.readReport(env, @tagName(desc.kind)), .want = src_schema };
     const m = Morsels{ .sql = .{ .split = split, .predicates = sp.predicates, .schema = src_schema } };
-    try mapDrive(env, &m, pre.recs, lp.lane, lp.out_schema, w, opts, stats, lanes_used);
+    try mapDrive(env, &m, pre.recs, lp.lane, lp.out_schema, w, opts, stats, lanes_used, 0);
     return true;
 }
 

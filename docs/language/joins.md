@@ -149,7 +149,10 @@ every `-j`. The last join of such a pipeline, past the first, is decided on what
 the run meets instead: the joins before it run on the lanes first, into memory and
 narrowed to the columns the rest reads, and if they leave fewer rows than a
 quarter of its right side's estimate they are indexed and the lanes read that
-side (TPC-H Q3: customers and orders indexed, lineitem streamed). Past that many
+side (TPC-H Q3: customers and orders indexed, lineitem streamed). The joins run
+into memory first choose their own sides by the same rule, as nothing sees the order
+of the rows they hold: Q3's filtered customers are indexed and its orders read on
+the lanes. Past that many
 rows the held rows are dropped and the pipeline runs as planned; a join after it,
 such as an `IN`, would lose its [runtime filter](#runtime-filters), so only the
 last join is taken. A single join whose head is filtered is decided the same way:

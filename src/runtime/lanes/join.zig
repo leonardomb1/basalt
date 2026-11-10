@@ -35,8 +35,8 @@ const parquetSplit = @import("sources.zig").parquetSplit;
 const csvSplitFile = @import("sources.zig").csvSplitFile;
 const passingRows = @import("sources.zig").passingRows;
 const csv = @import("../../format/csv.zig");
-const estimate = @import("../plan/estimate.zig");
 const joinorder = @import("../plan/joinorder.zig");
+const projectedColumns = @import("../plan.zig").projectedColumns;
 const RunOptions = @import("../env.zig").RunOptions;
 const runtime_filters = @import("../plan/runtime_filters.zig");
 const connect_mod = @import("../connect.zig");
@@ -167,6 +167,9 @@ pub const LaneJoin = struct {
     /// As `op.Join`'s: what a runtime filter for it is named by, and whether it may own one.
     name: []const u8 = "",
     filter_off: bool = false,
+    /// `joinorder.choose`'s note on a flipped join, shown under it as the serial
+    /// plan's is.
+    note: []const u8 = "",
 };
 
 const LaneJoinPlan = struct { lane: LaneJoin, out_schema: types.Schema };
@@ -418,6 +421,7 @@ pub fn buildLaneJoinChain(ta: std.mem.Allocator, errctx: ?*op.ErrCtx, lj: LaneJo
         .state = ta,
         .name = lj.name,
         .filter_off = lj.filter_off,
+        .note = lj.note,
     };
     j.stats.at = lj.at;
     return chainOps(ta, errctx, lj.suffix, try restored(ta, errctx, lj, .{ .join = j }));
@@ -487,15 +491,11 @@ pub const Flip = struct {
     read_at: u64,
 };
 
-/// The first join of a lane aggregate flipped, as the serial plan flips one
-/// (`joinorder.zig`), when its kind has a mirror, nothing forbids it, its left side
-/// (`left`, the head read and the stages before the join) is estimated `flip_ratio`
-/// times smaller than its right and within the lane cap (a right side that filters,
-/// against a left side of `sample_left` rows or more, is taken at the pass rate of
-/// its first rows, `passingRows`: q12's lineitem leaves 31K of 6M rows, which index
-/// far cheaper than its 1.5M orders), and its right side is a
-/// local Parquet or CSV read followed only by map stages, which the lanes read as
-/// they read a head. The join is resolved as written; the flipped one indexes the
+/// The first join of a lane pipeline flipped when `joinorder.choose` holds its left
+/// side (`left`, the head read and the stages before the join) under the lane cap,
+/// the right side's pass rate sampled (`Sample`), and its right side is a local
+/// Parquet or CSV read followed only by map stages, which the lanes read as they
+/// read a head. The join is resolved as written; the flipped one indexes the
 /// left rows on the written left keys and probes with the right rows, its kind
 /// mirrored, under a projection that gives back the written columns, so the suffix
 /// and everything after see the written join. A left join turned right leaves its
@@ -511,13 +511,9 @@ pub fn flipFirstJoin(env: *Env, left: []const ast.Stage, js: ast.Stage, suffix: 
     if (rstages.len == 0 or rstages[0].node != .read or rstages[0].hints.len > 0) return null;
     for (rstages[1..]) |st| if (!analyze.isMap(st.node, false)) return null;
     const cap = try laneJoinCap(env, j, js.hints);
-    const left_est = estimate.ofSide(env, left);
-    const right_est = estimate.ofSide(env, rstages);
-    var p = joinorder.decide(left_est, right_est, cap) orelse return null;
-    if (filters(rstages[1..]) and (left_est.rows orelse 0) >= sample_left) if (right_est.rows) |total| {
-        const kept = try passingRows(env, rstages, w, opts, total, turn_sample);
-        p = joinorder.decide(left_est, .{ .rows = kept }, cap) orelse return null;
-    };
+    var sample = Sample{ .env = env, .rstages = rstages, .w = w, .opts = opts };
+    const choice = (try joinorder.choose(env, left, js, rstages, rest, cap, sample.sampler())) orelse return null;
+    if (!choice.held_left) return null;
 
     const src_base = env.sources.items.len;
     var done = false;
@@ -567,7 +563,6 @@ pub fn flipFirstJoin(env: *Env, left: []const ast.Stage, js: ast.Stage, suffix: 
         break :blk words;
     } else null;
     const after = try chainAt(env, written.*, suffix);
-    const note = try msgfmt.allocPrint(arena, "build: left (est. {s} vs {s})", .{ try estimate.describe(arena, p.left, p.unit), try estimate.describe(arena, p.right, p.unit) });
     done = true;
     return .{
         .m = m,
@@ -589,26 +584,50 @@ pub fn flipFirstJoin(env: *Env, left: []const ast.Stage, js: ast.Stage, suffix: 
             .restore_schema = written,
             .name = if (j.alias.len > 0) j.alias else j.binding,
             .filter_off = runtime_filters.disabled(js.hints),
+            .note = choice.note,
+            .at = profile.keyOf(js.pos),
         },
         .out_schema = after.out.*,
-        .note = note,
+        .note = choice.note,
         .read_at = profile.keyOf(rstages[0].pos),
     };
+}
+
+/// The head read asked for only the columns `after` (every stage past it) takes,
+/// for a first join turned around (`flipFirstJoin`), which reads its left side, the
+/// head, into memory: read whole, a wide head was held with every column. The list
+/// names the joined sides' columns too, which the Parquet and CSV readers pass over.
+pub fn narrowHead(env: *Env, h: ast.Stage, after: []const ast.Stage) !ast.Stage {
+    if (h.node != .read or h.node.read.cols.len > 0) return h;
+    const cols = (try projectedColumns(env, after)) orelse return h;
+    var out = h;
+    var rd = h.node.read;
+    rd.cols = cols;
+    out.node = .{ .read = rd };
+    return out;
 }
 
 /// The rows a filtered right side's pass rate is taken over: enough for a ratio of
 /// `joinorder.flip_ratio`, too few to cost what a row group's text costs to decode.
 const turn_sample: u64 = 1 << 14;
 
-/// The left rows from which indexing them costs more than sampling the right side
-/// does (opening and decoding one of its row groups); below it the turn is taken on
-/// the estimates, as q13's 150K customers against 1.5M orders.
-const sample_left: u64 = 1 << 19;
+/// `joinorder.choose`'s sample of a right side the lanes can read: its first
+/// `turn_sample` rows' pass rate (`passingRows`).
+const Sample = struct {
+    env: *Env,
+    rstages: []const ast.Stage,
+    w: ast.Write,
+    opts: RunOptions,
 
-fn filters(stages: []const ast.Stage) bool {
-    for (stages) |st| if (st.node == .filter) return true;
-    return false;
-}
+    fn sampler(self: *Sample) joinorder.Sampler {
+        return .{ .ctx = self, .rows = rows };
+    }
+
+    fn rows(ctx: *anyopaque, total: u64) anyerror!u64 {
+        const self: *Sample = @ptrCast(@alignCast(ctx));
+        return passingRows(self.env, self.rstages, self.w, self.opts, total, turn_sample);
+    }
+};
 
 fn mirror(kind: ast.JoinKind) ast.JoinKind {
     return switch (kind) {

@@ -282,6 +282,43 @@ test "a first lane join whose right side filters to few rows gives the rows it g
     }
 }
 
+test "the joins held before a turned last join choose their own sides, and give the rows they give as written at every -j" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try writeParquet(a, try std.fs.path.join(a, &.{ base, "in.parquet" }), 0, rows);
+    try writeParquet(a, try std.fs.path.join(a, &.{ base, "big.parquet" }), 0, 300_000);
+    var cust = std.array_list.Managed(u8).init(a);
+    try cust.appendSlice("ck,seg,nk\n");
+    for (0..5000) |i| try cust.writer().print("{d},{s},{d}\n", .{ i * 3, if (i % 5 == 0) "x" else "y", i % 7 });
+    try tmp.dir.writeFile(.{ .sub_path = "cust.csv", .data = cust.items });
+    try tmp.dir.writeFile(.{ .sub_path = "nat.csv", .data = "nk,name\n0,n0\n1,n1\n2,n2\n3,n3\n4,n4\n5,n5\n6,n6\n" });
+    const opts = env_mod.RunOptions{ .morsel_bytes = 16 << 10 };
+
+    const shapes = [_][]const u8{
+        "SELECT o.g, COUNT(*) AS n, SUM(b.k) AS t, SUM(o.id) AS u FROM '$B/cust.csv' c JOIN '$B/in.parquet' o ON o.k = c.ck$W JOIN '$B/big.parquet' b ON b.id = o.id WHERE c.seg = 'x' GROUP BY o.g ORDER BY o.g",
+        "SELECT n.name, o.g, COUNT(*) AS n, SUM(b.k) AS t FROM '$B/nat.csv' n JOIN '$B/cust.csv' c ON c.nk = n.nk$W JOIN '$B/in.parquet' o ON o.k = c.ck$W JOIN '$B/big.parquet' b ON b.id = o.id WHERE n.name = 'n1' GROUP BY n.name, o.g ORDER BY n.name, o.g",
+        "SELECT c.nk, COUNT(*) AS n, COUNT(o.id) AS m, COUNT(b.id) AS r, SUM(b.k) AS t FROM '$B/cust.csv' c LEFT JOIN '$B/in.parquet' o ON o.k = c.ck$W LEFT JOIN '$B/big.parquet' b ON b.id = o.id WHERE c.seg = 'x' GROUP BY c.nk ORDER BY c.nk",
+    };
+    for (shapes) |shape| {
+        const written = try resultOf(a, tmp.dir, base, "", try std.mem.replaceOwned(u8, a, shape, "$W", " WITH (join_order = 'written')"), 1, opts);
+        try testing.expect(std.mem.count(u8, written, "\n") > 2);
+        const auto = try std.mem.replaceOwned(u8, a, shape, "$W", "");
+        for ([_]usize{ 1, 4, 8 }) |threads| try testing.expectEqualStrings(written, try resultOf(a, tmp.dir, base, "", auto, threads, opts));
+    }
+
+    const floats = "SELECT o.g, SUM(b.f) AS t, AVG(o.f) AS m FROM '$B/cust.csv' c JOIN '$B/in.parquet' o ON o.k = c.ck JOIN '$B/big.parquet' b ON b.id = o.id WHERE c.seg = 'x' GROUP BY o.g ORDER BY o.g";
+    const one = try resultOf(a, tmp.dir, base, "", floats, 1, opts);
+    for ([_]usize{ 4, 8 }) |threads| try testing.expectEqualStrings(one, try resultOf(a, tmp.dir, base, "", floats, threads, opts));
+
+    const own = "SELECT c.ck, o.id FROM '$B/cust.csv' c JOIN '$B/in.parquet' o ON o.k = c.ck$W";
+    const as_written = try resultOf(a, tmp.dir, base, "", try std.mem.replaceOwned(u8, a, own, "$W", " WITH (join_order = 'written')"), 1, opts);
+    try testing.expectEqualStrings(as_written, try resultOf(a, tmp.dir, base, "", try std.mem.replaceOwned(u8, a, own, "$W", ""), 4, opts));
+}
+
 test "a later join's runtime filter narrows a Parquet build side the lanes read, rows the same with it and without, at every -j" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

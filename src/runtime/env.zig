@@ -367,6 +367,11 @@ pub const Env = struct {
     fns: *const std.StringHashMap(ast.FnDecl),
     materialized: std.StringHashMapUnmanaged(Materialized) = .{},
     mem_sink: ?*MemSink = null,
+    /// Whether nothing sees the order of the rows the running pipeline writes:
+    /// `flipLaterJoin` holds them only to index them for a join an aggregate takes.
+    /// Scoped to that run, and cleared for a run into memory nested in it (a binding
+    /// it reads); `joinorder.orderFreeIn` reads it.
+    out_order_free: bool = false,
     /// The one sink a split-parallel union's branches all write to, so the union is
     /// one result: `openSink` hands it to each branch, and the union closes it.
     union_sink: ?driver.Sink = null,

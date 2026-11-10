@@ -30,14 +30,16 @@
 //! Row order. A join emits rows in its probe side's order, which `queries.md`
 //! promises for a pipeline that only filters, projects and joins. So neither
 //! choice is made unless an aggregate or a sort follows the join, with only
-//! filters, selects, explodes and joins between (`orderFree`). A float `SUM` may
-//! then differ in its last digits, as it does between `-j` runs.
+//! filters, selects, explodes and joins between (`orderFree`), or the run's rows
+//! are only held to be indexed (`orderFreeIn`, `Env.out_order_free`). A float `SUM`
+//! may then differ in its last digits from the written order, never between `-j`.
 //!
-//! Not chosen here: semi, anti and cross joins, outer joins in a star chain, NOT
-//! IN, a join with a residual condition, a join under `WITH (join_order = 'written')`, and joins the
-//! parallel lanes run (`lanes/join.zig` indexes the right side and probes with the
-//! head read in every lane; a right side too large for that already sends the
-//! pipeline back to the serial plan, where this applies). `EXPLAIN ANALYZE` (and
+//! `choose` is the one rule every path takes: the serial plan here, and the lanes'
+//! first join (`lanes/join.zig` `flipFirstJoin`, a right side's pass rate sampled),
+//! whether an aggregate or a map follows. Not chosen: semi, anti and cross joins,
+//! outer joins in a star chain, NOT IN, a join with a residual condition, a join
+//! under `WITH (join_order = 'written')`, and a side whose rows cannot be estimated,
+//! such as one that joins before (`estimate.ofSide`). `EXPLAIN ANALYZE` (and
 //! `run --explain`) prints the choice under the join.
 
 const Env = @import("../env.zig").Env;
@@ -77,11 +79,67 @@ pub fn mode(hints: []const ast.Hint) Mode {
 /// Whether the stages after a join reorder its rows anyway before anything sees
 /// their order: an aggregate or a sort, reached through order-keeping stages only.
 pub fn orderFree(after: []const ast.Stage) bool {
+    return orderAt(after, false);
+}
+
+/// `orderFree` within a run: past its last stage, its rows' order is seen unless
+/// the run says otherwise (`Env.out_order_free`).
+pub fn orderFreeIn(env: *const Env, after: []const ast.Stage) bool {
+    return orderAt(after, env.out_order_free);
+}
+
+fn orderAt(after: []const ast.Stage, at_end: bool) bool {
     for (after) |st| switch (st.node) {
         .filter, .select, .join, .explode => {},
         .aggregate, .sort => return true,
         else => return false,
     };
+    return at_end;
+}
+
+/// A join's choice of the side it indexes: the left side when `held_left`, with the
+/// estimates that decided it in `note`, shown under the join.
+pub const Choice = struct { held_left: bool, note: []const u8 };
+
+/// The right side's rows its filters are estimated to leave, taken from a sample
+/// of them by the caller that can read it (the lanes' `passingRows`).
+pub const Sampler = struct {
+    ctx: *anyopaque,
+    rows: *const fn (ctx: *anyopaque, total: u64) anyerror!u64,
+};
+
+/// The left rows from which indexing them costs more than sampling the right side
+/// does (opening and decoding one of its row groups); below it the turn is taken on
+/// the estimates, as q13's 150K customers against 1.5M orders.
+pub const sample_left: u64 = 1 << 19;
+
+/// The one rule for which side of join `js` is indexed, for every path: the left
+/// side (`left`, the stages before the join) when the join is `flippable`, nothing
+/// after it (`after`) sees its rows' order, and the left side is estimated
+/// `flip_ratio` times smaller than the right (`right`, its read and map stages) and
+/// within `cap` bytes. A right side that filters, against `sample_left` rows or
+/// more, is taken at the pass rate `sampled` gives, when given (q12: lineitem's 31K
+/// of 6M rows index far cheaper than its 1.5M orders). Null when the estimates
+/// cannot be compared or the join may not turn: it runs as written.
+pub fn choose(env: *Env, left: []const ast.Stage, js: ast.Stage, right: []const ast.Stage, after: []const ast.Stage, cap: usize, sampled: ?Sampler) !?Choice {
+    if (!flippable(js) or !orderFreeIn(env, after)) return null;
+    const left_est = estimate.ofSide(env, left);
+    var right_est = estimate.ofSide(env, right);
+    var p = decide(left_est, right_est, cap) orelse return try asWritten(env.arena, left_est, right_est);
+    if (sampled) |s| if (filters(right) and (left_est.rows orelse 0) >= sample_left) if (right_est.rows) |total| {
+        right_est = .{ .rows = try s.rows(s.ctx, total) };
+        p = decide(left_est, right_est, cap) orelse return try asWritten(env.arena, left_est, right_est);
+    };
+    return .{ .held_left = true, .note = try msgfmt.allocPrint(env.arena, "build: left (est. {s} vs {s})", .{ try estimate.describe(env.arena, p.left, p.unit), try estimate.describe(env.arena, p.right, p.unit) }) };
+}
+
+fn asWritten(arena: std.mem.Allocator, left: estimate.Estimate, right: estimate.Estimate) !?Choice {
+    const q = estimate.pair(left, right) orelse return null;
+    return .{ .held_left = false, .note = try msgfmt.allocPrint(arena, "build: right (est. {s} vs {s})", .{ try estimate.describe(arena, q.right, q.unit), try estimate.describe(arena, q.left, q.unit) }) };
+}
+
+fn filters(stages: []const ast.Stage) bool {
+    for (stages) |st| if (st.node == .filter) return true;
     return false;
 }
 
@@ -146,7 +204,7 @@ pub fn buildAt(env: *Env, stages: []const ast.Stage, si: usize, probe: op.Op, sc
         return planErr(env.diag, invalid_msg);
     if (take == null) {
         const end = chainEnd(stages, si);
-        if (end - si >= 2 and orderFree(stages[end..]))
+        if (end - si >= 2 and orderFreeIn(env, stages[end..]))
             return .{ .res = try buildChain(env, stages[si..end], stages[end..], probe, schema), .next = end };
     }
     const j = st.node.join;
@@ -154,18 +212,14 @@ pub fn buildAt(env: *Env, stages: []const ast.Stage, si: usize, probe: op.Op, sc
     const a = try plan.assembleJoin(env, j, st.hints, side, schema, probe, take);
     if (a.nl) |r| return .{ .res = r, .next = si + 1 };
     const plain: Built = .{ .res = .{ .op = .{ .join = a.o }, .schema = a.schema }, .next = si + 1 };
-    if (!flippable(st) or a.o.residual != null or !orderFree(stages[si + 1 ..])) return plain;
-    const left = estimate.ofSide(env, stages[0..si]);
-    const right = estimate.ofSide(env, side.rstages);
-    const spill_at = try plan.joinSpillAt(env, st.hints);
-    const p = decide(left, right, spill_at) orelse {
-        if (estimate.pair(left, right)) |q|
-            a.o.note = try msgfmt.allocPrint(env.arena, "build: right (est. {s} vs {s})", .{ try estimate.describe(env.arena, q.right, q.unit), try estimate.describe(env.arena, q.left, q.unit) });
+    if (a.o.residual != null) return plain;
+    const c = (try choose(env, stages[0..si], st, side.rstages, stages[si + 1 ..], try plan.joinSpillAt(env, st.hints), null)) orelse return plain;
+    if (!c.held_left) {
+        a.o.note = c.note;
         return plain;
-    };
-    const note = try msgfmt.allocPrint(env.arena, "build: left (est. {s} vs {s})", .{ try estimate.describe(env.arena, p.left, p.unit), try estimate.describe(env.arena, p.right, p.unit) });
-    env.log.log(.info, "join with `{s}`: the left side is held in memory, {s}", .{ j.alias, note["build: left ".len..] });
-    return .{ .res = try flipped(env.arena, a.o, a.schema, note, env.errctx), .next = si + 1 };
+    }
+    env.log.log(.info, "join with `{s}`: the left side is held in memory, {s}", .{ j.alias, c.note["build: left ".len..] });
+    return .{ .res = try flipped(env.arena, a.o, a.schema, c.note, env.errctx), .next = si + 1 };
 }
 
 /// `o` turned around, its right side probing an index of its left side, under a

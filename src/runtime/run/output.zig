@@ -229,9 +229,12 @@ pub fn runToMemory(env: *Env, opts: RunOptions, stages: []const ast.Stage, what:
     var ms = env_mod.MemSink{ .arena = env.arena, .batches = std.array_list.Managed(Batch).init(env.arena) };
     const outer_sink = env.mem_sink;
     const outer_name = env.sink_name;
+    const outer_free = env.out_order_free;
     env.mem_sink = &ms;
     defer env.mem_sink = outer_sink;
     defer env.sink_name = outer_name;
+    env.out_order_free = false;
+    defer env.out_order_free = outer_free;
     var scratch: Stats = .{};
     var delegated = false;
     const outer_scope = enterScope(env, what);
@@ -254,9 +257,12 @@ fn materializeNamed(env: *Env, opts: RunOptions, name: []const u8, lanes_used: *
     var ms = env_mod.MemSink{ .arena = env.shared orelse env.arena, .batches = std.array_list.Managed(Batch).init(env.shared orelse env.arena) };
     const outer_sink = env.mem_sink;
     const outer_name = env.sink_name;
+    const outer_free = env.out_order_free;
     env.mem_sink = &ms;
     defer env.mem_sink = outer_sink;
     defer env.sink_name = outer_name;
+    env.out_order_free = false;
+    defer env.out_order_free = outer_free;
     var scratch: Stats = .{};
     var delegated = false;
     {
@@ -398,8 +404,11 @@ fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: ast.
     {
         const outer_sink = env.mem_sink;
         const outer_name = env.sink_name;
+        const outer_free = env.out_order_free;
         env.mem_sink = &ms;
         defer env.mem_sink = outer_sink;
+        env.out_order_free = true;
+        defer env.out_order_free = outer_free;
         defer env.sink_name = outer_name;
         var scratch: Stats = .{};
         var delegated = false;

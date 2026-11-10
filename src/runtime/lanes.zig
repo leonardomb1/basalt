@@ -124,8 +124,8 @@ fn runShape(env: *Env, split: Morsels, head: ast.Stage, shape: LaneShape, w: ast
         .sink => |x| runParallelAgg(env, &split, head, x, w, opts, stats, lanes_used),
         .distinct => |x| runParallelDistinct(env, &split, x.prefix, x.dist, x.tail, w, opts, stats, lanes_used),
         .top_n => |x| runParallelTopN(env, &split, x.prefix, x.srt, x.lim, w, opts, stats, lanes_used),
-        .map => |x| runParallelMap(env, split, x, null, w, opts, stats, lanes_used),
-        .map_join => |x| runParallelMap(env, split, x.prefix, x, w, opts, stats, lanes_used),
+        .map => |x| runParallelMap(env, split, head, x, null, w, opts, stats, lanes_used),
+        .map_join => |x| runParallelMap(env, split, head, x.prefix, x, w, opts, stats, lanes_used),
         .sort => |x| runParallelSort(env, &split, x, w, opts, stats, lanes_used),
     };
 }
