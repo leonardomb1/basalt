@@ -89,6 +89,7 @@ const topNStages = @import("../lanes.zig").topNStages;
 const types = @import("../../lang/types.zig");
 const lake = @import("../../format/lake/table.zig");
 const feed = @import("feed.zig");
+const changes_pg = @import("../connect/changes_pg.zig");
 const delta = @import("../../format/lake/delta.zig");
 const delta_write = @import("../../format/lake/delta_write.zig");
 const mkLit = @import("../env.zig").mkLit;
@@ -127,6 +128,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     };
     const t0 = std.time.Instant.now() catch null;
     if (last.write.changes != null) stages = try feed.prepare(env, out, opts_in, lanes_used, batch_arena);
+    stages = try changes_pg.materialize(env, stages);
     defer if (last.write.changes != null) {
         _ = env.params.remove(analyze.since_name);
         _ = env.params_expr.remove(analyze.since_name);

@@ -275,6 +275,9 @@ test "check takes a SQL table's change feed options, a $param as the position, a
     const bad = try checkText(a, try std.mem.concat(a, u8, &.{ conn, "SELECT * FROM db.dbo.orders WITH (changes_since = $since);" }), "t.sql", ".", .{ .declarations_only = true });
     try std.testing.expectEqual(@as(usize, 1), bad.len);
     try std.testing.expect(std.mem.indexOf(u8, bad[0].msg, "unknown read option `changes_since`") != null);
+    const pg = "CREATE CONNECTION shop TYPE postgres OPTIONS (host = 'h', database = 'd', user = 'u', password = 'p');\nPARAM since STRING DEFAULT '';\n";
+    const pg_ok = try checkText(a, try std.mem.concat(a, u8, &.{ pg, "SELECT * FROM shop.public.orders WITH (changes_from = $since, slot = 'basalt_orders', publication = 'basalt_pub');" }), "t.sql", ".", .{ .declarations_only = true });
+    try std.testing.expectEqual(@as(usize, 0), pg_ok.len);
 }
 
 test "check warns where ANCHOR SCHEMA is written, and takes schema_from silently" {

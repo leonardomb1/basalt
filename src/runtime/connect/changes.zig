@@ -31,6 +31,7 @@ const Env = @import("../env.zig").Env;
 const SqlConnInfo = @import("../connect.zig").SqlConnInfo;
 const catalogQuery = @import("../plan/estimate.zig").catalogQuery;
 const planErr = @import("../env.zig").planErr;
+const changes_pg = @import("changes_pg.zig");
 
 /// Whether read options `hints` ask for the change feed.
 pub fn asked(hints: []const ast.Hint) bool {
@@ -45,7 +46,8 @@ pub const Meta = struct { instance: []const u8, cols: []const []const u8, min: [
 /// options give.
 pub fn read(env: *Env, rd: ast.Read, hints: []const ast.Hint, conn: ast.Connection, info: SqlConnInfo) !ast.Read {
     if (rd.form != .table) return planErr(env.diag, "`changes_from` reads a table's change feed; give the table, not a query");
-    if (info.dialect != .sqlserver) return planErr(env.diag, try msgfmt.allocPrint(env.arena, "`changes_from` on a {s} table is not read yet; a SQL Server table with CDC is", .{@tagName(info.dialect)}));
+    if (info.dialect == .postgres) return changes_pg.read(env, rd, hints, conn, info);
+    if (info.dialect != .sqlserver) return planErr(env.diag, try msgfmt.allocPrint(env.arena, "`changes_from` on a {s} table is not read yet; a SQL Server table with CDC or a PostgreSQL table with logical decoding is", .{@tagName(info.dialect)}));
     const from = try position(env, hints, "changes_from");
     const to_given = try position(env, hints, "changes_to");
     const m = try metaOf(env, rd, hints, conn, info);
@@ -72,6 +74,7 @@ pub fn read(env: *Env, rd: ast.Read, hints: []const ast.Hint, conn: ast.Connecti
 /// job has removed changes past it, so reading on from it could skip some. False
 /// for a read that is no SQL Server table's.
 pub fn cleanedPast(env: *Env, rd: ast.Read, hints: []const ast.Hint, conn: ast.Connection, info: SqlConnInfo, since: []const u8) !bool {
+    if (rd.form == .table and info.dialect == .postgres) return changes_pg.cleanedPast(env, rd, hints, conn, info, since);
     if (rd.form != .table or info.dialect != .sqlserver) return false;
     const f = (try lsn(env, "changes_from", since)) orelse return false;
     const m = try metaOf(env, rd, hints, conn, info);
@@ -149,7 +152,7 @@ fn metaOf(env: *Env, rd: ast.Read, hints: []const ast.Hint, conn: ast.Connection
 }
 
 /// The rows of catalog query `q`, each cell as text, NULL as empty.
-fn askRows(env: *Env, conn: ast.Connection, info: SqlConnInfo, q: []const u8) ![]const []const []const u8 {
+pub fn askRows(env: *Env, conn: ast.Connection, info: SqlConnInfo, q: []const u8) ![]const []const []const u8 {
     const Ctx = struct { a: std.mem.Allocator, out: *std.array_list.Managed([]const []const u8) };
     var out = std.array_list.Managed([]const []const u8).init(env.arena);
     try catalogQuery(env, conn, info, q, Ctx{ .a = env.arena, .out = &out }, struct {

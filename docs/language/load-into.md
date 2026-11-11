@@ -104,7 +104,7 @@ mini-DuckDB.
 ## Change feeds
 
 `USING changes (...)` makes an UPSERT apply a change feed, a query whose rows are
-changes to keyed rows (a SQL Server table read `WITH (changes_from = $since)`,
+changes to keyed rows (a SQL Server or PostgreSQL table read `WITH (changes_from = $since)`,
 [Sources](sources.md), or any query of a change log):
 
 ```sql ignore

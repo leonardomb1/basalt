@@ -402,6 +402,10 @@ pub const Env = struct {
     profile: ?*Profile = null,
     probes: std.ArrayListUnmanaged(Probed) = .empty,
     change_meta: std.ArrayListUnmanaged(ChangeMeta) = .empty,
+    /// PostgreSQL change feeds a statement read (`connect/changes_pg.zig`), their
+    /// meta and decoded range asked once.
+    pg_feeds: std.ArrayListUnmanaged(@import("connect/changes_pg.zig").Entry) = .empty,
+    pg_feed_seq: usize = 0,
     loop_report: ?*@import("run/explain.zig").LoopReport = null,
     report_row: usize = 0,
     last_request: ?*op.Request = null,
@@ -443,6 +447,7 @@ pub const Env = struct {
         if (self.tables) |m| m.endStatement(wrote);
         self.probes = .empty;
         self.change_meta = .empty;
+        self.pg_feeds = .empty;
     }
 
     pub fn takeResult(self: *Env) arrow.ResultInfo {

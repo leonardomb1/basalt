@@ -2032,7 +2032,7 @@ const file_reads = blk: {
 };
 const stdin_read = ReadKind{ .what = "a STDIN read", .keys = formats.stdin_read_keys, .takes = formats.takes(formats.stdin_read_keys) };
 const rest_read = ReadKind{ .what = "a REST read", .keys = &rest_read_keys, .takes = "items, paginate, bearer_env and the other REST options in docs/language/sources.md" };
-const sql_read = ReadKind{ .what = "a SQL table read", .keys = &[_][]const u8{ "split", "splits", "split_kind", "changes_from", "changes_to", "capture_instance" }, .takes = "split, splits, split_kind, changes_from, changes_to, capture_instance" };
+const sql_read = ReadKind{ .what = "a SQL table read", .keys = &[_][]const u8{ "split", "splits", "split_kind", "changes_from", "changes_to", "capture_instance", "slot", "publication" }, .takes = "split, splits, split_kind, changes_from, changes_to, capture_instance, slot, publication" };
 const union_read = ReadKind{ .what = "a UNION", .keys = &union_read_keys, .takes = "table_field, tag_field, tag_substr, schema_from" };
 const other_read = ReadKind{ .what = "this source", .keys = &.{}, .takes = "no options" };
 

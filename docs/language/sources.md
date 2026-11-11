@@ -163,8 +163,9 @@ nulls, and a table with a filtered index or an indexed view can be written.
 
 ### A table's change feed
 
-`WITH (changes_from = <position>)` reads what changed in a SQL Server table
-since a position, through its change data capture, instead of the table: each
+`WITH (changes_from = <position>)` reads what changed in a SQL Server or
+PostgreSQL table since a position, through SQL Server's change data capture or
+PostgreSQL's logical decoding, instead of the table: each
 row has the table's columns, then `_change_type` (`insert`, `update_postimage`
 or `delete`), `_commit_version` (the commit's LSN as 20 hex digits),
 `_commit_timestamp` and `_change_seq`, the change's order in the read (commit
@@ -195,7 +196,41 @@ AS SELECT * FROM erp.dbo.orders WITH (changes_from = $since);
 - An option's value may be a `$param` or `LET`, resolved as the statement runs:
   `changes_from = $since`.
 
-Postgres tables are not read this way yet.
+A PostgreSQL table's feed is read by logical decoding, with the same columns,
+`_commit_version` the commit's LSN as 16 hex digits:
+
+```sql ignore
+LOAD INTO sr.orders UPSERT ON (id)
+  USING changes (sequence_by = _change_seq, delete_when = _change_type = 'delete',
+                 position = _commit_version)
+AS SELECT * FROM shop.public.orders WITH (changes_from = $since, slot = 'basalt_orders');
+```
+
+- Setup is the database owner's, as CDC is on SQL Server: `wal_level = logical`, a
+  publication carrying the table (`CREATE PUBLICATION basalt_pub FOR TABLE
+  orders;`) and a `pgoutput` slot for the feed (`SELECT
+  pg_create_logical_replication_slot('basalt_orders', 'pgoutput');`, a role with
+  REPLICATION), named by `slot`. The publication is found from the table;
+  `publication = '<name>'` picks one when it is in several. A missing one fails the
+  read, naming the statement that creates it.
+- The changes are peeked through SQL and never consumed; the one thing basalt does
+  to the source is move the slot up to the position its target holds, at the next
+  run's start, so the server can drop the WAL before it. Give each feed its own
+  slot: two targets on one slot move it past each other's positions.
+- The read ends where the WAL stood when the statement started, so a rerun reads
+  the same changes; `changes_to` is not taken. A run decodes its range into memory
+  once, so it suits runs frequent enough to keep that range small.
+- With no position the whole table is read as inserts at that end, as above.
+- Under `USING changes` the table is also read whole, and the keys it no longer
+  holds kept as deleted, when the slot was invalidated or moved past the position
+  (a slot dropped and created again), when the table was truncated in the range,
+  and when an update left a large (TOASTed) value unchanged on a table that does
+  not log whole rows: logical decoding sends no value for it then.
+  `ALTER TABLE orders REPLICA IDENTITY FULL;` avoids that, and also makes a delete
+  carry the whole row; without it a deleted row arrives with its key alone, the
+  other columns NULL.
+- The change feed is read as a statement's FROM, or the CTE it starts with, not
+  as a joined table.
 
 ## Source clauses
 

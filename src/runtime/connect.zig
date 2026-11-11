@@ -382,6 +382,7 @@ test "an http connection reads user/password only where its auth uses them" {
 }
 
 test {
+    _ = @import("connect/changes_pg.zig");
     _ = @import("connect/dbconfig.zig");
     _ = @import("connect/facts.zig");
     _ = @import("connect/lane_sink.zig");

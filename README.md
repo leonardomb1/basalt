@@ -157,7 +157,7 @@ zig build -Doptimize=ReleaseFast
 | **Object storage** — S3 and S3-compatible, Azure Blob / ADLS Gen2 | ✓ | ✓ |
 | **File servers** — SFTP, Windows and Samba shares (SMB 2.1–3.1.1, NTLMv2 or Kerberos); FTP | ✓ | ✓ (not FTP) |
 | **Databases** — PostgreSQL, MySQL, SQL Server, StarRocks, Apache Doris | ✓ | ✓ |
-| **Change feeds** — SQL Server CDC and a Delta table's feed, applied to any table by `UPSERT ... USING changes` | ✓ | ✓ |
+| **Change feeds** — SQL Server CDC, PostgreSQL logical decoding and a Delta table's feed, applied to any table by `UPSERT ... USING changes` | ✓ | ✓ |
 | **HTTP APIs** — paginated REST, with bearer, basic, OAuth2 and login flows | ✓ | |
 | **Standard input and output** — `FROM STDIN` reads CSV, JSON, NDJSON or XML; a final `SELECT` prints a table, CSV, TSV, JSON or Arrow | ✓ | ✓ |
 
@@ -252,8 +252,9 @@ getting data out of the systems that hold it and into the ones that need it:
   append, replace or upsert (copy-on-write, deletion vectors, row tracking, the
   change data feed), compacted and vacuumed.
 - **Change data capture without a server.** `UPSERT ... USING changes` applies a
-  change feed, a SQL Server table's CDC or a Delta table's, to any table it writes,
-  each run taking what is new since the target's last position.
+  change feed, a SQL Server table's CDC, a PostgreSQL table's logical decoding or
+  a Delta table's, to any table it writes, each run taking what is new since the
+  target's last position.
 - **Checked before it runs.** A whole script is parsed, typed and planned before a
   row is read; `basalt check` does it without connecting. Exit code `75` tells a
   scheduler a failure is worth retrying.

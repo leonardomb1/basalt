@@ -427,7 +427,7 @@ fn parseDataRow(conn: *Conn, p: []const u8, builders: []column.Builder) !void {
 }
 
 /// The kind from `typemap`; a numeric's precision and scale from its typmod.
-fn pgType(oid: i32, typmod: i32) types.Type {
+pub fn pgType(oid: i32, typmod: i32) types.Type {
     const kind = typemap.readKind(.postgres, .pg(oid)).?;
     return (if (kind == .decimal) decimalFromTypmod(typmod) else types.Type.init(kind)).asNullable();
 }
