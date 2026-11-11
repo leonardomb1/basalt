@@ -188,7 +188,7 @@ pub fn unnestCol(self: *Parser) Error!ast.QualName {
 
 /// The WHERE filters from `from` on, each conjunct that names no column an UNNEST
 /// makes moved below the UNNESTs in front of it, which give the same rows either
-/// way: below them a computed list (`UNNEST(chunks(body, ...))`) is built only for
+/// way: below them a computed list (`UNNEST(text_chunks(body, ...))`) is built only for
 /// the rows the filter keeps, not for every row and then mostly dropped.
 fn sinkPastUnnests(self: *Parser, stages: *std.array_list.Managed(ast.Stage), from: usize) Error!void {
     var i = from;

@@ -1,4 +1,4 @@
-//! `chunks(text, size [, overlap])`: a text cut into pieces of at most `size`
+//! `text_chunks(text, size [, overlap])`: a text cut into pieces of at most `size`
 //! characters, for embedding, as a LIST of STRUCT(no, start, text): `no` counts
 //! the chunks from 1 and `start` is a chunk's first character's position from 1,
 //! so `substr(text, start, length(chunk))` gives the chunk back.
@@ -45,7 +45,7 @@ const list_type = Type{ .kind = .array, .elem = &chunk_type, .nullable = true };
 const max_chunk_bytes = 64 * max_str_bytes;
 
 pub fn typing(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
-    if (c.args.len != 2 and c.args.len != 3) return self.err("`chunks` takes (text, size) or (text, size, overlap)", .{});
+    if (c.args.len != 2 and c.args.len != 3) return self.err("`text_chunks` takes (text, size) or (text, size, overlap)", .{});
     _ = try self.wantText(c, 0);
     _ = try self.wantInt(c, 1, "size");
     if (c.args.len == 3) _ = try self.wantInt(c, 2, "overlap");
@@ -100,8 +100,8 @@ fn isSpace(b: u8) bool {
 
 /// `text`'s chunks appended to `out`, as the file's rule says.
 fn cut(arena: std.mem.Allocator, out: *Out, text: []const u8, size: i64, overlap: i64) EvalError!void {
-    if (size <= 0) return failWith(error.CastFailed, "chunks: size must be positive, got {d}", .{size});
-    if (overlap < 0 or overlap >= size) return failWith(error.CastFailed, "chunks: overlap must be from 0 to below size ({d}), got {d}", .{ size, overlap });
+    if (size <= 0) return failWith(error.CastFailed, "text_chunks: size must be positive, got {d}", .{size});
+    if (overlap < 0 or overlap >= size) return failWith(error.CastFailed, "text_chunks: overlap must be from 0 to below size ({d}), got {d}", .{ size, overlap });
     var at = std.array_list.Managed(usize).init(arena);
     var i: usize = 0;
     while (i < text.len) : (i += charWidth(text, i)) try at.append(i);
@@ -128,7 +128,7 @@ fn cut(arena: std.mem.Allocator, out: *Out, text: []const u8, size: i64, overlap
         }
         const piece = text[bo[pos]..bo[stop]];
         held += piece.len;
-        if (held > max_chunk_bytes) return failWith(error.CastFailed, "chunks: the chunks pass {d} bytes; lower the overlap", .{max_chunk_bytes});
+        if (held > max_chunk_bytes) return failWith(error.CastFailed, "text_chunks: the chunks pass {d} bytes; lower the overlap", .{max_chunk_bytes});
         try out.nos.append(no);
         try out.starts.append(@intCast(pos + 1));
         try out.texts.push(piece);
@@ -238,5 +238,5 @@ test "chunks' kernel gives each row the chunks its row form does" {
     var cols = [_]Column{try sb.finish()};
     const schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = cols[0].ty }} };
     const batch = Batch{ .schema = &schema, .columns = &cols, .len = 5 };
-    try @import("testing_util.zig").expectVecMatchesRows(a, batch, &.{ "chunks(s, 7, 2)", "chunks(s, 12)", "cardinality(chunks(s, 5, 4))" }, false);
+    try @import("testing_util.zig").expectVecMatchesRows(a, batch, &.{ "text_chunks(s, 7, 2)", "text_chunks(s, 12)", "cardinality(text_chunks(s, 5, 4))" }, false);
 }

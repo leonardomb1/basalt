@@ -2203,7 +2203,7 @@ test "a LEFT JOIN's ON with thousands of conjuncts stays shallow once split into
     }
 }
 
-test "chunks cuts a text at whitespace past half its size, overlapping into the next word, and UNNEST takes the call; its rule is pinned here, since an embedding is of exactly these pieces" {
+test "text_chunks cuts a text at whitespace past half its size, overlapping into the next word, and UNNEST takes the call; its rule is pinned here, since an embedding is of exactly these pieces" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2215,7 +2215,7 @@ test "chunks cuts a text at whitespace past half its size, overlapping into the 
         \\4,"supercalifragilisticexpialidocious"
         \\5,"ação é útil na região sul"
         \\
-    , "SELECT d.id, c.no, c.start, c.text, substr(d.body, c.start, length(c.text)) = c.text AS ok FROM '$IN' d CROSS JOIN UNNEST(chunks(d.body, 20, 5)) AS c ORDER BY d.id, c.no");
+    , "SELECT d.id, c.no, c.start, c.text, substr(d.body, c.start, length(c.text)) = c.text AS ok FROM '$IN' d CROSS JOIN UNNEST(text_chunks(d.body, 20, 5)) AS c ORDER BY d.id, c.no");
     defer alloc.free(out);
     try std.testing.expectEqualStrings(
         "id,no,start,text,ok\n" ++
@@ -2232,6 +2232,6 @@ test "chunks cuts a text at whitespace past half its size, overlapping into the 
         out,
     );
     try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "body\nsome text\n" });
-    try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT chunks(body, 0) AS c FROM '$B/t.csv';", 1, "chunks: size must be positive, got 0");
-    try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT chunks(body, 10, 10) AS c FROM '$B/t.csv';", 1, "chunks: overlap must be from 0 to below size (10), got 10");
+    try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT text_chunks(body, 0) AS c FROM '$B/t.csv';", 1, "text_chunks: size must be positive, got 0");
+    try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT text_chunks(body, 10, 10) AS c FROM '$B/t.csv';", 1, "text_chunks: overlap must be from 0 to below size (10), got 10");
 }

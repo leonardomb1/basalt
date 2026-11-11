@@ -173,7 +173,7 @@ const base = [_]Builtin{
     .{ .name = "list_any", .type_fn = fn_list.typing, .eval_fn = fn_list.rowFn, .vec_fn = fn_list.vecFn },
     .{ .name = "list_all", .type_fn = fn_list.typing, .eval_fn = fn_list.rowFn, .vec_fn = fn_list.vecFn },
     .{ .name = "list_reduce", .type_fn = fn_list.typing, .eval_fn = fn_list.rowFn, .vec_fn = fn_list.vecFn },
-    .{ .name = "chunks", .type_fn = fn_chunks.typing, .eval_fn = fn_chunks.rowFn, .vec_fn = fn_chunks.vecFn },
+    .{ .name = "text_chunks", .type_fn = fn_chunks.typing, .eval_fn = fn_chunks.rowFn, .vec_fn = fn_chunks.vecFn },
     .{ .name = "list_cosine_similarity", .type_fn = fn_vector.typing, .eval_fn = fn_vector.rowFn, .vec_fn = fn_vector.vecFn },
     .{ .name = "list_cosine_distance", .type_fn = fn_vector.typing, .eval_fn = fn_vector.rowFn, .vec_fn = fn_vector.vecFn },
     .{ .name = "list_distance", .type_fn = fn_vector.typing, .eval_fn = fn_vector.rowFn, .vec_fn = fn_vector.vecFn },
