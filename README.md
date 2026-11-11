@@ -123,6 +123,29 @@ JOIN sales.public.customers c ON c.id = o.customer_id
 WHERE o.status = 'paid';
 ```
 
+An API can be called per row, too. Documents split into chunks, each chunk sent to
+an embeddings model in batches of 128, and the vectors upserted into pgvector; a
+rerun skips the chunks the table already holds, so it pays only for new text:
+
+```sql ignore
+CREATE CONNECTION ai TYPE http OPTIONS (base_url = 'https://api.openai.com',
+    auth = 'bearer', token = env('OPENAI_API_KEY'));
+CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'pg.internal', database = 'search');
+
+CREATE FUNCTION embed(input) RETURNS TABLE AS
+  SELECT CAST(embedding AS LIST(DOUBLE)) AS embedding
+  FROM ai.POST('/v1/embeddings')
+  WITH (body_type = 'json', body = '{"model": "text-embedding-3-small", "input": ${input}}',
+        items = 'data', batch = 128);
+
+LOAD INTO pg.public.doc_chunks UPSERT ON (doc_id, no) AS
+SELECT d.id AS doc_id, c.no, c.text, sha256(c.text) AS text_hash, e.embedding
+FROM 'docs.parquet' d
+CROSS JOIN UNNEST(text_chunks(d.body, 1000, 200)) AS c
+CROSS JOIN LATERAL embed(c.text) e
+WHERE sha256(c.text) NOT IN (SELECT text_hash FROM pg.public.doc_chunks);
+```
+
 ## Install
 
 A prebuilt binary for Linux x86-64, statically linked:
@@ -158,7 +181,7 @@ zig build -Doptimize=ReleaseFast
 | **File servers** — SFTP, Windows and Samba shares (SMB 2.1–3.1.1, NTLMv2 or Kerberos); FTP | ✓ | ✓ (not FTP) |
 | **Databases** — PostgreSQL, MySQL, SQL Server, StarRocks, Apache Doris | ✓ | ✓ |
 | **Change feeds** — SQL Server CDC, PostgreSQL logical decoding and a Delta table's feed, applied to any table by `UPSERT ... USING changes` | ✓ | ✓ |
-| **HTTP APIs** — paginated REST, with bearer, basic, OAuth2 and login flows | ✓ | |
+| **HTTP APIs** — paginated REST, with bearer, basic, OAuth2 and login flows; an endpoint called per row, in ordered batches (embeddings, geocoding, enrichment) | ✓ | |
 | **Standard input and output** — `FROM STDIN` reads CSV, JSON, NDJSON or XML; a final `SELECT` prints a table, CSV, TSV, JSON or Arrow | ✓ | ✓ |
 
 A folder — local, remote or a storage prefix — reads as one table. Parquet is
@@ -255,12 +278,17 @@ getting data out of the systems that hold it and into the ones that need it:
   change feed, a SQL Server table's CDC, a PostgreSQL table's logical decoding or
   a Delta table's, to any table it writes, each run taking what is new since the
   target's last position.
+- **Embeddings and statistics in the same SQL.** Text chunked by `text_chunks`,
+  embedded through a model's API per row, stored in pgvector, StarRocks or SQL
+  Server 2025 vector columns and searched with `list_cosine_similarity`;
+  correlation, regression (`regr_*`), skewness and kurtosis over groups and
+  windows, and the elementary math (`ln`, `atan2`, `gcd`, ...) beside them.
 - **Checked before it runs.** A whole script is parsed, typed and planned before a
   row is read; `basalt check` does it without connecting. Exit code `75` tells a
   scheduler a failure is worth retrying.
 - **Scripts, not just queries.** `PARAM`, `LET`, `FOR EACH` (a load per row, to a
-  target named per row), `CASE`, functions and table functions, libraries pinned
-  by hash.
+  target named per row), `CASE`, functions and table functions (an API endpoint
+  is one), libraries pinned by hash.
 - **Easy to run anywhere.** One static 7.6 MB binary, no runtime, starting in a millisecond;
   logins from environment variables; `EXPLAIN ANALYZE` shows every request each
   source was sent.
