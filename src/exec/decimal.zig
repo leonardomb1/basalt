@@ -228,12 +228,18 @@ pub fn roundOutScale(c: ast.Expr.Call, in_scale: u8) u8 {
     return @intCast(std.math.clamp(d.int_lit, 0, in_scale));
 }
 
-pub fn roundDecimal(d: Decimal, digits: i64, out_scale: u8) ?Decimal {
+/// How `round` and `trunc` drop digits: half away from zero, or toward zero.
+pub const Rounding = enum { half_away, toward_zero };
+
+pub fn roundDecimal(d: Decimal, digits: i64, out_scale: u8, mode: Rounding) ?Decimal {
     var r = d;
     if (digits < d.scale) {
         const drop = @as(i64, d.scale) - digits;
         if (drop > 38) return .{ .unscaled = 0, .scale = out_scale };
-        var q = roundScaleDown(d.unscaled, @intCast(drop));
+        var q = switch (mode) {
+            .half_away => roundScaleDown(d.unscaled, @intCast(drop)),
+            .toward_zero => @divTrunc(d.unscaled, pow10_i128[@intCast(drop)]),
+        };
         if (digits < 0) {
             q = std.math.mul(i128, q, pow10_i128[@intCast(@min(-digits, 38))]) catch return null;
             r = .{ .unscaled = q, .scale = 0 };

@@ -244,12 +244,12 @@ pub const typing = struct {
     }
 
     pub fn round(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
-        if (c.args.len != 1 and c.args.len != 2) return self.err("`round` takes (x) or (x, digits)", .{});
+        if (c.args.len != 1 and c.args.len != 2) return self.err("`{s}` takes (x) or (x, digits)", .{c.name});
         const a = try self.argType(c, 0);
-        if (!numericish(a)) return self.err("`round` needs a numeric argument", .{});
+        if (!numericish(a)) return self.err("`{s}` needs a numeric argument", .{c.name});
         if (c.args.len == 2) {
             const d = try self.argType(c, 1);
-            if (!numericish(d)) return self.err("`round` digits must be an integer", .{});
+            if (!numericish(d)) return self.err("`{s}` digits must be an integer", .{c.name});
         }
         if (a.unknown or (a.kind == .int and c.args.len == 1)) return a;
         if (a.kind == .decimal) return Type.decimal(a.precision, roundOutScale(c, a.scale)).withNull(a.nullable);

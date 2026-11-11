@@ -123,9 +123,23 @@ pub fn applyFilter(self: *Parser, name: []const u8, args: []*ast.Expr, c: *ast.E
 /// The call `name(args)` just parsed, at `OVER`: recorded on the select core's list,
 /// and replaced by its hidden column.
 pub fn parseWindowCall(self: *Parser, name: []const u8, args: []const *ast.Expr, distinct: bool, nulls: ?bool, pos: Pos) Error!*ast.Expr {
-    const sink = self.win_sink orelse
+    return windowCall(self, name, args, distinct, nulls, pos, try parseOver(self, pos));
+}
+
+/// `OVER (...)` or `OVER name`, at `OVER`.
+pub fn parseOver(self: *Parser, pos: Pos) Error!Spec {
+    if (self.win_sink == null)
         return self.fail(pos, "a window function is only allowed in the SELECT list or ORDER BY — compute it in a derived table or CTE to filter, group or join on it", .{});
     _ = self.advance();
+    if (self.eat(.lparen)) return self.parseSpecBody(pos);
+    return .{ .base = try self.expectIdent(), .bare = true, .pos = pos };
+}
+
+/// `name(args)` over the window `spec`, recorded on the select core's list and
+/// replaced by its hidden column.
+pub fn windowCall(self: *Parser, name: []const u8, args: []const *ast.Expr, distinct: bool, nulls: ?bool, pos: Pos, spec: Spec) Error!*ast.Expr {
+    const sink = self.win_sink orelse
+        return self.fail(pos, "a window function is only allowed in the SELECT list or ORDER BY — compute it in a derived table or CTE to filter, group or join on it", .{});
     const func: ast.WinFn = if (std.meta.stringToEnum(ast.WinKind, name)) |k|
         .{ .win = k }
     else if (aggregates.lookup(name)) |a|
@@ -141,11 +155,7 @@ pub fn parseWindowCall(self: *Parser, name: []const u8, args: []const *ast.Expr,
         };
         if (!takes) return self.fail(pos, "IGNORE NULLS and RESPECT NULLS apply to LAG, LEAD, FIRST_VALUE, LAST_VALUE and NTH_VALUE, not `{s}`", .{name});
     }
-    if (self.eat(.lparen)) {
-        call.spec = try self.parseSpecBody(pos);
-    } else {
-        call.spec = .{ .base = try self.expectIdent(), .bare = true, .pos = pos };
-    }
+    call.spec = spec;
     for (sink.items) |prev| {
         if (call.arg) |a| if (refsName(a, prev.hidden)) return nested(self, pos);
         for (call.spec.partition) |e| if (refsName(e, prev.hidden)) return nested(self, pos);

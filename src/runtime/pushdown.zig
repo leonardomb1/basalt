@@ -257,7 +257,7 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
             }
             return try msgfmt.allocPrint(arena, "{s}({s})", .{ if (item.func == .min) "MIN" else "MAX", col });
         },
-        .median, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .any_value, .arg_max, .arg_min, .array_agg, .string_agg, .percentile_cont, .percentile_disc => return null,
+        .median, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .any_value, .arg_max, .arg_min, .array_agg, .string_agg, .percentile_cont, .percentile_disc, .skewness, .kurtosis, .product, .mode, .entropy => return null,
     }
 }
 

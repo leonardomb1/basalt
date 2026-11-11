@@ -102,10 +102,25 @@ The hashes are over the value's text. For a row's change key, write
 | `abs(x)` | the absolute value, of `x`'s type |
 | `floor(x)`, `ceil(x)` | rounded down or up to a whole number: an INT stays one, a DECIMAL is an exact `DECIMAL(p, 0)`, a FLOAT a FLOAT |
 | `round(x[, digits])` | rounded half away from zero, to `digits` decimal places; deliberately engine-side, never pushed down. On a DECIMAL it is exact, and a literal `digits` answers `DECIMAL(p, digits)` (a negative one `DECIMAL(p, 0)`: `round(1234.5, -2)` is `1200`) |
+| `trunc(x[, digits])` | as `round`, toward zero: `trunc(-2.7)` is `-2`, `trunc(2.129, 2)` is `2.12` |
 | `mod(a, b)` | `a % b`: the remainder, with the dividend's sign — `mod(-7, 3)` is `-1`, `mod(-7.5, 2.25)` is `-0.75`; typed as `%` is, and a zero `b` fails the run |
 | `power(base, exponent)` | `base` raised to `exponent`, a FLOAT (PostgreSQL answers a `numeric` for a numeric base) |
 | `sqrt(x)` | the square root, a FLOAT (PostgreSQL answers a `numeric` for a numeric `x`) |
 | `sign(x)` | `-1`, `0` or `1`, of `x`'s kind (an INT, a `DECIMAL(1,0)` or a FLOAT) |
+| `exp(x)`, `ln(x)`, `log10(x)`, `log2(x)`, `log(base, x)` | FLOATs; a logarithm of a number that is not positive, or to a base that is not positive or is 1, is null. There is no one-argument `log`, as engines disagree on its base |
+| `cbrt(x)` | the cube root, a FLOAT, defined for negatives |
+| `pi()` | π |
+| `sin(x)`, `cos(x)`, `tan(x)`, `cot(x)` | in radians, FLOATs; `cot(0)` is null |
+| `asin(x)`, `acos(x)`, `atan(x)`, `atan2(y, x)` | in radians; `asin`/`acos` outside [-1, 1] are null; `atan2` takes the quadrant from both signs |
+| `degrees(x)`, `radians(x)` | converts between the two |
+| `gcd(a, b)`, `lcm(a, b)` | INTs, never negative; `gcd(0, 0)` is `0`, `lcm` with a `0` is `0`, and one past the INT range fails the run |
+| `factorial(n)` | an INT; a negative `n` is null, past `20!` fails the run |
+| `isnan(x)`, `isinf(x)`, `isfinite(x)` | BOOLs, for a FLOAT that came in as `NaN` or `inf` |
+
+Outside its domain a function answers null, as `sqrt(-1)` does; a FLOAT that
+overflows is `inf` (`exp(1000)`), as `power` gives. `exp`, `sin`, `cos`, `tan`,
+`atan`, `degrees` and `radians` push down to a SQL source, spelled alike in every
+dialect; the rest run in basalt.
 
 ## Nulls and comparison
 

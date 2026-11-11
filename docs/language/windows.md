@@ -27,7 +27,7 @@ FROM 'movimentos.csv';
 | `LAG(x[, n[, default]])` / `LEAD(x[, n[, default]])` | `x` from `n` rows before / after (default 1), within the partition; past its edge the `default`, else null |
 | `FIRST_VALUE(x)` / `LAST_VALUE(x)` | `x` at the frame's first / last row |
 | `NTH_VALUE(x, n)` | `x` at the frame's `n`-th row, null if the frame is shorter |
-| every aggregate | `SUM`, `COUNT(*)`, `COUNT(x)`, `COUNT(DISTINCT x)`, `AVG`, `MIN`, `MAX`, `MEDIAN`, `count_if`, `bool_and` / `bool_or`, `bit_and` / `bit_or` / `bit_xor`, `var_samp` / `variance` / `var_pop`, `stddev_samp` / `stddev` / `stddev_pop` — over the frame, as [under `GROUP BY`](queries.md#operators) |
+| every aggregate | `SUM`, `COUNT(*)`, `COUNT(x)`, `COUNT(DISTINCT x)`, `AVG`, `MIN`, `MAX`, `MEDIAN`, `count_if`, `bool_and` / `bool_or`, `bit_and` / `bit_or` / `bit_xor`, `var_samp` / `variance` / `var_pop`, `stddev_samp` / `stddev` / `stddev_pop`, `corr`, `covar_*`, `regr_*`, `weighted_avg`, `geomean`, `skewness`, `kurtosis`, `product` — over the frame, as [under `GROUP BY`](queries.md#operators) |
 
 - The ranking and distribution functions, `NTILE`, `LAG` and `LEAD` need an
   `ORDER BY` inside `OVER (...)` — it is what they number by — and take no frame;

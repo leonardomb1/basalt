@@ -7,6 +7,7 @@ const Error = @import("../sql_parser.zig").Error;
 const Pos = @import("../sql_parser.zig").Pos;
 const Window = @import("window.zig");
 const aggregates = @import("../aggregates.zig");
+const stats = @import("stats.zig");
 const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const max_expr_depth = Parser.max_expr_depth;
@@ -522,6 +523,10 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                     if (agg_order.len > 0) return self.fail(tpos, "`{s}` takes its ORDER BY inside the call or in WITHIN GROUP, not both", .{lower});
                     agg_order = try Window.parseOrderKeys(self);
                     _ = try self.expect(.rparen);
+                }
+                if (stats.isStat(lower)) {
+                    if (nulls != null) return self.fail(tpos, "IGNORE NULLS and RESPECT NULLS do not apply to `{s}`", .{lower});
+                    return stats.expand(self, lower, args.items, call_distinct, tpos);
                 }
                 if (aggregates.lookup(lower)) |f| if (args.items.len > aggregates.spec(f).max_args) {
                     const most = aggregates.spec(f).max_args;

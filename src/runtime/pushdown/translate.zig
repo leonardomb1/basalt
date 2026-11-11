@@ -737,6 +737,13 @@ pub const pushable = [_]Pushable{
     .{ .name = "sign", .sql = "SIGN", .min_args = 1, .max_args = 1, .render = render.plain },
     .{ .name = "reverse", .sql = "REVERSE", .min_args = 1, .max_args = 1, .render = render.plain },
     .{ .name = "power", .sql = "POWER", .min_args = 2, .max_args = 2, .render = render.plain },
+    .{ .name = "exp", .sql = "EXP", .min_args = 1, .max_args = 1, .render = render.plain },
+    .{ .name = "sin", .sql = "SIN", .min_args = 1, .max_args = 1, .render = render.plain },
+    .{ .name = "cos", .sql = "COS", .min_args = 1, .max_args = 1, .render = render.plain },
+    .{ .name = "tan", .sql = "TAN", .min_args = 1, .max_args = 1, .render = render.plain },
+    .{ .name = "atan", .sql = "ATAN", .min_args = 1, .max_args = 1, .render = render.plain },
+    .{ .name = "degrees", .sql = "DEGREES", .min_args = 1, .max_args = 1, .render = render.plain },
+    .{ .name = "radians", .sql = "RADIANS", .min_args = 1, .max_args = 1, .render = render.plain },
     .{ .name = "nullif", .sql = "NULLIF", .min_args = 2, .max_args = 2, .render = render.plain },
     .{ .name = "ceil", .min_args = 1, .max_args = 1, .render = render.ceil },
     .{ .name = "mod", .min_args = 2, .max_args = 2, .render = render.mod },
@@ -1131,6 +1138,12 @@ test "translateCall: same-name numeric builtins render identically everywhere" {
     try testing.expectEqualStrings("REVERSE([b])", (try translateExpr(a, rev_e, .sqlserver, testSchema(), true)).?);
     const pow_e = try callExpr(a, "power", &[_]*ast.Expr{ try fld(a, "a"), try intLit(a, 2) });
     try testing.expectEqualStrings("POWER([a], 2)", (try translateExpr(a, pow_e, .sqlserver, testSchema(), true)).?);
+    const exp_e = try callExpr(a, "exp", &[_]*ast.Expr{try fld(a, "a")});
+    try testing.expectEqualStrings("EXP(\"a\")", (try translateExpr(a, exp_e, .postgres, testSchema(), true)).?);
+    const rad_e = try callExpr(a, "radians", &[_]*ast.Expr{try fld(a, "a")});
+    try testing.expectEqualStrings("RADIANS(`a`)", (try translateExpr(a, rad_e, .mysql, testSchema(), true)).?);
+    const ln_e = try callExpr(a, "ln", &[_]*ast.Expr{try fld(a, "a")});
+    try testing.expect((try translateExpr(a, ln_e, .postgres, testSchema(), true)) == null);
     const nif_e = try callExpr(a, "nullif", &[_]*ast.Expr{ try fld(a, "b"), try strLit(a, "x") });
     try testing.expectEqualStrings("NULLIF(`b`, 'x')", (try translateExpr(a, nif_e, .mysql, testSchema(), true)).?);
 

@@ -651,20 +651,135 @@ pub fn Bits(comptime op: BitOp) type {
 }
 
 /// A group's count, mean and sum of squared deviations.
-pub const Moments = struct {
-    n: f64 = 0,
-    mean: f64 = 0,
-    m2: f64 = 0,
+pub const Moments = MomentsOf(2);
 
-    /// Chan et al.'s pairwise merge of two groups' moments.
-    pub fn merge(a: Moments, b: Moments) Moments {
-        if (a.n == 0) return b;
-        if (b.n == 0) return a;
-        const n = a.n + b.n;
-        const d = b.mean - a.mean;
-        return .{ .n = n, .mean = a.mean + d * b.n / n, .m2 = a.m2 + b.m2 + d * d * a.n * b.n / n };
+/// The central moments of a group to `order` (2 or 4): its count, mean and sums of
+/// the deviations' powers, `m3` and `m4` only at order 4.
+pub fn MomentsOf(comptime order_: u8) type {
+    const F = if (order_ >= 4) f64 else void;
+    return struct {
+        const Self = @This();
+        n: f64 = 0,
+        mean: f64 = 0,
+        m2: f64 = 0,
+        m3: F = if (order_ >= 4) 0 else {},
+        m4: F = if (order_ >= 4) 0 else {},
+
+        pub fn of(x: f64) Self {
+            return .{ .n = 1, .mean = x };
+        }
+
+        /// The pairwise merge of two groups' moments: Chan et al.'s to the second,
+        /// Pebay's to the fourth.
+        pub fn merge(a: Self, b: Self) Self {
+            if (a.n == 0) return b;
+            if (b.n == 0) return a;
+            const n = a.n + b.n;
+            const d = b.mean - a.mean;
+            const ab = a.n * b.n;
+            var out = Self{ .n = n, .mean = a.mean + d * b.n / n, .m2 = a.m2 + b.m2 + d * d * ab / n };
+            if (order_ >= 4) {
+                const d2 = d * d;
+                out.m3 = a.m3 + b.m3 + d2 * d * ab * (a.n - b.n) / (n * n) + 3 * d * (a.n * b.m2 - b.n * a.m2) / n;
+                out.m4 = a.m4 + b.m4 + d2 * d2 * ab * (a.n * a.n - ab + b.n * b.n) / (n * n * n) +
+                    6 * d2 * (a.n * a.n * b.m2 + b.n * b.n * a.m2) / (n * n) + 4 * d * (a.n * b.m3 - b.n * a.m3) / n;
+            }
+            return out;
+        }
+    };
+}
+
+/// SKEWNESS (adjusted Fisher-Pearson, G1) or KURTOSIS (excess, G2) of a group's
+/// moments, the sample statistics DuckDB, Excel and pandas give: NULL below 3 or 4
+/// values, or when every value is the same.
+pub fn shapeOf(func: ast.AggFunc, m: MomentsOf(4)) Value {
+    const n = m.n;
+    if (n < (if (func == .skewness) @as(f64, 3) else 4) or !(m.m2 > 0)) return .null;
+    if (func == .skewness) {
+        const g1 = @sqrt(n) * m.m3 / std.math.pow(f64, m.m2, 1.5);
+        return .{ .float = g1 * @sqrt(n * (n - 1)) / (n - 2) };
+    }
+    const g2 = n * m.m4 / (m.m2 * m.m2) - 3;
+    return .{ .float = ((n + 1) * g2 + 6) * (n - 1) / ((n - 2) * (n - 3)) };
+}
+
+/// SKEWNESS or KURTOSIS, by the moments to the fourth.
+pub fn Shape(comptime func: ast.AggFunc) type {
+    return struct {
+        pub const In = f64;
+        pub const State = MomentsOf(4);
+        pub fn add(s: *State, x: f64, _: Ctx) !void {
+            s.* = State.merge(s.*, State.of(x));
+        }
+        pub fn merge(d: *State, s: *const State, _: Ctx) !void {
+            d.* = State.merge(d.*, s.*);
+        }
+        pub fn finish(s: *const State, _: Ctx) !Value {
+            return shapeOf(func, s.*);
+        }
+    };
+}
+
+/// PRODUCT: the values multiplied, a FLOAT; NULL over none.
+pub const Product = struct {
+    pub const In = f64;
+    pub const State = struct { n: i64 = 0, p: f64 = 1 };
+    pub fn add(s: *State, x: f64, _: Ctx) !void {
+        s.n += 1;
+        s.p *= x;
+    }
+    pub fn merge(d: *State, s: *const State, _: Ctx) !void {
+        d.n += s.n;
+        d.p *= s.p;
+    }
+    pub fn finish(s: *const State, _: Ctx) !Value {
+        return if (s.n == 0) .null else .{ .float = s.p };
     }
 };
+
+/// MODE (the most frequent value, the least of those tied) or ENTROPY (`-sum p ln
+/// p` over each value's share, in nats): the values held as `percentile_disc` holds
+/// them, sorted at the end, so neither answer depends on the order rows came in.
+pub fn Tally(comptime T: type, comptime func: ast.AggFunc) type {
+    return struct {
+        pub const In = T;
+        pub const needs_alloc = true;
+        const H = Holding(T, keepOf(T));
+        pub const State = H.State;
+        pub const add = H.add;
+        pub const merge = H.merge;
+        pub const own = H.own;
+        pub fn finish(s: *const State, cx: Ctx) !Value {
+            const h = s.vals orelse return .null;
+            if (h.n == 0) return .null;
+            const xs = try h.gather(cx.scratch);
+            std.mem.sort(T, xs, {}, struct {
+                fn lt(_: void, a: T, b: T) bool {
+                    return order(T, a, b) == .lt;
+                }
+            }.lt);
+            const total: f64 = @floatFromInt(xs.len);
+            var best: usize = 0;
+            var best_run: usize = 0;
+            var ent: f64 = 0;
+            var i: usize = 0;
+            while (i < xs.len) {
+                var j = i + 1;
+                while (j < xs.len and order(T, xs[i], xs[j]) == .eq) j += 1;
+                const run = j - i;
+                if (run > best_run) {
+                    best = i;
+                    best_run = run;
+                }
+                const share = @as(f64, @floatFromInt(run)) / total;
+                ent -= share * @log(share);
+                i = j;
+            }
+            if (func == .entropy) return .{ .float = ent };
+            return toValue(T, xs[best], cx.out);
+        }
+    };
+}
 
 /// A variance or standard deviation (`func`) of `n` values with squared deviations
 /// `m2`: NULL below two values for the sample statistics and below one for the

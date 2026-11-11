@@ -103,6 +103,11 @@ pub const specs = [_]Spec{
     .{ .func = .string_agg, .names = &.{"string_agg"}, .arg = .any, .result = .string, .max_args = 2, .packs = true, .input_ordered = true, .windowed = false },
     .{ .func = .percentile_cont, .names = &.{"percentile_cont"}, .arg = .numeric, .result = .float, .windowed = false },
     .{ .func = .percentile_disc, .names = &.{"percentile_disc"}, .arg = .any, .result = .same, .windowed = false },
+    .{ .func = .skewness, .names = &.{"skewness"}, .arg = .numeric, .result = .float },
+    .{ .func = .kurtosis, .names = &.{"kurtosis"}, .arg = .numeric, .result = .float },
+    .{ .func = .product, .names = &.{"product"}, .arg = .numeric, .result = .float },
+    .{ .func = .mode, .names = &.{"mode"}, .arg = .any, .result = .same, .windowed = false },
+    .{ .func = .entropy, .names = &.{"entropy"}, .arg = .any, .result = .float, .windowed = false },
 };
 
 /// The argument a packed aggregate is typed by, `e` itself when it does not pack: the

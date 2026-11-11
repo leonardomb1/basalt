@@ -7,6 +7,7 @@ const max_str_bytes = @import("functions.zig").max_str_bytes;
 const pow10f = @import("../decimal.zig").pow10f;
 const simd = @import("../simd.zig");
 const std = @import("std");
+const Rounding = @import("../decimal.zig").Rounding;
 
 pub inline fn charWidth(s: []const u8, i: usize) usize {
     const b = s[i];
@@ -59,12 +60,25 @@ pub fn substrChars(arena: std.mem.Allocator, s: []const u8, start1: i64, len_opt
     return arena.dupe(u8, s[start..end]);
 }
 
-/// Half away from zero (2.5 to 3, -2.5 to -3), not banker's rounding. Engines
-/// disagree, so `round` stays out of the pushdown whitelist in runtime/pushdown.zig.
-pub fn roundHalfAway(x: f64, digits: i64) f64 {
-    if (digits == 0) return @round(x);
+/// `x` to `digits` places by `mode`: half away from zero (2.5 to 3, -2.5 to -3),
+/// not banker's rounding, or toward zero. Engines disagree on the first, so `round`
+/// stays out of the pushdown whitelist in runtime/pushdown.zig.
+pub fn roundFloat(x: f64, digits: i64, mode: Rounding) f64 {
+    const f = switch (mode) {
+        .half_away => &roundWhole,
+        .toward_zero => &truncWhole,
+    };
+    if (digits == 0) return f(x);
     const s = pow10f(@intCast(@min(@abs(digits), 22)));
-    return if (digits > 0) @round(x * s) / s else @round(x / s) * s;
+    return if (digits > 0) f(x * s) / s else f(x / s) * s;
+}
+
+fn roundWhole(x: f64) f64 {
+    return @round(x);
+}
+
+fn truncWhole(x: f64) f64 {
+    return @trunc(x);
 }
 
 /// Postgres `lpad`/`rpad`: pads to exactly `n` characters and truncates a longer

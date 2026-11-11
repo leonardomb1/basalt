@@ -69,6 +69,18 @@ const records = blk: {
     break :blk out;
 };
 
+const m = @import("fn_math.zig");
+
+/// The elementary math functions (`fn_math.zig`).
+const math = [_]Builtin{
+    auto("exp", m.Exp),           auto("ln", m.Ln),             auto("log10", m.Log10),             auto("log2", m.Log2),
+    auto("log", m.Log),           auto("cbrt", m.Cbrt),         auto("pi", m.Pi),                   auto("sin", m.Sin),
+    auto("cos", m.Cos),           auto("tan", m.Tan),           auto("cot", m.Cot),                 auto("asin", m.Asin),
+    auto("acos", m.Acos),         auto("atan", m.Atan),         auto("atan2", m.Atan2),             auto("degrees", m.Degrees),
+    auto("radians", m.Radians),   auto("gcd", m.Gcd),           auto("lcm", m.Lcm),                 auto("factorial", m.Factorial),
+    auto("isnan", m.Class(.nan)), auto("isinf", m.Class(.inf)), auto("isfinite", m.Class(.finite)),
+};
+
 pub const max_str_bytes = 1 << 20;
 
 /// `mod(a, b)` is `a % b`, in both forms.
@@ -97,7 +109,7 @@ pub const Builtin = struct {
     io: bool = false,
 };
 
-pub const builtins = base ++ records[0..records.len].*;
+pub const builtins = base ++ records[0..records.len].* ++ math;
 
 const base = [_]Builtin{
     .{ .name = "now", .type_fn = typing.now, .eval_fn = per_row.now, .vec_fn = vectorized.now },
@@ -137,6 +149,7 @@ const base = [_]Builtin{
     .{ .name = "floor", .type_fn = typing.floorCeil, .eval_fn = f.Whole(true).eval, .vec_fn = f.Whole(true).vec },
     .{ .name = "ceil", .type_fn = typing.floorCeil, .eval_fn = f.Whole(false).eval, .vec_fn = f.Whole(false).vec },
     .{ .name = "round", .type_fn = typing.round, .eval_fn = f.Round.eval, .vec_fn = f.Round.vec },
+    .{ .name = "trunc", .type_fn = typing.round, .eval_fn = f.Trunc.eval, .vec_fn = f.Trunc.vec },
     .{ .name = "mod", .type_fn = typing.mod, .eval_fn = Mod.eval, .vec_fn = Mod.vec },
     .{ .name = "power", .type_fn = typing.power, .eval_fn = S(f.Power).eval, .vec_fn = S(f.Power).vec },
     .{ .name = "sqrt", .type_fn = typing.sqrt, .eval_fn = S(f.Sqrt).eval, .vec_fn = S(f.Sqrt).vec },

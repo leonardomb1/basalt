@@ -365,6 +365,11 @@ pub const AggFunc = enum {
     string_agg,
     percentile_cont,
     percentile_disc,
+    skewness,
+    kurtosis,
+    product,
+    mode,
+    entropy,
 };
 pub const AggItem = struct { name: []const u8, func: AggFunc, arg: ?*Expr, distinct: bool = false };
 pub const Aggregate = struct { aggs: []const AggItem, by: []const QualName, by_rest: ?[]const []const u8 = null, on_empty: []const []const u8 = &.{} };

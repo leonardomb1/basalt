@@ -762,6 +762,50 @@ pub const Window = struct {
         };
     }
 
+    /// A sliding aggregate over a mergeable state `M` (`M.of` one value, `M.merge`
+    /// two) through a `TwoStack`, its answer `M`'s by `answer`: SKEWNESS, KURTOSIS
+    /// and PRODUCT, which no value can be taken back out of.
+    fn Merged(comptime M: type, comptime answer: fn (M) Value) type {
+        return struct {
+            pub const In = f64;
+            pub const State = struct { stack: TwoStack(M, .{}, M.merge) = .{} };
+            pub fn reset(s: *State) void {
+                s.stack.reset();
+            }
+            pub fn add(s: *State, x: f64, cx: Ctx) !void {
+                try s.stack.push(cx.alloc, M.of(x));
+            }
+            pub fn remove(s: *State, _: f64, cx: Ctx) !void {
+                try s.stack.pop(cx.alloc);
+            }
+            pub fn finish(s: *const State, _: Ctx) !Value {
+                return answer(s.stack.get());
+            }
+        };
+    }
+
+    fn ShapeAnswer(comptime func: ast.AggFunc) fn (aggFuncs.MomentsOf(4)) Value {
+        return struct {
+            fn f(m: aggFuncs.MomentsOf(4)) Value {
+                return aggFuncs.shapeOf(func, m);
+            }
+        }.f;
+    }
+
+    const Prod = struct {
+        n: i64 = 0,
+        p: f64 = 1,
+        fn of(x: f64) Prod {
+            return .{ .n = 1, .p = x };
+        }
+        fn merge(a: Prod, b: Prod) Prod {
+            return .{ .n = a.n + b.n, .p = a.p * b.p };
+        }
+        fn answer(m: Prod) Value {
+            return if (m.n == 0) .null else .{ .float = m.p };
+        }
+    };
+
     const Median = struct {
         pub const In = f64;
         pub const State = Halves;
@@ -882,7 +926,9 @@ pub const Window = struct {
             .bit_or => runOf(BitStack(.@"or"), kind),
             .bit_xor => runOf(aggFuncs.Bits(.xor), kind),
             .var_samp, .var_pop, .stddev_samp, .stddev_pop => if (kind == .int) runAt(Spread(true), .int) else runOf(Spread(false), kind),
-            .any_value, .arg_max, .arg_min, .array_agg, .string_agg, .percentile_cont, .percentile_disc => unreachable,
+            inline .skewness, .kurtosis => |sk| runOf(Merged(aggFuncs.MomentsOf(4), ShapeAnswer(sk)), kind),
+            .product => runOf(Merged(Prod, Prod.answer), kind),
+            .any_value, .arg_max, .arg_min, .array_agg, .string_agg, .percentile_cont, .percentile_disc, .mode, .entropy => unreachable,
         };
     }
 
@@ -1396,6 +1442,24 @@ fn bruteValue(a: std.mem.Allocator, rows: []const BruteRow, k: usize, f: Window.
                 };
                 break :blk .{ .int = m };
             },
+            .skewness, .kurtosis => blk: {
+                var mo = aggFuncs.MomentsOf(4){ .n = @floatFromInt(ys.len) };
+                if (ys.len == 0) break :blk .null;
+                for (ys) |y| mo.mean += @floatFromInt(y);
+                mo.mean /= mo.n;
+                for (ys) |y| {
+                    const d = @as(f64, @floatFromInt(y)) - mo.mean;
+                    mo.m2 += d * d;
+                    mo.m3 += d * d * d;
+                    mo.m4 += d * d * d * d;
+                }
+                break :blk aggFuncs.shapeOf(agg, mo);
+            },
+            .product => if (ys.len == 0) .null else blk: {
+                var p: f64 = 1;
+                for (ys) |y| p *= @floatFromInt(y);
+                break :blk .{ .float = p };
+            },
             else => unreachable,
         },
     }
@@ -1410,7 +1474,7 @@ fn windowOutType(f: Window.Func) types.Type {
         },
         .agg => |agg| switch (agg) {
             .count, .count_if => types.Type.init(.int),
-            .avg, .median, .var_samp, .var_pop, .stddev_samp, .stddev_pop => types.Type.init(.float).asNullable(),
+            .avg, .median, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .skewness, .kurtosis, .product => types.Type.init(.float).asNullable(),
             else => types.Type.init(.int).asNullable(),
         },
     };
@@ -1511,7 +1575,7 @@ test "window frames: every bound pair, ROWS and RANGE, ties, nulls and edges mat
     var prng = std.Random.DefaultPrng.init(0x5eed);
     const rnd = prng.random();
     const offs = [_]i64{ 0, 1, 2, 5 };
-    const aggs = [_]ast.AggFunc{ .sum, .count, .avg, .min, .max, .median, .var_samp, .stddev_pop, .bit_and, .bit_or, .bit_xor };
+    const aggs = [_]ast.AggFunc{ .sum, .count, .avg, .min, .max, .median, .var_samp, .stddev_pop, .bit_and, .bit_or, .bit_xor, .skewness, .kurtosis, .product };
     var bounds = std.array_list.Managed(Window.Bound).init(a);
     try bounds.append(.unbounded_preceding);
     for (offs) |n| try bounds.append(.{ .preceding = .{ .rows = n, .int = n } });

@@ -34,6 +34,13 @@ LIMIT 100 OFFSET 20;
 | `bool_and(cond)` / `bool_or(cond)` | aggregate — whether `cond` held for every row / for any row; nulls ignored, null when the group has no non-null value |
 | `bit_and(x)` / `bit_or(x)` / `bit_xor(x)` | aggregate — the bitwise fold of an `INT` column; nulls ignored, null when there is nothing to fold |
 | `var_samp(x)` / `var_pop(x)`, `stddev_samp(x)` / `stddev_pop(x)` | aggregate — the sample and population variance and standard deviation, as floats; nulls ignored. `variance` and `stddev` are the **sample** ones, as in Postgres, DuckDB, Trino and SQL Server (MySQL and StarRocks read them as population). A sample statistic of fewer than two values is null; a population one of a single value is `0` |
+| `corr(y, x)`, `covar_pop(y, x)`, `covar_samp(y, x)` | aggregate — the correlation and covariances of the pairs where both values are present, as floats. `corr` is null when either value does not vary |
+| `regr_slope(y, x)`, `regr_intercept(y, x)`, `regr_r2(y, x)`, `regr_count(y, x)`, `regr_avgx`, `regr_avgy`, `regr_sxx`, `regr_syy`, `regr_sxy` | aggregate — the least-squares line of `y` on `x` over the complete pairs, as in PostgreSQL: slope and intercept null when `x` does not vary, `regr_r2` 1 when only `y` is constant |
+| `weighted_avg(x, weight)`, `geomean(x)` | aggregate — the weighted mean over complete pairs, and the geometric mean, null when any value is not positive |
+| `skewness(x)`, `kurtosis(x)` | aggregate — the sample skewness (adjusted Fisher-Pearson) and excess kurtosis, as DuckDB, Excel and pandas give them; null below 3 and 4 values, or when every value is the same |
+| `product(x)` | aggregate — the values multiplied, a float |
+| `mode(x)`, `entropy(x)` | aggregate — the most frequent value (the least of those tied, so input order never shows) and the entropy of the values' shares in nats. Like `MEDIAN`, they hold the group's values to the end; not over a window |
+
 | `SUM(x) FILTER (WHERE cond)` | any aggregate over only the rows where `cond` holds — under `GROUP BY`, over the whole table or over a window; see [Aggregates](aggregates.md#filter) |
 | `f(...) OVER (PARTITION BY .. ORDER BY .. [frame])` | window — a value per row from its partition and frame, anywhere in a `SELECT` item; see [Window functions](windows.md) |
 | `HAVING <expr>` | filter after the aggregate; aggregate calls in it refer to the columns it produced, including ones the `SELECT` list never asked for |
@@ -46,6 +53,13 @@ LIMIT 100 OFFSET 20;
 | `CROSS JOIN UNNEST(text_chunks(body, 1000, 200)) AS c` | a function's list, computed per row and exploded as a column's is: any call that returns a `LIST` (`text_chunks`, `list_filter(...)`); without `AS` its column is named `unnest`. A `WHERE` condition that names none of an `UNNEST`'s columns is applied before it, so the list is computed only for the rows it keeps |
 | `CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag` | explode a JSON array: one row per element — strings unquoted, objects and arrays as JSON text, a JSON `null` as null. A null or `null` cell gives no rows; an object or scalar is an error |
 | `[INNER\|LEFT [OUTER]\|RIGHT [OUTER]\|FULL [OUTER]\|CROSS\|SEMI\|ANTI] JOIN <source> [AS] x ON a = b [AND ...]` | join — the right side a CTE, `(SELECT ...)`, table function, path or connection table; `JOIN LATERAL f(x.col)` passes a column to a table function ([user functions](user-functions.md)), and one whose body reads an http connection is called per row ([HTTP APIs](../connectors/http.md#calling-a-function-per-row)); see [Joins](joins.md) |
+
+The pair statistics, `weighted_avg` and `geomean` are written over the stable
+variance and the mean: the covariance is `(var(x + y) - var(x) - var(y)) / 2`,
+exact to about the float epsilon times the variances, so only two values whose
+spreads differ by many orders of magnitude lose precision. Every one of them, like
+the variance, takes `FILTER (WHERE ...)` and `OVER (...)`, runs on lanes and
+spills.
 
 Row order without `ORDER BY` is not defined in SQL, and `GROUP BY` returns groups
 in hash-partition order; at `-j` above 1, groups whose aggregates are all exact

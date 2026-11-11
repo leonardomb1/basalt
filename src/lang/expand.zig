@@ -23,6 +23,7 @@ const msgfmt = @import("../format/msgfmt.zig");
 const builtins = @import("../exec/builtins.zig");
 const eval = @import("../exec/eval.zig");
 const aggregates = @import("aggregates.zig");
+const stats = @import("parse/stats.zig");
 const parser = @import("sql_parser.zig");
 const deeperThan = @import("parse/expr.zig").deeperThan;
 const ast = @import("ast.zig");
@@ -111,7 +112,7 @@ fn collectFns(arena: std.mem.Allocator, program: ast.Program, msg: *[]const u8, 
     var fns = std.StringHashMap(ast.FnDecl).init(arena);
     for (program.stmts) |s| if (s == .func) {
         at.* = s.func.pos;
-        if (builtins.lookup(s.func.name) != null or aggregates.lookup(s.func.name) != null) {
+        if (builtins.lookup(s.func.name) != null or aggregates.lookup(s.func.name) != null or stats.isStat(s.func.name)) {
             msg.* = msgfmt.allocPrint(arena, "`{s}` is a built-in function and cannot be redefined", .{s.func.name}) catch "CREATE FUNCTION shadows a builtin";
             return error.ExpandFailed;
         }

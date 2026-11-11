@@ -508,17 +508,17 @@ test "type errors: unknown field and non-bool not" {
     try std.testing.expect(std.mem.indexOf(u8, ctx.msg, "bool operand") != null);
 }
 
+/// Asserts `src` evaluates to the DECIMAL `unscaled` at `scale`.
+fn dec(al: std.mem.Allocator, src: []const u8, unscaled: i128, scale: u8) !void {
+    const d = (try evalLit(al, src)).decimal;
+    try std.testing.expectEqual(unscaled, d.unscaled);
+    try std.testing.expectEqual(scale, d.scale);
+}
+
 test "math builtins: rounding direction, mod by zero, domain edges, decimal in decimal out" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const dec = struct {
-        fn f(al: std.mem.Allocator, src: []const u8, unscaled: i128, scale: u8) !void {
-            const d = (try evalLit(al, src)).decimal;
-            try std.testing.expectEqual(unscaled, d.unscaled);
-            try std.testing.expectEqual(scale, d.scale);
-        }
-    }.f;
 
     try std.testing.expectEqual(@as(i64, 7), (try evalLit(a, "abs(-7)")).int);
     try dec(a, "abs(-2.50)", 250, 2);
@@ -551,6 +551,58 @@ test "math builtins: rounding direction, mod by zero, domain edges, decimal in d
     try std.testing.expectEqual(@as(f64, -1), (try evalLit(a, "sign(-0.5e0)")).float);
     try std.testing.expectEqual(@as(i64, 0), (try evalLit(a, "sign(0)")).int);
     try std.testing.expectEqual(@as(i64, 1), (try evalLit(a, "sign(42)")).int);
+}
+
+test "math: logs, powers, trigonometry and number theory answer NULL outside their domain and fail on integer overflow" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const close = struct {
+        fn f(want: f64, got: Value) !void {
+            try std.testing.expectApproxEqAbs(want, got.float, 1e-12);
+        }
+    }.f;
+    try close(std.math.e, try evalLit(a, "exp(1)"));
+    try close(1, try evalLit(a, "ln(exp(1))"));
+    try close(3, try evalLit(a, "log10(1000)"));
+    try close(10, try evalLit(a, "log2(1024)"));
+    try close(3, try evalLit(a, "log(2, 8)"));
+    try close(-3, try evalLit(a, "cbrt(-27)"));
+    try close(std.math.pi, try evalLit(a, "pi()"));
+    try close(180, try evalLit(a, "degrees(pi())"));
+    try close(std.math.pi / 2.0, try evalLit(a, "radians(90)"));
+    try close(1, try evalLit(a, "sin(radians(90))"));
+    try close(-1, try evalLit(a, "cos(pi())"));
+    try close(1, try evalLit(a, "tan(pi() / 4)"));
+    try close(1, try evalLit(a, "cot(pi() / 4)"));
+    try close(std.math.pi / 2.0, try evalLit(a, "asin(1)"));
+    try close(0, try evalLit(a, "acos(1)"));
+    try close(std.math.pi / 4.0, try evalLit(a, "atan(1)"));
+    try close(3 * std.math.pi / 4.0, try evalLit(a, "atan2(1, -1)"));
+    for ([_][]const u8{ "ln(0)", "ln(-1)", "log10(0)", "log2(-4)", "log(1, 8)", "log(-2, 8)", "log(2, 0)", "asin(1.5)", "acos(-2)", "cot(0)", "factorial(-1)", "ln(NULL)" }) |src|
+        try std.testing.expect((try evalLit(a, src)).isNull());
+    try std.testing.expect(std.math.isInf((try evalLit(a, "exp(1000)")).float));
+
+    try std.testing.expectEqual(@as(i64, 6), (try evalLit(a, "gcd(12, -18)")).int);
+    try std.testing.expectEqual(@as(i64, 0), (try evalLit(a, "gcd(0, 0)")).int);
+    try std.testing.expectEqual(@as(i64, 12), (try evalLit(a, "lcm(-4, 6)")).int);
+    try std.testing.expectEqual(@as(i64, 0), (try evalLit(a, "lcm(0, 6)")).int);
+    try std.testing.expectEqual(@as(i64, 2432902008176640000), (try evalLit(a, "factorial(20)")).int);
+    try std.testing.expectEqual(@as(i64, 1), (try evalLit(a, "factorial(0)")).int);
+    try std.testing.expectError(error.IntOverflow, evalLit(a, "factorial(21)"));
+    try std.testing.expectError(error.IntOverflow, evalLit(a, "lcm(9223372036854775807, 2)"));
+
+    try std.testing.expect((try evalLit(a, "isnan(CAST('nan' AS DOUBLE))")).bool);
+    try std.testing.expect((try evalLit(a, "isinf(exp(1000))")).bool);
+    try std.testing.expect(!(try evalLit(a, "isfinite(exp(1000))")).bool);
+    try std.testing.expect((try evalLit(a, "isfinite(1)")).bool);
+
+    try dec(a, "trunc(2.7)", 2, 0);
+    try dec(a, "trunc(-2.7)", -2, 0);
+    try dec(a, "trunc(2.129, 2)", 212, 2);
+    try dec(a, "trunc(-123.456, -1)", -120, 0);
+    try std.testing.expectEqual(@as(i64, 17), (try evalLit(a, "trunc(17)")).int);
+    try std.testing.expectEqual(@as(f64, -2.12), (try evalLit(a, "trunc(-2.129e0, 2)")).float);
 }
 
 test "nullif propagates nulls; greatest/least ignore them" {
@@ -819,7 +871,7 @@ test "division: INT / INT truncates, a DECIMAL quotient takes PostgreSQL's scale
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const dec = struct {
+    const decText = struct {
         fn f(al: std.mem.Allocator, src: []const u8, want: []const u8) !void {
             const d = (try evalLit(al, src)).decimal;
             try std.testing.expectEqualStrings(want, try formatDecimal(al, d.unscaled, d.scale));
@@ -827,16 +879,16 @@ test "division: INT / INT truncates, a DECIMAL quotient takes PostgreSQL's scale
     }.f;
     try std.testing.expectEqual(@as(i64, 3), (try evalLit(a, "7 / 2")).int);
     try std.testing.expectEqual(@as(i64, -3), (try evalLit(a, "-7 / 2")).int);
-    try dec(a, "1 / 3.0", "0.33333333333333333333");
-    try dec(a, "10 / 3.0", "3.3333333333333333");
-    try dec(a, "7.0 / 2", "3.5000000000000000");
-    try dec(a, "9999 / 10000.0", "0.99990000000000000000");
-    try dec(a, "10000 / 9999.0", "1.0001000100010001");
-    try dec(a, "1 / 3000000.0", "0.000000333333333333333333");
-    try dec(a, "2 / 0.0001", "20000.000000000000");
-    try dec(a, "-1 / 6.0", "-0.16666666666666666667");
-    try dec(a, "12345678901234567890.5 / 0.0003", "41152263004115226301666.6667");
-    try dec(a, "123456789012345678901234567890 / 7", "17636684144620811271604938270");
+    try decText(a, "1 / 3.0", "0.33333333333333333333");
+    try decText(a, "10 / 3.0", "3.3333333333333333");
+    try decText(a, "7.0 / 2", "3.5000000000000000");
+    try decText(a, "9999 / 10000.0", "0.99990000000000000000");
+    try decText(a, "10000 / 9999.0", "1.0001000100010001");
+    try decText(a, "1 / 3000000.0", "0.000000333333333333333333");
+    try decText(a, "2 / 0.0001", "20000.000000000000");
+    try decText(a, "-1 / 6.0", "-0.16666666666666666667");
+    try decText(a, "12345678901234567890.5 / 0.0003", "41152263004115226301666.6667");
+    try decText(a, "123456789012345678901234567890 / 7", "17636684144620811271604938270");
     try std.testing.expectEqual(@as(f64, 2.5), (try evalLit(a, "5 / 2e0")).float);
     try std.testing.expectError(error.DivByZero, evalLit(a, "1 / 0"));
     try std.testing.expectError(error.DivByZero, evalLit(a, "1 / 0.0"));

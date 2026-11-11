@@ -46,6 +46,7 @@ const std = @import("std");
 const table = @import("../connect/table.zig");
 const ast = @import("../lang/ast.zig");
 const aggregates = @import("../lang/aggregates.zig");
+const stats = @import("../lang/parse/stats.zig");
 const runtime = @import("../runtime/run.zig");
 const complete = @import("repl/complete.zig");
 const hilite = @import("repl/hilite.zig");
@@ -314,6 +315,10 @@ test "Tab's built-in functions are exactly the engine's: every scalar, aggregate
         std.debug.print("aggregate `{s}` is missing from complete.builtin_functions\n", .{n});
         return error.TestUnexpectedResult;
     };
+    for (stats.names) |n| if (!listed.has(n)) {
+        std.debug.print("statistic `{s}` is missing from complete.builtin_functions\n", .{n});
+        return error.TestUnexpectedResult;
+    };
     inline for (@typeInfo(ast.WinKind).@"enum".fields) |f| try std.testing.expect(listed.has(f.name));
     const syntax = [_][]const u8{ "cast", "try_cast", "if" };
     for (complete.builtin_functions, 0..) |f, i| {
@@ -321,6 +326,7 @@ test "Tab's built-in functions are exactly the engine's: every scalar, aggregate
         try std.testing.expect(std.mem.startsWith(u8, f.sig, f.name) and f.sig[f.name.len] == '(');
         const known = eval.lookupBuiltin(f.name) != null or
             aggregates.lookup(f.name) != null or
+            stats.isStat(f.name) or
             std.meta.stringToEnum(ast.WinKind, f.name) != null or
             table_builtins.lookup(f.name) != null or
             for (syntax) |x| (if (std.mem.eql(u8, x, f.name)) break true) else false;

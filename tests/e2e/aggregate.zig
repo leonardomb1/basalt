@@ -439,6 +439,7 @@ test "GROUP BY and DISTINCT past --op-memory spill to disk and return what they 
         "SELECT g, COUNT(*) AS c, SUM(v * 2) AS sv, bit_xor(v) AS bx FROM '$B/in.csv' GROUP BY g ORDER BY g",
         "WITH t AS (SELECT g, v, CAST(f AS DECIMAL(10,2)) AS d FROM '$B/in.csv') SELECT g, COUNT(*) AS c, SUM(d * v) AS sd, SUM(d - 1.255) AS se FROM t GROUP BY g ORDER BY g",
         "SELECT DISTINCT g, s FROM '$B/in.csv' ORDER BY g, s",
+        "SELECT g, corr(v, f) AS r, regr_slope(f, v) AS m, weighted_avg(f, v) AS wa, skewness(f) AS sk, kurtosis(v) AS ku, product(f / 13) AS p, mode(s) AS mo, entropy(s) AS e FROM '$B/in.csv' GROUP BY g ORDER BY g",
         "WITH d AS (SELECT DISTINCT ON (g) g, v FROM '$B/in.csv') SELECT * FROM d ORDER BY g",
     };
     for (queries) |tmpl| {
@@ -710,4 +711,75 @@ test "a Parquet string column grouped by and named nowhere else is read as dicti
             try std.testing.expectEqualStrings(want, got);
         }
     }
+}
+
+test "pair statistics: corr, covariance and the regr_* family skip a pair missing a value, give NULL over no spread, group by ROLLUP, and agree across lanes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const input = "g,x,y,w\na,1,2,1\na,2,4.1,2\na,3,5.9,1\na,4,8.2,3\na,,9,1\nb,5,5,1\nb,6,,1\n";
+    const q =
+        \\SELECT g, round(corr(y, x), 6) AS r, round(covar_pop(y, x), 6) AS cp, round(covar_samp(y, x), 6) AS cs,
+        \\       round(regr_slope(y, x), 6) AS m, round(regr_intercept(y, x), 6) AS b, round(regr_r2(y, x), 6) AS r2,
+        \\       regr_count(y, x) AS n, round(regr_sxx(y, x), 6) AS sxx, round(regr_syy(y, x), 6) AS syy, round(regr_sxy(y, x), 6) AS sxy,
+        \\       round(regr_avgx(y, x), 6) AS ax, round(regr_avgy(y, x), 6) AS ay, round(weighted_avg(x, w), 6) AS wa, round(geomean(x), 6) AS gm
+        \\FROM '$IN' GROUP BY ROLLUP (g) ORDER BY g NULLS LAST
+    ;
+    const want = "g,r,cp,cs,m,b,r2,n,sxx,syy,sxy,ax,ay,wa,gm\n" ++
+        "a,0.998992,2.55,3.4,2.04,-0.05,0.997986,4,5,20.85,10.2,2.5,5.05,2.857143,2.213364\n" ++
+        "b,,0,,,,,1,0,0,0,5,5,5.5,5.477226\n" ++
+        ",0.699435,2.02,2.525,1.01,2.01,0.48921,5,10,20.852,10.1,3,5.04,3.444444,2.993795\n";
+    const serial = try runToString(alloc, &tmp, input, q);
+    defer alloc.free(serial);
+    try std.testing.expectEqualStrings(want, serial);
+    const threaded = try runCsvThreaded(alloc, &tmp, input, q, 4);
+    defer alloc.free(threaded);
+    try std.testing.expectEqualStrings(want, threaded);
+}
+
+test "shape and frequency: skewness and kurtosis as sample statistics, product, mode (ties to the least) and entropy, the same across lanes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const input = "g,x,s\na,2,u\na,8,v\na,0,u\na,5,w\na,11,u\na,3,v\nb,4,z\nb,4,z\nc,,\n";
+    const q =
+        \\SELECT g, round(skewness(x), 6) AS sk, round(kurtosis(x), 6) AS ku, product(x) AS p, mode(s) AS m,
+        \\       round(entropy(s), 6) AS e, mode(x) AS mx
+        \\FROM '$IN' GROUP BY g ORDER BY g
+    ;
+    const want = "g,sk,ku,p,m,e,mx\na,0.553661,-0.720095,0,u,1.011404,0\nb,,,16,z,0,4\nc,,,,,,\n";
+    const serial = try runToString(alloc, &tmp, input, q);
+    defer alloc.free(serial);
+    try std.testing.expectEqualStrings(want, serial);
+    const threaded = try runCsvThreaded(alloc, &tmp, input, q, 4);
+    defer alloc.free(threaded);
+    try std.testing.expectEqualStrings(want, threaded);
+}
+
+test "the new statistics over many morsels: the same bits at every -j of 2 or more, and the serial plan's to rounding" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var csv = std.array_list.Managed(u8).init(alloc);
+    defer csv.deinit();
+    try csv.appendSlice("g,s,v,f\n");
+    for (0..60000) |i| try csv.writer().print("{d},n{d},{d},{d}.25\n", .{ (i * 7919) % 40, i % 7, i % 1000, i % 13 });
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = csv.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const exact = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT g, corr(v, f) AS r, regr_intercept(f, v) AS b, skewness(f) AS sk, kurtosis(v) AS ku, mode(s) AS mo, entropy(s) AS e FROM '{s}/in.csv' GROUP BY g ORDER BY g;", .{ base, base });
+    defer alloc.free(exact);
+    const two = try runScriptOpts(alloc, &tmp, exact, .{ .threads = 2 });
+    defer alloc.free(two);
+    const eight = try runScriptOpts(alloc, &tmp, exact, .{ .threads = 8 });
+    defer alloc.free(eight);
+    try std.testing.expectEqualStrings(two, eight);
+    const rounded = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS SELECT g, round(corr(v, f), 9) AS r, round(regr_intercept(f, v), 9) AS b, round(skewness(f), 9) AS sk, round(kurtosis(v), 9) AS ku, mode(s) AS mo, round(entropy(s), 9) AS e FROM '{s}/in.csv' GROUP BY g ORDER BY g;", .{ base, base });
+    defer alloc.free(rounded);
+    const one = try runScriptOpts(alloc, &tmp, rounded, .{ .threads = 1 });
+    defer alloc.free(one);
+    const many = try runScriptOpts(alloc, &tmp, rounded, .{ .threads = 8 });
+    defer alloc.free(many);
+    try std.testing.expectEqual(@as(usize, 41), std.mem.count(u8, one, "\n"));
+    try std.testing.expectEqualStrings(one, many);
 }

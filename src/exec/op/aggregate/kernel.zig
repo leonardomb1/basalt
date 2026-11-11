@@ -258,6 +258,12 @@ pub fn kernelFor(agg: Agg) struct { k: *const Kernel, ty: types.Type } {
         .percentile_disc => .{ .k = switch (agg.ty.kind) {
             inline else => |k| if (agg.ty.unknown) kernelOf(funcs.Disc(Value)) else if (comptime read.Phys(k)) |T| kernelOf(funcs.Disc(T)) else kernelOf(funcs.Disc(Value)),
         }, .ty = agg.ty },
+        .skewness => .{ .k = kernelOf(funcs.Shape(.skewness)), .ty = float },
+        .kurtosis => .{ .k = kernelOf(funcs.Shape(.kurtosis)), .ty = float },
+        .product => .{ .k = kernelOf(funcs.Product), .ty = float },
+        inline .mode, .entropy => |f| .{ .k = switch (arg.kind) {
+            inline else => |k| if (arg.unknown) kernelOf(funcs.Tally(Value, f)) else if (comptime read.Phys(k)) |T| kernelOf(funcs.Tally(T, f)) else kernelOf(funcs.Tally(Value, f)),
+        }, .ty = arg },
     };
 }
 

@@ -11,7 +11,8 @@ const Type = @import("../../lang/types.zig").Type;
 const TypeKind = @import("../../lang/types.zig").TypeKind;
 const ast = @import("../../lang/ast.zig");
 const roundDecimal = @import("../decimal.zig").roundDecimal;
-const roundHalfAway = @import("strings.zig").roundHalfAway;
+const roundFloat = @import("strings.zig").roundFloat;
+const Rounding = @import("../decimal.zig").Rounding;
 const roundOutScale = @import("../decimal.zig").roundOutScale;
 const time = @import("time.zig");
 const civil = @import("../civil.zig");
@@ -375,45 +376,48 @@ pub const Sign = Numeric(struct {
     }
 });
 
-/// `round(x[, digits])`, half away from zero: an INT without digits as it is, with
-/// them a FLOAT; a DECIMAL exactly, at the scale `roundOutScale` gives each value.
-pub const Round = Overload(struct {
-    pub const variants = .{ RoundInt, RoundFloat, RoundDec };
-    pub fn pick(c: ast.Expr.Call, k: TypeKind) ?usize {
-        return switch (k) {
-            .int => if (c.args.len == 1) 0 else 1,
-            .float => 1,
-            .decimal => 2,
-            else => null,
-        };
-    }
-});
+/// `round(x[, digits])` half away from zero, `trunc(x[, digits])` toward zero: an
+/// INT without digits as it is, with them a FLOAT; a DECIMAL exactly, at the scale
+/// `roundOutScale` gives each value.
+pub fn Rounded(comptime mode: Rounding) type {
+    const RoundInt = struct {
+        pub const args = .{ .exact_int, .opt_int };
+        pub fn apply(_: Cx, x: i64, _: ?i64) EvalError!i64 {
+            return x;
+        }
+    };
+    const RoundFloat = struct {
+        pub const args = .{ .num, .opt_int };
+        pub fn apply(_: Cx, x: f64, digits: ?i64) EvalError!f64 {
+            return roundFloat(x, digits orelse 0, mode);
+        }
+    };
+    const RoundDec = struct {
+        pub const args = .{ .dec, .opt_int };
+        pub const value_scale = true;
+        pub fn resultType(c: ast.Expr.Call, arg: Type) Type {
+            return Type.decimal(arg.precision, roundOutScale(c, arg.scale));
+        }
+        /// Digits past ±39 round as ±39 do (nothing, or to zero), so no count overflows.
+        pub fn apply(cx: Cx, d: Decimal, digits: ?i64) EvalError!Decimal {
+            return roundDecimal(d, std.math.clamp(digits orelse 0, -39, 39), roundOutScale(cx.call, d.scale), mode) orelse error.IntOverflow;
+        }
+    };
+    return Overload(struct {
+        pub const variants = .{ RoundInt, RoundFloat, RoundDec };
+        pub fn pick(c: ast.Expr.Call, k: TypeKind) ?usize {
+            return switch (k) {
+                .int => if (c.args.len == 1) 0 else 1,
+                .float => 1,
+                .decimal => 2,
+                else => null,
+            };
+        }
+    });
+}
 
-const RoundInt = struct {
-    pub const args = .{ .exact_int, .opt_int };
-    pub fn apply(_: Cx, x: i64, _: ?i64) EvalError!i64 {
-        return x;
-    }
-};
-
-const RoundFloat = struct {
-    pub const args = .{ .num, .opt_int };
-    pub fn apply(_: Cx, x: f64, digits: ?i64) EvalError!f64 {
-        return roundHalfAway(x, digits orelse 0);
-    }
-};
-
-const RoundDec = struct {
-    pub const args = .{ .dec, .opt_int };
-    pub const value_scale = true;
-    pub fn resultType(c: ast.Expr.Call, arg: Type) Type {
-        return Type.decimal(arg.precision, roundOutScale(c, arg.scale));
-    }
-    /// Digits past ±39 round as ±39 do (nothing, or to zero), so no count overflows.
-    pub fn apply(cx: Cx, d: Decimal, digits: ?i64) EvalError!Decimal {
-        return roundDecimal(d, std.math.clamp(digits orelse 0, -39, 39), roundOutScale(cx.call, d.scale)) orelse error.IntOverflow;
-    }
-};
+pub const Round = Rounded(.half_away);
+pub const Trunc = Rounded(.toward_zero);
 
 /// `date_trunc`: a DATE or TIMESTAMP down to the start of its unit, as a TIMESTAMP.
 pub const DateTrunc = struct {
