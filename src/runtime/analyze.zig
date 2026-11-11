@@ -304,6 +304,7 @@ pub const JoinPlan = @import("analyze/schema.zig").JoinPlan;
 pub const joinPlan = @import("analyze/schema.zig").joinPlan;
 pub const KeyPrep = @import("analyze/schema.zig").KeyPrep;
 pub const Resolved = @import("analyze/schema.zig").Resolved;
+pub const LookupPlan = @import("analyze/schema.zig").LookupPlan;
 pub const Chain = @import("analyze/schema.zig").Chain;
 pub const JoinResolved = @import("analyze/schema.zig").JoinResolved;
 pub const isMap = @import("analyze/schema.zig").isMap;
@@ -1763,6 +1764,7 @@ const Ctx = struct {
             else
                 try msgfmt.allocPrint(self.arena, "{d}{s}", .{ l.count, if (l.offset > 0) " (offset)" else "" }), .breaker = false },
             .explode => |e| .{ .kind = "explode", .detail = e.field, .breaker = false },
+            .lookup => |lk| .{ .kind = "lookup", .detail = lk.name, .breaker = false },
             .distinct => .{ .kind = "distinct", .detail = "", .breaker = true },
             .sort => |s| .{ .kind = "sort", .detail = try msgfmt.allocPrint(self.arena, "{d} key(s)", .{s.keys.len}), .breaker = true },
             .aggregate => |ag| .{ .kind = "aggregate", .detail = try msgfmt.allocPrint(self.arena, "{d} agg(s), {d} group(s)", .{ ag.aggs.len, ag.by.len }), .breaker = true },
@@ -2019,6 +2021,7 @@ pub const rest_read_keys = [_][]const u8{
     "page_param",     "start_page",    "start_offset", "size_param",  "page_size", "cursor_param",
     "cursor_field",   "total_field",   "max_pages",    "stop_short",  "prefetch",  "retries",
     "retry_statuses", "retry_base_ms", "timeout_ms",   "progress_ms", "paging_in", "total_rows_field",
+    "batch",          "concurrency",
 };
 const union_read_keys = [_][]const u8{ "tag", "table_field", "tag_field", "tag_substr", "schema_from" };
 

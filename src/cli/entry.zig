@@ -8,7 +8,6 @@ const isQuit = @import("repl/repl.zig").isQuit;
 const parser = @import("../lang/sql_parser.zig");
 const std = @import("std");
 const Catalog = @import("repl/catalog.zig").Catalog;
-const httpResources = @import("repl/catalog.zig").httpResources;
 
 /// Next statement-level `;`, skipping strings, dollar quotes and comments by the
 /// lexer's own rules, so the REPL agrees with the parser on where a statement ends.
@@ -123,7 +122,7 @@ pub fn splitStatements(arena: std.mem.Allocator, s: []const u8) ![]const []const
     return out.toOwnedSlice();
 }
 
-pub const DeclKind = enum { connection, function, param, let, resource };
+pub const DeclKind = enum { connection, function, param, let };
 
 pub const DeclId = struct { kind: DeclKind, name: []const u8 };
 
@@ -142,8 +141,7 @@ fn identPrefix(w: []const u8) []const u8 {
     return w[0..n];
 }
 
-/// The session declaration a statement makes, by its first words, or null. A resource
-/// is named `conn.name`, as two connections may each have one of the same name.
+/// The session declaration a statement makes, by its first words, or null.
 pub fn declOf(stmt: []const u8) ?DeclId {
     var i: usize = 0;
     var w = nextWord(stmt, &i) orelse return null;
@@ -161,13 +159,6 @@ pub fn declOf(stmt: []const u8) ?DeclId {
         w = nextWord(stmt, &i) orelse return null;
         if (!std.ascii.eqlIgnoreCase(w, "replace")) return null;
         w = nextWord(stmt, &i) orelse return null;
-    }
-    if (std.ascii.eqlIgnoreCase(w, "resource")) {
-        const q = nextWord(stmt, &i) orelse return null;
-        const conn = identPrefix(q);
-        if (conn.len == 0 or conn.len + 1 >= q.len or q[conn.len] != '.') return null;
-        const n = identPrefix(q[conn.len + 1 ..]);
-        return if (n.len == 0) null else .{ .kind = .resource, .name = q[0 .. conn.len + 1 + n.len] };
     }
     const kind: DeclKind = if (std.ascii.eqlIgnoreCase(w, "connection"))
         .connection
@@ -252,28 +243,6 @@ test "splitStatements splits on statement-level semicolons only" {
     try std.testing.expectEqualStrings("-- ; not a split\nSELECT 2", parts[2]);
 }
 
-test "Tab lists an http connection's resources as its tables" {
-    const gpa = std.testing.allocator;
-    var sess = Session{ .decls = DeclStore.init(gpa), .catalog = Catalog.init(gpa) };
-    defer sess.decls.deinit();
-    defer sess.catalog.deinit();
-    for ([_][]const u8{
-        "CREATE CONNECTION rc TYPE http OPTIONS (base_url = 'u')",
-        "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h')",
-        "CREATE RESOURCE rc.countries AS GET('/all')",
-        "CREATE RESOURCE rc.regions AS GET('/regions')",
-        "CREATE RESOURCE rcx.other AS GET('/o')",
-    }) |t| try sess.decls.put(declOf(t).?, t);
-
-    var ar = std.heap.ArenaAllocator.init(gpa);
-    defer ar.deinit();
-    const got = (try httpResources(ar.allocator(), &sess.completer(), "rc")).?;
-    try std.testing.expectEqual(@as(usize, 2), got.len);
-    try std.testing.expectEqualStrings("countries", got[0]);
-    try std.testing.expectEqualStrings("regions", got[1]);
-    try std.testing.expect(try httpResources(ar.allocator(), &sess.completer(), "pg") == null);
-}
-
 test "declOf names session declarations" {
     try std.testing.expectEqual(DeclKind.connection, declOf("CREATE CONNECTION erp TYPE postgres").?.kind);
     try std.testing.expectEqualStrings("erp", declOf("CREATE CONNECTION erp TYPE postgres").?.name);
@@ -283,9 +252,6 @@ test "declOf names session declarations" {
     try std.testing.expectEqual(DeclKind.param, declOf("param since date DEFAULT '2020-01-01'").?.kind);
     try std.testing.expectEqualStrings("since", declOf("param since date").?.name);
     try std.testing.expect(declOf("CREATE WIDGET w") == null);
-    try std.testing.expectEqual(DeclKind.resource, declOf("CREATE RESOURCE rc.countries AS GET('/all')").?.kind);
-    try std.testing.expectEqualStrings("rc.countries", declOf("CREATE RESOURCE rc.countries AS GET('/all')").?.name);
-    try std.testing.expect(declOf("CREATE RESOURCE countries AS GET('/all')") == null);
 
     try std.testing.expect(declOf("SELECT 1") == null);
     try std.testing.expect(declOf("CREATE TABLE t") == null);

@@ -17,4 +17,5 @@ test {
     _ = @import("lake.zig");
     _ = @import("lake_write.zig");
     _ = @import("avro.zig");
+    _ = @import("lookup.zig");
 }

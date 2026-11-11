@@ -2,7 +2,7 @@
 //!
 //! The REPL carries declarations across entries; this exposes the same session
 //! to a program. Each script runs against every `CREATE CONNECTION`, `CREATE
-//! FUNCTION`, `CREATE RESOURCE`, `PARAM` and `LET` an earlier script declared —
+//! FUNCTION`, `PARAM` and `LET` an earlier script declared —
 //! the declarations are kept as text and replayed ahead of the next script, so
 //! a script sees exactly what a single file holding them all would. A `WITH`
 //! belongs to its query and is not kept: two scripts may reuse a CTE name.

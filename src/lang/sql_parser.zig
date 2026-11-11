@@ -469,8 +469,6 @@ pub const TableFrame = struct {
 
 pub const max_tvf_depth = 16;
 
-pub const Resource = struct { conn: []const u8, name: []const u8, path: []const u8, post: bool, hints: []const ast.Hint };
-
 pub const Parser = struct {
     arena: std.mem.Allocator,
     toks: []const Token,
@@ -488,7 +486,6 @@ pub const Parser = struct {
     lambda_n: usize = 0,
     conn_names: std.array_list.Managed([]const u8) = undefined,
     conn_types: std.array_list.Managed([]const u8) = undefined,
-    resources: std.array_list.Managed(Resource) = undefined,
     let_names: std.array_list.Managed([]const u8) = undefined,
     pending_bindings: std.array_list.Managed(ast.Stmt) = undefined,
     derived_n: usize = 0,
@@ -856,10 +853,6 @@ pub const Parser = struct {
     pub const parseHttpClauses = @import("parse/decl.zig").parseHttpClauses;
     pub const parseHttpCall = @import("parse/decl.zig").parseHttpCall;
     pub const isHttpVerb = @import("parse/decl.zig").isHttpVerb;
-    pub const findResource = @import("parse/decl.zig").findResource;
-    pub const parseResource = @import("parse/decl.zig").parseResource;
-    pub const showResources = @import("parse/decl.zig").showResources;
-    pub const hasHint = @import("parse/decl.zig").hasHint;
     pub const envCall = @import("parse/decl.zig").envCall;
     pub const parseFunction = @import("parse/decl.zig").parseFunction;
     pub const atStmtBody = @import("parse/decl.zig").atStmtBody;
@@ -925,13 +918,16 @@ pub const Parser = struct {
     pub const checkTableBody = @import("parse/tablefn.zig").checkTableBody;
     pub const LateralKey = struct { left: ast.QualName, right: []const u8 };
 
-    pub const TableCall = struct { binding: []const u8, keys: []const LateralKey = &.{} };
+    /// A table function call: the binding its body lowered to, the keys a LATERAL
+    /// one joins on, or, for an http body called per row, the lookup that calls it.
+    pub const TableCall = struct { binding: []const u8 = "", keys: []const LateralKey = &.{}, lookup: ?ast.Lookup = null };
 
     pub const callTableFn = @import("parse/tablefn.zig").callTableFn;
-    pub const Correlated = struct { param: []const u8, left: ast.QualName, marker: *ast.Expr };
+    pub const Correlated = struct { param: []const u8, arg: *ast.Expr, marker: *ast.Expr };
 
     pub const decorrelate = @import("parse/tablefn.zig").decorrelate;
     pub const inTableFn = @import("parse/tablefn.zig").inTableFn;
+    pub const perRowOnly = @import("parse/tablefn.zig").perRowOnly;
     pub const parseDerivedTable = @import("parse/tablefn.zig").parseDerivedTable;
     pub const Derived = struct { binding: []const u8, alias: ?[]const u8, alias_pos: Pos, join_hints: []const ast.Hint = &.{}, own: []const u8 = "" };
 

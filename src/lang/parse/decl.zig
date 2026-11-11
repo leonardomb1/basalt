@@ -1,10 +1,9 @@
-//! Declarations: connections and their HTTP clauses, resources, functions (scalar,
+//! Declarations: connections and their HTTP clauses, functions (scalar,
 //! table and statement), CALL, THROW, parameters and type names.
 
 const Parser = @import("../sql_parser.zig").Parser;
 const Error = @import("../sql_parser.zig").Error;
 const Pos = @import("../sql_parser.zig").Pos;
-const Resource = @import("../sql_parser.zig").Resource;
 const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const std = @import("std");
@@ -45,7 +44,7 @@ pub fn parseConnection(self: *Parser, pos: Pos) Error!ast.Connection {
 }
 
 /// `[PAGINATE ...] [RETRY ...] [WITH (...)]` in any order, for every read of a
-/// connection or resource.
+/// connection.
 pub fn parseHttpClauses(self: *Parser, hints: *std.array_list.Managed(ast.Hint)) Error!void {
     while (true) {
         if (self.isKw("paginate")) {
@@ -87,87 +86,6 @@ pub fn parseHttpCall(self: *Parser, conn: []const u8, hints: *std.array_list.Man
 
 pub fn isHttpVerb(self: *Parser) bool {
     return (self.isKw("get") or self.isKw("post")) and self.peekTag() == .lparen;
-}
-
-pub fn findResource(self: *Parser, conn: []const u8, name: []const u8) ?Resource {
-    for (self.resources.items) |r| {
-        if (std.ascii.eqlIgnoreCase(r.conn, conn) and std.ascii.eqlIgnoreCase(r.name, name)) return r;
-    }
-    return null;
-}
-
-/// `CREATE RESOURCE conn.name AS GET(...)|POST(...) ...` names an http endpoint that
-/// `FROM conn.name` reads like a table. Expanded here; the plan never sees it.
-pub fn parseResource(self: *Parser, pos: Pos) Error!void {
-    const conn = try self.expectIdent();
-    const kind = self.connType(conn) orelse
-        return self.fail(pos, "CREATE RESOURCE: `{s}` is not a connection declared above", .{conn});
-    if (!std.mem.eql(u8, kind, "http"))
-        return self.fail(pos, "CREATE RESOURCE: `{s}` is a {s} connection — resources name endpoints of an http one", .{ conn, kind });
-    _ = try self.expect(.dot);
-    const name = try self.expectIdent();
-    try self.expectKw("as");
-    if (!self.isHttpVerb())
-        return self.fail(self.curPos(), "CREATE RESOURCE {s}.{s}: expected GET(...) or POST(...) after AS", .{ conn, name });
-    var hints = std.array_list.Managed(ast.Hint).init(self.arena);
-    const rd = try self.parseHttpCall(conn, &hints);
-    try self.parseHttpClauses(&hints);
-    _ = try self.expect(.semi);
-    const r = Resource{ .conn = conn, .name = name, .path = rd.form.path, .post = self.hasHint(hints.items, "method"), .hints = try hints.toOwnedSlice() };
-    for (self.resources.items) |*old| {
-        if (std.ascii.eqlIgnoreCase(old.conn, conn) and std.ascii.eqlIgnoreCase(old.name, name)) {
-            old.* = r;
-            return;
-        }
-    }
-    try self.resources.append(r);
-}
-
-/// `SHOW TABLES FROM <http conn>`: its resources as rows, built from `RANGE(n)`.
-pub fn showResources(self: *Parser, conn: []const u8, like: ?[]const u8, pos: Pos) Error!ast.Pipeline {
-    var mine = std.array_list.Managed(Resource).init(self.arena);
-    for (self.resources.items) |r| {
-        if (std.ascii.eqlIgnoreCase(r.conn, conn)) try mine.append(r);
-    }
-    const range_col = try self.mk(.{ .field = .{ .parts = try self.arena.dupe([]const u8, &.{"range"}) } });
-    const cols = [_][]const u8{ "resource", "method", "path" };
-    const items = try self.arena.alloc(ast.SelectItem, cols.len);
-    for (cols, items, 0..) |name, *item, c| {
-        var e = try self.mk(.{ .str_lit = "" });
-        var k = mine.items.len;
-        while (k > 0) {
-            k -= 1;
-            const r = mine.items[k];
-            const v = try self.mk(.{ .str_lit = switch (c) {
-                0 => r.name,
-                1 => if (r.post) "POST" else "GET",
-                else => r.path,
-            } });
-            const idx = try self.mk(.{ .int_lit = @intCast(k) });
-            const is_k = try self.mk(.{ .binary = .{ .op = .eq, .l = range_col, .r = idx } });
-            e = try self.mk(.{ .cond = .{ .cond = is_k, .then = v, .els = e } });
-        }
-        item.* = .{ .computed = .{ .name = name, .expr = e } };
-    }
-    var stages = std.array_list.Managed(ast.Stage).init(self.arena);
-    const n = try self.arena.dupe(*ast.Expr, &.{try self.mk(.{ .int_lit = @intCast(mine.items.len) })});
-    try stages.append(.{ .node = .{ .read = .{ .connector = "range", .form = .{ .builtin = .{ .name = "range", .args = n } } } }, .hints = &.{}, .pos = pos });
-    try stages.append(.{ .node = .{ .select = items }, .hints = &.{}, .pos = pos });
-    if (like) |pat| {
-        const args = try self.arena.alloc(*ast.Expr, 2);
-        args[0] = try self.mk(.{ .field = .{ .parts = try self.arena.dupe([]const u8, &.{"resource"}) } });
-        args[1] = try self.mk(.{ .str_lit = pat });
-        try stages.append(.{ .node = .{ .filter = try self.mk(.{ .call = .{ .name = "like", .args = args } }) }, .hints = &.{}, .pos = pos });
-    }
-    try stages.append(.{ .node = .{ .write = .{ .connector = "stdout", .form = null, .target = "", .mode = .default } }, .hints = &.{}, .pos = pos });
-    return .{ .stages = try stages.toOwnedSlice(), .pos = pos };
-}
-
-pub fn hasHint(_: *Parser, hints: []const ast.Hint, key: []const u8) bool {
-    for (hints) |h| {
-        if (std.mem.eql(u8, h.key, key)) return true;
-    }
-    return false;
 }
 
 pub fn envCall(self: *Parser, conn_name: []const u8, suffix: []const u8) Error!*ast.Expr {

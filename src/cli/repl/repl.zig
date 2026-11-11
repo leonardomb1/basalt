@@ -341,8 +341,7 @@ fn offsetOf(text: []const u8, pos: ast.Pos) ?usize {
 
 /// The entry's statements, each cut at its own last top-level `;`, so a statement
 /// function is one statement however many `;`s its body holds. Engine-made bindings
-/// (`__scalar1`, `__derived2`) are not the person's and are skipped; a `CREATE
-/// RESOURCE`, which leaves no statement behind, is found in the text between.
+/// (`__scalar1`, `__derived2`) are not the person's and are skipped.
 pub fn entryStatements(arena: std.mem.Allocator, text: []const u8, entry_at: usize, prog: ast.Program) ![]EntryStmt {
     const Found = struct { off: usize, stmt: ast.Stmt };
     var found = std.array_list.Managed(Found).init(arena);
@@ -359,8 +358,6 @@ pub fn entryStatements(arena: std.mem.Allocator, text: []const u8, entry_at: usi
         }
     }.lt);
     var out = std.array_list.Managed(EntryStmt).init(arena);
-    const lead_end = if (found.items.len > 0) found.items[0].off else text.len;
-    try appendResources(&out, try splitStatements(arena, text[entry_at..lead_end]));
     for (found.items, 0..) |f, i| {
         if (i + 1 < found.items.len and found.items[i + 1].off == f.off) continue;
         const end = if (i + 1 < found.items.len) found.items[i + 1].off else text.len;
@@ -376,7 +373,6 @@ pub fn entryStatements(arena: std.mem.Allocator, text: []const u8, entry_at: usi
             const parts = try splitStatements(arena, piece);
             if (parts.len > 0) {
                 try out.append(.{ .id = id, .text = parts[0] });
-                try appendResources(&out, parts[1..]);
                 continue;
             }
         }
@@ -396,13 +392,6 @@ fn engineMade(st: ast.Stmt) bool {
         .binding => |b| std.mem.startsWith(u8, b.name, "__"),
         else => false,
     };
-}
-
-fn appendResources(out: *std.array_list.Managed(EntryStmt), parts: []const []const u8) !void {
-    for (parts) |part| {
-        const id = declOf(part) orelse continue;
-        if (id.kind == .resource) try out.append(.{ .id = id, .text = part });
-    }
 }
 
 /// Only a position inside the entry, the part the person typed, gets a caret.
@@ -789,13 +778,13 @@ fn replHelp(msg: *std.Io.Writer) !void {
     );
 }
 
-test "entryStatements: an engine-made scalar subquery LET is not a declaration; a resource is" {
+test "entryStatements: an engine-made scalar subquery LET is not a declaration; an endpoint's table function is" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const entry =
         \\CREATE CONNECTION h TYPE http OPTIONS (base_url = 'http://localhost:1');
-        \\CREATE RESOURCE h.r AS GET('/x');
+        \\CREATE FUNCTION r() RETURNS TABLE AS SELECT * FROM h.GET('/x');
         \\SELECT (SELECT count(*) FROM RANGE(3)) AS c;
     ;
     var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
@@ -804,8 +793,8 @@ test "entryStatements: an engine-made scalar subquery LET is not a declaration; 
     try std.testing.expectEqual(@as(usize, 3), got.len);
     try std.testing.expectEqual(DeclKind.connection, got[0].id.?.kind);
     try std.testing.expectEqualStrings("CREATE CONNECTION h TYPE http OPTIONS (base_url = 'http://localhost:1')", got[0].text);
-    try std.testing.expectEqual(DeclKind.resource, got[1].id.?.kind);
-    try std.testing.expectEqualStrings("h.r", got[1].id.?.name);
+    try std.testing.expectEqual(DeclKind.function, got[1].id.?.kind);
+    try std.testing.expectEqualStrings("r", got[1].id.?.name);
     try std.testing.expect(got[2].id == null);
     try std.testing.expectEqualStrings("SELECT (SELECT count(*) FROM RANGE(3)) AS c", got[2].text);
 }

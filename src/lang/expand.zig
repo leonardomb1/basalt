@@ -980,3 +980,14 @@ test "json-form union: $param.path renders the branch array into discover_json" 
         try std.testing.expectEqualStrings("[]", s.output.stages[0].node.union_.discover_json);
     }
 }
+
+/// The parameter of `params` whose `${p}` hole `text` holds first, if any.
+pub fn paramHole(text: []const u8, params: []const []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, text, i, "${")) |at| {
+        const end = std.mem.indexOfScalarPos(u8, text, at + 2, '}') orelse return null;
+        for (params) |p| if (std.mem.eql(u8, p, text[at + 2 .. end])) return p;
+        i = end + 1;
+    }
+    return null;
+}

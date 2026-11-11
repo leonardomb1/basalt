@@ -20,7 +20,7 @@ A query reads from one source, named after `FROM`, and joins may read more
 | FTP | `FROM 'ftp://ftp.example.org/dados/arquivo.csv'` — anonymous, `ftp://user:pass@host/path`, or `ftp://name/path` through a `CREATE CONNECTION name TYPE ftp`; downloaded once per run, then read like a local file in any format; a trailing `/` a folder; read only ([FTP](../connectors/ftp.md)) |
 | Windows share (SMB) | `FROM 'smb://fs/share/2026-10.xlsx'` — `fs` a `CREATE CONNECTION fs TYPE smb` (below), or `smb://[domain;]user@host/share/path`; any file format, a trailing `/` a folder; `LOAD INTO 'smb://…'` writes |
 | REST (connection) | `FROM crm.GET('/v1/customers', status = 'open')` — path on the conn's base URL; each `name = value` is a URL-encoded query param (`name = NULL`, or a value that is `NULL`, such as a `PARAM` defaulting to `NULL`, leaves it out), and path and values are expressions (`'/v1/customers/' \|\| $id`). `crm.POST('/search', body = $$...$$)` sends a body. `crm.'/v1/customers'` is the older spelling of a bare GET |
-| REST resource | `FROM crm.customers` — an endpoint named with `CREATE RESOURCE` ([HTTP APIs](../connectors/http.md)) |
+| REST endpoint | `FROM crm.GET('/customers')`, or named once as a table function, `FROM customers()` ([HTTP APIs](../connectors/http.md)) |
 | REST (raw URL) | `FROM HTTP('https://host/api/x')` — the URL exactly as written, the way `QUERY()` is raw SQL |
 | discovered union | `FROM EACH TABLE OF (...)` ([UNION ALL BY NAME](set-operations.md)) |
 | raw records of a file | `FROM lines('app.log')` / `fixed('cnab.ret', 240)` / `split('order.edi', '~')` / `chunks('blob.bin', 65536)` — one row per record as `n`, `offset`, `rec`; see [Raw records](#raw-records) |
@@ -297,7 +297,7 @@ matched in any case; a value holding a loop's `${...}` is checked once filled in
 | `header` | `false` reads an Excel sheet's first row as data, the columns named `A`, `B`, … |
 | `buffer` | a flag: drain the source fully before opening the sink |
 
-**REST sources** — `HTTP(...)`, `conn.GET(...)`, `conn.POST(...)` and resources
+**REST sources** — `HTTP(...)`, `conn.GET(...)` and `conn.POST(...)`
 
 | option | default | meaning |
 |---|---|---|
@@ -324,6 +324,7 @@ matched in any case; a value holding a loop's `${...}` is checked once filled in
 | `stop_short` | off | a flag (bare, or `= true` / `= false`): stop after a page shorter than `page_size` |
 | `prefetch` | `1` | pages kept in flight at once, in `page` and `offset` modes |
 | `retries` | `2` | retries of a transient failure (`RETRY n`) |
+| `batch`, `concurrency` | none, `4` | of a table function called per row only: rows per request, and requests in flight ([HTTP APIs](../connectors/http.md#calling-a-function-per-row)) |
 | `retry_statuses` | none | extra HTTP codes treated as transient, as `'404,501'`, on top of 408, 429 and every 5xx but 501, 505 and 511 (`RETRY n ON (...)`) |
 | `retry_base_ms` | `500` | the first retry's back-off, doubled each time, ±30% jitter |
 | `timeout_ms` | `300000` | the limit on one page's fetch or one login, retries included |

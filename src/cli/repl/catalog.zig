@@ -1,5 +1,5 @@
 //! What Tab completion fetches: a connection's tables and columns, a file's columns,
-//! an http connection's resources and local paths, cached per session.
+//! and local paths, cached per session.
 
 const DeclStore = @import("../entry.zig").DeclStore;
 const Editor = @import("line.zig").Editor;
@@ -105,18 +105,13 @@ pub fn csvCells(a: std.mem.Allocator, line: []const u8) ![]const []const u8 {
     return cells.toOwnedSlice();
 }
 
-pub fn httpResources(arena: std.mem.Allocator, cx: *const Completer, conn: []const u8) !?[]const []const u8 {
-    const is_http = for (cx.decls.items.items) |e| {
-        if (e.kind == .connection and std.ascii.eqlIgnoreCase(e.name, conn))
-            break std.ascii.eqlIgnoreCase(connTypeOf(e.text) orelse "", "http");
-    } else false;
-    if (!is_http) return null;
-    var out = std.array_list.Managed([]const u8).init(arena);
+/// Whether `conn` is a declared http connection, which has no tables to list.
+fn isHttp(cx: *const Completer, conn: []const u8) bool {
     for (cx.decls.items.items) |e| {
-        if (e.kind != .resource or e.name.len <= conn.len or e.name[conn.len] != '.') continue;
-        if (std.ascii.eqlIgnoreCase(e.name[0..conn.len], conn)) try out.append(e.name[conn.len + 1 ..]);
+        if (e.kind == .connection and std.ascii.eqlIgnoreCase(e.name, conn))
+            return std.ascii.eqlIgnoreCase(connTypeOf(e.text) orelse "", "http");
     }
-    return try out.toOwnedSlice();
+    return false;
 }
 
 pub fn connTables(cx: *const Completer, conn: []const u8) []const []const u8 {
@@ -270,7 +265,6 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
         .connection => try conns.append(e.name),
         .function => try fns.append(e.name),
         .param, .let => try params.append(e.name),
-        .resource => {},
     };
     try loopVarsAt(text, cursor, &params);
 
@@ -306,7 +300,7 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
             const typing = cursor > p and cursor <= e;
             if (dots == 1 and !typing and (e == text.len or text[e] != '(')) for (sourceColumns(cx, text[p..e])) |col| try columns.append(col);
         }
-        if (wanted) try tables.append(.{ .conn = c, .tables = try httpResources(arena, cx, c) orelse connTables(cx, c) });
+        if (wanted) try tables.append(.{ .conn = c, .tables = if (isHttp(cx, c)) &.{} else connTables(cx, c) });
     }
     var q: usize = 0;
     while (std.mem.indexOfScalarPos(u8, text, q, '\'')) |open| {

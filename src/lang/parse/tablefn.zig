@@ -88,9 +88,9 @@ pub fn callTableFn(self: *Parser, name: []const u8, pos: Pos, place: enum { from
         nm.* = p.name;
         if (!self.constItemExpr(a.*)) {
             const column = a.*.* == .field and !a.*.field.dollar;
-            if (lateral and column) {
+            if (lateral) {
                 const marker = try self.mk(.{ .field = .{ .parts = try self.arena.dupe([]const u8, &.{ "\x00lateral", p.name }) } });
-                try correlated.append(.{ .param = p.name, .left = a.*.field, .marker = marker });
+                try correlated.append(.{ .param = p.name, .arg = a.*, .marker = marker });
                 a.* = marker;
                 continue;
             }
@@ -122,6 +122,11 @@ pub fn callTableFn(self: *Parser, name: []const u8, pos: Pos, place: enum { from
     var stages = std.array_list.Managed(ast.Stage).init(self.arena);
     self.parseQuery(&inner, &stages) catch |e| return self.inTableFn(e, fd.name, pos);
     _ = self.expect(.semi) catch |e| return self.inTableFn(e, fd.name, pos);
+    if (try httpCall(self, fd, pos, stages.items, inner.items, args.items, correlated.items)) |lk| {
+        if (lateral) return .{ .lookup = lk };
+        return .{ .binding = try oneRowCall(self, fd.name, pos, lk) };
+    }
+    for (stages.items) |st| if (perRowHint(st.hints)) |h| return self.perRowOnly(h);
     const keys = if (correlated.items.len == 0) &.{} else try self.decorrelate(fd.name, pos, &stages, inner.items, correlated.items);
 
     const bname = try msgfmt.allocPrint(self.arena, "__tvf{d}_{s}", .{ frame.id, fd.name });
@@ -140,6 +145,8 @@ pub fn callTableFn(self: *Parser, name: []const u8, pos: Pos, place: enum { from
 /// LIMIT, DISTINCT, GROUP BY or window, or uses `$param` any other way.
 pub fn decorrelate(self: *Parser, name: []const u8, pos: Pos, stages: *std.array_list.Managed(ast.Stage), inner: []const ast.Stmt, cor: []const Correlated) Error![]const LateralKey {
     const p0 = cor[0].param;
+    for (cor) |c| if (c.arg.* != .field or c.arg.field.dollar)
+        return self.fail(pos, "`{s}`: `${s}` gets a row's value matched in the body's WHERE, so pass a column, not an expression", .{ name, c.param });
     for (stages.items) |st| switch (st.node) {
         .read, .ref, .join, .filter, .select => {},
         else => return self.fail(pos, "`{s}`: a row's column passed as `${s}` needs a body that is a plain SELECT ... FROM ... WHERE — this one has {s}, which the join could not apply per row", .{ name, p0, stageWord(st.node) }),
@@ -218,11 +225,106 @@ pub fn decorrelate(self: *Parser, name: []const u8, pos: Pos, stages: *std.array
             try items.append(.{ .computed = .{ .name = pn, .expr = try self.mk(.{ .field = q.col }) } });
             break :blk pn;
         };
-        key.* = .{ .left = cor[q.cor].left, .right = out };
+        key.* = .{ .left = cor[q.cor].arg.field, .right = out };
     }
     const sel = ast.Stage{ .node = .{ .select = try items.toOwnedSlice() }, .hints = &.{}, .pos = pos };
     if (sel_at) |si| stages.items[si] = sel else try stages.append(sel);
     return keys;
+}
+
+/// A function parameter's hole in a request, renamed so a script's `PARAM` or loop
+/// variable of the same name, rendered into the request before it is sent, cannot
+/// take it.
+pub const arg_hole = "__arg_";
+
+/// The lookup calling `fd` per row, when its body is one http read (`SELECT ... FROM
+/// conn.GET(...)`) and the call passes a row's value or the request holds a `${p}`
+/// hole; null for any other body, which lowers as a derived table. A row's value
+/// written `$p` in the path is that hole too.
+fn httpCall(self: *Parser, fd: ast.FnDecl, pos: Pos, stages: []const ast.Stage, inner: []const ast.Stmt, args: []const *ast.Expr, cor: []const Correlated) Error!?ast.Lookup {
+    if (stages.len == 0 or stages[0].node != .read) return null;
+    const rd = stages[0].node.read;
+    const kind = self.connType(rd.connector) orelse return null;
+    if (!std.mem.eql(u8, kind, "http") or rd.form != .path) return null;
+    const names = try self.arena.alloc([]const u8, fd.params.len);
+    for (fd.params, names) |p, *n| n.* = try msgfmt.allocPrint(self.arena, arg_hole ++ "{s}", .{p.name});
+    const path = try ownHoles(self, rd.form.path, fd, cor);
+    const hints = try self.arena.dupe(ast.Hint, stages[0].hints);
+    var holes = expand.paramHole(path, names) != null;
+    for (hints) |*h| switch (h.value) {
+        .str => |t| {
+            h.value = .{ .str = try ownHoles(self, t, fd, cor) };
+            holes = holes or expand.paramHole(h.value.str, names) != null;
+        },
+        else => {},
+    };
+    if (cor.len == 0 and !holes) return null;
+    if (inner.len > 0 or stages.len != 2 or stages[1].node != .select)
+        return self.fail(pos, "`{s}`: a function called per row is one request and its typed columns — SELECT CAST(<field> AS <type>) AS name, ... FROM {s}.GET(...) or .POST(...)", .{ fd.name, rd.connector });
+    const items = stages[1].node.select;
+    for (items) |it| if (it != .computed or it.computed.expr.* != .cast)
+        return self.fail(pos, "`{s}`: a function called per row types each column, so planning calls nothing — CAST(<field> AS <type>) AS name", .{fd.name});
+    if (perRowHint(hints)) |b| if (std.mem.eql(u8, b.key, "batch")) {
+        const outside = expand.paramHole(path, names) orelse for (hints) |h| {
+            if (std.mem.eql(u8, h.key, "body") or h.value != .str) continue;
+            if (expand.paramHole(h.value.str, names)) |p| break p;
+        } else null;
+        if (outside) |p| return self.fail(b.pos, "`{s}`: `${{{s}}}` outside the body cannot carry a batch of rows; with `batch`, a parameter goes in the JSON body", .{ fd.name, p[arg_hole.len..] });
+    };
+    const call_args = try self.arena.dupe(*ast.Expr, args);
+    for (cor) |c| for (fd.params, call_args) |p, *a| {
+        if (std.mem.eql(u8, p.name, c.param)) a.* = c.arg;
+    };
+    return .{ .conn = rd.connector, .name = fd.name, .path = path, .hints = hints, .params = names, .args = call_args, .items = items, .hidden = "" };
+}
+
+/// The first `batch` or `concurrency` of `hints`, options of a function called per
+/// row, or null.
+pub fn perRowHint(hints: []const ast.Hint) ?ast.Hint {
+    for (hints) |h| if (std.mem.eql(u8, h.key, "batch") or std.mem.eql(u8, h.key, "concurrency")) return h;
+    return null;
+}
+
+/// `text` with each hole of a parameter of `fd`, `${p}` or a row's value written
+/// `$p` (`${\x00lateral.p}`), as its reserved `${__arg_p}`.
+fn ownHoles(self: *Parser, text: []const u8, fd: ast.FnDecl, cor: []const Correlated) Error![]const u8 {
+    var out = text;
+    for (cor) |c| {
+        const marked = try msgfmt.allocPrint(self.arena, "${{\x00lateral.{s}}}", .{c.param});
+        out = try std.mem.replaceOwned(u8, self.arena, out, marked, try msgfmt.allocPrint(self.arena, "${{{s}}}", .{c.param}));
+    }
+    for (fd.params) |p| {
+        const plain = try msgfmt.allocPrint(self.arena, "${{{s}}}", .{p.name});
+        out = try std.mem.replaceOwned(u8, self.arena, out, plain, try msgfmt.allocPrint(self.arena, "${{" ++ arg_hole ++ "{s}}}", .{p.name}));
+    }
+    return out;
+}
+
+/// A call whose arguments are all constants, of a function `httpCall` lowers: the
+/// lookup over a single row, its items the binding's rows.
+fn oneRowCall(self: *Parser, name: []const u8, pos: Pos, found: ast.Lookup) Error![]const u8 {
+    self.derived_n += 1;
+    var lk = found;
+    lk.hidden = "\x00lookup";
+    const row = "\x00call";
+    const one = try self.arena.dupe(*ast.Expr, &.{try self.mk(.{ .int_lit = 1 })});
+    const out = try self.arena.alloc(ast.SelectItem, lk.items.len);
+    for (lk.items, out) |it, *o| o.* = .{ .computed = .{ .name = it.computed.name, .expr = try self.mk(.{ .field = .{ .parts = try self.arena.dupe([]const u8, &.{ row, it.computed.name }) } }) } };
+    const stages = try self.arena.dupe(ast.Stage, &.{
+        .{ .node = .{ .read = .{ .connector = "range", .form = .{ .builtin = .{ .name = "range", .args = one } } } }, .hints = &.{}, .pos = pos },
+        .{ .node = .{ .lookup = lk }, .hints = &.{}, .pos = pos },
+        .{ .node = .{ .explode = .{ .field = lk.hidden, .as_name = row } }, .hints = &.{}, .pos = pos },
+        .{ .node = .{ .select = out }, .hints = &.{}, .pos = pos },
+    });
+    const bname = try msgfmt.allocPrint(self.arena, "__tvf{d}_{s}", .{ self.derived_n, name });
+    try self.let_names.append(bname);
+    try self.pending_bindings.append(.{ .binding = .{ .name = bname, .pipeline = .{ .stages = stages, .pos = pos }, .pos = pos } });
+    return bname;
+}
+
+/// The error for `h`, a per-row option on a read that sends one request.
+pub fn perRowOnly(self: *Parser, h: ast.Hint) Error {
+    return self.fail(h.pos, "`{s}` is for a function called per row (JOIN LATERAL f(t.col), or a `${{param}}` in its request); this read sends one request", .{h.key});
 }
 
 /// Name the call that reached an error inside a table function's body, once, at

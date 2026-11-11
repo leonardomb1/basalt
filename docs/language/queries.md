@@ -45,7 +45,7 @@ LIMIT 100 OFFSET 20;
 | `CROSS JOIN UNNEST(tags) AS tag` | a `LIST` column: one row per element, typed as the list's element; a `MAP` gives its entries (`tag.key`, `tag.value`); a NULL or empty list gives no rows |
 | `CROSS JOIN UNNEST(text_chunks(body, 1000, 200)) AS c` | a function's list, computed per row and exploded as a column's is: any call that returns a `LIST` (`text_chunks`, `list_filter(...)`); without `AS` its column is named `unnest`. A `WHERE` condition that names none of an `UNNEST`'s columns is applied before it, so the list is computed only for the rows it keeps |
 | `CROSS JOIN UNNEST(JSON_EACH(tags)) AS tag` | explode a JSON array: one row per element — strings unquoted, objects and arrays as JSON text, a JSON `null` as null. A null or `null` cell gives no rows; an object or scalar is an error |
-| `[INNER\|LEFT [OUTER]\|RIGHT [OUTER]\|FULL [OUTER]\|CROSS\|SEMI\|ANTI] JOIN <source> [AS] x ON a = b [AND ...]` | join — the right side a CTE, `(SELECT ...)`, table function, path or connection table; `JOIN LATERAL f(x.col)` passes a column to a table function ([user functions](user-functions.md)); see [Joins](joins.md) |
+| `[INNER\|LEFT [OUTER]\|RIGHT [OUTER]\|FULL [OUTER]\|CROSS\|SEMI\|ANTI] JOIN <source> [AS] x ON a = b [AND ...]` | join — the right side a CTE, `(SELECT ...)`, table function, path or connection table; `JOIN LATERAL f(x.col)` passes a column to a table function ([user functions](user-functions.md)), and one whose body reads an http connection is called per row ([HTTP APIs](../connectors/http.md#calling-a-function-per-row)); see [Joins](joins.md) |
 
 Row order without `ORDER BY` is not defined in SQL, and `GROUP BY` returns groups
 in hash-partition order; at `-j` above 1, groups whose aggregates are all exact

@@ -117,7 +117,7 @@ test "union: plain UNION [ALL] lines branches up by position" {
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "branch 2 has 2 columns") != null);
 }
 
-test "NOT IN (SELECT ...): a NULL in the subquery keeps no row, a NULL probe survives only an empty one" {
+test "NOT IN (SELECT ...): a NULL in the subquery keeps no row, a NULL probe survives only an empty one; a computed left side keys the same way" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -136,6 +136,10 @@ test "NOT IN (SELECT ...): a NULL in the subquery keeps no row, a NULL probe sur
         .{ .q = "SELECT k FROM '$B/l.csv' WHERE k IN (SELECT k FROM '$B/r.csv' INTERSECT SELECT 2 AS k)", .want = "k\n2\n" },
         .{ .q = "SELECT k FROM '$B/l.csv' WHERE k IN (SELECT k FROM '$B/r.csv' EXCEPT SELECT 2 AS k)", .want = "k\n" },
         .{ .q = "SELECT k FROM '$B/l.csv' WHERE k NOT IN (SELECT k FROM '$B/r.csv' WHERE k > 2 UNION SELECT 1 AS k UNION ALL SELECT 1 AS k)", .want = "k\n2\n" },
+        .{ .q = "SELECT v FROM '$B/l.csv' WHERE k + 1 IN (SELECT k FROM '$B/r.csv') ORDER BY v", .want = "v\na\nc\n" },
+        .{ .q = "SELECT v FROM '$B/l.csv' WHERE k + 1 NOT IN (SELECT k FROM '$B/r.csv' WHERE k IS NOT NULL)", .want = "v\n" },
+        .{ .q = "SELECT v FROM '$B/l.csv' WHERE upper(v) NOT IN (SELECT upper(v) AS u FROM '$B/r.csv') ORDER BY v", .want = "v\na\nb\nc\n" },
+        .{ .q = "SELECT * FROM '$B/l.csv' WHERE k * 1 NOT IN (SELECT k FROM '$B/r.csv')", .want = "k,v\n" },
     };
     for (cases) |c| {
         const q = try std.mem.replaceOwned(u8, alloc, c.q, "$B", base);

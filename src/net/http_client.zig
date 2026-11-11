@@ -658,7 +658,7 @@ fn enumNoCase(comptime E: type, v: []const u8) ?E {
 }
 
 /// A number written bare or quoted, as a loop's `'${n}'` renders.
-fn intOf(v: ast.HintVal) ?i64 {
+pub fn intOf(v: ast.HintVal) ?i64 {
     return switch (v) {
         .int => |n| n,
         .str => |s| std.fmt.parseInt(i64, std.mem.trim(u8, s, " "), 10) catch null,

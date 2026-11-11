@@ -306,7 +306,7 @@ pub fn httpAttrUsed(conn: ast.Connection, auth: []const u8, key: []const u8) boo
     return true;
 }
 
-/// A name given twice (a resource's, then the read's own) keeps the later value.
+/// A name given twice (the connection's, then the read's own) keeps the later value.
 pub fn queryParams(arena: std.mem.Allocator, hints: []const ast.Hint) ![]const http_client.KV {
     var out = std.array_list.Managed(http_client.KV).init(arena);
     for (hints) |h| {

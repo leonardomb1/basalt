@@ -1,4 +1,4 @@
-//! FROM sources: paths, connections' tables and queries, HTTP calls and resources,
+//! FROM sources: paths, connections' tables and queries, HTTP calls,
 //! buffers, `EACH TABLE OF`, table builtins (RANGE, LINES, FIXED, SPLIT, CHUNKS),
 //! and the read clauses (PAGINATE, RETRY, BODY).
 
@@ -71,10 +71,7 @@ pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array
             } else {
                 const npos = self.curPos();
                 const name = try self.expectIdent();
-                const r = self.findResource(head, name) orelse
-                    return self.fail(npos, "`{s}.{s}`: no such resource — declare it with CREATE RESOURCE {s}.{s} AS GET('/...'), or read {s}.GET('/...')", .{ head, name, head, name, head });
-                try read_hints.appendSlice(r.hints);
-                node = .{ .read = .{ .connector = head, .form = .{ .path = r.path } } };
+                return self.fail(npos, "`{s}.{s}`: an http connection has no tables — read {s}.GET('/...'), or name the endpoint as a function: CREATE FUNCTION {s}() RETURNS TABLE AS SELECT * FROM {s}.GET('/...'), read FROM {s}()", .{ head, name, head, name, head, name });
             }
         } else if (self.at(.dot)) {
             _ = self.advance();

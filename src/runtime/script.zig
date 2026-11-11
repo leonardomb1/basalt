@@ -281,6 +281,15 @@ fn renderStage(arena: std.mem.Allocator, src: ast.Stage, lr: LoopRow) anyerror!a
             if (l.offset_expr) |e| r.offset_expr = try renderExpr(arena, e, lr);
             dst.node = .{ .limit = r };
         },
+        .lookup => |lk| {
+            var r = lk;
+            r.path = try interpAll(arena, lk.path, lr);
+            r.hints = try renderHints(arena, lk.hints, lr);
+            const args = try arena.alloc(*ast.Expr, lk.args.len);
+            for (lk.args, args) |e, *o| o.* = try renderExpr(arena, e, lr);
+            r.args = args;
+            dst.node = .{ .lookup = r };
+        },
         else => {},
     }
     return dst;

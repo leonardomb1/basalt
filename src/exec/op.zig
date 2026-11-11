@@ -196,6 +196,7 @@ pub const Op = union(enum) {
     explode: *Explode,
     union_: *Union,
     runtime_filter: *RuntimeFilter,
+    lookup: *Lookup,
 
     pub fn stats(self: Op) *Stats {
         return switch (self) {
@@ -356,6 +357,7 @@ pub const Op = union(enum) {
             .explode => |e| e.next(arena),
             .union_ => |u| u.next(arena),
             .runtime_filter => |f| f.next(arena),
+            .lookup => |l| l.next(arena),
         };
     }
 };
@@ -430,6 +432,7 @@ pub fn linearize(arena: std.mem.Allocator, top: Op) !?Linear {
 }
 
 pub const Explode = @import("op/explode.zig").Explode;
+pub const Lookup = @import("op/lookup.zig").Lookup;
 pub const Window = @import("op/window.zig").Window;
 pub const Distinct = @import("op/distinct.zig").Distinct;
 pub const Sort = @import("op/sort.zig").Sort;
@@ -917,6 +920,7 @@ test {
     _ = @import("op/aggregate.zig");
     _ = @import("op/distinct.zig");
     _ = @import("op/explode.zig");
+    _ = @import("op/lookup.zig");
     _ = @import("op/join.zig");
     _ = @import("op/keyset.zig");
     _ = @import("op/bloom.zig");

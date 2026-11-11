@@ -6,7 +6,6 @@ const AliasSet = @import("../sql_parser.zig").AliasSet;
 const Error = @import("../sql_parser.zig").Error;
 const PendingSemiJoin = Parser.PendingSemiJoin;
 const Pos = @import("../sql_parser.zig").Pos;
-const Resource = @import("../sql_parser.zig").Resource;
 const ast = @import("../ast.zig");
 const binOpText = @import("../sql_parser.zig").binOpText;
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
@@ -22,7 +21,6 @@ pub fn parseProgram(self: *Parser) Error!ast.Program {
         try self.conn_names.append(c.name);
         try self.conn_types.append(c.connector);
     }
-    self.resources = std.array_list.Managed(Resource).init(self.arena);
     self.table_fns = std.array_list.Managed(ast.FnDecl).init(self.arena);
     try self.table_fns.appendSlice(self.known_fns);
     self.let_names = std.array_list.Managed([]const u8).init(self.arena);
@@ -58,7 +56,7 @@ pub fn parseProgram(self: *Parser) Error!ast.Program {
 }
 
 /// Whether the statement at token `i` has a body with `;`s of its own (a
-/// connection or resource is one statement).
+/// connection is one statement).
 pub fn opensBlock(self: *Parser, i: usize) bool {
     if (i >= self.toks.len) return false;
     const t = self.toks[i];
@@ -150,9 +148,7 @@ pub fn parseShow(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!vo
     _ = try self.expect(.semi);
     if (std.mem.eql(u8, kind, "http")) {
         if (schema != null) return self.fail(pos, "SHOW TABLES FROM: `{s}` is an http connection, which has no schemas", .{conn});
-        var p = try self.showResources(conn, like, pos);
-        p.show = true;
-        return out.append(.{ .output = p });
+        return self.fail(pos, "SHOW TABLES FROM: `{s}` is an http connection, which has no tables; an endpoint is a function, CREATE FUNCTION f() RETURNS TABLE AS SELECT * FROM {s}.GET('/...'), read FROM f()", .{ conn, conn });
     }
 
     var q = std.array_list.Managed(u8).init(self.arena);
@@ -274,8 +270,9 @@ pub fn parseCreate(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!
     if (self.eatKw("function")) {
         return out.append(.{ .func = try self.parseFunction(pos, replace) });
     }
-    if (self.eatKw("resource")) return self.parseResource(pos);
-    return self.fail(self.curPos(), "expected CONNECTION, RESOURCE, or FUNCTION after CREATE", .{});
+    if (self.isKw("resource"))
+        return self.fail(pos, "CREATE RESOURCE is gone: an endpoint is a table function, CREATE FUNCTION name(param, ...) RETURNS TABLE AS SELECT * FROM conn.GET('/path') WITH (...); read FROM name(...), or per row JOIN LATERAL name(t.col)", .{});
+    return self.fail(self.curPos(), "expected CONNECTION or FUNCTION after CREATE", .{});
 }
 
 /// One dotted name atom: an identifier, or `IDENTIFIER(<expr>)` lowered to a `${...}`

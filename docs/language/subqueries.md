@@ -27,7 +27,9 @@ The subquery of `IN` must produce exactly one named column — a `UNION`,
 as a **top-level AND condition of `WHERE`** — under an `OR`, a `NOT` or a `CASE`
 it cannot be lifted into a join without changing what the predicate means, so
 those shapes are parse errors (spell them as an explicit join). The left side
-must be a plain column. The literal-list form `IN (1, 2, 3)` is unchanged.
+may be any expression of the row (`WHERE sha256(c.text) NOT IN (...)`): one that
+is not a plain column is computed into a hidden join key. A correlated `IN` takes
+a plain column. The literal-list form `IN (1, 2, 3)` is unchanged.
 
 A scalar query — inline or as `LET x = (SELECT ...);` — must produce exactly one
 column; one row is the value, zero rows read as `NULL` (standard SQL), and more

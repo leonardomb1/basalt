@@ -2,8 +2,7 @@
 
 `basalt kernel` keeps one session alive for a program to drive, the way `repl`
 keeps one for a person. Each script it runs sees every `CREATE CONNECTION`,
-`CREATE FUNCTION`, `CREATE RESOURCE`, `PARAM` and `LET` an earlier script
-declared: they are kept as text and replayed ahead of the next script, so a
+`CREATE FUNCTION`, `PARAM` and `LET` an earlier script declared: they are kept as text and replayed ahead of the next script, so a
 script behaves exactly as it would in one file below them all, and re-declaring
 a name replaces it. A `WITH` belongs to its query and is not kept — two scripts
 may reuse a CTE name. A `LET` keeps the value it was given in the script that

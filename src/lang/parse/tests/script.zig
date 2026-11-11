@@ -330,7 +330,7 @@ test "sql: DESCRIBE lowers to a describe-mode EXPLAIN that asks a table for no r
     try testing.expect(std.mem.indexOf(u8, diag.msg, "not a connection") != null);
 }
 
-test "sql: http reads — GET/POST calls, connection clauses, resources" {
+test "sql: http reads — GET/POST calls, connection clauses, an endpoint as a table function" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -339,45 +339,41 @@ test "sql: http reads — GET/POST calls, connection clauses, resources" {
         \\CREATE CONNECTION rc TYPE http OPTIONS (base_url = 'https://x/v1')
         \\  RETRY 3 ON (429) WITH (items = 'data');
         \\PARAM code STRING DEFAULT 'br';
-        \\CREATE RESOURCE rc.countries AS GET('/countries', region = 'europe')
-        \\  PAGINATE BY page (param = 'p');
+        \\CREATE FUNCTION countries(region) RETURNS TABLE AS
+        \\  SELECT * FROM rc.GET('/countries', region = $region) PAGINATE BY page (param = 'p') WITH (items = 'rows');
         \\SELECT * FROM rc.GET('/alpha/' || $code, fields = 'name', since = NULL);
         \\SELECT * FROM rc.POST('/search', body = $$ {"q": 1} $$);
-        \\SELECT * FROM rc.countries WITH (items = 'rows');
-        \\SHOW TABLES FROM rc LIKE 'c%';
+        \\SELECT * FROM countries('europe');
     , &diag);
     const conn = prog.stmts[1].connection;
     try testing.expectEqual(@as(i64, 3), conn.hints[0].value.int);
     try testing.expectEqualStrings("data", hintStr(conn.hints, "items").?);
 
-    const get = prog.stmts[3].output.stages[0];
+    const get = prog.stmts[4].output.stages[0];
     try testing.expectEqualStrings("rc", get.node.read.connector);
     try testing.expectEqualStrings("/alpha/${code}", get.node.read.form.path);
     try testing.expectEqualStrings("name", hintStr(get.hints, "query:fields").?);
     try testing.expect(hintStr(get.hints, "query:since") == null);
 
-    const post = prog.stmts[4].output.stages[0];
+    const post = prog.stmts[5].output.stages[0];
     try testing.expectEqualStrings("/search", post.node.read.form.path);
     try testing.expectEqualStrings("post", hintStr(post.hints, "method").?);
     try testing.expectEqualStrings(" {\"q\": 1} ", hintStr(post.hints, "body").?);
 
-    const res = prog.stmts[5].output.stages[0];
-    try testing.expectEqualStrings("/countries", res.node.read.form.path);
-    try testing.expectEqualStrings("europe", hintStr(res.hints, "query:region").?);
-    try testing.expectEqualStrings("page", hintStr(res.hints, "paginate").?);
-    try testing.expectEqualStrings("rows", res.hints[res.hints.len - 1].value.str);
-
-    const show = prog.stmts[6].output.stages;
-    try testing.expectEqualStrings("range", show[0].node.read.connector);
-    try testing.expect(show[1].node == .select);
-    try testing.expect(show[2].node == .filter);
+    const call = for (prog.stmts) |st| {
+        if (st == .binding and std.mem.startsWith(u8, st.binding.name, "__tvf")) break st.binding.pipeline.stages[0];
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("/countries", call.node.read.form.path);
+    try testing.expectEqualStrings("europe", hintStr(call.hints, "query:region").?);
+    try testing.expectEqualStrings("page", hintStr(call.hints, "paginate").?);
+    try testing.expectEqualStrings("rows", hintStr(call.hints, "items").?);
 
     const bad = [_]struct { src: []const u8, msg: []const u8 }{
-        .{ .src = "CREATE CONNECTION rc TYPE http OPTIONS (base_url = 'u'); SELECT * FROM rc.nope;", .msg = "no such resource" },
+        .{ .src = "CREATE CONNECTION rc TYPE http OPTIONS (base_url = 'u'); SELECT * FROM rc.nope;", .msg = "an http connection has no tables" },
+        .{ .src = "CREATE CONNECTION rc TYPE http OPTIONS (base_url = 'u'); SHOW TABLES FROM rc;", .msg = "an http connection, which has no tables" },
+        .{ .src = "CREATE CONNECTION rc TYPE http OPTIONS (base_url = 'u'); CREATE RESOURCE rc.t AS GET('/t');", .msg = "CREATE RESOURCE is gone" },
         .{ .src = "CREATE CONNECTION rc TYPE http OPTIONS (base_url = 'u'); SELECT * FROM rc.GET('/x', body = 'b');", .msg = "GET takes no body" },
         .{ .src = "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h') RETRY 2;", .msg = "http` connections only" },
-        .{ .src = "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h'); CREATE RESOURCE pg.t AS GET('/t');", .msg = "postgres connection" },
-        .{ .src = "CREATE RESOURCE nope.t AS GET('/t');", .msg = "not a connection" },
     };
     for (bad) |b| {
         try testing.expectError(error.ParseFailed, parseSource(a, b.src, &diag));

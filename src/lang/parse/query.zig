@@ -8,6 +8,7 @@ const Core = Parser.Core;
 const Error = @import("../sql_parser.zig").Error;
 const ExprAlias = Parser.ExprAlias;
 const LateralKey = Parser.LateralKey;
+const perRowHint = @import("tablefn.zig").perRowHint;
 const Pos = @import("../sql_parser.zig").Pos;
 const SetOpTok = Parser.SetOpTok;
 const Window = @import("window.zig");
@@ -186,47 +187,120 @@ pub fn unnestCol(self: *Parser) Error!ast.QualName {
     return .{ .parts = try self.arena.dupe([]const u8, &.{ first, try self.expectIdent() }) };
 }
 
-/// The WHERE filters from `from` on, each conjunct that names no column an UNNEST
-/// makes moved below the UNNESTs in front of it, which give the same rows either
-/// way: below them a computed list (`UNNEST(text_chunks(body, ...))`) is built only for
-/// the rows the filter keeps, not for every row and then mostly dropped.
+/// `JOIN LATERAL f(args) x` of a function `callTableFn` calls per row: a lookup
+/// whose items land in a hidden list, exploded into `x` (a struct, `x.embedding`).
+/// Under LEFT, `ON TRUE` follows (it may under any) and a row whose reply holds no
+/// item stays, `x` NULL.
+fn lookupJoin(self: *Parser, stages: *std.array_list.Managed(ast.Stage), aliases: *AliasSet, found: ast.Lookup, alias: []const u8, outer: bool, pos: Pos) Error!void {
+    if (outer or self.isKw("on")) {
+        try self.expectKw("on");
+        try self.expectKw("true");
+    }
+    var lk = found;
+    const args = try self.arena.alloc(*ast.Expr, lk.args.len);
+    for (lk.args, args) |a, *o| o.* = try self.stripExpr(a, aliases);
+    lk.args = args;
+    lk.outer = outer;
+    lk.hidden = try std.fmt.allocPrint(self.arena, "\x00lookup{d}", .{stages.items.len});
+    try stages.append(.{ .node = .{ .lookup = lk }, .hints = &.{}, .pos = pos });
+    try stages.append(.{ .node = .{ .explode = .{ .field = lk.hidden, .as_name = alias } }, .hints = &.{}, .pos = pos });
+}
+
+/// The WHERE filters and the semi and anti joins it became from `from` on, each
+/// conjunct moved down the UNNESTs and lookups in front of it to just above the last
+/// one making a name it reads, which gives the same rows: there a computed list
+/// (`UNNEST(text_chunks(body, ...))`) is built, and an API called, only for the rows
+/// the condition keeps, not for every row and then mostly dropped.
 fn sinkPastUnnests(self: *Parser, stages: *std.array_list.Managed(ast.Stage), from: usize) Error!void {
     var i = from;
     while (i < stages.items.len) : (i += 1) {
-        if (stages.items[i].node != .filter) continue;
-        var made = std.array_list.Managed([]const u8).init(self.arena);
-        var b = i;
-        var unnests = false;
-        while (b > 0) : (b -= 1) {
-            const st = stages.items[b - 1].node;
-            switch (st) {
-                .explode => |ex| {
-                    try made.append(ex.field);
-                    if (ex.as_name) |n| try made.append(n);
-                    unnests = true;
-                },
-                .select => |items| {
-                    if (items.len != 2 or items[0] != .star or items[1] != .computed or !std.mem.startsWith(u8, items[1].computed.name, "\x00unnest")) break;
-                    try made.append(items[1].computed.name);
-                },
-                else => break,
+        const node = stages.items[i].node;
+        const sifted = node == .join and (node.join.kind == .semi or node.join.kind == .anti);
+        if (node != .filter and !sifted) continue;
+        var lo = i;
+        var makers = false;
+        while (lo > 0) {
+            const prev = stages.items[lo - 1].node;
+            if (!crossable(prev)) break;
+            if (prev == .explode or prev == .lookup) makers = true;
+            lo -= 1;
+        }
+        if (!makers) continue;
+        const pos = stages.items[i].pos;
+        const run = try self.arena.dupe(ast.Stage, stages.items[lo..i]);
+        var conds = std.array_list.Managed(ast.Stage).init(self.arena);
+        var ats = std.array_list.Managed(usize).init(self.arena);
+        if (sifted) {
+            try conds.append(stages.items[i]);
+            try ats.append(try lowest(self, run, .{ .join = node.join }));
+        } else {
+            var conj = std.array_list.Managed(*ast.Expr).init(self.arena);
+            try splitAnd(node.filter, &conj);
+            const at_of = try self.arena.alloc(usize, conj.items.len);
+            for (conj.items, 0..) |c, k| at_of[k] = try lowest(self, run, .{ .expr = c });
+            for (0..run.len + 1) |k| {
+                var here = std.array_list.Managed(*ast.Expr).init(self.arena);
+                for (conj.items, at_of) |c, at| if (at == k) try here.append(c);
+                if (try self.andAll(here.items)) |e| {
+                    try conds.append(.{ .node = .{ .filter = e }, .hints = &.{}, .pos = pos });
+                    try ats.append(k);
+                }
             }
         }
-        if (!unnests) continue;
-        var conj = std.array_list.Managed(*ast.Expr).init(self.arena);
-        try splitAnd(stages.items[i].node.filter, &conj);
-        var down = std.array_list.Managed(*ast.Expr).init(self.arena);
-        var stay = std.array_list.Managed(*ast.Expr).init(self.arena);
-        for (conj.items) |c| try (if (namesAny(c, made.items)) &stay else &down).append(c);
-        const moved = (try self.andAll(down.items)) orelse continue;
-        const pos = stages.items[i].pos;
-        const rest = try self.andAll(stay.items);
-        if (rest) |r| {
-            stages.items[i].node = .{ .filter = r };
-        } else _ = stages.orderedRemove(i);
-        try stages.insert(b, .{ .node = .{ .filter = moved }, .hints = &.{}, .pos = pos });
-        if (rest != null) i += 1;
+        var out = std.array_list.Managed(ast.Stage).init(self.arena);
+        for (0..run.len + 1) |k| {
+            for (conds.items, ats.items) |c, at| if (at == k) try out.append(c);
+            if (k < run.len) try out.append(run[k]);
+        }
+        try stages.replaceRange(lo, i + 1 - lo, out.items);
+        i = lo + out.items.len - 1;
     }
+}
+
+/// Whether a condition may move below `n`: an explode, a lookup, the select that
+/// computes an UNNEST's list, a filter, or a semi or anti join, which all keep or
+/// copy rows without reading what a condition after them reads.
+fn crossable(n: ast.Stage.Node) bool {
+    return switch (n) {
+        .explode, .lookup, .filter => true,
+        .join => |j| j.kind == .semi or j.kind == .anti,
+        .select => |items| items.len == 2 and items[0] == .star and items[1] == .computed and std.mem.startsWith(u8, items[1].computed.name, "\x00unnest"),
+        else => false,
+    };
+}
+
+const Cond = union(enum) { expr: *const ast.Expr, join: ast.Join };
+
+/// The lowest place in `run` a condition can go, as an index into it: just above
+/// the last stage that makes a name it reads.
+fn lowest(self: *Parser, run: []const ast.Stage, c: Cond) Error!usize {
+    var k = run.len;
+    while (k > 0) : (k -= 1) {
+        var made = std.array_list.Managed([]const u8).init(self.arena);
+        switch (run[k - 1].node) {
+            .explode => |ex| {
+                try made.append(ex.field);
+                if (ex.as_name) |n| try made.append(n);
+            },
+            .lookup => |lk| try made.append(lk.hidden),
+            .select => |items| try made.append(items[1].computed.name),
+            else => {},
+        }
+        const reads = switch (c) {
+            .expr => |e| namesAny(e, made.items),
+            .join => |j| joinNamesAny(j, made.items),
+        };
+        if (reads) break;
+    }
+    return k;
+}
+
+/// Whether semi or anti join `j` reads a column of `names` on its left side.
+fn joinNamesAny(j: ast.Join, names: []const []const u8) bool {
+    for (j.left_keys) |k| for (names) |n| if (std.ascii.eqlIgnoreCase(k.parts[0], n)) return true;
+    for (j.deferred) |d| if (namesAny(d.a, names) or namesAny(d.b, names)) return true;
+    if (j.residual) |r| if (namesAny(r, names)) return true;
+    return false;
 }
 
 /// Whether `e` reads a column of `names`, bare or as a struct's head (`c.text`).
@@ -1071,6 +1145,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         } else break;
     }
 
+    if (self.tvf == null) if (perRowHint(read_hints.items)) |h| return self.perRowOnly(h);
     var stages = std.array_list.Managed(ast.Stage).init(self.arena);
     try stages.append(.{ .node = src, .hints = try read_hints.toOwnedSlice(), .pos = pos });
     var key_cols = std.array_list.Managed([]const u8).init(self.arena);
@@ -1169,6 +1244,11 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             const has_alias = self.at(.lparen) or self.atAlias();
             if (self.at(.lparen)) {
                 const call = try self.callTableFn(binding, bpos, if (lateral) .lateral else .join);
+                if (call.lookup) |lk| {
+                    self.eatAliasAs();
+                    try lookupJoin(self, &stages, &aliases, lk, if (self.atAlias()) self.advance().text else written, kind == .left, jpos);
+                    continue;
+                }
                 binding = call.binding;
                 lateral_keys = call.keys;
                 if (!self.atAlias()) jalias = written;

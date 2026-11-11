@@ -552,7 +552,26 @@ pub const Stage = struct {
         join: Join,
         window: Window,
         write: Write,
+        lookup: Lookup,
     };
+};
+
+/// A table function whose body reads an http connection, called with each row's
+/// arguments (`JOIN LATERAL f(c.text) x`, `run/lookup.zig`): the body's request
+/// (`conn`, `path`, `hints`, its `${p}` holes filled per request), and its SELECT
+/// `items`, each a CAST, over every item a reply holds, as a list in column
+/// `hidden`, which an explode turns into `x`. `outer` (a LEFT JOIN LATERAL) keeps a
+/// row whose reply holds no item.
+pub const Lookup = struct {
+    conn: []const u8,
+    name: []const u8,
+    path: []const u8,
+    hints: []const Hint,
+    params: []const []const u8,
+    args: []const *Expr,
+    items: []const SelectItem,
+    hidden: []const u8,
+    outer: bool = false,
 };
 
 pub const WinKind = enum { row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, first_value, last_value, nth_value };

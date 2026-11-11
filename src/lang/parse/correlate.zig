@@ -626,17 +626,50 @@ pub fn lowerWhere(
     if (post) |e| try stages.append(.{ .node = .{ .filter = try self.stripExpr(e, aliases) }, .hints = &.{}, .pos = fpos });
     for (self.pending_semijoins.items[sj_base..]) |sj| {
         const kind: ast.JoinKind = if (sj.negated) .anti else .semi;
-        const j: ast.Join = if (sj.corr) |c| try corrJoin(self, kind, sj.binding, c, aliases) else .{
+        const j: ast.Join = if (sj.corr) |c| try corrJoin(self, kind, sj.binding, c, aliases) else if (isColumn(sj.lhs.?, aliases)) .{
             .kind = kind,
             .binding = sj.binding,
             .left_keys = try self.arena.dupe(ast.QualName, &.{stripQual(sj.lhs.?.field, aliases)}),
             .right_keys = try self.arena.dupe(ast.QualName, &.{try self.singleName(sj.right_col)}),
             .pins = &.{.{ .left = true, .right = true }},
             .null_aware = sj.negated,
-        };
+        } else try computedIn(self, kind, sj, aliases, hidden);
         try stages.append(.{ .node = .{ .join = j }, .hints = &.{}, .pos = sj.pos });
     }
     self.pending_semijoins.shrinkRetainingCapacity(sj_base);
+}
+
+/// Whether the left side of `x IN (SELECT ...)` is a column of a table of this
+/// FROM, which keys the join as is; anything else (`sha256(t)`, an UNNEST's
+/// `c.text`) is a computed key.
+fn isColumn(e: *const ast.Expr, aliases: *const AliasSet) bool {
+    if (e.* != .field) return false;
+    const q = e.field;
+    return q.dollar or q.parts.len == 1 or aliases.knows(q.parts[0]);
+}
+
+/// `expr [NOT] IN (SELECT col ...)` as a semi or anti join keyed on `expr`, computed
+/// over the left rows into a hidden column the output drops.
+fn computedIn(self: *Parser, kind: ast.JoinKind, sj: Parser.PendingSemiJoin, aliases: *AliasSet, hidden: *std.array_list.Managed([]const u8)) Error!ast.Join {
+    const ln = try self.freshName("__jk{d}");
+    const rn = try self.freshName("__jk{d}");
+    try hidden.append(ln);
+    const right = try self.mk(.{ .field = try self.singleName(sj.right_col) });
+    return .{
+        .kind = kind,
+        .binding = sj.binding,
+        .left_keys = &.{},
+        .right_keys = &.{},
+        .null_aware = sj.negated,
+        .deferred = try self.arena.dupe(ast.DeferredKey, &.{.{
+            .a = try self.stripExpr(sj.lhs.?, aliases),
+            .b = right,
+            .left_name = ln,
+            .right_name = rn,
+            .pos = sj.pos,
+            .a_left = true,
+        }}),
+    };
 }
 
 fn corrJoin(self: *Parser, kind: ast.JoinKind, binding: []const u8, c: Corr, aliases: *const AliasSet) Error!ast.Join {

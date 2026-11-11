@@ -349,6 +349,65 @@ fn windowTopKLanes(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, la
     return outer;
 }
 
+/// Whether `stages`, or a binding they read (a CTE, a joined one, a union's branch),
+/// calls an http function per row (`JOIN LATERAL f(t.col)`). Such a statement runs
+/// on one lane, the lookup's own requests the only ones in flight: a parallel path
+/// samples, reads ahead or reruns its input, and every call is paid for.
+fn callsApi(env: *Env, stages: []const ast.Stage, depth: usize) bool {
+    if (depth > 16) return false;
+    for (stages) |st| switch (st.node) {
+        .lookup => return true,
+        .ref => |name| if (env.bindings.get(name)) |b| if (callsApi(env, b.stages, depth + 1)) return true,
+        .join => |j| if (env.bindings.get(j.binding)) |b| if (callsApi(env, b.stages, depth + 1)) return true,
+        .union_ => |u| for (u.branches) |br| if (br.pipeline) |pl| if (callsApi(env, pl.stages, depth + 1)) return true,
+        else => {},
+    };
+    return false;
+}
+
+/// How often `stages`, and the bindings they read, read each binding, a binding's
+/// own reads walked the first time it is met, so `counts` lists the ones it reads
+/// before it.
+fn countReads(env: *Env, stages: []const ast.Stage, counts: *std.StringArrayHashMap(usize), depth: usize) !void {
+    if (depth > 16) return;
+    for (stages) |st| {
+        const name = switch (st.node) {
+            .ref => |n| n,
+            .join => |j| j.binding,
+            .union_ => |u| {
+                for (u.branches) |br| if (br.pipeline) |pl| try countReads(env, pl.stages, counts, depth + 1);
+                continue;
+            },
+            else => continue,
+        };
+        if (counts.getPtr(name)) |n| {
+            n.* += 1;
+            continue;
+        }
+        if (env.bindings.get(name)) |b| try countReads(env, b.stages, counts, depth + 1);
+        try counts.put(name, 1);
+    }
+}
+
+/// Each binding that calls an API and is read more than once, run into memory once
+/// ahead, the ones it reads first, so every read takes the same rows and no row is
+/// sent twice. A binding read once streams as it is. Returns their names, for the
+/// caller to drop.
+fn materializeApiBindings(env: *Env, opts: RunOptions, stages: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror![]const []const u8 {
+    var counts = std.StringArrayHashMap(usize).init(env.arena);
+    try countReads(env, stages, &counts, 0);
+    var names = std.array_list.Managed([]const u8).init(env.arena);
+    for (counts.keys(), counts.values()) |name, n| {
+        if (n < 2 or env.materialized.contains(name)) continue;
+        const b = (try stampedBinding(env, name)) orelse continue;
+        if (!callsApi(env, b.stages, 0)) continue;
+        const ms = try runToMemory(env, opts, b.stages, name, lanes_used, batch_arena);
+        try env.materialized.put(env.arena, name, .{ .schema = ms.schema, .batches = ms.batches.items });
+        try names.append(name);
+    }
+    return names.toOwnedSlice();
+}
+
 const flip_left = "__flip_left";
 const min_flip_rows: u64 = 1 << 16;
 const max_flip_depth = 8;
@@ -589,6 +648,8 @@ fn sideOf(schemas: []const ?types.Schema, name: []const u8) enum { yes, no, unkn
 
 fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, last: @FieldType(ast.Stage, "node"), stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, delegated: *bool) anyerror!void {
     var opts = opts_in;
+    const api = callsApi(env, stages_in, 0);
+    if (api) opts.threads = 1;
     const arena = env.arena;
     const gpa = env.gpa;
     var stages = stages_in;
@@ -607,6 +668,10 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         break :blk f;
     } else null;
 
+    const api_held = if (api) try materializeApiBindings(env, opts, stages, lanes_used, batch_arena) else &.{};
+    defer for (api_held) |name| {
+        _ = env.materialized.remove(name);
+    };
     const mat = try materializeBinding(env, opts, stages, lanes_used, batch_arena);
     defer if (mat) |name| {
         _ = env.materialized.remove(name);

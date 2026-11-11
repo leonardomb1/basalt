@@ -77,3 +77,7 @@ CREATE FUNCTION itens(pedido) RETURNS TABLE AS
 SELECT p.num, p.cliente, i.produto, i.qtd
 FROM paid_orders($desde) p CROSS JOIN LATERAL itens(p.num) i;
 ```
+
+The one exception is a body that reads an http connection: an API cannot be
+joined, so `JOIN LATERAL f(x.col)` calls it per row, in batches, and any
+expression of the row may be passed — see [HTTP APIs](../connectors/http.md#calling-a-function-per-row).

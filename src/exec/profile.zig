@@ -595,6 +595,7 @@ pub fn kindsOf(node: std.meta.Tag(ast.Stage.Node)) []const Kind {
         .aggregate => &.{.aggregate},
         .join => &.{ .join, .nl_join },
         .explode => &.{.explode},
+        .lookup => &.{.lookup},
         .ref, .write => &.{},
     };
 }
@@ -660,6 +661,14 @@ pub fn stageText(arena: std.mem.Allocator, st: ast.Stage) ![]const u8 {
             }
         },
         .explode => |ex| try w.writeAll(ex.field),
+        .lookup => |lk| {
+            try w.print("{s}(", .{lk.name});
+            for (lk.args, 0..) |e, i| {
+                if (i > 0) try w.writeAll(", ");
+                try print.expr(w, e);
+            }
+            try w.writeByte(')');
+        },
         .write => {},
     }
     return out.written();

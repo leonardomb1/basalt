@@ -225,10 +225,10 @@ pub fn parseBin(self: *Parser, min_bp: u8) Error!*ast.Expr {
             if (self.isKw("select") or self.isKw("with")) {
                 if (!self.in_where)
                     return self.fail(inpos, "IN (SELECT ...) is only supported in a WHERE clause", .{});
-                if (lhs.* != .field)
-                    return self.fail(inpos, "the left side of IN (SELECT ...) must be a plain column", .{});
                 const cap = try self.captureSubquery();
                 if (cap.refs.len > 0) {
+                    if (lhs.* != .field)
+                        return self.fail(inpos, "the left side of a correlated IN (SELECT ...) must be a plain column", .{});
                     lhs = try self.correlatedIn(lhs, cap, negated, inpos);
                     continue;
                 }

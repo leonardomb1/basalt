@@ -577,14 +577,21 @@ const Fit = struct { left: bool = true, right: bool = true, unknown: ?[]const u8
 
 /// Whether every column of `e` is the left side's, and whether every one is the
 /// right side's; the first that is neither's, for the error.
+/// Whether `q` reads a field of a struct column of `s` (`c.text`, `c` an UNNEST's).
+fn structHead(s: types.Schema, q: ast.QualName) bool {
+    if (q.parts.len < 2) return false;
+    const i = s.indexOf(q.parts[0]) orelse return false;
+    return s.fields[i].ty.kind == .@"struct";
+}
+
 fn fitOf(arena: std.mem.Allocator, e: *const ast.Expr, left: types.Schema, right: types.Schema) !Fit {
     var quals = std.array_list.Managed(ast.QualName).init(arena);
     try collectQuals(arena, e, &quals);
     var f = Fit{};
     for (quals.items) |q| {
         if (q.dollar) continue;
-        const in_l = left.resolve(q.parts) != null;
-        const in_r = q.parts.len == 1 and right.indexOf(q.parts[0]) != null;
+        const in_l = left.resolve(q.parts) != null or structHead(left, q);
+        const in_r = (q.parts.len == 1 and right.indexOf(q.parts[0]) != null) or structHead(right, q);
         f.left = f.left and in_l;
         f.right = f.right and in_r;
         if (!in_l and !in_r and f.unknown == null) f.unknown = lastPart(q);
@@ -759,8 +766,50 @@ pub const Resolved = struct {
         sort: []const op.Sort.Key,
         window: WindowPlan,
         aggregate: struct { by: []const usize, aggs: []const op.Aggregate.Agg },
+        lookup: LookupPlan,
     };
 };
+
+/// A lookup's arguments with their types, and the schema of its reply items.
+/// A lookup typed: its arguments and their types, and each reply item's columns,
+/// `exprs` (the body's CASTs) computing `items` from a reply's fields.
+pub const LookupPlan = struct {
+    args: []const *const ast.Expr,
+    arg_types: []const types.Type,
+    exprs: []const *const ast.Expr,
+    items: *const types.Schema,
+    item_fields: []const types.Type.Field,
+    list_ty: types.Type,
+};
+
+/// `lk` over `in`: its arguments typed, the hidden list of its items appended. An
+/// item's type is its CAST's, so nothing is called to learn it.
+pub fn lookupPlan(arena: std.mem.Allocator, in: types.Schema, lk: ast.Lookup, params: *const ParamMap, diag: *Diag) Error!struct { plan: LookupPlan, schema: types.Schema } {
+    const args = try arena.alloc(*const ast.Expr, lk.args.len);
+    const tys = try arena.alloc(types.Type, lk.args.len);
+    for (lk.args, args, tys) |a, *e, *t| {
+        e.* = try substExpr(arena, a, params);
+        t.* = try exprType(arena, in, e.*, diag);
+    }
+    const exprs = try arena.alloc(*const ast.Expr, lk.items.len);
+    const tfields = try arena.alloc(types.Type.Field, lk.items.len);
+    const fields = try arena.alloc(types.Schema.Field, lk.items.len);
+    for (lk.items, exprs, tfields, fields) |it, *e, *tf, *f| {
+        e.* = try substExpr(arena, it.computed.expr, params);
+        tf.* = .{ .name = it.computed.name, .ty = it.computed.expr.cast.ty.asNullable() };
+        f.* = .{ .name = tf.name, .ty = tf.ty };
+    }
+    const st = try arena.create(types.Type);
+    st.* = .{ .kind = .@"struct", .fields = tfields, .nullable = true };
+    const list_ty = types.Type{ .kind = .array, .elem = st, .nullable = true };
+    const out = try arena.alloc(types.Schema.Field, in.fields.len + 1);
+    @memcpy(out[0..in.fields.len], in.fields);
+    out[in.fields.len] = .{ .name = lk.hidden, .ty = list_ty };
+    return .{
+        .plan = .{ .args = args, .arg_types = tys, .exprs = exprs, .items = try schemaRef(arena, .{ .fields = fields }), .item_fields = tfields, .list_ty = list_ty },
+        .schema = .{ .fields = out },
+    };
+}
 
 /// Records of `stages`, each over the schema the one before leaves; `out` is the last's.
 pub const Chain = struct { recs: []const Resolved, out: *const types.Schema };
@@ -803,6 +852,11 @@ pub fn resolve(arena: std.mem.Allocator, in: types.Schema, st: ast.Stage, params
             const ep = try explodePlan(arena, in, ex, diag);
             out = try schemaRef(arena, ep.schema);
             break :blk .{ .explode = ep.idx };
+        },
+        .lookup => |lk| blk: {
+            const lp = try lookupPlan(arena, in, lk, params, diag);
+            out = try schemaRef(arena, lp.schema);
+            break :blk .{ .lookup = lp.plan };
         },
         .distinct => |d| blk: {
             const on: ?[]usize = if (d.on) |f| try fieldIndices(arena, in, f, diag) else null;

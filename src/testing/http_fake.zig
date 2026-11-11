@@ -232,3 +232,75 @@ pub const RangeServer = struct {
         return null;
     }
 };
+
+/// A server that answers each request from its target and body (`handler`, given
+/// both, returns the reply's JSON), one connection at a time, the first `fail_first`
+/// requests answered `429` with `Retry-After: 0` instead. Counts every request, so a
+/// test sees exactly how many went out.
+pub const EchoServer = struct {
+    pub const Handler = *const fn (arena: std.mem.Allocator, target: []const u8, body: []const u8) anyerror![]const u8;
+
+    listener: std.net.Server,
+    handler: Handler,
+    fail_first: usize = 0,
+    thread: std.Thread = undefined,
+    stopping: std.atomic.Value(bool) = .init(false),
+    count: std.atomic.Value(usize) = .init(0),
+
+    pub fn start(self: *EchoServer, handler: Handler, fail_first: usize) !void {
+        self.* = .{ .listener = try listen(128), .handler = handler, .fail_first = fail_first };
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+    }
+
+    pub fn url(self: *EchoServer, arena: std.mem.Allocator) ![]const u8 {
+        return urlOf(arena, &self.listener, "");
+    }
+
+    pub fn requests(self: *EchoServer) usize {
+        return self.count.load(.seq_cst);
+    }
+
+    pub fn stop(self: *EchoServer) void {
+        self.stopping.store(true, .seq_cst);
+        wake(&self.listener);
+        self.thread.join();
+        self.listener.deinit();
+    }
+
+    fn serve(self: *EchoServer) void {
+        while (true) {
+            const conn = self.listener.accept() catch return;
+            defer conn.stream.close();
+            if (self.stopping.load(.seq_cst)) return;
+            self.answer(conn.stream) catch continue;
+        }
+    }
+
+    fn answer(self: *EchoServer, stream: std.net.Stream) !void {
+        var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer ar.deinit();
+        const a = ar.allocator();
+        var head: [8192]u8 = undefined;
+        var n: usize = 0;
+        const end = try readHead(stream, &head, &n);
+        const len = contentLength(head[0..end]);
+        const body = try a.alloc(u8, len);
+        const have = @min(n - end, len);
+        @memcpy(body[0..have], head[end..][0..have]);
+        var got = have;
+        while (got < len) {
+            const r = try stream.read(body[got..]);
+            if (r == 0) return error.EndOfStream;
+            got += r;
+        }
+        const k = self.count.fetchAdd(1, .seq_cst);
+        if (k < self.fail_first) {
+            try stream.writeAll("HTTP/1.1 429 Too Many Requests\r\nretry-after: 0\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            return;
+        }
+        var words = std.mem.tokenizeScalar(u8, head[0..end], ' ');
+        _ = words.next();
+        const reply = self.handler(a, words.next() orelse "", body) catch "{}";
+        try stream.writeAll(try std.fmt.allocPrint(a, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n{s}", .{ reply.len, reply }));
+    }
+};

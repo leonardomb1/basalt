@@ -450,22 +450,10 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
     if (rd_eff.where.len > 0 and !std.mem.eql(u8, conn.connector, "http"))
         if (env.scan) |t| driver.ScanTally.add(&t.sql_filters, 1);
     if (std.mem.eql(u8, conn.connector, "http")) {
-        if (rd.form != .path) return planErr(env.diag, "reading an http connection needs a path: conn.GET('/path') or a CREATE RESOURCE");
-        const cfg = RunCfg{ .env = env, .connector = conn.connector };
-        var auth: []const u8 = "";
-        for (conn.config) |attr| {
-            if (std.mem.eql(u8, attr.key, "auth")) auth = try cfg.text(attr.value);
-        }
-        var kvs = std.array_list.Managed(http_client.KV).init(env.arena);
-        for (conn.config) |attr| {
-            if (!httpAttrUsed(conn, auth, attr.key)) continue;
-            try kvs.append(.{ .key = attr.key, .value = try cfg.text(attr.value) });
-        }
-        var errmsg: []const u8 = "";
-        const cc = http_client.connFromKvs(env.arena, kvs.items, &errmsg) catch
-            return planErr(env.diag, try options.httpConnMsg(env.arena, rd.connector, errmsg));
-        const all = try std.mem.concat(env.arena, ast.Hint, &.{ conn.hints, hints });
-        if (try http_client.optionProblem(env.arena, all, false, true)) |p| return planErr(env.diag, p.msg);
+        if (rd.form != .path) return planErr(env.diag, "reading an http connection needs a path: conn.GET('/path')");
+        const hc = try httpConn(env, rd.connector, conn, hints);
+        const cc = hc.cc;
+        const all = hc.hints;
         var hopts = try http_client.optsFromHints(env.arena, all);
         hopts.logger = env.log;
         const path = try http_client.withQuery(env.arena, rd.form.path, try queryParams(env.arena, all));
@@ -499,6 +487,27 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         }
     }
     return planErr(env.diag, try options.unsupportedSourceMsg(env.arena, conn.connector));
+}
+
+/// An http connection's settings, and a read's options (`hints`) after its own,
+/// checked: what a read of one of its paths, or a lookup's request, is opened with.
+pub fn httpConn(env: *Env, name: []const u8, conn: ast.Connection, hints: []const ast.Hint) !struct { cc: http_client.ConnConfig, hints: []const ast.Hint } {
+    const cfg = RunCfg{ .env = env, .connector = conn.connector };
+    var auth: []const u8 = "";
+    for (conn.config) |attr| {
+        if (std.mem.eql(u8, attr.key, "auth")) auth = try cfg.text(attr.value);
+    }
+    var kvs = std.array_list.Managed(http_client.KV).init(env.arena);
+    for (conn.config) |attr| {
+        if (!httpAttrUsed(conn, auth, attr.key)) continue;
+        try kvs.append(.{ .key = attr.key, .value = try cfg.text(attr.value) });
+    }
+    var errmsg: []const u8 = "";
+    const cc = http_client.connFromKvs(env.arena, kvs.items, &errmsg) catch
+        return planErr(env.diag, try options.httpConnMsg(env.arena, name, errmsg));
+    const all = try std.mem.concat(env.arena, ast.Hint, &.{ conn.hints, hints });
+    if (try http_client.optionProblem(env.arena, all, false, true)) |p| return planErr(env.diag, p.msg);
+    return .{ .cc = cc, .hints = all };
 }
 
 /// Read options `hints` with each `$name` value the run's PARAM or LET of that name,

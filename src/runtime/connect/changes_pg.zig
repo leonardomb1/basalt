@@ -40,6 +40,7 @@ const SqlConnInfo = @import("../connect.zig").SqlConnInfo;
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const catalogQuery = @import("../plan/estimate.zig").catalogQuery;
 const planErr = @import("../env.zig").planErr;
+const hasFlagHint = @import("../env.zig").hasFlagHint;
 
 /// The microseconds from 1970 to PostgreSQL's epoch, 2000-01-01.
 const pg_epoch_us: i64 = 946_684_800_000_000;
@@ -241,7 +242,7 @@ pub fn materialize(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
     }
     if (st.node != .read) return stages;
     const rd = st.node.read;
-    if (rd.form != .table or !hasHint(st.hints, "changes_from")) return stages;
+    if (rd.form != .table or !hasFlagHint(st.hints, "changes_from")) return stages;
     const conn = env.connections.get(rd.connector) orelse return stages;
     const info = sqlConnInfo(conn) orelse return stages;
     if (info.dialect != .postgres) return stages;
@@ -258,11 +259,6 @@ pub fn materialize(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
     const out = try env.arena.dupe(ast.Stage, stages);
     out[0] = .{ .node = .{ .ref = name }, .hints = &.{}, .pos = st.pos };
     return out;
-}
-
-fn hasHint(hints: []const ast.Hint, key: []const u8) bool {
-    for (hints) |h| if (std.mem.eql(u8, h.key, key)) return true;
-    return false;
 }
 
 /// The rows of catalog query `q`, each cell as text, NULL as empty.

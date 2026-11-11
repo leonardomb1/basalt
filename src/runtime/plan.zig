@@ -820,6 +820,7 @@ pub fn buildOp(env: *Env, r: analyze.Resolved, child: op.Op) anyerror!PipeRes {
     const arena = env.arena;
     const o: op.Op = switch (r.plan) {
         .filter, .project, .explode => try mapOp(arena, env.errctx, r, child),
+        .lookup => |lp| .{ .lookup = try @import("run/lookup.zig").build(env, r.stage.node.lookup, lp, child, r.out) },
         .limit => blk: {
             const lim = r.stage.node.limit;
             const l = try arena.create(op.Limit);
