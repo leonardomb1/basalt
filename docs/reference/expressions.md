@@ -151,6 +151,18 @@ columns it has not seen.
     FROM 'docs.parquet' ORDER BY s DESC NULLS LAST LIMIT 10`, a parallel top-N
     over the file's row groups. `NULLS LAST` matters: a descending order puts
     NULLs first.
+  - `chunks(text, size [, overlap])` cuts a text into pieces of at most `size`
+    characters for embedding, as a `LIST` of `STRUCT(no, start, text)`: `no`
+    counts them from 1 and `start` is a piece's first character's position from
+    1, so `substr(text, start, length(piece))` is the piece. A piece is an exact
+    substring, never trimmed; it ends after the last space, tab or line break in
+    its `size` characters when one lies in their second half, else at `size`
+    characters or the text's end. The next piece starts `overlap` characters
+    (default 0, below `size`) before that end, moved forward to the next word
+    when that lands inside one. Characters are UTF-8 code points; an empty text
+    has no pieces and a NULL text gives NULL. The rule will not change, so a
+    piece's hash stays a key to its embedding:
+    `SELECT d.id, c.no, c.text FROM docs d CROSS JOIN UNNEST(chunks(d.body, 1000, 200)) AS c`.
   - `s.*` is a struct's fields as columns of their own.
   - `CROSS JOIN UNNEST(l) AS e` gives a row per element of a list (a map's
     entries as `e.key`, `e.value`), the row's other columns repeated; a NULL or

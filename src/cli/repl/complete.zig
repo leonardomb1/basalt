@@ -146,6 +146,7 @@ const listed = [_]Builtin{
     .{ .name = "list_any", .sig = "list_any(list, x -> condition)" },
     .{ .name = "list_all", .sig = "list_all(list, x -> condition)" },
     .{ .name = "list_reduce", .sig = "list_reduce(list, initial, (acc, x) -> value)" },
+    .{ .name = "chunks", .sig = "chunks(text, size [, overlap])" },
     .{ .name = "list_cosine_similarity", .sig = "list_cosine_similarity(list, list)" },
     .{ .name = "list_cosine_distance", .sig = "list_cosine_distance(list, list)" },
     .{ .name = "list_distance", .sig = "list_distance(list, list)" },

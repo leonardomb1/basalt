@@ -1000,3 +1000,30 @@ test "sql: a CSV column read only through CAST is read as text; any bare use, a 
         }
     }
 }
+
+test "UNNEST takes a call through a hidden column, and the WHERE conjuncts that name none of its columns move below it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const p = try parseTest(a,
+        \\LOAD INTO 'out.csv' AS
+        \\SELECT d.id, c.text FROM 'in.csv' d CROSS JOIN UNNEST(chunks(d.body, 20, 5)) AS c
+        \\WHERE d.id < 5 AND c.no > 1 AND d.kind = 'x';
+    );
+    const st = p.stmts[1].output.stages;
+    const kinds = [_]std.meta.Tag(ast.Stage.Node){ .read, .filter, .select, .explode, .filter, .select, .write };
+    try testing.expectEqual(kinds.len, st.len);
+    for (kinds, st) |k, s| try testing.expectEqual(k, std.meta.activeTag(s.node));
+    try testing.expectEqualStrings("c", st[3].node.explode.as_name.?);
+    try testing.expectEqualStrings("chunks", st[2].node.select[1].computed.expr.call.name);
+    try testing.expect(st[1].node.filter.* == .binary and st[1].node.filter.binary.op == .@"and");
+    try testing.expect(st[4].node.filter.* == .binary and st[4].node.filter.binary.op == .gt);
+
+    const kept = try parseTest(a,
+        \\LOAD INTO 'out.csv' AS
+        \\SELECT * FROM 'in.csv' CROSS JOIN UNNEST(tags) AS tag WHERE tag = 'a' OR id = 1;
+    );
+    const ks = kept.stmts[1].output.stages;
+    try testing.expectEqual(std.meta.Tag(ast.Stage.Node).explode, std.meta.activeTag(ks[1].node));
+    try testing.expectEqual(std.meta.Tag(ast.Stage.Node).filter, std.meta.activeTag(ks[2].node));
+}

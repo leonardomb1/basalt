@@ -186,6 +186,61 @@ pub fn unnestCol(self: *Parser) Error!ast.QualName {
     return .{ .parts = try self.arena.dupe([]const u8, &.{ first, try self.expectIdent() }) };
 }
 
+/// The WHERE filters from `from` on, each conjunct that names no column an UNNEST
+/// makes moved below the UNNESTs in front of it, which give the same rows either
+/// way: below them a computed list (`UNNEST(chunks(body, ...))`) is built only for
+/// the rows the filter keeps, not for every row and then mostly dropped.
+fn sinkPastUnnests(self: *Parser, stages: *std.array_list.Managed(ast.Stage), from: usize) Error!void {
+    var i = from;
+    while (i < stages.items.len) : (i += 1) {
+        if (stages.items[i].node != .filter) continue;
+        var made = std.array_list.Managed([]const u8).init(self.arena);
+        var b = i;
+        var unnests = false;
+        while (b > 0) : (b -= 1) {
+            const st = stages.items[b - 1].node;
+            switch (st) {
+                .explode => |ex| {
+                    try made.append(ex.field);
+                    if (ex.as_name) |n| try made.append(n);
+                    unnests = true;
+                },
+                .select => |items| {
+                    if (items.len != 2 or items[0] != .star or items[1] != .computed or !std.mem.startsWith(u8, items[1].computed.name, "\x00unnest")) break;
+                    try made.append(items[1].computed.name);
+                },
+                else => break,
+            }
+        }
+        if (!unnests) continue;
+        var conj = std.array_list.Managed(*ast.Expr).init(self.arena);
+        try splitAnd(stages.items[i].node.filter, &conj);
+        var down = std.array_list.Managed(*ast.Expr).init(self.arena);
+        var stay = std.array_list.Managed(*ast.Expr).init(self.arena);
+        for (conj.items) |c| try (if (namesAny(c, made.items)) &stay else &down).append(c);
+        const moved = (try self.andAll(down.items)) orelse continue;
+        const pos = stages.items[i].pos;
+        const rest = try self.andAll(stay.items);
+        if (rest) |r| {
+            stages.items[i].node = .{ .filter = r };
+        } else _ = stages.orderedRemove(i);
+        try stages.insert(b, .{ .node = .{ .filter = moved }, .hints = &.{}, .pos = pos });
+        if (rest != null) i += 1;
+    }
+}
+
+/// Whether `e` reads a column of `names`, bare or as a struct's head (`c.text`).
+fn namesAny(e: *const ast.Expr, names: []const []const u8) bool {
+    const S = struct {
+        fn hit(ns: []const []const u8, n: *const ast.Expr) ?bool {
+            if (n.* != .field) return null;
+            for (ns) |name| if (std.ascii.eqlIgnoreCase(n.field.parts[0], name)) return true;
+            return false;
+        }
+    };
+    return ast.anyExpr(e, names, S.hit);
+}
+
 /// `e` as `__change_need(e, what, target)`: a NULL `sequence_by` or `position`
 /// fails the run, a NULL `delete_when` is false.
 pub fn changeNeed(self: *Parser, e: *ast.Expr, what: []const u8, target: []const u8) Error!*ast.Expr {
@@ -1067,6 +1122,15 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 if (dt.text.len == 0) return self.fail(dpos, "SPLIT needs a non-empty delimiter", .{});
                 delim = dt.text;
                 _ = try self.expect(.rparen);
+            } else if (self.at(.ident) and self.peekTag() == .lparen) {
+                const e = try self.stripExpr(try self.parseExpr(), &aliases);
+                const hidden = try std.fmt.allocPrint(self.arena, "\x00unnest{d}", .{stages.items.len});
+                const items = try self.arena.dupe(ast.SelectItem, &.{ .star, .{ .computed = .{ .name = hidden, .expr = e } } });
+                try stages.append(.{ .node = .{ .select = items }, .hints = &.{}, .pos = jpos });
+                _ = try self.expect(.rparen);
+                const as_name = if (self.eatKw("as")) try self.expectIdent() else "unnest";
+                try stages.append(.{ .node = .{ .explode = .{ .field = hidden, .as_name = as_name } }, .hints = &.{}, .pos = jpos });
+                continue;
             } else {
                 col = try self.unnestCol();
             }
@@ -1321,7 +1385,9 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             else
                 raw;
         }
+        const where_at = stages.items.len;
         try Correlate.lowerWhere(self, &stages, &aliases, remaining, fpos, sj_base, scope.scalars.items, &corr_hidden);
+        try sinkPastUnnests(self, &stages, where_at);
     }
     const where_end = stages.items.len + @intFromBool(key_cols.items.len > 0);
     if (key_cols.items.len > 0) {

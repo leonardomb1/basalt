@@ -15,6 +15,7 @@ const runScriptOpts = @import("harness.zig").runScriptOpts;
 const checkAndRun = @import("harness.zig").checkAndRun;
 const expectFile = @import("harness.zig").expectFile;
 const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
+const expectRunRefuses = @import("harness.zig").expectRunRefuses;
 
 test "union all by name: a branch may be any query, not just a table" {
     const alloc = std.testing.allocator;
@@ -2200,4 +2201,37 @@ test "a LEFT JOIN's ON with thousands of conjuncts stays shallow once split into
         try checkAndRun(alloc, &tmp, q.items, 1, &.{});
         try expectFile(&tmp, "o.csv", "x,z\n1,9999999\n2,\n");
     }
+}
+
+test "chunks cuts a text at whitespace past half its size, overlapping into the next word, and UNNEST takes the call; its rule is pinned here, since an embedding is of exactly these pieces" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try runToString(alloc, &tmp,
+        \\id,body
+        \\1,"The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs."
+        \\2,
+        \\3,""
+        \\4,"supercalifragilisticexpialidocious"
+        \\5,"ação é útil na região sul"
+        \\
+    , "SELECT d.id, c.no, c.start, c.text, substr(d.body, c.start, length(c.text)) = c.text AS ok FROM '$IN' d CROSS JOIN UNNEST(chunks(d.body, 20, 5)) AS c ORDER BY d.id, c.no");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings(
+        "id,no,start,text,ok\n" ++
+            "1,1,1,The quick brown fox ,true\n" ++
+            "1,2,17,fox jumps over the ,true\n" ++
+            "1,3,32,the lazy dog. Pack ,true\n" ++
+            "1,4,46,Pack my box with ,true\n" ++
+            "1,5,58,with five dozen ,true\n" ++
+            "1,6,74,liquor jugs.,true\n" ++
+            "4,1,1,supercalifragilistic,true\n" ++
+            "4,2,16,isticexpialidocious,true\n" ++
+            "5,1,1,ação é útil na ,true\n" ++
+            "5,2,13,na região sul,true\n",
+        out,
+    );
+    try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "body\nsome text\n" });
+    try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT chunks(body, 0) AS c FROM '$B/t.csv';", 1, "chunks: size must be positive, got 0");
+    try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT chunks(body, 10, 10) AS c FROM '$B/t.csv';", 1, "chunks: overlap must be from 0 to below size (10), got 10");
 }
