@@ -136,6 +136,21 @@ columns it has not seen.
     does not hold, and an empty list is false for `list_any`, true for
     `list_all`. The body runs once over all of a batch's elements, not row by
     row; `list_reduce` alone folds them one at a time.
+  - `list_cosine_similarity(a, b)`, `list_cosine_distance(a, b)`,
+    `list_distance(a, b)` (Euclidean), `list_inner_product(a, b)` and
+    `list_negative_inner_product(a, b)` compare two lists of numbers, such as
+    embeddings, as DuckDB's functions of those names do: elements of any numeric
+    type (a Parquet `list<float>`, an Arrow fixed-size list) are taken as
+    doubles, and the result is a `DOUBLE`. A NULL list gives NULL; a NULL element,
+    or lists of different lengths, fail the run, naming the function (a `CASE`
+    can keep such rows out). Two empty lists are 0 apart; a cosine with an empty
+    or all-zero side is NULL, not NaN, which sorts above every number. A query
+    vector is a cast from its JSON text, often a parameter (`PARAM q STRING;`,
+    `-p 'q=[0.12, ...]'`); the nearest ten are
+    `SELECT id, list_cosine_similarity(embedding, CAST($q AS LIST(DOUBLE))) AS s
+    FROM 'docs.parquet' ORDER BY s DESC NULLS LAST LIMIT 10`, a parallel top-N
+    over the file's row groups. `NULLS LAST` matters: a descending order puts
+    NULLs first.
   - `s.*` is a struct's fields as columns of their own.
   - `CROSS JOIN UNNEST(l) AS e` gives a row per element of a list (a map's
     entries as `e.key`, `e.value`), the row's other columns repeated; a NULL or

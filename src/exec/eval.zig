@@ -973,6 +973,7 @@ test {
     _ = @import("eval/fn_row.zig");
     _ = @import("eval/fn_typing.zig");
     _ = @import("eval/fn_vec.zig");
+    _ = @import("eval/fn_vector.zig");
     _ = @import("eval/format.zig");
     _ = @import("eval/functions.zig");
     _ = @import("eval/row.zig");

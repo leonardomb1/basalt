@@ -600,3 +600,36 @@ test "the list lambdas filter, transform, test and fold a LIST in place, its ele
     defer alloc.free(q);
     try std.testing.expectEqualStrings("id\n1\n2\n3\n4\n", q);
 }
+
+test "vector functions read embeddings pyarrow wrote, a list and a fixed-size list of floats, against a constant and a column; a NULL element or unequal lengths fail unless a CASE keeps them out" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "e.parquet", .data = fixtures.embeddings_pyarrow_parquet });
+    try tmp.dir.writeFile(.{ .sub_path = "e.arrow", .data = fixtures.embeddings_fixed_pyarrow_arrow });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const want =
+        "id,cs,l2,sq,g\n" ++
+        "1,0.3333333333333333,2.8284271247461903,9,\n" ++
+        "2,0.2182178902359924,2.29128784747792,5.25,\n" ++
+        "3,,1,0,\n" ++
+        "4,,,,\n" ++
+        "5,0.6,4.47213595499958,25,\n";
+    for ([_][]const u8{ "e.parquet", "e.arrow" }) |file| {
+        const script = try std.fmt.allocPrint(alloc,
+            \\LOAD INTO '{s}/out.csv' AS SELECT id,
+            \\  list_cosine_similarity(embedding, CAST('[1,0,0,0]' AS LIST(DOUBLE))) AS cs,
+            \\  list_distance(embedding, CAST('[1,0,0,0]' AS LIST(DOUBLE))) AS l2,
+            \\  list_inner_product(embedding, embedding) AS sq,
+            \\  CASE WHEN cardinality(embedding) = 2 THEN list_distance(embedding, CAST('[1,0]' AS LIST(DOUBLE))) END AS g
+            \\FROM '{s}/{s}' ORDER BY id;
+        , .{ base, base, file });
+        defer alloc.free(script);
+        const out = try runScript(alloc, &tmp, script, &[_]ParamArg{});
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings(want, out);
+    }
+    try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT list_distance(embedding, CAST('[1,0]' AS LIST(DOUBLE))) AS d FROM '$B/e.parquet';", 1, "list_distance: the lists' lengths differ, 4 and 2");
+    try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT list_inner_product(embedding, CAST('[1,null,0,0]' AS LIST(DOUBLE))) AS d FROM '$B/e.parquet';", 1, "list_inner_product: a list holds a NULL element");
+}

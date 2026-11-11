@@ -35,6 +35,7 @@ const cases = [_]Case{
     .{ .q = "SELECT DISTINCT g FROM '$B/in.csv'", .want = "csv parallel distinct" },
     .{ .q = "SELECT id, v FROM '$B/in.csv' ORDER BY v DESC, id LIMIT 5", .want = "csv parallel top-n" },
     .{ .q = "SELECT id FROM '$B/in.csv' ORDER BY v DESC, id LIMIT 5", .want = "serial" },
+    .{ .q = "SELECT id, list_cosine_similarity(CAST(concat('[', v, ',1]') AS LIST(DOUBLE)), CAST('[1,2]' AS LIST(DOUBLE))) AS s FROM '$B/p.parquet' ORDER BY s DESC NULLS LAST, id LIMIT 5", .want = "parquet parallel top-n" },
     .{ .q = "SELECT id FROM '$B/in.csv' ORDER BY v, id", .want = "csv parallel sort" },
     .{ .q = "SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM '$B/in.csv'", .want = "csv parallel window" },
     .{ .q = "SELECT * FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY g ORDER BY id) AS rn FROM '$B/in.csv') r WHERE rn <= 2", .want = "serial" },
