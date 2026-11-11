@@ -99,12 +99,13 @@ fn readPages(
     var cast = try castOf(elem);
     cast.ty = cast.ty.asNullable();
     const entries = rows orelse std.math.cast(usize, meta.num_values) orelse return Error.CorruptParquetPage;
+    const reserve = reserveOf(meta, entries);
     var levels: ?Levels = if (rows == null) .{
-        .reps = std.array_list.Managed(u32).init(arena),
-        .defs = std.array_list.Managed(u32).init(arena),
+        .reps = try std.array_list.Managed(u32).initCapacity(arena, reserve),
+        .defs = try std.array_list.Managed(u32).initCapacity(arena, reserve),
     } else null;
 
-    var b = try column.Builder.initCapacity(arena, cast.ty, @min(entries, capacity_hint));
+    var b = try column.Builder.initCapacity(arena, cast.ty, reserve);
     b.codes_only = codes_only and rows != null and (cast.ty.kind == .string or cast.ty.kind == .bytes);
     var dict: ?Dict = null;
     const at = std.math.cast(u64, meta.startOffset()) orelse return Error.CorruptParquetPage;
@@ -130,6 +131,21 @@ fn readPages(
     const vals = try b.finish();
     readUnsigned(elem, vals);
     return .{ .vals = vals, .levels = levels };
+}
+
+/// Compressed bytes per entry a chunk is pre-sized for at most: 64 entries a byte
+/// is past any chunk of numbers or text, so only a count the footer lies about, or
+/// a near-constant column RLE folds, reserves less than its count and grows.
+const entries_per_byte = 64;
+
+/// The entries a chunk's buffers are reserved for before any is decoded: its
+/// count, as far as its own compressed bytes bear it out, and never under
+/// `capacity_hint`. Doubling up from the hint copied a nested chunk's values and
+/// levels three times over, and a lane's fresh pages were zeroed for every copy:
+/// a 4.8M-entry `list<float>` chunk read 1.8x slower, and slower at -j 8 than -j 1.
+fn reserveOf(meta: parquet.ColumnMetaData, entries: usize) usize {
+    const bytes = std.math.cast(usize, meta.total_compressed_size) orelse 0;
+    return @min(entries, @max(capacity_hint, bytes *| entries_per_byte));
 }
 
 fn readPageOf(arena: std.mem.Allocator, file_bytes: []const u8, offset: usize, meta: parquet.ColumnMetaData, elem: parquet.SchemaElement) !parquet.Page {
@@ -800,4 +816,16 @@ test "a data page claiming more values than its chunk has left fails before its 
     const body = [_]u8{ 6, 0, 0, 0, 0x80, 0x80, 0x80, 0x80, 0x08, 1, 1, 0, 0, 0 };
     const pg: parquet.Page = .{ .header = .{ .ty = .data_page, .num_values = 1 << 30, .encoding = .plain }, .data = &body, .next_offset = 0 };
     try testing.expectError(Error.CorruptParquetPage, appendDataPage(a, &b, pg, .{ .ty = .int32 }, .{ .ty = .int32 }, cast, 1, null, 0, null, 4));
+}
+
+test "a chunk reserves its count up to 64 entries a compressed byte, never under the hint" {
+    var meta: parquet.ColumnMetaData = .{};
+    meta.total_compressed_size = 20 << 20;
+    try testing.expectEqual(@as(usize, 4_800_000), reserveOf(meta, 4_800_000));
+    try testing.expectEqual(@as(usize, (20 << 20) * entries_per_byte), reserveOf(meta, 1 << 40));
+    meta.total_compressed_size = 100;
+    try testing.expectEqual(@as(usize, capacity_hint), reserveOf(meta, 1 << 40));
+    try testing.expectEqual(@as(usize, 10), reserveOf(meta, 10));
+    meta.total_compressed_size = -5;
+    try testing.expectEqual(@as(usize, capacity_hint), reserveOf(meta, 1 << 40));
 }

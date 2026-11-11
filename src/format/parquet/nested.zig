@@ -300,6 +300,7 @@ const Assembler = struct {
     /// of `rep` (an empty list).
     fn list(self: *Assembler, rep: *const NNode, element: ?*const NNode, inst: Inst, valid: ?column.Bitmap, ty: types.Type) anyerror!column.Column {
         const bm = valid orelse try column.Bitmap.initFull(self.arena, inst.n);
+        if (try self.leafList(rep, element, inst, bm, ty)) |c| return c;
         const offsets = try self.arena.alloc(i32, inst.n + 1);
         offsets[0] = 0;
         const parts = try self.arena.alloc(std.ArrayListUnmanaged(Span), self.entries.len);
@@ -326,6 +327,49 @@ const Assembler = struct {
         const child_inst = Inst{ .n = total, .spans = spans };
         const child = if (ty.kind == .map) try self.entriesOf(rep, child_inst, ty) else if (element) |el| try self.field(el, child_inst) else try self.value(&asValue(rep), child_inst);
         return self.nested(ty, inst.n, bm, .{ .list = .{ .offsets = offsets, .child = child } });
+    }
+
+    /// A list whose element is one leaf (`list<float>`, an embedding): every entry
+    /// of an instance that holds elements is one element, so the offsets are the
+    /// spans' lengths, with no span per element. When the instances' entries are
+    /// all elements, end to end (no NULL or empty list among them), the leaf's
+    /// values as decoded are the child; else the elements are gathered by index.
+    /// Null for any other list, which `list` splits entry by entry.
+    fn leafList(self: *Assembler, rep: *const NNode, element: ?*const NNode, inst: Inst, bm: column.Bitmap, ty: types.Type) anyerror!?column.Column {
+        if (ty.kind == .map or rep.nleaves != 1) return null;
+        const bare = asValue(rep);
+        const leaf = element orelse &bare;
+        if (leaf.kind != .leaf or leaf.repeated) return null;
+        const spans = try spansOf(rep, inst);
+        const e = self.entries[rep.first_leaf];
+        const offsets = try self.arena.alloc(i32, inst.n + 1);
+        offsets[0] = 0;
+        var total: usize = 0;
+        var cursor: usize = 0;
+        var whole = true;
+        for (spans, 0..) |sp, i| {
+            if (sp.lo >= sp.hi or sp.hi > e.reps.len) return Error.CorruptParquetPage;
+            if (bm.get(i) and e.defs[sp.lo] >= rep.def) {
+                for (e.reps[sp.lo + 1 .. sp.hi]) |r| if (r != rep.rep) return Error.CorruptParquetPage;
+                if (sp.lo != cursor) whole = false;
+                cursor = sp.hi;
+                total += sp.hi - sp.lo;
+            } else whole = false;
+            offsets[i + 1] = @intCast(try column.checkSpan(total));
+        }
+        var child = if (whole and cursor == e.vals.len) e.vals else blk: {
+            const idx = try self.arena.alloc(usize, total);
+            var k: usize = 0;
+            for (spans, 0..) |sp, i| if (bm.get(i) and e.defs[sp.lo] >= rep.def) {
+                for (sp.lo..sp.hi) |x| {
+                    idx[k] = x;
+                    k += 1;
+                }
+            };
+            break :blk try column.permute(self.arena, e.vals, idx);
+        };
+        child.ty = try valueType(self.arena, self.schema, leaf);
+        return try self.nested(ty, inst.n, bm, .{ .list = .{ .offsets = offsets, .child = child } });
     }
 
     /// A map's entries as the struct of its key and value.
