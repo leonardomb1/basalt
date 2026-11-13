@@ -12,9 +12,10 @@
 //!
 //! The body is fields separated by 0x01 and rows by 0x02, control bytes Stream
 //! Load does no quoting for; `\n` would let an embedded newline split a row.
-//! Stray 0x01/0x02 bytes in source text become spaces. NULL is `\N`, which has no
-//! escape in StarRocks CSV, so a value that is exactly `\N` is refused rather than
-//! silently loaded as NULL; loads run at max_filter_ratio=0, never partial.
+//! A text value holding a 0x01/0x02 byte is refused rather than altered. NULL is
+//! `\N`, which has no escape in StarRocks CSV, so a value that is exactly `\N` is
+//! refused rather than silently loaded as NULL; loads run at max_filter_ratio=0,
+//! never partial.
 //!
 //! The body streams with chunked transfer encoding: each batch is one chunk of a
 //! transaction that stays open until it reaches `load_size` (or half its timeout),
@@ -39,6 +40,7 @@
 const std = @import("std");
 const HttpClient = @import("../net/http_std.zig");
 const msgfmt = @import("../format/msgfmt.zig");
+const explain = @import("../exec/eval/support.zig").explain;
 const types = @import("../lang/types.zig");
 const ast = @import("../lang/ast.zig");
 const Batch = @import("../exec/batch.zig").Batch;
@@ -293,7 +295,7 @@ fn appendCell(out: *std.array_list.Managed(u8), c: *const Column, r: usize) !voi
 }
 
 /// The `celltext.write` policy for a stream-load body: `\N` is null, so a string may
-/// not be exactly that, and 0x01/0x02, the separators, become spaces in one.
+/// not be exactly that, nor hold 0x01/0x02, the separators.
 const TsvText = struct {
     pub const null_text = NULL_MARKER;
     pub const bool_true = "true";
@@ -301,22 +303,29 @@ const TsvText = struct {
 
     pub fn string(_: TsvText, w: *std.Io.Writer, s: []const u8) !void {
         if (std.mem.eql(u8, s, NULL_MARKER)) return error.StreamLoadNullMarkerInData;
-        sanitize(try w.writableSlice(s.len), s);
+        if (!copyFramed(try w.writableSlice(s.len), s))
+            return explain(error.StreamLoadSeparatorInData, "a value holds the byte 0x01 or 0x02, which a Stream Load body uses to separate fields and rows; strip it from text first, e.g. replace(col, chr(1), ''), or load a binary column as to_hex(col)");
     }
 };
 
-/// Copies `s` into `dst` with 0x01 and 0x02 replaced by spaces, sixteen bytes at a time.
-fn sanitize(dst: []u8, s: []const u8) void {
+/// Copies `s` into `dst` sixteen bytes at a time; false when it holds 0x01 or 0x02,
+/// the body's own separators, which a value cannot carry.
+fn copyFramed(dst: []u8, s: []const u8) bool {
     const V = @Vector(16, u8);
     const one: V = @splat(1);
     const two: V = @splat(2);
-    const space: V = @splat(' ');
+    var hit = false;
     var i: usize = 0;
     while (i + 16 <= s.len) : (i += 16) {
         const v: V = s[i..][0..16].*;
-        dst[i..][0..16].* = @select(u8, v -% one < two, space, v);
+        dst[i..][0..16].* = v;
+        hit = hit or @reduce(.Or, v -% one < two);
     }
-    for (s[i..], dst[i..]) |b, *d| d.* = if (b -% 1 < 2) ' ' else b;
+    for (s[i..], dst[i..]) |b, *d| {
+        d.* = b;
+        hit = hit or b -% 1 < 2;
+    }
+    return !hit;
 }
 
 pub const StreamLoadSink = struct {
@@ -1172,7 +1181,7 @@ test "label and column list" {
     try std.testing.expectEqualStrings("`id`,`amount`", try columnList(a, schema));
 }
 
-test "stream-load TSV body: control-byte framing, nulls, sanitized values" {
+test "stream-load TSV body: control-byte framing and nulls; a value holding a separator byte is refused, not altered" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1185,7 +1194,7 @@ test "stream-load TSV body: control-byte framing, nulls, sanitized values" {
     try b0.append(.null);
     try b0.append(.{ .int = 2 });
     var b1 = columnmod.Builder.init(a, str_ty);
-    try b1.append(.{ .string = "memo\x01with\x02bytes" });
+    try b1.append(.{ .string = "memo" });
     try b1.append(.{ .string = "line\nbreak" });
     try b1.append(.{ .string = "clean value" });
     const cols = try a.alloc(columnmod.Column, 2);
@@ -1199,7 +1208,17 @@ test "stream-load TSV body: control-byte framing, nulls, sanitized values" {
 
     var out = std.array_list.Managed(u8).init(a);
     try appendBatchTsv(&out, batch);
-    try std.testing.expectEqualStrings("1\x01memo with bytes\x02\\N\x01line\nbreak\x022\x01clean value\x02", out.items);
+    try std.testing.expectEqualStrings("1\x01memo\x02\\N\x01line\nbreak\x022\x01clean value\x02", out.items);
+
+    for ([_][]const u8{ "memo\x01with", "a value of more than sixteen bytes\x02in it" }) |bad| {
+        var bb = columnmod.Builder.init(a, str_ty);
+        try bb.append(.{ .string = bad });
+        const bcols = try a.alloc(columnmod.Column, 1);
+        bcols[0] = try bb.finish();
+        var bschema = types.Schema{ .fields = &.{.{ .name = "memo", .ty = str_ty }} };
+        out.clearRetainingCapacity();
+        try std.testing.expectError(error.StreamLoadSeparatorInData, appendBatchTsv(&out, .{ .schema = &bschema, .columns = bcols, .len = 1 }));
+    }
 }
 
 test "stream-load TSV body of a few rows sliced from a long string column reserves for those rows alone" {
@@ -1250,7 +1269,7 @@ test "a value that is literally the null marker is refused, not written as null"
     try std.testing.expectEqualStrings("a\\Nb\x02", out.items);
 }
 
-test "stream-load body of every kind" {
+test "stream-load body of every kind; the golden text and bytes, which hold the separators, are refused" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1258,7 +1277,11 @@ test "stream-load body of every kind" {
     const got = try a.alloc([]const u8, batches.len);
     for (batches, got) |batch, *g| {
         var out = std.array_list.Managed(u8).init(a);
-        try appendBatchTsv(&out, batch);
+        appendBatchTsv(&out, batch) catch |e| {
+            try std.testing.expectEqual(error.StreamLoadSeparatorInData, e);
+            g.* = "refused";
+            continue;
+        };
         g.* = out.items;
     }
     const tiny = celltext.golden_tiny;
@@ -1267,8 +1290,8 @@ test "stream-load body of every kind" {
         "0\x02-1\x02-9223372036854775808\x029223372036854775807\x02\\N\x02",
         "0.1\x020\x02-0\x02" ++ tiny ++ "\x021000000000000000000000\x02-2.25\x02nan\x02inf\x02-inf\x02\\N\x02",
         "123.45\x02-0.0007\x025\x020.12345\x02-18446744073709.551615\x020.00\x02\\N\x02",
-        "\x02plain\x02tab\there\x02line\nbreak\x02cr\rlf\r\n\x02say \"hi\"\x02O'Brien\x02back\\slash\\\x02a\\Nb\x02\\N \x02NULL\x02a b c\x02a,b;c:d.e-1 0\x02\xc3\xb3 \xf0\x9f\x98\x80\x02\x00nul\x02sixteen bytes and more \x02\\N\x02",
-        "\x02plain\x02   \\ \t\n\"\x02\xc3\xb3\x02\\N\x02",
+        "refused",
+        "refused",
         "1970-01-01\x022024-01-01\x020000-01-01\x02-5877641-06-24\x02\\N\x02",
         "00:00:00\x0201:02:03.000001\x0223:59:59.999999\x02\\N\x02",
         "1970-01-01 00:00:00\x022024-01-01 00:00:00.123456\x021969-12-31 23:59:59.999999\x020001-01-01 00:00:00\x02\\N\x02",
