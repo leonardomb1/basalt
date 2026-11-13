@@ -672,7 +672,7 @@ pub fn loopColumnsProblem(arena: std.mem.Allocator, ncols: usize, nvars: usize) 
     return try msgfmt.allocPrint(arena, "for-each: the discovery query returns fewer columns than loop variables ({d} for {d})", .{ ncols, nvars });
 }
 
-/// The name `ANCHOR SCHEMA` matches a union branch by: a table's last name part,
+/// The name `schema_from` matches a union branch by: a table's last name part,
 /// `query` for a subquery, nothing for a file.
 pub fn unionBranchName(b: ast.UnionBranch) []const u8 {
     if (b.pipeline != null) return "query";
@@ -682,10 +682,10 @@ pub fn unionBranchName(b: ast.UnionBranch) []const u8 {
     };
 }
 
-/// `ANCHOR SCHEMA name` must name one of the union's tables (`first` names the first).
+/// `schema_from` must name one of the union's tables (`first` names the first).
 pub fn unionCanonProblem(arena: std.mem.Allocator, canon: []const u8, names: []const []const u8) Error!?[]const u8 {
     if (std.mem.eql(u8, canon, "first") or ast.nameIn(names, canon)) return null;
-    return try msgfmt.allocPrint(arena, "union canon `{s}` is not one of the source tables", .{canon});
+    return try msgfmt.allocPrint(arena, "`schema_from = '{s}'` names none of the union's source tables", .{canon});
 }
 
 pub fn notJsonParamMsg(arena: std.mem.Allocator, name: []const u8) Error![]const u8 {
@@ -1669,7 +1669,7 @@ const Ctx = struct {
                         if (std.mem.indexOf(u8, n, "${") != null) break true;
                     } else false;
                     const at = for (lead.hints) |h| {
-                        if (std.mem.eql(u8, h.key, "schema_from") or std.mem.eql(u8, h.key, "canon")) break h.pos;
+                        if (std.mem.eql(u8, h.key, "schema_from")) break h.pos;
                     } else lead.pos;
                     if (!rendered) if (try unionCanonProblem(self.arena, c, names)) |why| return failPos(self.diag, at, "{s}", .{why});
                 };
@@ -1878,7 +1878,7 @@ const Ctx = struct {
         return .{ .stages = head, .via = via };
     }
 
-    /// The WHERE the leading SQL read would be sent (raw `PUSHDOWN` AND the contiguous
+    /// The WHERE the leading SQL read would be sent (its own WHERE AND the contiguous
     /// filters), params in; text comparisons are left to the run, which knows collation.
     fn previewPushdown(self: *Ctx, stages: []const ast.Stage) !?struct { where: []const u8, dialect: Dialect, bound: []const ast.Stage } {
         if (stages[0].node != .read) return null;
@@ -1886,10 +1886,7 @@ const Ctx = struct {
         if (rd.form != .table and rd.form != .query) return null;
         const conn = self.connections.get(rd.connector) orelse return null;
         const d = dialectOf(conn.connector) orelse return null;
-        var raw: []const u8 = rd.where;
-        for (stages[0].hints) |h| {
-            if (std.mem.eql(u8, h.key, "where") and h.value == .str) raw = h.value.str;
-        }
+        const raw: []const u8 = rd.where;
         const bound = try substFilterParams(self.arena, stages, self.params);
         var wants = false;
         const implicit = pushdown.serialWhereWith(self.arena, d, bound, null, &wants) catch null;
@@ -2008,12 +2005,10 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
         if (w.mode != .upsert or w.mode.upsert.keys.len == 0) return fail(diag, "`USING changes` applies changes by key: write it with `UPSERT ON (<key>)`", .{});
         return;
     }
-    if (stream and std.mem.eql(u8, form, "stream_load")) return;
-    if (stream) return fail(diag, "unknown load path `USING {s}`; a {s} target loads by `stream_load`", .{ form, connector });
-    return fail(diag, "`USING {s}` does not apply here: only a starrocks or doris target takes `USING stream_load`", .{form});
+    return fail(diag, "unknown load path `USING {s}`; `USING` takes `changes (...)`", .{form});
 }
 
-const any_read_keys = [_][]const u8{ "where", "canon", "buffer" };
+const any_read_keys = [_][]const u8{"buffer"};
 
 pub const rest_read_keys = [_][]const u8{
     "items",          "method",        "body",         "body_type",   "header",    "bearer",

@@ -15,11 +15,9 @@ AS
   `.arrows` for the stream format, local paths only), or an object-store
   path `LOAD INTO 'az://account/container/bronze/x.parquet'` or
   `LOAD INTO 's3://bucket/bronze/x.parquet'`.
-- A StarRocks or Doris table loads by Stream Load. `USING stream_load`, which
-  named that, is deprecated: it still loads the same, with a warning where it is
-  written, and will be removed. `USING` names how a load's rows apply, as
-  `USING changes (...)` below; how they travel is the target's, and would be a
-  `WITH` option if a target had a choice.
+- A StarRocks or Doris table loads by Stream Load. `USING` names how a load's
+  rows apply, as `USING changes (...)` below; how they travel is the target's,
+  and would be a `WITH` option if a target had a choice.
 - `UPSERT ON (k) USING changes (sequence_by = s, position = p[, delete_when =
   <condition>])` applies a change feed to any table that takes an UPSERT:
   the latest change per key, a delete kept as `_deleted`, each run reading on

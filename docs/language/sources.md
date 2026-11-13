@@ -235,7 +235,7 @@ AS SELECT * FROM shop.public.orders WITH (changes_from = $since, slot = 'basalt_
 ## Source clauses
 
 These follow the source, in any order. The rules for what a SQL source is asked
-to do, and the deprecated `PUSHDOWN`, are on [Pushdown](pushdown.md).
+to do are on [Pushdown](pushdown.md).
 
 - **`PAGINATE BY page|offset|cursor (param = 'page', size = 100,
   total = 'count', field = 'next', start = 2, max = 50)`** — REST pagination.

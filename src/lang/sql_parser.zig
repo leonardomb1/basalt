@@ -8,9 +8,8 @@
 //!   LOAD INTO tgt USING f ... AS q  -> output Pipeline ending in a write stage
 //!   terminal SELECT                 -> output Pipeline ending in `write stdout`
 //!   WITH name AS (...)              -> Let binding (+ ref stage when sourced)
-//!   FROM conn.tbl PUSHDOWN($$..$$)  -> read stage with a `where` hint
 //!   WHERE / GROUP BY / ORDER BY ... -> filter / aggregate / sort / limit stages
-//!   UNION [ALL] [BY NAME] + ANCHOR  -> union_ stage (+ distinct; tag col = literal-as-alias)
+//!   UNION [ALL] [BY NAME]           -> union_ stage (+ distinct; tag col = literal-as-alias)
 //!   FOR EACH ROW OF (...) AS (...)  -> ForEach (PARALLEL / ON ERROR -> hints)
 //!   CASE ... THEN <stmts> END CASE  -> StmtMatch (plan-time dispatch)
 //!
@@ -844,9 +843,7 @@ pub const Parser = struct {
     pub const parseNameSegment = @import("parse/stmt.zig").parseNameSegment;
     pub const parseColRef = @import("parse/stmt.zig").parseColRef;
     pub const parseTargetSegment = @import("parse/stmt.zig").parseTargetSegment;
-    pub const parseUnionClauses = @import("parse/stmt.zig").parseUnionClauses;
     pub const exprToTemplate = @import("parse/stmt.zig").exprToTemplate;
-    pub const notePushdown = @import("parse/stmt.zig").notePushdown;
     pub const templatePart = @import("parse/stmt.zig").templatePart;
     pub const unparse = @import("parse/stmt.zig").unparse;
     pub const parseConnection = @import("parse/decl.zig").parseConnection;

@@ -147,7 +147,7 @@ pub fn parseSubQuery(self: *Parser, pos: Pos) Error!ast.Pipeline {
 }
 
 /// `EACH TABLE OF (SELECT ... | conn.QUERY(...) | $param.path | '<json>' IN conn)
-/// [AS (name, tag)] [ANCHOR SCHEMA q]`: one branch per row, on the discovery
+/// [AS (name, tag)]`: one branch per row, on the discovery
 /// query's connection unless `IN conn` says otherwise.
 pub fn parseEachTableOf(self: *Parser, hints: *std.array_list.Managed(ast.Hint)) Error!ast.Stage.Node {
     const pos = self.curPos();
@@ -203,7 +203,6 @@ pub fn parseEachTableOf(self: *Parser, hints: *std.array_list.Managed(ast.Hint))
         }
         _ = try self.expect(.rparen);
     }
-    try self.parseUnionClauses(hints, pos);
     return .{ .union_ = u };
 }
 

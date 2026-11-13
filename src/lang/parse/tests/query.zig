@@ -612,8 +612,6 @@ test "sql: plain UNION [ALL] lines up by position; INTERSECT binds tighter than 
     try testing.expect(std.mem.indexOf(u8, diag.msg, "`BY NAME` applies to a chain of UNIONs only") != null);
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' UNION ALL BY NAME SELECT k FROM 'y.csv' UNION ALL SELECT k FROM 'z.csv';", &diag));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "all `BY NAME` or all by position") != null);
-    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT k FROM 'x.csv' UNION ALL SELECT k FROM 'y.csv' ANCHOR SCHEMA first;", &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.msg, "`ANCHOR` applies to `UNION ALL BY NAME`") != null);
 }
 
 test "sql: SPLIT BY is a clause of its own, and JOBS takes a positive count" {
@@ -631,7 +629,7 @@ test "sql: SPLIT BY is a clause of its own, and JOBS takes a positive count" {
     try testing.expectEqual(@as(usize, 38), diag.col);
 }
 
-test "sql: UNION ALL BY NAME with tag literal and anchor" {
+test "sql: UNION ALL BY NAME with tag literal and schema_from" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -639,14 +637,14 @@ test "sql: UNION ALL BY NAME with tag literal and anchor" {
     const prog = try parseTest(a,
         \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
         \\CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', database = 'b');
-        \\LOAD INTO sr.CT2_UNIFIED USING stream_load
+        \\LOAD INTO sr.CT2_UNIFIED
         \\  UPSERT ON (CT2_EMPRESA, R_E_C_N_O_)
         \\  SPLIT BY (R_E_C_N_O_)
         \\AS
         \\SELECT '01' AS CT2_EMPRESA, t.* FROM erp.dbo.CT2010 t
         \\UNION ALL BY NAME
         \\SELECT '02' AS CT2_EMPRESA, t.* FROM erp.dbo.CT2020 t
-        \\ANCHOR SCHEMA erp.dbo.CT2010;
+        \\WITH (schema_from = 'CT2010');
     );
     const pl = prog.stmts[3].output;
     try testing.expectEqual(@as(usize, 2), pl.stages.len);
@@ -656,8 +654,8 @@ test "sql: UNION ALL BY NAME with tag literal and anchor" {
     try testing.expectEqualStrings("02", u.branches[1].tag.?);
     try testing.expectEqualStrings("tag", pl.stages[0].hints[0].key);
     try testing.expectEqualStrings("CT2_EMPRESA", pl.stages[0].hints[0].value.ident);
-    try testing.expectEqualStrings("canon", pl.stages[0].hints[1].key);
-    try testing.expectEqualStrings("CT2010", pl.stages[0].hints[1].value.ident);
+    try testing.expectEqualStrings("schema_from", pl.stages[0].hints[1].key);
+    try testing.expectEqualStrings("CT2010", pl.stages[0].hints[1].value.str);
     const w = pl.stages[1].node.write;
     try testing.expectEqual(@as(usize, 2), w.mode.upsert.keys.len);
     try testing.expectEqualStrings("R_E_C_N_O_", w.split.?.col);
@@ -843,7 +841,6 @@ test "sql: a qualifier naming no table of its query is a correlated subquery's, 
         "SELECT l.k FROM 'dir/l.csv' WHERE l.k > 2 ORDER BY l.k;",
         "SELECT a.k FROM 'l.csv' a WHERE a.k IN (SELECT b.k FROM 'r.csv' b WHERE b.s <> 'x');",
         "SELECT a.k, b.s FROM 'l.csv' a JOIN 'r.csv' b ON a.k = b.k ORDER BY b.s;",
-        "SELECT a.k FROM 'l.csv' a PUSHDOWN(x.k > 1);",
         "SELECT * FROM 'l.csv' a WHERE k IN (SELECT k FROM 'r.csv' b WHERE b.s = a.s);",
         "SELECT * FROM 'l.csv' a WHERE v > (SELECT max(k) FROM 'r.csv' b WHERE b.s = a.s);",
         "SELECT (SELECT max(k) FROM 'r.csv' b WHERE b.s = a.s) AS m FROM 'l.csv' a;",

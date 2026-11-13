@@ -310,39 +310,6 @@ pub fn parseTargetSegment(self: *Parser) Error![]const u8 {
     return self.expectColName();
 }
 
-/// A union's trailing clauses in either order: `PUSHDOWN(<expr>)`, a `where` hint for
-/// every branch (empty means none), and `ANCHOR SCHEMA <table>`.
-pub fn parseUnionClauses(self: *Parser, hints: *std.array_list.Managed(ast.Hint), pos: Pos) Error!void {
-    while (true) {
-        if (self.isKw("pushdown")) {
-            try self.notePushdown();
-            _ = self.advance();
-            _ = try self.expect(.lparen);
-            const outer_quals = self.qual_sink;
-            self.qual_sink = null;
-            const e = try self.parseExpr();
-            self.qual_sink = outer_quals;
-            _ = try self.expect(.rparen);
-            const frag = try self.exprToTemplate(e);
-            if (frag.len > 0)
-                try hints.append(.{ .key = "where", .value = .{ .str = frag }, .pos = pos });
-        } else if (self.isKw("anchor")) {
-            try self.notes.append(self.arena, .{ .pos = self.curPos(), .msg = "`ANCHOR SCHEMA` is deprecated and will be removed: write `WITH (schema_from = '<table>')` after the union" });
-            _ = self.advance();
-            try self.expectKw("schema");
-            const q = try self.parseQualNameTok();
-            try hints.append(.{ .key = "canon", .value = .{ .ident = q.last() }, .pos = pos });
-        } else break;
-    }
-}
-
-/// Notes the deprecated `PUSHDOWN(...)` at its keyword: a `WHERE` now descends
-/// into a read's query and into each branch of a union, so a raw predicate is
-/// no longer needed.
-pub fn notePushdown(self: *Parser) Error!void {
-    try self.notes.append(self.arena, .{ .pos = self.curPos(), .msg = "`PUSHDOWN(...)` is deprecated and will be removed: write the filter as a `WHERE`, which descends into the source's query (and into every branch of `EACH TABLE OF` or a union by name) on its own; for raw SQL the translator cannot express, read a `QUERY($$...$$)`" });
-}
-
 /// Lower a reflection expression to a `${...}` template: a `concat`/`||` chain splices
 /// literal text with holes, a string literal stays literal, anything else is one hole.
 pub fn exprToTemplate(self: *Parser, e: *const ast.Expr) Error![]const u8 {

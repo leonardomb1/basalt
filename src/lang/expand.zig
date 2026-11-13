@@ -954,7 +954,7 @@ test "json-form union: $param.path renders the branch array into discover_json" 
         \\PARAM job JSON;
         \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
         \\CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', database = 'b');
-        \\LOAD INTO sr.UNIFIED USING stream_load AS
+        \\LOAD INTO sr.UNIFIED AS
         \\SELECT * FROM EACH TABLE OF ($job.tables) IN erp AS (table_name, emp);
     , &diag);
 

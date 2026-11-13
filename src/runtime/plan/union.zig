@@ -61,7 +61,6 @@ const UnionSpec = struct { read: ast.Read, tag: ?[]const u8, name: []const u8, p
 pub fn unionSpecs(env: *Env, u: ast.Union, hints: []const ast.Hint) ![]UnionSpec {
     const arena = env.arena;
     var specs = std.array_list.Managed(UnionSpec).init(arena);
-    const where = forHintName(hints, "where") orelse "";
     if (u.discover_json.len > 0) {
         const table_key = forHintName(hints, "table_field");
         const tag_key = forHintName(hints, "tag_field");
@@ -92,7 +91,7 @@ pub fn unionSpecs(env: *Env, u: ast.Union, hints: []const ast.Hint) ![]UnionSpec
             const parts = try arena.alloc([]const u8, 1);
             parts[0] = tbl;
             try specs.append(.{
-                .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } }, .where = where },
+                .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } } },
                 .tag = tag,
                 .name = tbl,
             });
@@ -101,18 +100,17 @@ pub fn unionSpecs(env: *Env, u: ast.Union, hints: []const ast.Hint) ![]UnionSpec
         for (try discoverRowsPipeline(env, pipe, 2)) |row| {
             const parts = try arena.alloc([]const u8, 1);
             parts[0] = row[0];
-            try specs.append(.{ .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } }, .where = where }, .tag = row[1], .name = row[0] });
+            try specs.append(.{ .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } } }, .tag = row[1], .name = row[0] });
         }
     } else if (u.discover_query.len > 0) {
         const disc = ast.Read{ .connector = u.discover_conn, .form = .{ .query = u.discover_query } };
         for (try discoverRows(env, disc, 2)) |row| {
             const parts = try arena.alloc([]const u8, 1);
             parts[0] = row[0];
-            try specs.append(.{ .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } }, .where = where }, .tag = row[1], .name = row[0] });
+            try specs.append(.{ .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } } }, .tag = row[1], .name = row[0] });
         }
     } else for (u.branches) |b| {
-        var rd = b.read;
-        if (where.len > 0) rd.where = where;
+        const rd = b.read;
         try specs.append(.{
             .read = rd,
             .tag = b.tag,

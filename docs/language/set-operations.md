@@ -28,8 +28,7 @@ similar tables needs. It applies to `UNION` only, and a chain is one or the othe
 `WITH (schema_from = '<table>')`, after the last branch or after `EACH TABLE OF`,
 names the branch whose columns and types the union takes, the others fitted to
 it (`'first'`, the default, takes the first branch's, widened by the rest); a name
-no branch has is refused. It replaces `ANCHOR SCHEMA <table>`, which still works
-but is deprecated: `check` and `run` warn where it is written.
+no branch has is refused.
 
 A `BY NAME` branch may be **any query** — a file, a filter, a projection, an
 aggregate — not only `SELECT ['tag' AS c,] t.* FROM <conn>.<table>`. That shape

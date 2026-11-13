@@ -246,24 +246,6 @@ test "analyze: EXPLAIN tells which side's SQL read takes the other side's join k
     }
 }
 
-test "analyze pushdown preview: raw PUSHDOWN AND-ed with the translated filter" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const prog = try parse(a,
-        \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
-        \\LOAD INTO '/tmp/x.csv' AS
-        \\SELECT filial FROM erp.dbo.T PUSHDOWN($$D_E_L_E_T_ <> '*'$$)
-        \\WHERE valor > 0 AND status = 'ok';
-    );
-    var diag = Diag{};
-    const plan = try analyze(a, prog, &diag);
-    try std.testing.expectEqualStrings(
-        "(D_E_L_E_T_ <> '*') AND ((([valor] > 0) AND ([status] = 'ok')))",
-        plan.outputs[0].source.pushdown,
-    );
-}
-
 test "analyze pushdown preview: an untranslatable filter is not pushed (stays engine-side)" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();

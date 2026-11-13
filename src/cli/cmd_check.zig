@@ -225,26 +225,13 @@ test "checkText: an error inside an included table function's body, reached from
     try std.testing.expectEqual(@as(u32, 63), issues[0].pos.?.col);
 }
 
-test "check warns where PUSHDOWN is written, without failing" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const issues = try checkText(a, "SELECT * FROM 'x.csv' PUSHDOWN($$a > 1$$);", "t.sql", ".", .{ .declarations_only = true });
-    try std.testing.expectEqual(@as(usize, 1), issues.len);
-    try std.testing.expect(issues[0].warning);
-    try std.testing.expect(std.mem.indexOf(u8, issues[0].msg, "`PUSHDOWN(...)` is deprecated") != null);
-    try std.testing.expectEqual(@as(u32, 1), issues[0].pos.?.line);
-}
-
-test "check warns where USING stream_load is written, and takes the load without it silently" {
+test "check takes a starrocks load without USING silently, and refuses the removed USING stream_load" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const conn = "CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', fe_port = 9030, be_url = 'http://h:8040', database = 'db', user = 'u', password = 'p');\n";
     const old = try checkText(a, try std.mem.concat(a, u8, &.{ conn, "LOAD INTO sr.db.t USING stream_load AS SELECT 1 AS a;" }), "t.sql", ".", .{ .declarations_only = true });
-    try std.testing.expectEqual(@as(usize, 1), old.len);
-    try std.testing.expect(old[0].warning and std.mem.indexOf(u8, old[0].msg, "`USING stream_load` is deprecated") != null);
-    try std.testing.expectEqual(@as(u32, 2), old[0].pos.?.line);
+    try std.testing.expect(old.len == 1 and !old[0].warning);
     const new = try checkText(a, try std.mem.concat(a, u8, &.{ conn, "LOAD INTO sr.db.t AS SELECT 1 AS a;" }), "t.sql", ".", .{ .declarations_only = true });
     try std.testing.expectEqual(@as(usize, 0), new.len);
 }
@@ -280,13 +267,17 @@ test "check takes a SQL table's change feed options, a $param as the position, a
     try std.testing.expectEqual(@as(usize, 0), pg_ok.len);
 }
 
-test "check warns where ANCHOR SCHEMA is written, and takes schema_from silently" {
+test "check takes schema_from silently, and refuses the removed ANCHOR SCHEMA and PUSHDOWN" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const old = try checkText(a, "SELECT * FROM 'a.csv' UNION ALL BY NAME SELECT * FROM 'b.csv' ANCHOR SCHEMA first;", "t.sql", ".", .{ .declarations_only = true });
-    try std.testing.expectEqual(@as(usize, 1), old.len);
-    try std.testing.expect(old[0].warning and std.mem.indexOf(u8, old[0].msg, "`ANCHOR SCHEMA` is deprecated") != null);
+    for ([_][]const u8{
+        "SELECT * FROM 'a.csv' UNION ALL BY NAME SELECT * FROM 'b.csv' ANCHOR SCHEMA first;",
+        "SELECT * FROM 'x.csv' PUSHDOWN($$a > 1$$);",
+    }) |src| {
+        const old = try checkText(a, src, "t.sql", ".", .{ .declarations_only = true });
+        try std.testing.expect(old.len == 1 and !old[0].warning);
+    }
     const new = try checkText(a, "SELECT * FROM 'a.csv' UNION ALL BY NAME SELECT * FROM 'b.csv' WITH (schema_from = 'first');", "t.sql", ".", .{ .declarations_only = true });
     try std.testing.expectEqual(@as(usize, 0), new.len);
 }

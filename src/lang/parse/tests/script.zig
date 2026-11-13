@@ -1,10 +1,9 @@
 //! Parser tests for scripts: statements, EXPLAIN and DESCRIBE, FOR EACH discovery,
-//! functions, THROW and PRINT, IDENTIFIER and PUSHDOWN lowering, connections and
+//! functions, THROW and PRINT, IDENTIFIER lowering, connections and
 //! error recovery.
 
 const ast = @import("../../ast.zig");
 const Diagnostic = @import("../../sql_parser.zig").Diagnostic;
-const firstPipelineStages = @import("../testing_util.zig").firstPipelineStages;
 const hintStr = @import("../testing_util.zig").hintStr;
 const parseSource = @import("../../sql_parser.zig").parseSource;
 const parseSourceOpts = @import("../../sql_parser.zig").parseSourceOpts;
@@ -80,25 +79,6 @@ test "sql: EXPLAIN COSTS is rejected in either position" {
     try testing.expect(std.mem.indexOf(u8, diag.msg, "after EXPLAIN") != null);
 }
 
-test "sql: PUSHDOWN fragment becomes a where hint on the read" {
-    var ar = std.heap.ArenaAllocator.init(testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    const prog = try parseTest(a,
-        \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
-        \\LOAD INTO 'out.csv' AS
-        \\SELECT filial, valor FROM erp.dbo.SC5010
-        \\  PUSHDOWN($$D_E_L_E_T_ <> '*'$$)
-        \\WHERE valor > 0;
-    );
-    const pl = prog.stmts[2].output;
-    try testing.expect(pl.stages[0].node == .read);
-    try testing.expectEqualStrings("where", pl.stages[0].hints[0].key);
-    try testing.expectEqualStrings("D_E_L_E_T_ <> '*'", pl.stages[0].hints[0].value.str);
-    try testing.expect(pl.stages[1].node == .filter);
-}
-
 test "sql: FOR EACH ROW OF json path with CASE dispatch" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -112,10 +92,10 @@ test "sql: FOR EACH ROW OF json path with CASE dispatch" {
         \\  PARALLEL ON ERROR CONTINUE
         \\  CASE
         \\    WHEN pk IS EMPTY THEN
-        \\      LOAD INTO sr.'crm_${lower(name)}' USING stream_load AS
+        \\      LOAD INTO sr.'crm_${lower(name)}' AS
         \\      SELECT * FROM crm.QUERY($$SELECT * FROM ${name}$$);
         \\    ELSE
-        \\      LOAD INTO sr.'crm_${lower(name)}' USING stream_load
+        \\      LOAD INTO sr.'crm_${lower(name)}'
         \\        UPSERT ON ('${pk}') AS
         \\      SELECT *, now() AS extraction_timestamp
         \\      FROM crm.QUERY($$SELECT * FROM ${name}$$);
@@ -238,7 +218,7 @@ test "sql: connection credential convention injects env calls" {
     try testing.expect(saw_user and saw_pass);
 }
 
-test "sql: reflection lowering — IDENTIFIER / || / PUSHDOWN(expr) -> ${...} templates" {
+test "sql: reflection lowering — IDENTIFIER / || -> ${...} templates" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -250,10 +230,9 @@ test "sql: reflection lowering — IDENTIFIER / || / PUSHDOWN(expr) -> ${...} te
         \\FOR EACH ROW OF ($tables) AS (name, where)
         \\  PARALLEL ON ERROR CONTINUE
         \\  LOAD INTO sr.IDENTIFIER('fluig_' || lower($name))
-        \\    USING stream_load UPSERT AS
+        \\    UPSERT AS
         \\  SELECT *, now() AS extraction_timestamp
-        \\  FROM fluig.dbo.IDENTIFIER($name)
-        \\  PUSHDOWN($where);
+        \\  FROM fluig.dbo.IDENTIFIER($name);
         \\END FOR;
     );
     const fe = prog.stmts[4].for_each;
@@ -261,8 +240,6 @@ test "sql: reflection lowering — IDENTIFIER / || / PUSHDOWN(expr) -> ${...} te
     const rd = body.stages[0].node.read;
     try testing.expectEqualStrings("dbo", rd.form.table.parts[0]);
     try testing.expectEqualStrings("${name}", rd.form.table.parts[1]);
-    try testing.expectEqualStrings("where", body.stages[0].hints[0].key);
-    try testing.expectEqualStrings("${where}", body.stages[0].hints[0].value.str);
     const w = body.stages[body.stages.len - 1].node.write;
     try testing.expectEqualStrings("fluig_${lower(name)}", w.target);
     try testing.expect(w.mode == .upsert);
@@ -469,7 +446,6 @@ test "sql: IDENTIFIER in an UPSERT key -> per-row computed key column" {
         \\CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', database = 'b');
         \\FOR EACH ROW OF ($tables) AS (name, pk)
         \\  LOAD INTO sr.T
-        \\    USING stream_load
         \\    UPSERT ON (IDENTIFIER(if($pk = '', $name || 'id', $pk))) AS
         \\  SELECT * FROM 'x.csv';
         \\END FOR;
@@ -490,8 +466,8 @@ test "sql: CREATE FUNCTION — expression, typed/DEFAULT params, statement body,
         \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
         \\CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', database = 'b');
         \\CREATE FUNCTION sync_table(name, filter) AS
-        \\  LOAD INTO sr.IDENTIFIER('bronze_' || lower($name)) USING stream_load UPSERT AS
-        \\  SELECT * FROM erp.dbo.IDENTIFIER($name) PUSHDOWN($filter);
+        \\  LOAD INTO sr.IDENTIFIER('bronze_' || lower($name)) UPSERT AS
+        \\  SELECT * FROM erp.dbo.IDENTIFIER($name) WHERE D_E_L_E_T_ <> $filter;
         \\END;
         \\CALL sync_table('SC5010', $$D_E_L_E_T_ <> '*'$$);
     );
@@ -515,7 +491,7 @@ test "sql: CREATE FUNCTION — expression, typed/DEFAULT params, statement body,
     try testing.expectEqual(@as(usize, 1), sync.body.stmts.len);
     const pipe = sync.body.stmts[0].output;
     try testing.expectEqualStrings("${name}", pipe.stages[0].node.read.form.table.parts[1]);
-    try testing.expectEqualStrings("${filter}", pipe.stages[0].hints[0].value.str);
+    try testing.expect(pipe.stages[1].node == .filter);
     try testing.expectEqualStrings("bronze_${lower(name)}", pipe.stages[pipe.stages.len - 1].node.write.target);
 
     const call = prog.stmts[6].call;
@@ -582,59 +558,6 @@ test "sql: a function may not name a parameter twice, nor a required one after a
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT a, b, COUNT(*) AS c FROM 'x.csv' GROUP BY a;", &diag));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "`b` is neither an aggregate nor a grouping key") != null);
     try testing.expectEqual(@as(usize, 11), diag.col);
-}
-
-test "sql: PUSHDOWN on a discovered union becomes a per-branch where hint" {
-    var ar = std.heap.ArenaAllocator.init(testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    const prog = try parseTest(a,
-        \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
-        \\SELECT * FROM EACH TABLE OF (erp.QUERY($$SELECT name, x FROM sys.tables$$))
-        \\  AS (table_name, EMPRESA)
-        \\  PUSHDOWN($$D_E_L_E_T_ <> '*'$$)
-        \\  ANCHOR SCHEMA SC5010;
-    );
-    const st = firstPipelineStages(prog);
-    var saw_where = false;
-    var saw_canon = false;
-    for (st[0].hints) |h| {
-        if (std.mem.eql(u8, h.key, "where")) {
-            saw_where = true;
-            try testing.expectEqualStrings("D_E_L_E_T_ <> '*'", h.value.str);
-        }
-        if (std.mem.eql(u8, h.key, "canon")) saw_canon = true;
-    }
-    try testing.expect(saw_where);
-    try testing.expect(saw_canon);
-}
-
-test "sql: ANCHOR SCHEMA before PUSHDOWN parses the same" {
-    var ar = std.heap.ArenaAllocator.init(testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-
-    const prog = try parseTest(a,
-        \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
-        \\SELECT * FROM EACH TABLE OF (erp.QUERY($$SELECT name, x FROM sys.tables$$))
-        \\  AS (table_name, EMPRESA)
-        \\  ANCHOR SCHEMA SC5010
-        \\  PUSHDOWN($$1 = 1$$);
-    );
-    const st = firstPipelineStages(prog);
-    var n: usize = 0;
-    for (st[0].hints) |h| {
-        if (std.mem.eql(u8, h.key, "where")) {
-            n += 1;
-            try testing.expectEqualStrings("1 = 1", h.value.str);
-        }
-        if (std.mem.eql(u8, h.key, "canon")) {
-            n += 1;
-            try testing.expectEqualStrings("SC5010", h.value.ident);
-        }
-    }
-    try testing.expectEqual(@as(usize, 2), n);
 }
 
 test "sql: PRINT takes a literal or a `||` chain over params" {

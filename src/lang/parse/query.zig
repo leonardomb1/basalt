@@ -138,8 +138,6 @@ pub fn parseLoadUsing(self: *Parser, write: *ast.Write, items: *?[]const ast.Sel
     const pos = self.curPos();
     const name = try self.expectIdent();
     write.form = name;
-    if (std.mem.eql(u8, name, "stream_load"))
-        try self.notes.append(self.arena, .{ .pos = pos, .msg = "`USING stream_load` is deprecated and will be removed: a starrocks or doris table always loads by Stream Load, so leave it out; `USING` names how a load applies, as `USING changes (...)`" });
     if (!self.at(.lparen)) {
         if (std.mem.eql(u8, name, "changes")) return self.fail(pos, "`USING changes` takes its arguments: `USING changes (sequence_by = <col>, position = <col>[, delete_when = <condition>])`", .{});
         return;
@@ -1124,18 +1122,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         .{ .read = .{ .connector = "unit", .form = .unit } };
 
     while (true) {
-        if (self.isKw("pushdown")) {
-            try self.notePushdown();
-            _ = self.advance();
-            _ = try self.expect(.lparen);
-            self.qual_sink = null;
-            const e = try self.parseExpr();
-            self.qual_sink = &quals;
-            _ = try self.expect(.rparen);
-            const frag = try self.exprToTemplate(e);
-            if (frag.len > 0)
-                try read_hints.append(.{ .key = "where", .value = .{ .str = frag }, .pos = pos });
-        } else if (self.isKw("paginate")) {
+        if (self.isKw("paginate")) {
             try self.parsePaginate(&read_hints);
         } else if (self.isKw("retry")) {
             try self.parseRetry(&read_hints);
@@ -2451,7 +2438,7 @@ pub fn unionBranchFromStages(self: *Parser, branch_stages: []const ast.Stage) Er
     };
 }
 
-/// Collapse `core (UNION [ALL|DISTINCT] [BY NAME] core)... [ANCHOR SCHEMA q]` into one
+/// Collapse `core (UNION [ALL|DISTINCT] [BY NAME] core)...` into one
 /// union_ stage. A chain is all positional or all by name; a `UNION` without ALL
 /// deduplicates everything to its left.
 pub fn parseUnionTail(self: *Parser, first: Core, stages: *std.array_list.Managed(ast.Stage)) Error!void {
@@ -2489,8 +2476,6 @@ pub fn parseUnionTail(self: *Parser, first: Core, stages: *std.array_list.Manage
 
     const cs = cores.items;
     if (!by_name) {
-        if (self.isKw("anchor") or self.isKw("pushdown"))
-            return self.fail(self.curPos(), "`{s}` applies to `UNION ALL BY NAME`; a plain UNION lines branches up by position", .{self.cur().text});
         if (last_distinct == 0) return self.appendUnion(cs, false, true, stages, pos);
         if (last_distinct == cs.len - 1) return self.appendUnion(cs, true, true, stages, pos);
         var prefix = std.array_list.Managed(ast.Stage).init(self.arena);
@@ -2517,8 +2502,6 @@ pub fn parseSetOps(self: *Parser, cores: []const Core, ops: []const SetOpTok, st
         if (o.named)
             return self.fail(o.pos, "`BY NAME` applies to a chain of UNIONs only; INTERSECT and EXCEPT line columns up by position", .{});
     }
-    if (self.isKw("anchor") or self.isKw("pushdown"))
-        return self.fail(self.curPos(), "`{s}` applies to `UNION ALL BY NAME`", .{self.cur().text});
 
     var terms = std.array_list.Managed([]const ast.Stage).init(self.arena);
     var joins = std.array_list.Managed(SetOpTok).init(self.arena);
@@ -2576,7 +2559,6 @@ pub fn appendUnion(self: *Parser, cores_in: []const Core, distinct: bool, positi
     if (tag_col) |tc|
         try hints.append(.{ .key = "tag", .value = .{ .ident = tc }, .pos = pos });
     if (schema_from) |h| try hints.append(h);
-    if (!positional) try self.parseUnionClauses(&hints, pos);
 
     try stages.append(.{
         .node = .{ .union_ = .{ .branches = try branches.toOwnedSlice(), .positional = positional, .pos = pos } },
