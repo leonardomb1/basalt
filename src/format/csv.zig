@@ -97,35 +97,19 @@ pub const Dialect = struct {
 
 /// The column names of a header line, every one a nullable string until sniffed. A
 /// quoted name loses its quotes (`""` is one quote) and may hold the delimiter; an
-/// unquoted one is trimmed of spaces and tabs.
+/// unquoted one is trimmed of spaces and tabs. Names are copied onto `arena`, as the
+/// line lives in a read buffer or a mapping that outlasts neither the read nor `close`.
 fn headerFields(arena: std.mem.Allocator, header: []const u8, d: Dialect) ![]types.Schema.Field {
     var fields = std.array_list.Managed(types.Schema.Field).init(arena);
     var i: usize = 0;
-    while (true) {
+    while (i <= header.len) {
         while (i < header.len and (header[i] == ' ' or header[i] == '\t')) i += 1;
-        var name = std.array_list.Managed(u8).init(arena);
-        if (i < header.len and header[i] == '"') {
-            i += 1;
-            while (i < header.len) : (i += 1) {
-                if (header[i] != '"') {
-                    try name.append(header[i]);
-                } else if (i + 1 < header.len and header[i + 1] == '"') {
-                    try name.append('"');
-                    i += 1;
-                } else {
-                    i += 1;
-                    break;
-                }
-            }
-        }
-        const end = std.mem.indexOfScalarPos(u8, header, i, d.delim) orelse header.len;
-        try name.appendSlice(std.mem.trim(u8, header[i..end], " \t"));
+        var f = takeField(header, &i, d.delim);
+        if (f.quoted) f.tail = std.mem.trim(u8, f.tail, " \t") else f.text = std.mem.trim(u8, f.text, " \t");
         try fields.append(.{
-            .name = try decodeField(arena, d.encoding, name.items),
+            .name = try arena.dupe(u8, try decodeField(arena, d.encoding, try f.value(arena))),
             .ty = types.Type.init(.string).asNullable(),
         });
-        if (end >= header.len) break;
-        i = end + 1;
     }
     return fields.toOwnedSlice();
 }
@@ -351,8 +335,7 @@ pub const CsvReader = struct {
         try self.join_buf.appendSlice(first);
         var quoted = true;
         while (quoted) {
-            const more = (try self.takePhysical()) orelse
-                return explainf(error.CsvUnterminatedQuote, "`{s}`: the quote opened on line {d} is never closed, so every line after it would read as one field", .{ self.path, self.rec_line });
+            const more = (try self.takePhysical()) orelse return unterminated(self.path, self.rec_line);
             quoted = quotesOpen(more, self.dialect.delim, true);
             if (self.join_buf.items.len + more.len >= MAX_RECORD)
                 return explainf(error.CsvRecordTooLong, "`{s}`: the record from line {d} runs past {d} MiB without closing its quote — is a quote left open?", .{ self.path, self.rec_line, MAX_RECORD >> 20 });
@@ -520,6 +503,7 @@ pub const MappedCsv = struct {
 
         if (std.mem.indexOfScalar(u8, data, '\n') == null) return error.NotMappable;
         const head = scanRecord(data, 0, dialect.delim);
+        if (head.open) return unterminated(path, 1);
         if (data[head.next - 1] != '\n') return error.EmptyCsv;
         var fields = std.array_list.Managed(types.Schema.Field).fromOwnedSlice(arena, try headerFields(arena, stripBom(head.line), dialect));
 
@@ -529,6 +513,7 @@ pub const MappedCsv = struct {
         var pos: usize = 0;
         while (pos < body.len) {
             const rec = scanRecord(body, pos, dialect.delim);
+            if (rec.open) return unterminated(path, std.mem.count(u8, data[0 .. head.next + pos], "\n") + 1);
             if (rec.line.len > 0) {
                 if (fed == SAMPLE_ROWS) break;
                 sniff.feed(rec.line);
@@ -632,6 +617,7 @@ pub const CsvSliceReader = struct {
         while (rows < BATCH_ROWS and self.pos < self.data.len) {
             const rec = scanRecord(self.data, self.pos, self.dialect.delim);
             const line = rec.line;
+            if (rec.open) return unterminated(self.path, self.lineOf(line));
             self.pos = rec.next;
             if (line.len == 0) continue;
             splitInto(arena, line, builders, self.dialect, self.slot) catch |e|
@@ -686,8 +672,8 @@ const TypeSniffer = struct {
         var i: usize = 0;
         for (self.cols) |*c| {
             if (i > line.len) break;
-            const quoted = i < line.len and line[i] == '"';
-            c.note(nextField(line, &i, self.delim), quoted);
+            const f = takeField(line, &i, self.delim);
+            c.note(f.text, f.quoted);
         }
     }
 
@@ -696,75 +682,70 @@ const TypeSniffer = struct {
     }
 };
 
-/// One record from `data[start]` and where the next begins. Records were once cut
-/// on the first raw newline, so basalt could not read back its own quoted newlines.
-/// A quoteless line ends at the next newline, found by two SIMD scans.
-fn scanRecord(data: []const u8, start: usize, delim: u8) struct { line: []const u8, next: usize } {
-    if (std.mem.indexOfScalarPos(u8, data, start, '\n')) |nl| {
-        if (std.mem.indexOfScalar(u8, data[start..nl], '"') == null) {
-            var end = nl;
-            if (end > start and data[end - 1] == '\r') end -= 1;
-            return .{ .line = data[start..end], .next = nl + 1 };
-        }
-    }
-    var i = start;
-    var in_q = false;
-    var at_field = true;
-    while (i < data.len) : (i += 1) {
-        const c = data[i];
-        if (c == '"') {
-            if (in_q) {
-                if (i + 1 < data.len and data[i + 1] == '"') {
-                    i += 1;
-                    continue;
+/// A record's quoting as its bytes go by, the one rule both readers and the append
+/// header cut records by: a quote opens a field only where a field starts, and
+/// inside one `""` is a quote.
+const Quoting = struct {
+    in_q: bool = false,
+    at_field: bool = true,
+
+    /// Steps over `s`, stopping at the first newline outside a quoted field, whose
+    /// index it returns; null when `s` holds none.
+    inline fn scan(self: *Quoting, s: []const u8, delim: u8) ?usize {
+        var i: usize = 0;
+        while (i < s.len) : (i += 1) {
+            const c = s[i];
+            if (c == '"') {
+                if (self.in_q) {
+                    if (i + 1 < s.len and s[i + 1] == '"') {
+                        i += 1;
+                        continue;
+                    }
+                    self.in_q = false;
+                } else if (self.at_field) {
+                    self.in_q = true;
                 }
-                in_q = false;
-            } else if (at_field) {
-                in_q = true;
+                self.at_field = false;
+            } else if (c == delim and !self.in_q) {
+                self.at_field = true;
+            } else if (c == '\n' and !self.in_q) {
+                return i;
+            } else {
+                self.at_field = false;
             }
-            at_field = false;
-        } else if (c == delim and !in_q) {
-            at_field = true;
-        } else if (c == '\n' and !in_q) {
-            var end = i;
-            if (end > start and data[end - 1] == '\r') end -= 1;
-            return .{ .line = data[start..end], .next = i + 1 };
-        } else {
-            at_field = false;
         }
+        return null;
     }
-    var end = data.len;
-    if (end > start and data[end - 1] == '\r') end -= 1;
-    return .{ .line = data[start..end], .next = data.len };
+};
+
+/// One record from `data[start]`, where the next begins, and whether it ends inside a
+/// quote the data never closes. A quoteless line ends at the next newline, found by
+/// two SIMD scans.
+fn scanRecord(data: []const u8, start: usize, delim: u8) struct { line: []const u8, next: usize, open: bool = false } {
+    if (std.mem.indexOfScalarPos(u8, data, start, '\n')) |nl| {
+        if (std.mem.indexOfScalar(u8, data[start..nl], '"') == null)
+            return .{ .line = trimCr(data[start..nl]), .next = nl + 1 };
+    }
+    var q = Quoting{};
+    if (q.scan(data[start..], delim)) |off|
+        return .{ .line = trimCr(data[start .. start + off]), .next = start + off + 1 };
+    return .{ .line = trimCr(data[start..]), .next = data.len, .open = q.in_q };
 }
 
 /// Whether a quoted field is left open at the end of `line`, which starts inside one
 /// when `in_quote` (a continuation line), so a long record is scanned once, not once
-/// per line. `""` counts two, so parity is the state; a quoteless line is one SIMD
-/// scan (a byte walk capped the parse at ~75 MB/s).
+/// per line; a quoteless line is one SIMD scan (a byte walk capped the parse at
+/// ~75 MB/s).
 fn quotesOpen(line: []const u8, delim: u8, in_quote: bool) bool {
     const first_q = std.mem.indexOfScalar(u8, line, '"') orelse return in_quote;
-    var in_q = in_quote;
-    var at_field = !in_quote and (first_q == 0 or line[first_q - 1] == delim);
-    var i: usize = first_q;
-    while (i < line.len) : (i += 1) {
-        const c = line[i];
-        if (c == '"') {
-            if (in_q) {
-                if (i + 1 < line.len and line[i + 1] == '"') {
-                    i += 1;
-                    continue;
-                }
-                in_q = false;
-            } else if (at_field) {
-                in_q = true;
-            }
-            at_field = false;
-        } else if (c == delim and !in_q) {
-            at_field = true;
-        } else at_field = false;
-    }
-    return in_q;
+    var q = Quoting{ .in_q = in_quote, .at_field = !in_quote and (first_q == 0 or line[first_q - 1] == delim) };
+    _ = q.scan(line[first_q..], delim);
+    return q.in_q;
+}
+
+/// The error for a quote opened on `line_no` that the data never closes.
+fn unterminated(path: []const u8, line_no: u64) anyerror {
+    return explainf(error.CsvUnterminatedQuote, "`{s}`: the quote opened on line {d} is never closed, so every line after it would read as one field", .{ path, line_no });
 }
 
 pub const Projection = struct {
@@ -804,47 +785,14 @@ fn splitInto(arena: std.mem.Allocator, line: []const u8, builders: []column.Buil
     while (col < ncols) : (col += 1) {
         const dest: ?*column.Builder = if (slot) |sl| (if (sl[col] >= 0) &builders[@intCast(sl[col])] else null) else &builders[col];
         if (i < line.len and line[i] == '"') {
-            i += 1;
-            const start = i;
-            var buf: ?std.array_list.Managed(u8) = null;
-            while (i < line.len) {
-                const q = std.mem.indexOfScalarPos(u8, line, i, '"') orelse line.len;
-                if (buf) |*bb| try bb.appendSlice(line[i..q]);
-                i = q;
-                if (i >= line.len) break;
-                if (i + 1 < line.len and line[i + 1] == '"') {
-                    if (buf == null and dest != null) {
-                        buf = std.array_list.Managed(u8).init(arena);
-                        try buf.?.appendSlice(line[start..i]);
-                    }
-                    if (buf) |*bb| try bb.append('"');
-                    i += 2;
-                    continue;
-                }
-                break;
-            }
-            const end = i;
-            if (i < line.len) i += 1;
-            const tail_end = std.mem.indexOfScalarPos(u8, line, i, d.delim) orelse line.len;
-            if (tail_end > i and dest != null) {
-                if (buf == null) {
-                    buf = std.array_list.Managed(u8).init(arena);
-                    try buf.?.appendSlice(line[start..end]);
-                }
-                try buf.?.appendSlice(line[i..tail_end]);
-            }
-            i = tail_end;
-            if (dest) |bld| {
-                const raw = if (buf) |*bb| try bb.toOwnedSlice() else line[start..end];
-                try putCell(arena, bld, raw, true, d.encoding);
-            }
+            const f = takeField(line, &i, d.delim);
+            if (dest) |bld| try putCell(arena, bld, try f.value(arena), true, d.encoding);
         } else {
-            const start = i;
-            i = std.mem.indexOfScalarPos(u8, line, i, d.delim) orelse line.len;
-            if (dest) |bld| try putCell(arena, bld, line[start..i], false, d.encoding);
+            const end = std.mem.indexOfScalarPos(u8, line, i, d.delim) orelse line.len;
+            if (dest) |bld| try putCell(arena, bld, line[i..end], false, d.encoding);
+            i = end + 1;
         }
-        if ((i < line.len) != (col + 1 < ncols)) return error.CsvRaggedRow;
-        i += 1;
+        if ((i <= line.len) != (col + 1 < ncols)) return error.CsvRaggedRow;
     }
 }
 
@@ -888,7 +836,7 @@ fn rowFailure(e: anyerror, path: []const u8, line_no: u64, line: []const u8, sch
     var i: usize = 0;
     var n: usize = 0;
     while (i <= line.len) : (n += 1) {
-        const raw = nextField(line, &i, d.delim);
+        const raw = takeField(line, &i, d.delim).text;
         if ((e != error.TextTypeMismatch and e != error.InvalidUtf8) or n >= ncols) continue;
         const f = if (slot) |sl| (if (sl[n] >= 0) schema.fields[@intCast(sl[n])] else continue) else schema.fields[n];
         if (charset.badUtf8(raw)) |bad| return notUtf8(where, f.name, bad);
@@ -916,29 +864,55 @@ fn notUtf8(where: []const u8, col: []const u8, bad: charset.BadByte) anyerror {
     return explainf(error.InvalidUtf8, "{s}, column `{s}`: not valid UTF-8 (byte 0x{x:0>2} at offset {d}); read it WITH (encoding = 'latin1') or 'cp1252' if it is not UTF-8", .{ where, clip(col), bad.byte, bad.offset });
 }
 
-/// One field's text from `line[i.*]` (a quoted one without its quotes, `""` kept),
-/// moving `i` past its delimiter; past the end once the last field is taken.
-fn nextField(line: []const u8, i: *usize, delim: u8) []const u8 {
-    const start = i.*;
-    var j = start;
-    var lo = start;
-    var hi: ?usize = null;
-    if (j < line.len and line[j] == '"') {
-        lo = j + 1;
-        j += 1;
-        while (j < line.len) : (j += 1) {
-            if (line[j] != '"') continue;
-            if (j + 1 < line.len and line[j + 1] == '"') {
-                j += 1;
-                continue;
-            }
-            hi = j;
-            break;
+/// One field of a record as written: `text`, between its quotes when `quoted`, each
+/// `""` in it still doubled when `escaped`, and `tail`, any text after the closing
+/// quote, which stays in the field.
+const Field = struct {
+    text: []const u8,
+    quoted: bool = false,
+    escaped: bool = false,
+    tail: []const u8 = "",
+
+    /// The field's value: `""` as one quote and the tail appended, a slice of the
+    /// line unless it has to be rebuilt on `arena`.
+    fn value(f: Field, arena: std.mem.Allocator) ![]const u8 {
+        if (!f.escaped and f.tail.len == 0) return f.text;
+        var buf = try std.array_list.Managed(u8).initCapacity(arena, f.text.len + f.tail.len);
+        var rest = f.text;
+        while (f.escaped) {
+            const q = std.mem.indexOfScalar(u8, rest, '"') orelse break;
+            buf.appendSliceAssumeCapacity(rest[0 .. q + 1]);
+            rest = rest[@min(q + 2, rest.len)..];
         }
+        buf.appendSliceAssumeCapacity(rest);
+        buf.appendSliceAssumeCapacity(f.tail);
+        return buf.items;
     }
-    const end = std.mem.indexOfScalarPos(u8, line, @min(j, line.len), delim) orelse line.len;
+};
+
+/// The field at `line[i.*]`, moving `i` past its delimiter, so `i` passes `line.len`
+/// once the last field is taken; a quote left open runs to the end of the line.
+fn takeField(line: []const u8, i: *usize, delim: u8) Field {
+    const start = i.*;
+    if (start >= line.len or line[start] != '"') {
+        const end = std.mem.indexOfScalarPos(u8, line, @min(start, line.len), delim) orelse line.len;
+        i.* = end + 1;
+        return .{ .text = line[@min(start, line.len)..end] };
+    }
+    var j = start + 1;
+    var escaped = false;
+    const hi = while (std.mem.indexOfScalarPos(u8, line, j, '"')) |q| {
+        if (q + 1 < line.len and line[q + 1] == '"') {
+            escaped = true;
+            j = q + 2;
+            continue;
+        }
+        break q;
+    } else line.len;
+    const after = @min(hi + 1, line.len);
+    const end = std.mem.indexOfScalarPos(u8, line, after, delim) orelse line.len;
     i.* = end + 1;
-    return line[lo..(hi orelse end)];
+    return .{ .text = line[start + 1 .. hi], .quoted = true, .escaped = escaped, .tail = line[after..end] };
 }
 
 inline fn putField(arena: std.mem.Allocator, builders: []column.Builder, slot: ?[]const i16, col: usize, raw: []const u8, enc: Encoding) !void {
@@ -1635,6 +1609,30 @@ fn readAllRows(a: std.mem.Allocator, path: []const u8) ![]const []const u8 {
         for (0..b.len) |i| for (b.columns) |c| try out.append(try eval.valueToString(a, c.getValue(i)));
     }
     return out.items;
+}
+
+test "a quote left open is refused by the mapped reader as by the streaming one, never read as one long field" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "open.csv", .data = "a,b\n1,\"x\n2,y\n3,z\n" });
+    const path = try std.fs.path.join(a, &.{ try tmp.dir.realpathAlloc(a, "."), "open.csv" });
+
+    try std.testing.expectError(error.CsvUnterminatedQuote, CsvReader.open(a, path, .{}));
+    try std.testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.CsvUnterminatedQuote).?, "the quote opened on line 2 is never closed") != null);
+
+    const err: ?anyerror = mapped: {
+        const m = MappedCsv.open(a, path, .{}) catch |e| break :mapped e;
+        defer m.close();
+        var sr = m.reader(0, 1, &m.schema);
+        while (sr.next(a) catch |e| break :mapped e) |_| {}
+        break :mapped null;
+    };
+    try std.testing.expectEqual(@as(?anyerror, error.CsvUnterminatedQuote), err);
+    try std.testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.CsvUnterminatedQuote).?, "the quote opened on line 2 is never closed") != null);
 }
 
 test "csv reader: a quoted CRLF keeps its CR, bare-CR files read, no line is too long" {
