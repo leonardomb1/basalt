@@ -381,7 +381,6 @@ pub const plan = [_]Rule{
     .{ .home = "scheme", .pattern = scheme_pattern, .exact = true },
     .{ .home = "dial", .pattern = dial_pattern, .exact = true, .allow = &.{
         "connect/driver.zig",
-        "net/http_std.zig",
     } },
     .{ .home = "options", .pattern = options_pattern, .exact = true, .allow = &options_allow },
     .{ .home = "retry", .pattern = retry_pattern, .exact = true, .allow = &retry_allow },

@@ -1,12 +1,18 @@
 //! Vendored from Zig 0.15.2 `std.http.Client`, without upstream's inline comments.
-//! One functional change: HTTPS runs through `tls_client.zig`, so an object store
-//! or REST source checks that every issuer in a chain is a CA, which std's TLS
-//! client does not. Every other `std.http` type stays std's. Drop this vendor once
-//! std checks issuers' basicConstraints; `dupscan` keeps `std.http.Client` out of
-//! the rest of src/ meanwhile.
+//! Two functional changes:
+//!
+//! - HTTPS runs through `tls_client.zig`, so an object store or REST source checks
+//!   that every issuer in a chain is a CA, which std's TLS client does not.
+//! - A connection opens through `driver.dial`, so its connect, reads and writes
+//!   fail after `io_timeout_s` of silence instead of hanging a lane forever.
+//!
+//! Every other `std.http` type stays std's. Drop this vendor once std checks
+//! issuers' basicConstraints and takes socket deadlines; `dupscan` keeps
+//! `std.http.Client` out of the rest of src/ meanwhile.
 
 const std = @import("std");
 const TlsClient = @import("tls_client.zig");
+const driver = @import("../connect/driver.zig");
 const builtin = @import("builtin");
 const testing = std.testing;
 const http = std.http;
@@ -33,6 +39,9 @@ tls_buffer_size: if (disable_tls) u0 else usize = if (disable_tls) 0 else TlsCli
 /// allows other processes with access to that stream to decrypt all
 /// traffic over connections created with this `Client`.
 ssl_key_log: ?*TlsClient.SslKeyLog = null,
+/// Seconds a connect, read or write may wait on a silent server before it fails;
+/// 0 for none. A REST source's own `timeout_ms` still bounds each request.
+io_timeout_s: u32 = @intCast(@divTrunc(driver.request_timeout_ms, 1000)),
 
 /// When this is `true`, the next time this client performs an HTTPS request,
 /// it will first rescan the system for root certificates.
@@ -1401,7 +1410,7 @@ pub fn connectTcpOptions(client: *Client, options: ConnectTcpOptions) ConnectTcp
         .protocol = protocol,
     })) |conn| return conn;
 
-    const stream = net.tcpConnectToHost(client.allocator, host, port) catch |err| switch (err) {
+    const stream = driver.dial(client.allocator, host, port, .{ .io_timeout_s = if (client.io_timeout_s > 0) client.io_timeout_s else null }) catch |err| switch (err) {
         error.ConnectionRefused => return error.ConnectionRefused,
         error.NetworkUnreachable => return error.NetworkUnreachable,
         error.ConnectionTimedOut => return error.ConnectionTimedOut,

@@ -51,6 +51,7 @@ const scheme = @import("scheme.zig");
 const http_client = @import("../net/http_client.zig");
 const percent = @import("../net/percent.zig");
 const FakeServer = @import("../testing/http_fake.zig").FakeServer;
+const http_fake = @import("../testing/http_fake.zig");
 const s3 = @import("s3.zig");
 const sftp = @import("sftp.zig");
 const smb = @import("smb.zig");
@@ -925,4 +926,24 @@ test "an HTTP date reads as milliseconds since the epoch; anything else as null"
     try std.testing.expectEqual(@as(?i64, 0), httpDateMs("Thu, 01 Jan 1970 00:00:00 GMT"));
     try std.testing.expect(httpDateMs("yesterday") == null);
     try std.testing.expect(httpDateMs("Wed, 21 Foo 2015 07:28:00 GMT") == null);
+}
+
+test "a store that accepts a request and never answers fails it after the client's io timeout instead of hanging" {
+    var ar = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var listener = try http_fake.listen(16);
+    defer listener.deinit();
+    http_fake.hang_released.store(false, .seq_cst);
+    const th = try std.Thread.spawn(.{}, http_fake.serveThenHang, .{ &listener, @as([]const []const u8, &.{}) });
+    defer th.join();
+    defer http_fake.hang_released.store(true, .seq_cst);
+
+    var client = HttpClient{ .allocator = std.heap.page_allocator, .io_timeout_s = 1 };
+    defer client.deinit();
+    var location: ?[]const u8 = null;
+    const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/bucket/key", .{listener.listen_address.getPort()});
+    const started = std.time.milliTimestamp();
+    try std.testing.expect(std.meta.isError(exchangeOnce(a, &client, .{ .method = .GET, .url = url }, &location)));
+    try std.testing.expect(std.time.milliTimestamp() - started < 5_000);
 }
