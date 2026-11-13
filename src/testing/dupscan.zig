@@ -358,6 +358,7 @@ pub const plan = [_]Rule{
     .{ .home = "textconv", .pattern = textconv_pattern, .exact = true, .allow = &textconv_allow },
     .{ .home = "floatord", .pattern = floatord_pattern, .exact = true, .allow = &.{"exec/floatord.zig"} },
     .{ .home = "decimal", .pattern = decimal_pattern, .exact = true, .allow = &.{"exec/decimal.zig"} },
+    .{ .home = "decimal.Digits", .pattern = digits_pattern, .exact = true, .allow = &.{"exec/decimal.zig"} },
     .{ .home = "jsontext", .pattern = jsontext_pattern, .exact = true, .allow = &.{
         "exec/jsontext.zig",
     } },
@@ -412,6 +413,7 @@ pub const part_pattern = "\"(year|month|week|day|hour|minute|second)s?\", \\.(ye
 pub const textconv_pattern = "(eqlIgnoreCase\\(|eql\\(u8, )[^\"]*\"(true|false|yes|no)\"\\)|\\[0\\] == '[tTyY]'|0x1p63";
 pub const floatord_pattern = "0x7[fF][fF]8|>> 63 != 0\\) ~|\\| \\(1 << 63\\)|std\\.math\\.order\\([^)]*\\.float";
 pub const decimal_pattern = "fn pow10|std\\.math\\.powi?\\(i(64|128|256), 10,|@(divTrunc|rem|mod|divFloor|divExact)\\(\\w+\\.unscaled, ";
+pub const digits_pattern = "(places|scale) \\+= 1";
 pub const jsontext_pattern = "encodeJsonString(Chars)?|\\\\\\\\u(\\{[xX]:0>4|00\\{[xX]:0>2)\\}";
 pub const hex_pattern = "parseInt\\(.*16\\)|- 'a' \\+ 10|\"0123456789(abcdef|ABCDEF)\";|i == 8 or i == 13 or i == 18|i == 4 or i == 6 or i == 8";
 pub const utf16_pattern = "utf16LeToUtf8Alloc|utf8ToUtf16LeAlloc|utf16IsHighSurrogate|0xD800 \\+";

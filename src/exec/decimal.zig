@@ -138,6 +138,25 @@ pub fn pow10f(n: u8) f64 {
 
 pub const max_digits = 38;
 
+/// Decimal digits read exactly, one at a time: leading zeros count only as places,
+/// and a place past `max_digits` must be a trailing zero, which is dropped.
+const Digits = struct {
+    unscaled: i128 = 0,
+    digits: u8 = 0,
+    places: u8 = 0,
+
+    fn push(self: *Digits, d: u8, place: bool) error{ TooManyDigits, TooManyPlaces }!void {
+        if (place) {
+            if (self.places == max_digits) return if (d == 0) {} else error.TooManyPlaces;
+            self.places += 1;
+        }
+        if (self.unscaled == 0 and d == 0) return;
+        if (self.digits == max_digits) return error.TooManyDigits;
+        self.digits += 1;
+        self.unscaled = self.unscaled * 10 + d;
+    }
+};
+
 pub fn decimalOverflow() error{IntOverflow} {
     return @errorCast(failWith(error.IntOverflow, "decimal overflow: more than 38 digits", .{}));
 }
@@ -513,10 +532,8 @@ pub fn parse(t: []const u8) ?Decimal {
         neg = s[0] == '-';
         s = s[1..];
     }
-    if (s.len == 0) return null;
-    var unscaled: i128 = 0;
-    var scale: u8 = 0;
-    var digits: usize = 0;
+    var acc: Digits = .{};
+    var any = false;
     var after_dot = false;
     for (s) |c| {
         if (c == '.') {
@@ -525,13 +542,11 @@ pub fn parse(t: []const u8) ?Decimal {
             continue;
         }
         if (c < '0' or c > '9') return null;
-        unscaled = std.math.mul(i128, unscaled, 10) catch return null;
-        unscaled = std.math.add(i128, unscaled, c - '0') catch return null;
-        digits += 1;
-        if (after_dot) scale += 1;
+        any = true;
+        acc.push(c - '0', after_dot) catch return null;
     }
-    if (digits == 0) return null;
-    return .{ .unscaled = if (neg) -unscaled else unscaled, .scale = scale };
+    if (!any) return null;
+    return .{ .unscaled = if (neg) -acc.unscaled else acc.unscaled, .scale = acc.places };
 }
 
 /// Digits are produced with 64-bit division whenever the magnitude fits, and the
@@ -814,10 +829,9 @@ pub fn fieldDecimal(t: []const u8, point: ?u8, scale: i64) FieldError!Decimal {
     var i: usize = 0;
     const neg = t[0] == '-';
     if (t[0] == '-' or t[0] == '+') i = 1;
-    var v: i128 = 0;
-    var places: i64 = 0;
+    var acc: Digits = .{};
+    var any = false;
     var after = false;
-    var digits: usize = 0;
     for (t[i..]) |c| {
         if (point) |pt| {
             if (c == pt) {
@@ -828,18 +842,19 @@ pub fn fieldDecimal(t: []const u8, point: ?u8, scale: i64) FieldError!Decimal {
             if (c == (if (pt == ',') @as(u8, '.') else ',') and !after) continue;
         }
         if (c < '0' or c > '9') return error.NotDecimal;
-        digits += 1;
-        if (digits > max_digits) return error.TooManyDigits;
-        v = v * 10 + (c - '0');
-        if (after) places += 1;
+        any = true;
+        try acc.push(c - '0', after);
     }
-    if (digits == 0) return error.NotDecimal;
-    if (point == null) places = scale;
+    if (!any) return error.NotDecimal;
+    var v = acc.unscaled;
+    var places: i64 = if (point == null) scale else acc.places;
     while (places > scale) : (places -= 1) {
         if (@rem(v, 10) != 0) return error.TooManyPlaces;
         v = @divTrunc(v, 10);
     }
-    while (places < scale) : (places += 1) v *= 10;
+    const up: usize = @intCast(scale - places);
+    if (@abs(v) >= pow10_i128[max_digits - up]) return error.TooManyDigits;
+    v *= pow10_i128[up];
     return .{ .unscaled = if (neg) -v else v, .scale = @intCast(scale) };
 }
 
@@ -1033,27 +1048,18 @@ pub inline fn dropsDigits(d: Decimal, scale: u8) bool {
 /// A numeric literal's digits, with at most one `.`, read exactly: the scale is the
 /// digits written after the point, so `10.00` is 1000 at scale 2. Leading zeros
 /// count toward neither the digits nor the 38 limit, except as places. Null past
-/// 38 digits or 38 places.
+/// 38 digits, or past 38 places unless those are zeros.
 pub fn literal(text: []const u8) ?ast.Expr.DecLit {
-    var unscaled: i128 = 0;
-    var scale: u8 = 0;
-    var digits: u8 = 0;
+    var acc: Digits = .{};
     var frac = false;
     for (text) |ch| {
         if (ch == '.') {
             frac = true;
             continue;
         }
-        if (frac) scale += 1;
-        if (unscaled == 0 and ch == '0') {
-            if (scale > 38) return null;
-            continue;
-        }
-        digits += 1;
-        if (digits > 38 or scale > 38) return null;
-        unscaled = unscaled * 10 + (ch - '0');
+        acc.push(ch - '0', frac) catch return null;
     }
-    return .{ .unscaled = unscaled, .scale = scale };
+    return .{ .unscaled = acc.unscaled, .scale = acc.places };
 }
 
 /// Whether a double holds the decimal exactly enough to print back: at most 15
@@ -1174,6 +1180,28 @@ test "decimal rejects what it cannot read instead of inventing a number" {
     for ([_][]const u8{ "1000,00", "1.234,56", "1,2,3", "abc", "1.2.3", "12 34", "", "-", "R$ 10" }) |s| {
         try testing.expect(parse(s) == null);
     }
+}
+
+test "text past 38 places is refused unless the extra places are zeros, which are dropped" {
+    const zeros = "0" ** 49;
+    try testing.expect(parse("0." ++ zeros ++ "1") == null);
+    try testing.expect(parse("0." ++ "0" ** 300 ++ "1") == null);
+    const tail = parse("0.1" ++ zeros).?;
+    try testing.expectEqual(@as(u8, 38), tail.scale);
+    try testing.expect(tail.order(.{ .unscaled = 1, .scale = 1 }) == .eq);
+    try testing.expect(literal("0." ++ zeros ++ "1") == null);
+    try testing.expectEqual(@as(u8, 38), literal("0.5" ++ zeros).?.scale);
+    try testing.expect(parse("9" ** 39) == null);
+    try testing.expectEqual(@as(i128, 1), parse("0" ** 60 ++ "1").?.unscaled);
+}
+
+test "fieldDecimal refuses a value its scale would carry past 38 digits" {
+    try testing.expectError(error.TooManyDigits, fieldDecimal("1234567890123456789012345", '.', 20));
+    try testing.expectError(error.TooManyDigits, fieldDecimal("1" ** 20 ++ ".5", '.', 20));
+    const d = try fieldDecimal("12345678901234567.5", '.', 20);
+    try testing.expectEqual(@as(u8, 20), d.scale);
+    try testing.expectEqual(@as(i128, 1234567890123456750000000000000000000), d.unscaled);
+    try testing.expectEqual(@as(i128, 123), (try fieldDecimal("000000000000000000000000000000000000000123", null, 0)).unscaled);
 }
 
 test "pow10f_table matches the exact double literals up to exact_pow10f" {
