@@ -154,6 +154,7 @@ pub const Error = error{
     UnsupportedParquetNestedType,
     AppendNotSupported,
     UnsupportedParquetDecimal,
+    DecimalDropsDigits,
     ParquetValueOutOfRange,
     ParquetNullInRequired,
 } || std.mem.Allocator.Error || codec.Error;
@@ -668,25 +669,29 @@ pub const Writer = struct {
         while (start < batch.len) {
             const room = self.group_bytes -| self.bufferedBytes();
             const end = start + @max(1, @min(room / row_bytes, self.group_rows - self.rows, batch.len - start));
-            for (batch.columns, self.lays) |col, lay| {
-                if (lay.shape) |sh| {
-                    try self.shredRows(sa, sh, lay, col, start, end);
-                    continue;
-                }
-                const cb = &self.cols[lay.first];
-                const m = self.maps[lay.first];
-                var lo = start;
-                while (lo < end) {
-                    const hi = @min(end, lo + slice_rows);
-                    try encodeSlice(cb, sa, m, col, lo, hi);
-                    if (!cb.dict_ok and cb.values.items.len >= page_target_bytes) try cb.sealPage(sa);
-                    lo = hi;
-                }
+            for (batch.columns, self.lays, self.schema.fields) |col, lay, f| {
+                self.writeSpan(sa, col, lay, start, end) catch |e| {
+                    if (e == Error.DecimalDropsDigits) return decimal.dropsDigitsFailure(f.name, f.ty);
+                    return e;
+                };
             }
             self.rows += end - start;
             self.total_rows += @intCast(end - start);
             start = end;
             if (self.rows >= self.group_rows or self.bufferedBytes() >= self.group_bytes) try self.flushRowGroup();
+        }
+    }
+
+    fn writeSpan(self: *Writer, sa: std.mem.Allocator, col: column.Column, lay: Lay, start: usize, end: usize) !void {
+        if (lay.shape) |sh| return self.shredRows(sa, sh, lay, col, start, end);
+        const cb = &self.cols[lay.first];
+        const m = self.maps[lay.first];
+        var lo = start;
+        while (lo < end) {
+            const hi = @min(end, lo + slice_rows);
+            try encodeSlice(cb, sa, m, col, lo, hi);
+            if (!cb.dict_ok and cb.values.items.len >= page_target_bytes) try cb.sealPage(sa);
+            lo = hi;
         }
     }
 
@@ -1728,10 +1733,11 @@ fn plainFixed(buf: *[16]u8, m: Mapping, v: Value) Error![]const u8 {
     }
 }
 
-/// The unscaled integer restated to the schema's scale. Overflow is an error:
-/// clamping once turned `12.5` in a `numeric(38,18)` into `9.223372036854775807`.
+/// The unscaled integer restated exactly to the schema's scale (`exactAs`). Overflow
+/// is an error: clamping once turned `12.5` in a `numeric(38,18)` into
+/// `9.223372036854775807`.
 fn rescaleTo(comptime T: type, d: Decimal, want: i32) Error!T {
-    return decimal.rescaleAs(T, d, @intCast(want)) orelse Error.UnsupportedParquetDecimal;
+    return (try decimal.exactAs(T, d, @intCast(want))) orelse Error.UnsupportedParquetDecimal;
 }
 
 /// Big-endian two's complement in exactly `len` bytes (a FIXED_LEN_BYTE_ARRAY
@@ -1783,13 +1789,13 @@ test "definition levels pack LSB-first into bit-packed groups of eight" {
     try testing.expectEqualSlices(u32, &.{ 1, 0, 1, 1, 1, 1, 0, 1 }, got);
 }
 
-test "decimal rescaling restates the unscaled value against the column scale" {
+test "decimal rescaling restates the unscaled value against the column scale, never rounding" {
     try testing.expectEqual(@as(i128, 1550), try rescaleTo(i128, .{ .unscaled = 155, .scale = 1 }, 2));
     try testing.expectEqual(@as(i128, 155), try rescaleTo(i128, .{ .unscaled = 155, .scale = 2 }, 2));
-    try testing.expectEqual(@as(i128, 16), try rescaleTo(i128, .{ .unscaled = 155, .scale = 2 }, 1));
-    try testing.expectEqual(@as(i128, -16), try rescaleTo(i128, .{ .unscaled = -155, .scale = 2 }, 1));
-    try testing.expectEqual(@as(i128, 15), try rescaleTo(i128, .{ .unscaled = 154, .scale = 2 }, 1));
-    try testing.expectEqual(@as(i128, -1235), try rescaleTo(i128, .{ .unscaled = -12345, .scale = 3 }, 2));
+    try testing.expectEqual(@as(i128, 15), try rescaleTo(i128, .{ .unscaled = 150, .scale = 2 }, 1));
+    try testing.expectEqual(@as(i128, -15), try rescaleTo(i128, .{ .unscaled = -1500, .scale = 3 }, 1));
+    try testing.expectError(Error.DecimalDropsDigits, rescaleTo(i128, .{ .unscaled = 155, .scale = 2 }, 1));
+    try testing.expectError(Error.DecimalDropsDigits, rescaleTo(i128, .{ .unscaled = -12345, .scale = 3 }, 2));
     try testing.expectEqual(@as(i128, 12_500_000_000_000_000_000), try rescaleTo(i128, .{ .unscaled = 125, .scale = 1 }, 18));
     try testing.expectError(Error.UnsupportedParquetDecimal, rescaleTo(i128, .{ .unscaled = std.math.maxInt(i64), .scale = 0 }, 30));
     try testing.expectError(Error.UnsupportedParquetDecimal, rescaleTo(i64, .{ .unscaled = 125, .scale = 1 }, 18));
@@ -2798,4 +2804,23 @@ test "a bound on a struct's field skips the row groups its leaf's statistics rul
     try testing.expectEqual(@as(usize, 1), kept);
     const listed = [_]pqdecode.Bound{.{ .column = "doc.ids.list.element", .op = .ge, .value = .{ .int = 4 } }};
     for (r.md.row_groups) |g| try testing.expect(pqdecode.groupMayMatch(r.md.schema, r.leaves, g, &listed));
+}
+
+test "a decimal with digits past its column's scale fails the write, naming the column, rather than being rounded" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(a, &.{ try tmp.dir.realpathAlloc(a, "."), "d.parquet" });
+    const ty = types.Type.decimal(38, 2).asNullable();
+    const schema = types.Schema{ .fields = &.{.{ .name = "amount", .ty = ty }} };
+    var w = try Writer.open(a, path, schema, .snappy, .truncate);
+    defer w.abort();
+    var xs = try column.Builder.initCapacity(a, ty, 2);
+    try xs.append(.{ .decimal = .{ .unscaled = 1500, .scale = 3 } });
+    try xs.append(.{ .decimal = .{ .unscaled = 1234, .scale = 3 } });
+    var cols = [_]column.Column{try xs.finish()};
+    try testing.expectError(Error.DecimalDropsDigits, w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 2 }));
+    try testing.expect(std.mem.indexOf(u8, eval.takeFailure(Error.DecimalDropsDigits).?, "`amount`") != null);
 }

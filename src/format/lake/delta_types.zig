@@ -251,7 +251,7 @@ pub fn partitionText(arena: std.mem.Allocator, phys: pqwrite.Physical, scale: u8
         .date => |d| try writeDate(w, d),
         .timestamp => |us| try writeTimestamp(w, us, phys.utc, false),
         .decimal => |d| {
-            const r = decimal.rescaleTo(d, scale) orelse return Error.DeltaValueOutOfRange;
+            const r = (try decimal.exactAt(d, scale)) orelse return Error.DeltaValueOutOfRange;
             try decimal.writeDecimal(w, r.unscaled, r.scale);
         },
         else => return Error.DeltaValueOutOfRange,
@@ -533,7 +533,7 @@ test "delta_types: partition text and statistics as the writer spells them" {
     try testing.expectEqualStrings("10.50", (try partitionText(a, .{}, 2, .{ .decimal = .{ .unscaled = 105, .scale = 1 } })).?);
     try testing.expectEqualStrings("1.05", (try statText(a, .{}, .{ .decimal = .{ .unscaled = 105, .scale = 2 } }, .min)).?);
     try testing.expectEqualStrings("10.5", (try statText(a, .{}, .{ .decimal = .{ .unscaled = 105, .scale = 1 } }, .min)).?);
-    try testing.expectEqualStrings("11", (try partitionText(a, .{}, 0, .{ .decimal = .{ .unscaled = 105, .scale = 1 } })).?);
+    try testing.expectError(error.DecimalDropsDigits, partitionText(a, .{}, 0, .{ .decimal = .{ .unscaled = 105, .scale = 1 } }));
     try testing.expectError(Error.DeltaValueOutOfRange, partitionText(a, .{}, 2, .{ .decimal = .{ .unscaled = std.math.maxInt(i128), .scale = 0 } }));
     try testing.expect(try partitionText(a, .{}, 0, .{ .string = "" }) == null);
     try testing.expect(try partitionText(a, .{}, 0, .null) == null);

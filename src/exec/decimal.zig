@@ -26,6 +26,8 @@ const types = @import("../lang/types.zig");
 const Value = @import("value.zig").Value;
 const Type = types.Type;
 const failWith = @import("eval/support.zig").failWith;
+const explain = @import("eval/support.zig").explain;
+const msgfmt = @import("../format/msgfmt.zig");
 const trim = @import("eval/support.zig").trim;
 const fmt_bound = @import("eval/format.zig").fmt_bound;
 
@@ -215,10 +217,30 @@ pub fn fitTo(d: Decimal, precision: u8, scale: u8) ?Decimal {
     return if (fitsPrecision(r.unscaled, precision)) r else null;
 }
 
-/// The unscaled integer restated at `want` as a `T`; null when it overflows either.
-pub fn rescaleAs(comptime T: type, d: Decimal, want: u8) ?T {
-    const r = rescaleTo(d, want) orelse return null;
+/// `d` at `want` exactly, as a typed writer stores it: a nonzero digit past `want`
+/// would be rounded away, which only a CAST may ask for. Null on overflow.
+pub fn exactAt(d: Decimal, want: u8) error{DecimalDropsDigits}!?Decimal {
+    if (dropsDigits(d, want)) return error.DecimalDropsDigits;
+    return rescaleTo(d, want);
+}
+
+/// The unscaled integer of `exactAt` as a `T`; null when it overflows either.
+pub fn exactAs(comptime T: type, d: Decimal, want: u8) error{DecimalDropsDigits}!?T {
+    const r = (try exactAt(d, want)) orelse return null;
     return std.math.cast(T, r.unscaled);
+}
+
+/// A typed writer's `DecimalDropsDigits` for column `name` of type `ty`, naming the
+/// CAST that rounds its values on purpose.
+pub fn dropsDigitsFailure(name: []const u8, ty: Type) anyerror {
+    @branchHint(.cold);
+    var buf: [480]u8 = undefined;
+    const p: u8 = if (ty.precision == 0) max_digits else ty.precision;
+    const msg = if (ty.kind == .decimal)
+        msgfmt.clipPrint(&buf, "column `{s}` is DECIMAL({d},{d}) and holds a value with more decimal places, which writing would round away; CAST it to DECIMAL({d},{d}) to round on purpose", .{ name, p, ty.scale, p, ty.scale })
+    else
+        msgfmt.clipPrint(&buf, "column `{s}` holds a decimal with more places than its type's scale, which writing would round away; CAST it to that scale to round on purpose", .{name});
+    return explain(error.DecimalDropsDigits, msg);
 }
 
 /// Adds `d` to a DECIMAL SUM's wide total, at the sum's `scale`. The add needs no
@@ -660,10 +682,10 @@ pub fn fixedBigEndian(b: []u8, x: i128) bool {
     return true;
 }
 
-/// `d` restated at `scale` as 16 bytes of little-endian two's complement, as Arrow
-/// stores a decimal128; false when it overflows doing so.
-pub fn littleEndian128(out: *[16]u8, d: Decimal, scale: u8) bool {
-    const r = rescaleTo(d, scale) orelse return false;
+/// `d` restated exactly at `scale` (`exactAt`) as 16 bytes of little-endian two's
+/// complement, as Arrow stores a decimal128; false when it overflows doing so.
+pub fn littleEndian128(out: *[16]u8, d: Decimal, scale: u8) error{DecimalDropsDigits}!bool {
+    const r = (try exactAt(d, scale)) orelse return false;
     std.mem.writeInt(i128, out, r.unscaled, .little);
     return true;
 }

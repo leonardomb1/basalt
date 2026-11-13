@@ -77,10 +77,13 @@ columns it has not seen.
   DECIMAL(18,2))`, or reach for `TRY_CAST` to turn unreadable values into nulls.
 - **A decimal that loses digits rounds half away from zero**, as PostgreSQL and
   SQL Server round: `CAST('12.345' AS DECIMAL(10,2))` is `12.35` and `-12.345`
-  is `-12.35`. The rule is the same for a cast, for a value written to a file
-  column of smaller scale (Parquet, Arrow), and for an aggregate's result — one
-  answer whichever path a value takes. A database sink is sent the value whole
-  and its column does its own rounding. A float converts through its
+  is `-12.35`. The rule is the same for a cast and for an aggregate's result.
+  Writing never rounds: a value with more decimal places than its typed file
+  column's scale (Parquet, Arrow, Avro, Delta) fails the write, naming the
+  column, so `CAST(x AS DECIMAL(p, s))` rounds it on purpose. This meets a
+  PostgreSQL `numeric` declared without a scale, typed `DECIMAL(38,6)` while
+  each value keeps its own. A text file is written the value whole, and a
+  database sink is sent it whole, its column doing its own rounding. A float converts through its
   15 significant digits, as PostgreSQL converts `float8` to `numeric`: the
   double nearest `2.675` is `2.67499…`, and it still becomes `2.68`. A float too
   large for 38 digits fails the cast.

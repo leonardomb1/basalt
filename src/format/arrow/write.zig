@@ -40,6 +40,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const driver = @import("../../connect/driver.zig");
 const Part = @import("../../store/part.zig").Part;
 const flatbuf = @import("flatbuf.zig");
+const decimal = @import("../../exec/decimal.zig");
 const littleEndian128 = @import("../../exec/decimal.zig").littleEndian128;
 
 comptime {
@@ -182,7 +183,10 @@ pub const StreamWriter = struct {
                 continue;
             }
             const c = if (col.data == .nested) try column.copy(arena, col.*) else col.*;
-            try pushColumn(arena, &body, &nodes, &c, n);
+            pushColumn(arena, &body, &nodes, &c, n) catch |e| {
+                if (e == error.DecimalDropsDigits) return decimal.dropsDigitsFailure(f.name, f.ty);
+                return e;
+            };
         }
         const fb = &self.fb;
         fb.reset();
@@ -403,7 +407,7 @@ fn pushData(arena: std.mem.Allocator, body: *Body, col: *const Column, n: usize)
             @memset(out, 0);
             for (0..n) |i| {
                 if (!col.validity.get(i)) continue;
-                if (!littleEndian128(out[i * 16 ..][0..16], src.at(i), col.ty.scale)) return error.DecimalOverflow;
+                if (!try littleEndian128(out[i * 16 ..][0..16], src.at(i), col.ty.scale)) return error.DecimalOverflow;
             }
             try body.push(out);
         },
@@ -596,7 +600,7 @@ fn testBatch(arena: std.mem.Allocator, schema: *const types.Schema) !Batch {
     const rows = [_][8]V{
         .{ .{ .int = 1 }, .{ .string = "ana" }, .{ .bool = true }, .{ .decimal = .{ .unscaled = 1050, .scale = 2 } }, .{ .date = 20000 }, .{ .timestamp = 1_700_000_000_000_000 }, .{ .float = 1.5 }, .{ .time = 3_600_000_000 } },
         .{ .null, .null, .{ .bool = false }, .{ .decimal = .{ .unscaled = 3, .scale = 0 } }, .{ .date = 20001 }, .{ .timestamp = 1_700_000_000_000_001 }, .{ .float = -2.25 }, .{ .time = 0 } },
-        .{ .{ .int = 3 }, .{ .string = "bob" }, .{ .bool = true }, .{ .decimal = .{ .unscaled = -12345, .scale = 3 } }, .{ .date = 20002 }, .{ .timestamp = 0 }, .{ .float = 0 }, .{ .time = 86_399_000_000 } },
+        .{ .{ .int = 3 }, .{ .string = "bob" }, .{ .bool = true }, .{ .decimal = .{ .unscaled = -12340, .scale = 3 } }, .{ .date = 20002 }, .{ .timestamp = 0 }, .{ .float = 0 }, .{ .time = 86_399_000_000 } },
     };
     for (schema.fields, cols) |f, *c| {
         var b = column.Builder.init(arena, f.ty);
@@ -711,7 +715,7 @@ test "stream: a record batch carries validity, repacked bools and decimals, raw 
     try std.testing.expectEqual(@as(usize, 48), valor_data.len);
     try std.testing.expectEqual(@as(i128, 1050), std.mem.readInt(i128, body[valor_data.off..][0..16], .little));
     try std.testing.expectEqual(@as(i128, 300), std.mem.readInt(i128, body[valor_data.off + 16 ..][0..16], .little));
-    try std.testing.expectEqual(@as(i128, -1235), std.mem.readInt(i128, body[valor_data.off + 32 ..][0..16], .little));
+    try std.testing.expectEqual(@as(i128, -1234), std.mem.readInt(i128, body[valor_data.off + 32 ..][0..16], .little));
 
     const dia_data = try bufAt(rb, bufs.at, 10);
     try std.testing.expectEqual(@as(usize, 12), dia_data.len);
@@ -794,7 +798,7 @@ test "file sink: the IPC file and stream a sink writes read back through the rea
         }
         var rows: usize = 0;
         while (try r.next(a)) |b| {
-            const dec_want = [_][]const u8{ "10.50", "3.00", "-12.35" };
+            const dec_want = [_][]const u8{ "10.50", "3.00", "-12.34" };
             try std.testing.expectEqual(schema.fields.len, b.columns.len);
             for (0..b.len) |i| {
                 const src = (rows + i) % batch.len;

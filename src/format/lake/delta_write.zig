@@ -66,6 +66,7 @@ const merge = @import("delta_merge.zig");
 const dvs = @import("delta_dv.zig");
 const driver = @import("../../connect/driver.zig");
 const eval = @import("../../exec/eval.zig");
+const decimal = @import("../../exec/decimal.zig");
 const folder = @import("../../connect/folder.zig");
 const jsontext = @import("../../exec/jsontext.zig");
 const objstore = @import("../../store/objstore.zig");
@@ -1160,7 +1161,10 @@ pub const Sink = struct {
         for (0..b.len) |r| {
             key.clearRetainingCapacity();
             for (p.parts, vals) |k, *v| {
-                v.* = try dtypes.partitionText(arena, p.cols[k].phys, p.cols[k].ty.scale, b.columns[p.cols[k].src].getValue(r));
+                v.* = dtypes.partitionText(arena, p.cols[k].phys, p.cols[k].ty.scale, b.columns[p.cols[k].src].getValue(r)) catch |e| {
+                    if (e == error.DecimalDropsDigits) return decimal.dropsDigitsFailure(p.cols[k].name, p.cols[k].ty);
+                    return e;
+                };
                 if (v.*) |t| {
                     try key.append(1);
                     try key.appendSlice(t);

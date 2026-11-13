@@ -283,12 +283,13 @@ fn nestedBody(out: *std.array_list.Managed(u8), col: *const Column, row: usize) 
     }
 }
 
-/// A decimal restated at the column's scale, as Parquet's writer restates it, in the
-/// fewest big-endian two's complement bytes that hold it. One with more digits than
-/// the schema's precision fails naming the column, as a reader would refuse it.
+/// A decimal restated exactly at the column's scale, as Parquet's writer restates it,
+/// in the fewest big-endian two's complement bytes that hold it. One with more digits
+/// than the schema's precision fails naming the column, as a reader would refuse it.
 fn decimalBytes(out: *std.array_list.Managed(u8), d: Decimal, f: types.Schema.Field) !void {
     const p = precisionOf(f.ty);
-    const r = decimal.rescaleTo(d, f.ty.scale) orelse return decimalTooWide(f, p);
+    const exact = decimal.exactAt(d, f.ty.scale) catch return decimal.dropsDigitsFailure(f.name, f.ty);
+    const r = exact orelse return decimalTooWide(f, p);
     if (!decimal.withinPrecision(r.unscaled, p)) return decimalTooWide(f, p);
     const be = decimal.minimalBigEndian(r.unscaled);
     try bytesOf(out, be.bytes[be.start..]);
@@ -384,8 +385,8 @@ test "every golden column round-trips through each codec, two blocks each" {
         for (try celltext.goldenBatches(a)) |batch| {
             if (schemaProblem(batch.schema.*) != null) continue;
             if (batch.schema.fields[0].ty.kind == .decimal and batch.schema.fields.len == 1) {
-                try testing.expectError(error.AvroDecimalOverflow, roundTrip(a, tmp.dir, batch, codec));
-                try testing.expectEqualStrings("a value of column `c` does not fit its DECIMAL(14,2)", eval.takeFailure(error.AvroDecimalOverflow).?);
+                try testing.expectError(error.DecimalDropsDigits, roundTrip(a, tmp.dir, batch, codec));
+                try testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.DecimalDropsDigits).?, "`c`") != null);
                 continue;
             }
             try roundTrip(a, tmp.dir, batch, codec);

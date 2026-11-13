@@ -304,7 +304,9 @@ pub const Merge = struct {
                 try bd.append(v);
                 continue;
             }
-            const d = decimal.rescaleTo(v.decimal, c.ty.scale) orelse
+            const exact = decimal.exactAt(v.decimal, c.ty.scale) catch
+                return decimal.dropsDigitsFailure(c.name, c.ty);
+            const d = exact orelse
                 return self.fail(write.Error.DeltaValueOutOfRange, "column `{s}` is `{s}` in {s}, which cannot hold a value of the rows' scale {d}", .{ c.name, c.delta_type, self.plan.name, v.decimal.scale });
             try bd.append(.{ .decimal = d });
         }

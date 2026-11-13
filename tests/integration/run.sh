@@ -476,6 +476,30 @@ WITH (schema_from = 'it_ua') WHERE d = '2024-01-15' ORDER BY id;"; then
   fi
 fi
 
+# A bare postgres `numeric` is typed decimal(38,6), but a value keeps its own
+# dscale: a typed writer refuses one with digits past the column's scale rather
+# than round it away, and a CAST to that scale rounds it on purpose.
+if runs postgres; then
+  pgq() { docker compose -f tests/integration/compose.yaml exec -T postgres psql -U postgres -d it -t -A -F, "$@"; }
+  pgq -c "DROP TABLE IF EXISTS it_wide;
+          CREATE TABLE it_wide (k int, n numeric);
+          INSERT INTO it_wide VALUES (1, 2.5), (2, 0.0000001);" >/dev/null 2>&1
+  if $B run -q -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
+LOAD INTO '$out/pg_wide.parquet' AS SELECT k, n FROM db.public.it_wide;" >"$out/pg_wide.log" 2>&1; then
+    report "postgres-decimal-write-exact (rounded silently)" bad
+  elif ! grep -q 'column `n`' "$out/pg_wide.log"; then
+    report "postgres-decimal-write-exact (wrong message)" bad
+    head -3 "$out/pg_wide.log"
+  elif brun run -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
+LOAD INTO '$out/pg_wide.parquet' AS SELECT k, CAST(n AS DECIMAL(38,6)) AS n FROM db.public.it_wide ORDER BY k;
+LOAD INTO '$out/pg_wide.csv' AS SELECT * FROM '$out/pg_wide.parquet' ORDER BY k;"; then
+    printf 'k,n\n1,2.500000\n2,0.000000\n' >"$out/pg_wide_want.csv"
+    check postgres-decimal-write-exact "$out/pg_wide.csv" "$out/pg_wide_want.csv"
+  else
+    report "postgres-decimal-write-exact (CAST run error)" bad
+  fi
+fi
+
 # Decimal aggregates against the source's own answer. A bare postgres `numeric`
 # has no typmod, so the column is typed decimal(38,6) while each value arrives at
 # its own dscale — summing raw unscaled integers scaled the total by 10^4, and
