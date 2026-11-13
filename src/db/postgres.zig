@@ -104,7 +104,10 @@ pub const Conn = struct {
                     const code = try authCode(p);
                     switch (code) {
                         0 => {},
-                        3 => try self.sendPassword(password),
+                        3 => {
+                            if (self.wire.tls == null) return self.clearRefused();
+                            try self.sendPassword(password);
+                        },
                         5 => {
                             if (p.len < 8) return error.PgProtocol;
                             try self.sendMd5(user, password, p[4..8]);
@@ -122,6 +125,13 @@ pub const Conn = struct {
                 else => {},
             }
         }
+    }
+
+    /// A cleartext password goes only over TLS: a server, or anyone between, asking
+    /// for it on a plain connection is refused, as the MySQL driver refuses it.
+    fn clearRefused(self: *Conn) error{ PgAuthFailed, OutOfMemory } {
+        try self.wire.setError("the server asks for the password in clear text on a connection without TLS; set `tls = 'require'` (or 'insecure' for a self-signed certificate)");
+        return error.PgAuthFailed;
     }
 
     fn sendPassword(self: *Conn, password: []const u8) !void {
@@ -180,6 +190,10 @@ pub const Conn = struct {
         if ((try self.readMsg()) != 'R' or (try authCode(self.wire.msg.items)) != 11) return error.PgAuthFailed;
         const server_first = try a.dupe(u8, self.wire.msg.items[4..]);
         const sr = scramAttr(server_first, 'r') orelse return error.PgProtocol;
+        if (!std.mem.startsWith(u8, sr, client_nonce) or sr.len == client_nonce.len) {
+            try self.wire.setError("the server's SCRAM nonce does not extend the one basalt sent (RFC 5802), so the login is not this session's");
+            return error.PgAuthFailed;
+        }
         const ss = scramAttr(server_first, 's') orelse return error.PgProtocol;
         const si = scramAttr(server_first, 'i') orelse return error.PgProtocol;
         const iters = scramIterations(si) catch |e| {
@@ -777,5 +791,17 @@ test "a bytea reads as BYTES in either output format and a time as TIME; timetz 
     for (starts) |s| {
         try std.testing.expect(std.mem.indexOf(u8, s, "TimeZone\x00UTC\x00") != null);
         try std.testing.expect(std.mem.indexOf(u8, s, "bytea_output") == null);
+    }
+}
+
+test "a cleartext password request on a plain connection, and a SCRAM nonce that is not the client's, are refused before any secret is sent" {
+    const FakePg = @import("../testing/postgres_fake.zig").FakePg;
+    const gpa = std.testing.allocator;
+    for ([_]@import("../testing/postgres_fake.zig").Auth{ .cleartext, .scram_foreign_nonce }) |auth| {
+        const srv = try FakePg.start(gpa, &.{});
+        defer srv.finish();
+        srv.auth = auth;
+        try std.testing.expectError(error.PgAuthFailed, Conn.connect(gpa, "127.0.0.1", srv.port(), "u", "p", "d", .off, .{ .connect_s = 5 }));
+        try std.testing.expect(!srv.answered.load(.seq_cst));
     }
 }

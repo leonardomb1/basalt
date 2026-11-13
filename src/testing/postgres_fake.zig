@@ -1,5 +1,5 @@
-//! A PostgreSQL server for tests, each connection on a thread of its own: a trust
-//! login (AuthenticationOk, ReadyForQuery; an SSLRequest is refused with 'N'), and
+//! A PostgreSQL server for tests, each connection on a thread of its own: a login
+//! as `auth` asks (trust by default; an SSLRequest is refused with 'N'), and
 //! simple Query messages over tables held in memory, answered with RowDescription,
 //! DataRows in text format, CommandComplete and ReadyForQuery. Every query's text,
 //! and every StartupMessage's parameters, are recorded, so a test can assert what
@@ -32,10 +32,17 @@ pub const Table = struct {
     est_rows: i64 = 0,
 };
 
+/// How the fake answers a login: at once, asking first for a cleartext password, or
+/// with a SCRAM server-first whose nonce is not the one the client sent.
+pub const Auth = enum { trust, cleartext, scram_foreign_nonce };
+
 pub const FakePg = struct {
     gpa: std.mem.Allocator,
     listener: std.net.Server,
     tables: []const Table,
+    auth: Auth = .trust,
+    /// Set when a client answered a login challenge, its password or a SCRAM proof.
+    answered: std.atomic.Value(bool) = .init(false),
     fail_on: ?[]const u8 = null,
     fail_msg: []const u8 = "",
     drop_on: ?[]const u8 = null,
@@ -143,6 +150,24 @@ pub const FakePg = struct {
             defer self.mutex.unlock();
             try self.startups.append(try self.gpa.dupe(u8, body[4..]));
             break;
+        }
+        switch (self.auth) {
+            .trust => {},
+            .cleartext => {
+                try message(w, 'R', &.{ 0, 0, 0, 3 });
+                try w.flush();
+                _ = takeMessage(r, a) catch return;
+                self.answered.store(true, .seq_cst);
+            },
+            .scram_foreign_nonce => {
+                try message(w, 'R', &[_]u8{ 0, 0, 0, 10 } ++ "SCRAM-SHA-256\x00\x00");
+                try w.flush();
+                _ = takeMessage(r, a) catch return;
+                try message(w, 'R', &[_]u8{ 0, 0, 0, 11 } ++ "r=a-nonce-of-another-session,s=c2FsdA==,i=4096");
+                try w.flush();
+                _ = takeMessage(r, a) catch return;
+                self.answered.store(true, .seq_cst);
+            },
         }
         try message(w, 'R', &.{ 0, 0, 0, 0 });
         try message(w, 'Z', "I");
@@ -359,6 +384,16 @@ fn unquote(s: []const u8) []const u8 {
     const t = std.mem.trim(u8, s, " ");
     if (t.len >= 2 and t[0] == '"' and t[t.len - 1] == '"') return t[1 .. t.len - 1];
     return t;
+}
+
+/// One frontend message after the startup, its body on `a`.
+fn takeMessage(r: *std.Io.Reader, a: std.mem.Allocator) ![]u8 {
+    _ = try r.takeByte();
+    const len = try r.takeInt(u32, .big);
+    if (len < 4) return error.BadMessage;
+    const body = try a.alloc(u8, len - 4);
+    try r.readSliceAll(body);
+    return body;
 }
 
 fn message(w: *std.Io.Writer, t: u8, body: []const u8) !void {
