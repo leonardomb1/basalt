@@ -239,7 +239,7 @@ pub const CsvReader = struct {
                 self.stream_eof = true;
                 break;
             };
-            if (line.len == 0) continue;
+            if (skipsBlank(line, fields.items.len)) continue;
             const own = try arena.dupe(u8, line);
             if (pending.items.len < SAMPLE_ROWS) sniff.feed(own);
             try pending.append(.{ .text = own, .line_no = self.rec_line, .path = self.path });
@@ -284,7 +284,7 @@ pub const CsvReader = struct {
                 };
                 at = .{ .text = line, .line_no = self.rec_line, .path = self.path };
             }
-            if (line.len == 0) continue;
+            if (skipsBlank(line, ncols)) continue;
             splitInto(arena, line, builders, self.dialect, self.slot) catch |e|
                 return rowFailure(e, at.path, at.line_no, line, self.schema, self.dialect, self.slot);
             rows += 1;
@@ -597,6 +597,12 @@ pub const MappedCsv = struct {
 /// A chunk of a mapped file, read a batch at a time; with `release`, every
 /// `release_every` bytes the pages already read are released, so a lane holds a few
 /// MiB of its chunk resident, not all of it.
+/// A blank line is no record where a row has several fields; in a one-column file it
+/// is that column's NULL, as the writer spells one.
+inline fn skipsBlank(line: []const u8, ncols: usize) bool {
+    return line.len == 0 and ncols > 1;
+}
+
 pub const CsvSliceReader = struct {
     data: []const u8,
     pos: usize = 0,
@@ -614,17 +620,7 @@ pub const CsvSliceReader = struct {
         const builders = try arena.alloc(column.Builder, ncols);
         for (builders, self.schema.fields) |*b, f| b.* = try column.Builder.initCapacity(arena, f.ty, BATCH_ROWS);
 
-        var rows: usize = 0;
-        while (rows < BATCH_ROWS and self.pos < self.data.len) {
-            const rec = scanRecord(self.data, self.pos, self.dialect.delim);
-            const line = rec.line;
-            if (rec.open) return unterminated(self.path, self.lineOf(line));
-            self.pos = rec.next;
-            if (line.len == 0) continue;
-            splitInto(arena, line, builders, self.dialect, self.slot) catch |e|
-                return rowFailure(e, self.path, self.lineOf(line), line, self.schema.*, self.dialect, self.slot);
-            rows += 1;
-        }
+        const rows = if (ncols == 1) try self.fill(true, arena, builders) else try self.fill(false, arena, builders);
         if (rows == 0) return null;
         const cols = try arena.alloc(column.Column, ncols);
         for (builders, 0..) |*b, i| cols[i] = try b.finish();
@@ -633,6 +629,23 @@ pub const CsvSliceReader = struct {
             self.released = self.pos;
         }
         return Batch{ .schema = self.schema, .columns = cols, .len = rows };
+    }
+
+    /// Up to a batch of records into `builders`, the blank-line rule of `skipsBlank`
+    /// fixed per file, as a branch per record costs the many-column hot loop.
+    fn fill(self: *CsvSliceReader, comptime one_column: bool, arena: std.mem.Allocator, builders: []column.Builder) !usize {
+        var rows: usize = 0;
+        while (rows < BATCH_ROWS and self.pos < self.data.len) {
+            const rec = scanRecord(self.data, self.pos, self.dialect.delim);
+            const line = rec.line;
+            if (rec.open) return unterminated(self.path, self.lineOf(line));
+            self.pos = rec.next;
+            if (skipsBlank(line, if (one_column) 1 else 2)) continue;
+            splitInto(arena, line, builders, self.dialect, self.slot) catch |e|
+                return rowFailure(e, self.path, self.lineOf(line), line, self.schema.*, self.dialect, self.slot);
+            rows += 1;
+        }
+        return rows;
     }
 
     const release_every = 4 << 20;

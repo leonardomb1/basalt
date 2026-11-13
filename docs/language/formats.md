@@ -12,7 +12,8 @@ inside it, and a record may run to 64 MiB — past that the read stops with an e
 naming the file and line, as a file that is not CSV or a quote left open would
 otherwise be read into memory whole. Every row must have one field per
 header column: a row with more or fewer is an error naming the file, the line and
-both counts, never padded with nulls or cut short. A cell that is not valid UTF-8
+both counts, never padded with nulls or cut short. A blank line is skipped, but
+in a one-column file it is that column's NULL, as basalt writes one. A cell that is not valid UTF-8
 is an error naming the file, the line, the column and the first bad byte, never
 repaired, as DuckDB's reader refuses it: read a file that is not UTF-8 `WITH
 (encoding = 'latin1')` or `'cp1252'`, which decode every byte. A header name that

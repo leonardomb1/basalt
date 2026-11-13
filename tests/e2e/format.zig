@@ -279,6 +279,26 @@ test "csv: a column of ISO dates is inferred as DATE (empty cells are null)" {
     try std.testing.expectEqualStrings("n\n2026-02-01\n2026-02-02\n", got);
 }
 
+test "csv: a one-column file keeps its NULL rows through a write and a read, mapped, streamed and CRLF alike" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "crlf.csv", .data = "v\r\n1\r\n\r\n3\r\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc,
+        \\LOAD INTO '{0s}/one.csv' AS SELECT CASE WHEN range % 2 = 0 THEN NULL ELSE range END AS v FROM RANGE(4);
+        \\LOAD INTO '{0s}/one.csv.gz' AS SELECT * FROM '{0s}/one.csv';
+        \\LOAD INTO '{0s}/out.csv' AS
+        \\SELECT (SELECT count(*) FROM '{0s}/one.csv') AS mapped, (SELECT count(*) FROM '{0s}/one.csv.gz') AS streamed,
+        \\  (SELECT count(*) FROM '{0s}/one.csv' WHERE v IS NULL) AS nulls, (SELECT count(*) FROM '{0s}/crlf.csv') AS crlf;
+    , .{base});
+    defer alloc.free(script);
+    const got = try runScript(alloc, &tmp, script, &.{});
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("mapped,streamed,nulls,crlf\n4,4,2,3\n", got);
+}
+
 const fx_logical = fixtures.logical_types_parquet;
 
 test "a parquet UINT64 is DECIMAL(20,0): it joins and compares against an INT, and keeps a value past 2^63-1" {
