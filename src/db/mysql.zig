@@ -35,6 +35,10 @@ const wire = @import("wire.zig");
 const driver = @import("../connect/driver.zig");
 const typemap = @import("typemap.zig");
 
+/// utf8mb4_general_ci, so the session reads and writes four-byte UTF-8; utf8mb3
+/// (33) turned an emoji into '?'.
+const CHARSET_UTF8MB4 = 45;
+
 const CLIENT_LONG_PASSWORD = 0x00000001;
 const CLIENT_CONNECT_WITH_DB = 0x00000008;
 const CLIENT_LOCAL_FILES = 0x00000080;
@@ -341,7 +345,7 @@ pub const Conn = struct {
         const w = out.writer();
         try w.writeInt(u32, self.capsFor(database) | CLIENT_SSL, .little);
         try w.writeInt(u32, 0x01000000, .little);
-        try w.writeByte(33);
+        try w.writeByte(CHARSET_UTF8MB4);
         try w.writeByteNTimes(0, 23);
         _ = try self.writePacket(seq, out.items);
     }
@@ -371,7 +375,7 @@ pub const Conn = struct {
 
         try w.writeInt(u32, caps, .little);
         try w.writeInt(u32, 0x01000000, .little);
-        try w.writeByte(33);
+        try w.writeByte(CHARSET_UTF8MB4);
         try w.writeByteNTimes(0, 23);
         try w.writeAll(user);
         try w.writeByte(0);
@@ -472,7 +476,7 @@ const LoadDataProto = struct {
     pub const stmt = "LOAD DATA";
 
     pub fn command(arena: std.mem.Allocator, qtable: []const u8, schema: types.Schema) ![]const u8 {
-        return msgfmt.allocPrint(arena, "LOAD DATA LOCAL INFILE 'pipe' INTO TABLE {s} ({s})", .{ qtable, try sql.colList(arena, .mysql, schema) });
+        return msgfmt.allocPrint(arena, "LOAD DATA LOCAL INFILE 'pipe' INTO TABLE {s} CHARACTER SET utf8mb4 ({s})", .{ qtable, try sql.colList(arena, .mysql, schema) });
     }
 
     pub fn appendBatch(w: anytype, _: std.mem.Allocator, batch: Batch) !void {

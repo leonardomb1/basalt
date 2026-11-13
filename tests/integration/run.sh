@@ -265,6 +265,21 @@ LOAD INTO '$pq' AS SELECT n, code FROM db.it_coll;"; then
 }
 
 runs mysql     && collrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"      db.it_coll
+
+# Four-byte UTF-8 (an emoji) survives a write and a read: the session speaks
+# utf8mb4, which a utf8mb3 connection would turn into '?'.
+if runs mysql; then
+  decl="CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"
+  printf 'n,s\n1,caf\303\251 \360\237\230\200\n' >"$out/utf8mb4.csv"
+  if brun run -c "$decl
+LOAD INTO db.it_utf8mb4 REPLACE AS SELECT CAST(n AS INT) AS n, CAST(s AS STRING) AS s FROM '$out/utf8mb4.csv';" &&
+     $B run --format csv -q -c "$decl SELECT n, s FROM db.it_utf8mb4 ORDER BY n;" >"$out/utf8mb4_got.csv" 2>&1 &&
+     cmp -s "$out/utf8mb4.csv" "$out/utf8mb4_got.csv"; then
+    report mysql-utf8mb4 ok
+  else
+    report mysql-utf8mb4 bad; cat "$out/utf8mb4_got.csv"
+  fi
+fi
 runs postgres  && collrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      db.it_coll descends  # 16-alpine: musl, byte order
 runs sqlserver && collrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" db.it_coll
 
