@@ -147,8 +147,13 @@ pub fn buildBalanced(self: *Parser, op: ast.BinOp, items: []const *ast.Expr) Err
     return self.mk(.{ .binary = .{ .op = op, .l = try self.buildBalanced(op, items[0..mid]), .r = try self.buildBalanced(op, items[mid..]) } });
 }
 
+/// `LIKE`, `IN` and `BETWEEN` bind tighter than comparisons, as in PostgreSQL:
+/// `a = b LIKE c` is `a = (b LIKE c)`.
+const like_bp = 41;
+
 /// Binding powers, low to high: `or` 10, `and` 20, unary `not` 25, `??` 30, comparisons
-/// 40, `|` 42, `^` 44, `&` 46, shifts 48, `+ - ||` 50, `* / %` 60.
+/// and `IS` 40, `LIKE IN BETWEEN` 41 (`like_bp`), `|` 42, `^` 44, `&` 46, shifts 48,
+/// `+ - ||` 50, `* / %` 60.
 pub fn binInfo(self: *Parser) ?BinInfo {
     switch (self.curTag()) {
         .eq, .assign => return .{ .op = .eq, .lbp = 40 },
@@ -197,19 +202,19 @@ pub fn parseBin(self: *Parser, min_bp: u8) Error!*ast.Expr {
             }
             continue;
         }
-        if (self.isKw("like") and min_bp < 40) {
+        if (self.isKw("like") and min_bp < like_bp) {
             _ = self.advance();
-            const pat = try self.parseBin(40);
+            const pat = try self.parseBin(like_bp);
             const args = try self.arena.alloc(*ast.Expr, 2);
             args[0] = lhs;
             args[1] = pat;
             lhs = try self.mk(.{ .call = .{ .name = "like", .args = args } });
             continue;
         }
-        if (self.isKw("not") and self.peekKw("like") and min_bp < 40) {
+        if (self.isKw("not") and self.peekKw("like") and min_bp < like_bp) {
             _ = self.advance();
             _ = self.advance();
-            const pat = try self.parseBin(40);
+            const pat = try self.parseBin(like_bp);
             const args = try self.arena.alloc(*ast.Expr, 2);
             args[0] = lhs;
             args[1] = pat;
@@ -217,7 +222,7 @@ pub fn parseBin(self: *Parser, min_bp: u8) Error!*ast.Expr {
             lhs = try self.mk(.{ .unary = .{ .op = .not, .e = call } });
             continue;
         }
-        if ((self.isKw("in") or (self.isKw("not") and self.peekKw("in"))) and min_bp < 40) {
+        if ((self.isKw("in") or (self.isKw("not") and self.peekKw("in"))) and min_bp < like_bp) {
             const negated = self.isKw("not");
             if (negated) _ = self.advance();
             const inpos = self.curPos();
@@ -267,14 +272,14 @@ pub fn parseBin(self: *Parser, min_bp: u8) Error!*ast.Expr {
             lhs = if (negated) try self.mk(.{ .unary = .{ .op = .not, .e = alt.? } }) else alt.?;
             continue;
         }
-        if ((self.isKw("between") or (self.isKw("not") and self.peekKw("between"))) and min_bp < 40) {
+        if ((self.isKw("between") or (self.isKw("not") and self.peekKw("between"))) and min_bp < like_bp) {
             const negated = self.isKw("not");
             if (negated) _ = self.advance();
             _ = self.advance();
-            const lo = try self.parseBin(40);
+            const lo = try self.parseBin(like_bp);
             if (!self.eatKw("and"))
                 return self.fail(self.curPos(), "expected `AND` between the bounds of BETWEEN", .{});
-            const hi = try self.parseBin(40);
+            const hi = try self.parseBin(like_bp);
             const ge = try self.mk(.{ .binary = .{ .op = .ge, .l = lhs, .r = lo } });
             const le = try self.mk(.{ .binary = .{ .op = .le, .l = lhs, .r = hi } });
             const both = try self.mk(.{ .binary = .{ .op = .@"and", .l = ge, .r = le } });
@@ -483,7 +488,7 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                 _ = self.advance();
                 const name = try self.expectIdent();
                 _ = try self.expect(.assign);
-                const value = try self.parseBin(40);
+                const value = try self.parseBin(like_bp);
                 try self.expectKw("in");
                 const body = try self.parseExpr();
                 return self.mk(.{ .let_in = .{ .name = name, .value = value, .body = body } });

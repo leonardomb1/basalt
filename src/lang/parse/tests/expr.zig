@@ -13,6 +13,30 @@ const parseTypeStr = @import("../../sql_parser.zig").parseTypeStr;
 const std = @import("std");
 const testing = std.testing;
 
+test "sql expr: LIKE, IN and BETWEEN bind tighter than comparisons, NOT looser, as in PostgreSQL" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+
+    const lk = try parseExprStr(a, "f = name LIKE 'a%'", &diag);
+    try testing.expectEqual(ast.BinOp.eq, lk.binary.op);
+    try testing.expectEqualStrings("like", lk.binary.r.call.name);
+    const lk2 = try parseExprStr(a, "name LIKE 'a' || x = f", &diag);
+    try testing.expectEqual(ast.BinOp.eq, lk2.binary.op);
+    try testing.expectEqualStrings("like", lk2.binary.l.call.name);
+    try testing.expectEqualStrings("concat", lk2.binary.l.call.args[1].call.name);
+    const in_e = try parseExprStr(a, "f <> k IN (1, 2)", &diag);
+    try testing.expectEqual(ast.BinOp.ne, in_e.binary.op);
+    try testing.expectEqual(ast.BinOp.@"or", in_e.binary.r.binary.op);
+    const bt = try parseExprStr(a, "f = k BETWEEN 1 AND 2", &diag);
+    try testing.expectEqual(ast.BinOp.eq, bt.binary.op);
+    try testing.expectEqual(ast.BinOp.@"and", bt.binary.r.binary.op);
+    const nt = try parseExprStr(a, "NOT a = b", &diag);
+    try testing.expectEqual(ast.UnOp.not, nt.unary.op);
+    try testing.expectEqual(ast.BinOp.eq, nt.unary.e.binary.op);
+}
+
 test "sql expr: bitwise precedence slots between comparisons and additive" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

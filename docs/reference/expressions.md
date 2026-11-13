@@ -1,8 +1,9 @@
 # Expressions and types
 
-SQL-ish, Pratt-parsed. Precedence (high→low): unary `- NOT ~` → `* / %` →
-`+ - ||` → `<< >>` → `&` → `^` → `|` → comparisons
-`= == != <> < <= > >= LIKE IN IS` → `??` → `AND` → `OR`.
+SQL-ish, Pratt-parsed. Precedence (high→low): unary `- ~` → `* / %` →
+`+ - ||` → `<< >>` → `&` → `^` → `|` → `LIKE IN BETWEEN` → comparisons
+`= == != <> < <= > >= IS` → `??` → `NOT` → `AND` → `OR`. As in PostgreSQL,
+`NOT a = b` is `NOT (a = b)` and `a = b LIKE c` is `a = (b LIKE c)`.
 
 **Nulls** follow SQL's three-valued logic: a comparison with a null is null,
 which a `WHERE`, an `ON` or a `CASE WHEN` treats as false — so a null join key
