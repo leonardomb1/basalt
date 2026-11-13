@@ -517,6 +517,22 @@ LOAD INTO '$out/pg_wide.csv' AS SELECT * FROM '$out/pg_wide.parquet' ORDER BY k;
   fi
 fi
 
+# A $param, a LET or a scalar subquery in the SELECT list over a database table is
+# the engine's value, never a column the table is asked for.
+if runs postgres; then
+  pgq() { docker compose -f tests/integration/compose.yaml exec -T postgres psql -U postgres -d it -t -A -F, "$@"; }
+  pgq -c "DROP TABLE IF EXISTS it_sq; CREATE TABLE it_sq (p text); INSERT INTO it_sq VALUES ('a'), ('b');" >/dev/null 2>&1
+  if brun run -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
+PARAM n INT DEFAULT 7;
+LOAD INTO '$out/pg_dollar.csv' AS
+SELECT p, \$n AS x, (SELECT count(*) FROM db.public.it_sq WHERE p = 'a') AS hit FROM db.public.it_sq WHERE p <> 'z' ORDER BY p;"; then
+    printf 'p,x,hit\na,7,1\nb,7,1\n' >"$out/pg_dollar_want.csv"
+    check postgres-dollar-in-select "$out/pg_dollar.csv" "$out/pg_dollar_want.csv"
+  else
+    report "postgres-dollar-in-select (run error)" bad
+  fi
+fi
+
 # Decimal aggregates against the source's own answer. A bare postgres `numeric`
 # has no typmod, so the column is typed decimal(38,6) while each value arrives at
 # its own dscale — summing raw unscaled integers scaled the total by 10^4, and

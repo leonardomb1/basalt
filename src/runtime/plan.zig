@@ -255,6 +255,7 @@ const Needs = struct {
     }
 
     fn field(self: *Needs, q: ast.QualName) !void {
+        if (q.dollar) return;
         if (q.parts.len > 1) {
             if (self.own) |o| if (std.ascii.eqlIgnoreCase(o, q.parts[0])) return self.path(q.parts[1..]);
             for (self.right.items) |r| if (std.ascii.eqlIgnoreCase(r, q.parts[0])) return;
@@ -287,7 +288,7 @@ const Needs = struct {
                 }
             };
             if (ast.anyExpr(e, &quals, S.add)) return error.OutOfMemory;
-            for (quals.items) |q| try self.path(q.parts);
+            for (quals.items) |q| if (!q.dollar) try self.path(q.parts);
             return;
         }
         var quals = std.array_list.Managed(ast.QualName).init(self.env.arena);

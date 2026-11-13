@@ -377,11 +377,12 @@ pub fn serialWhereWith(arena: std.mem.Allocator, dialect: Dialect, stages: []con
 }
 
 /// Every source column an expression references, by `parts[0]`; a lambda's
-/// parameter is not one.
+/// parameter is not one, nor a `$param` or LET (a scalar subquery's included).
 pub fn collectFields(e: *const ast.Expr, set: *std.StringHashMap(void)) !void {
     const S = struct {
         fn add(m: *std.StringHashMap(void), n: *const ast.Expr) ?bool {
             if (n.* != .field) return null;
+            if (n.field.dollar) return false;
             m.put(n.field.parts[0], {}) catch return true;
             return false;
         }
@@ -916,4 +917,16 @@ test {
     _ = @import("pushdown/topn.zig");
     _ = @import("pushdown/translate.zig");
     _ = @import("pushdown/testing_util.zig");
+}
+
+test "collectFields names a source's columns only: a $param or LET reference is no column" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const n = try a.create(ast.Expr);
+    n.* = .{ .field = .{ .parts = &.{"n"}, .dollar = true } };
+    var set = std.StringHashMap(void).init(a);
+    try collectFields(try bin(a, .add, try fld(a, "p"), n), &set);
+    try testing.expectEqual(@as(u32, 1), set.count());
+    try testing.expect(set.contains("p"));
 }
