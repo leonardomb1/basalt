@@ -152,7 +152,18 @@ pub fn jsonOptions(hints: []const ast.Hint) json.Options {
     if (hintText(hints, "format")) |f| {
         if (std.ascii.eqlIgnoreCase(f, "ndjson") or std.ascii.eqlIgnoreCase(f, "jsonl")) o.shape = .ndjson;
     }
+    if (sampleHint(hints)) |n| o.sample = n;
     return o;
+}
+
+/// A read's `sample`, the rows a JSON source types its columns from; null when not
+/// given or not a whole number of 1 or more, which `checkSourceForm` refuses.
+pub fn sampleHint(hints: []const ast.Hint) ?usize {
+    for (hints) |h| if (std.mem.eql(u8, h.key, "sample")) {
+        if (h.value == .int and h.value.int >= 1) return @intCast(h.value.int);
+        return null;
+    };
+    return null;
 }
 
 /// The format a file write names, else a folder's (a Delta table), else the

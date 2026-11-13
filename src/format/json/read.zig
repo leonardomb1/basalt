@@ -11,9 +11,10 @@
 //! STRING, of unknown type when the sample read the whole input, so it unifies with
 //! any type as a CSV column of NULLs does (`Type.nullColumn`); the first of several
 //! files is not the whole input. Every row, sampled or later, is read into those
-//! columns as `CAST` reads a value (`Rows`): a key missing from a row is NULL, a key
-//! not among the columns is dropped, and a value its column cannot read is NULL
-//! rather than a guess.
+//! columns as `CAST` reads a value (`Rows`): a key missing from a row is NULL, while
+//! a key not among the columns, or a value its column cannot read, fails the read
+//! (`JsonPastSample`), as a CSV cell past its sniffed type does; `sample` widens the
+//! rows the columns are typed from.
 //!
 //! The input streams: values are cut out of a buffer that holds about one batch of
 //! rows (`Scan`), each validated and read in place by `exec/json.zig`, never built
@@ -30,7 +31,7 @@ const stream = @import("../stream.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 
-pub const Error = error{ InvalidJson, OutOfMemory } || std.Io.Reader.ShortError;
+pub const Error = error{ InvalidJson, JsonPastSample, OutOfMemory } || std.Io.Reader.ShortError;
 
 pub const Shape = enum { auto, ndjson, json };
 
@@ -41,6 +42,9 @@ pub const Options = struct {
     batch_rows: usize = 2048,
     chunk: usize = 64 << 10,
     schema: ?types.Schema = null,
+    /// The whole input's columns when `schema` is a projection of them: a key among
+    /// these but not read is skipped, while one in neither fails the read.
+    known: ?types.Schema = null,
     /// Whether this input is all that is read, so a sample that reaches its end has
     /// seen every row; false for the first of several files.
     alone: bool = true,
@@ -98,6 +102,7 @@ pub const Infer = struct {
 pub const Rows = struct {
     schema: types.Schema,
     index: std.StringHashMapUnmanaged(usize) = .empty,
+    known: std.StringHashMapUnmanaged(void) = .empty,
     builders: []column.Builder,
     fast: []Fast,
     vals: []?[]const u8,
@@ -107,7 +112,8 @@ pub const Rows = struct {
     /// appended as `read` would append it, without the `Value` and cast between.
     const Fast = enum { none, int, float, bool };
 
-    pub fn init(arena: std.mem.Allocator, schema: types.Schema, capacity: usize) Error!Rows {
+    /// `known`, the whole input's columns when `schema` projects them, else null.
+    pub fn init(arena: std.mem.Allocator, schema: types.Schema, known: ?types.Schema, capacity: usize) Error!Rows {
         var r = Rows{
             .schema = schema,
             .builders = try arena.alloc(column.Builder, schema.fields.len),
@@ -124,6 +130,7 @@ pub const Rows = struct {
             };
             try r.index.put(arena, f.name, i);
         }
+        if (known) |k| for (k.fields) |f| try r.known.put(arena, f.name, {});
         return r;
     }
 
@@ -139,14 +146,17 @@ pub const Rows = struct {
             var at: usize = 0;
             while (m.next()) |mem| {
                 const key = try jt.decodeString(arena, mem.key);
-                const ci = if (at < fields.len and std.mem.eql(u8, fields[at].name, key)) at else self.index.get(key) orelse continue;
+                const ci = if (at < fields.len and std.mem.eql(u8, fields[at].name, key)) at else self.index.get(key) orelse {
+                    if (self.known.contains(key)) continue;
+                    return pastSample("the key `{s}` is not among the keys of the rows sampled to type the columns, so its values would be dropped", .{clip(key)});
+                };
                 vals[ci] = mem.value;
                 at = ci + 1;
             }
         }
         for (self.builders, vals, fields, self.fast) |*b, raw, f, fa| {
             if (raw) |t| if (try appendFast(b, fa, t)) continue;
-            b.append(try read(arena, raw, f.ty)) catch |e| return switch (e) {
+            b.append(try read(arena, raw, f)) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.CastFailed => error.InvalidJson,
             };
@@ -180,10 +190,11 @@ pub const Rows = struct {
         return .{ .schema = schema, .columns = cols, .len = self.len };
     }
 
-    /// A JSON value as `ty`, as CAST reads it; a STRING column takes any value as text.
-    fn read(arena: std.mem.Allocator, raw_in: ?[]const u8, ty: types.Type) Error!Value {
+    /// A JSON value as its column's type, as CAST reads it; a STRING column takes any
+    /// value as text, and a value another column cannot read fails the read.
+    fn read(arena: std.mem.Allocator, raw_in: ?[]const u8, f: types.Schema.Field) Error!Value {
         const raw = raw_in orelse return .null;
-        if (ty.kind == .string) return switch (try jt.cell(arena, raw)) {
+        if (f.ty.kind == .string) return switch (try jt.cell(arena, raw)) {
             .null => .null,
             .text => |t| .{ .string = t },
         };
@@ -192,19 +203,37 @@ pub const Rows = struct {
             't' => .{ .bool = true },
             'f' => .{ .bool = false },
             '"' => .{ .string = try jt.decodeString(arena, raw[1 .. raw.len - 1]) },
-            '{', '[' => return .null,
+            '{', '[' => return mismatch(raw, f),
             else => switch (jt.number(raw)) {
                 .int => |x| .{ .int = x },
                 .float => |x| .{ .float = x },
                 .text => |t| .{ .string = t },
             },
         };
-        return eval.castValueTyped(arena, src, ty) catch |e| switch (e) {
+        return eval.castValueTyped(arena, src, f.ty) catch |e| switch (e) {
             error.OutOfMemory => error.OutOfMemory,
-            else => .null,
+            else => mismatch(raw, f),
         };
     }
+
+    fn mismatch(raw: []const u8, f: types.Schema.Field) Error {
+        return pastSample("the value {s} in `{s}` is not {s}, the type the sampled rows gave the column", .{ clip(raw), clip(f.name), @tagName(f.ty.kind) });
+    }
 };
+
+/// A read that met a key or value its sampled columns cannot hold: refused, never
+/// dropped or NULLed, with the way to widen the sample.
+fn pastSample(comptime fmt: []const u8, args: anytype) Error {
+    var buf: [400]u8 = undefined;
+    const head = std.fmt.bufPrint(&buf, fmt, args) catch "a JSON key or value falls outside its sampled columns";
+    var full: [480]u8 = undefined;
+    const msg = std.fmt.bufPrint(&full, "{s}; read with a larger WITH (sample = N) so the sample reaches it", .{head}) catch head;
+    return @errorCast(eval.explain(error.JsonPastSample, msg));
+}
+
+fn clip(s: []const u8) []const u8 {
+    return if (s.len <= 60) s else s[0..60];
+}
 
 /// The columns of `rows`, each a validated row's text, from the first `sample`.
 pub fn schemaOf(arena: std.mem.Allocator, rows: []const []const u8, sample: usize) Error!types.Schema {
@@ -215,7 +244,7 @@ pub fn schemaOf(arena: std.mem.Allocator, rows: []const []const u8, sample: usiz
 
 /// `rows`, each a validated row's text, read into `schema`'s columns as one batch.
 pub fn batchOf(arena: std.mem.Allocator, schema: *const types.Schema, rows: []const []const u8) Error!Batch {
-    var r = try Rows.init(arena, schema.*, rows.len);
+    var r = try Rows.init(arena, schema.*, null, rows.len);
     for (rows) |row| try r.add(arena, row);
     return r.finish(arena, schema);
 }
@@ -461,7 +490,7 @@ pub const Reader = struct {
 
     pub fn next(self: *Reader, arena: std.mem.Allocator) Error!?Batch {
         if (self.done) return null;
-        var rows = try Rows.init(arena, self.schema, self.opts.batch_rows);
+        var rows = try Rows.init(arena, self.schema, self.opts.known, self.opts.batch_rows);
         while (rows.len < self.opts.batch_rows) {
             if (self.held_at < self.held.len) {
                 try rows.add(arena, self.held[self.held_at]);
@@ -520,7 +549,34 @@ pub const Files = struct {
     pub fn open(arena: std.mem.Allocator, gpa: std.mem.Allocator, files: []const []const u8, opts: Options) !*Table {
         var o = opts;
         o.alone = opts.alone and files.len <= 1;
+        if (files.len > 1 and o.schema == null) o.schema = try sampleAcross(arena, gpa, files, opts);
         return Table.open(arena, gpa, files, o);
+    }
+
+    /// A folder's columns typed from up to `sample` rows read across its files in
+    /// order, so a key a later file brings is in the sample once it reaches that file.
+    fn sampleAcross(arena: std.mem.Allocator, gpa: std.mem.Allocator, files: []const []const u8, opts: Options) !types.Schema {
+        var infer = Infer{};
+        var left = opts.sample;
+        var every = true;
+        for (files) |path| {
+            if (left == 0) {
+                every = false;
+                break;
+            }
+            const s = try stream.Stream.open(arena, path);
+            defer s.close();
+            var o = opts;
+            o.sample = left;
+            o.alone = false;
+            const r = try Reader.open(arena, gpa, s.reader, o);
+            defer r.close();
+            for (r.held) |row| try infer.note(arena, row);
+            if (r.held.len >= left) every = false;
+            left -|= r.held.len;
+        }
+        infer.whole = every and opts.alone;
+        return infer.schema(arena);
     }
 
     pub fn on(arena: std.mem.Allocator, gpa: std.mem.Allocator, s: *stream.Stream, rest: []const []const u8, opts: Options) !*Table {
@@ -580,7 +636,6 @@ test "columns come from the sampled rows: keys in first-met order, types widened
         \\{"a":1,"b":null}
         \\{"a":2.5,"c":true,"b":"x"}
         \\{"a":3,"d":[1,2],"e":null,"c":1}
-        \\{"z":"late"}
     , .{ .sample = 3 });
     const want = [_]struct { []const u8, types.TypeKind }{ .{ "a", .float }, .{ "b", .string }, .{ "c", .string }, .{ "d", .string }, .{ "e", .string } };
     try testing.expectEqual(want.len, got.schema.fields.len);
@@ -591,7 +646,6 @@ test "columns come from the sampled rows: keys in first-met order, types widened
     try testing.expectEqual(@as(f64, 1), got.rows[0][0].float);
     try testing.expectEqualStrings("true", got.rows[1][2].string);
     try testing.expectEqualStrings("[1,2]", got.rows[2][3].string);
-    try testing.expect(got.rows[3][0].isNull());
 }
 
 test "a key with no value is of unknown type only when the sample read the whole input" {
@@ -683,21 +737,36 @@ test "Infer on widenSample types every key as the lattice it replaced did" {
     }
 }
 
-test "a value its column cannot read is NULL; strings and escaped keys decode" {
+test "a value its column reads as CAST would is kept; strings and escaped keys decode" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const got = try readAll(a,
-        \\[{"ok":true,"n":1,"s\u0074":"a\nb"},{"ok":"maybe","n":1e300,"st":"x"},{"ok":false,"n":"9","st":2},{"ok":null,"n":{"x":1},"st":[1]}]
+        \\[{"ok":true,"n":1,"s\u0074":"a\nb"},{"ok":false,"n":"9","st":2},{"ok":null,"n":null,"st":[1]}]
     , .{ .sample = 1 });
     try testing.expectEqualStrings("st", got.schema.fields[2].name);
     try testing.expectEqualStrings("a\nb", got.rows[0][2].string);
-    try testing.expect(got.rows[1][0].isNull());
-    try testing.expect(got.rows[1][1].isNull());
-    try testing.expectEqual(@as(i64, 9), got.rows[2][1].int);
-    try testing.expectEqualStrings("2", got.rows[2][2].string);
-    try testing.expect(got.rows[3][1].isNull());
-    try testing.expectEqualStrings("[1]", got.rows[3][2].string);
+    try testing.expectEqual(@as(i64, 9), got.rows[1][1].int);
+    try testing.expectEqualStrings("2", got.rows[1][2].string);
+    try testing.expect(got.rows[2][0].isNull());
+    try testing.expectEqualStrings("[1]", got.rows[2][2].string);
+}
+
+test "past the sample, a value its column cannot read, or a key it never met, fails the read; a larger sample reads it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const bad = [_][]const u8{
+        "{\"ok\":true,\"n\":1}\n{\"ok\":\"maybe\",\"n\":2}\n",
+        "{\"ok\":true,\"n\":1}\n{\"ok\":true,\"n\":1e300}\n",
+        "{\"ok\":true,\"n\":1}\n{\"ok\":true,\"n\":{\"x\":1}}\n",
+        "{\"ok\":true,\"n\":1}\n{\"ok\":true,\"n\":2,\"late\":\"x\"}\n",
+    };
+    for (bad) |doc| {
+        try testing.expectError(error.JsonPastSample, readAll(a, doc, .{ .sample = 1 }));
+        try testing.expect(std.mem.indexOf(u8, eval.takeFailure(error.JsonPastSample).?, "WITH (sample = N)") != null);
+        _ = try readAll(a, doc, .{ .sample = 2 });
+    }
 }
 
 test "items picks the array at a path; a value larger than the read chunk is whole" {
@@ -739,10 +808,31 @@ test "a folder whose later file cannot be opened fails once and frees each reade
     try tmp.dir.writeFile(.{ .sub_path = "1.jsonl", .data = "{\"k\":1}\n" });
     const base = try tmp.dir.realpathAlloc(a, ".");
     const files = [_][]const u8{ try std.fs.path.join(a, &.{ base, "1.jsonl" }), try std.fs.path.join(a, &.{ base, "gone.jsonl" }) };
-    const f = try Files.open(a, std.testing.allocator, &files, .{});
+    const f = try Files.open(a, std.testing.allocator, &files, .{ .sample = 1 });
     defer f.close();
     try std.testing.expect((try f.next(a)) != null);
     try std.testing.expectError(error.FileNotFound, f.next(a));
+    try std.testing.expectError(error.FileNotFound, Files.open(a, std.testing.allocator, &files, .{}));
+}
+
+test "a folder's columns are typed from rows across its files, so a key a later file brings is read" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "1.jsonl", .data = "{\"k\":1}\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "2.jsonl", .data = "{\"k\":2,\"new\":true}\n" });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const files = [_][]const u8{ try std.fs.path.join(a, &.{ base, "1.jsonl" }), try std.fs.path.join(a, &.{ base, "2.jsonl" }) };
+    const f = try Files.open(a, std.testing.allocator, &files, .{});
+    defer f.close();
+    try std.testing.expectEqual(@as(usize, 2), f.schema.fields.len);
+    try std.testing.expectEqualStrings("new", f.schema.fields[1].name);
+    try std.testing.expectEqual(types.TypeKind.bool, f.schema.fields[1].ty.kind);
+    var rows: usize = 0;
+    while (try f.next(a)) |b| rows += b.len;
+    try std.testing.expectEqual(@as(usize, 2), rows);
 }
 
 test "the column shortcuts append exactly what the general path does, whenever they take a value" {
@@ -770,7 +860,7 @@ test "the column shortcuts append exactly what the general path does, whenever t
             if (!try Rows.appendFast(&fast, fa, raw)) continue;
             taken += 1;
             var slow = column.Builder.init(a, ty);
-            try slow.append(try Rows.read(a, raw, ty));
+            try slow.append(try Rows.read(a, raw, .{ .name = "c", .ty = ty }));
             const want = (try slow.finish()).getValue(0);
             const got = (try fast.finish()).getValue(0);
             const same = switch (want) {

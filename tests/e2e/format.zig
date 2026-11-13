@@ -12,6 +12,7 @@ const runScript = @import("harness.zig").runScript;
 const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
 const expectRunRefuses = @import("harness.zig").expectRunRefuses;
 const checkAndRun = @import("harness.zig").checkAndRun;
+const expectFile = @import("harness.zig").expectFile;
 
 test "read a semicolon latin-1 file end to end" {
     const alloc = std.testing.allocator;
@@ -632,4 +633,15 @@ test "vector functions read embeddings pyarrow wrote, a list and a fixed-size li
     }
     try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT list_distance(embedding, CAST('[1,0]' AS LIST(DOUBLE))) AS d FROM '$B/e.parquet';", 1, "list_distance: the lists' lengths differ, 4 and 2");
     try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT list_inner_product(embedding, CAST('[1,null,0,0]' AS LIST(DOUBLE))) AS d FROM '$B/e.parquet';", 1, "list_inner_product: a list holds a NULL element");
+}
+
+test "a JSON key or value past the sample fails the read, a larger WITH (sample = N) reads it, and a sample that is no count is refused" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "late.ndjson", .data = "{\"id\":1}\n{\"id\":2}\n{\"id\":3,\"note\":\"x\"}\n" });
+    try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/late.ndjson' WITH (sample = 2);", 1, "the key `note` is not among the keys of the rows sampled");
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/late.ndjson' WITH (sample = 3);", 1, &.{});
+    try expectFile(&tmp, "o.csv", "id,note\n1,\n2,\n3,x\n");
+    try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/late.ndjson' WITH (sample = 0);", 1, "`sample` takes a whole number of rows, 1 or more");
 }

@@ -319,6 +319,7 @@ const sinkKind = @import("analyze/render.zig").sinkKind;
 pub const FileFormat = @import("analyze/targets.zig").FileFormat;
 pub const readFormat = @import("analyze/targets.zig").readFormat;
 pub const stdinProblem = @import("analyze/targets.zig").stdinProblem;
+const targets = @import("analyze/targets.zig");
 pub const hintText = @import("analyze/targets.zig").hintText;
 pub const dialectFromHints = @import("analyze/targets.zig").dialectFromHints;
 pub const formatFromHints = @import("analyze/targets.zig").formatFromHints;
@@ -2016,7 +2017,7 @@ pub const rest_read_keys = [_][]const u8{
     "page_param",     "start_page",    "start_offset", "size_param",  "page_size", "cursor_param",
     "cursor_field",   "total_field",   "max_pages",    "stop_short",  "prefetch",  "retries",
     "retry_statuses", "retry_base_ms", "timeout_ms",   "progress_ms", "paging_in", "total_rows_field",
-    "batch",          "concurrency",
+    "batch",          "concurrency",   "sample",
 };
 const union_read_keys = [_][]const u8{ "tag", "table_field", "tag_field", "tag_substr", "schema_from" };
 
@@ -2076,6 +2077,11 @@ pub fn checkSourceForm(arena: std.mem.Allocator, lead: ast.Stage, connector: []c
         diag.pos = h.pos;
         return e;
     }
+    for (lead.hints) |h| if (std.mem.eql(u8, h.key, "sample") and targets.sampleHint(lead.hints) == null) {
+        const e = fail(diag, "`sample` takes a whole number of rows, 1 or more", .{});
+        diag.pos = h.pos;
+        return e;
+    };
     if (std.mem.eql(u8, connector, "http")) {
         const all = try std.mem.concat(arena, ast.Hint, &.{ conn_hints, lead.hints });
         if (try http_client.optionProblem(arena, all, true, true)) |p| {

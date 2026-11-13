@@ -105,7 +105,7 @@ pub const table = [_]Format{
         .folder_exts = &.{ ".json", ".ndjson", ".jsonl" },
         .lanes = .serial,
         .stdin = true,
-        .read_keys = &.{ "format", "items" },
+        .read_keys = &.{ "format", "items", "sample" },
         .write = .{},
         .write_keys = &.{ "format", "array" },
     },

@@ -511,6 +511,8 @@ pub const Options = struct {
     cursor_param: []const u8 = "cursor",
     cursor_field: []const u8 = "next",
     max_pages: i64 = 10_000,
+    /// The items the columns are typed from, read across as many pages as it takes.
+    sample: usize = (fjson.Options{}).sample,
     prefetch: i64 = 1,
     retries: i64 = (Deadline{}).retries,
     retry_base_ms: i64 = (Deadline{}).retry_base_ms,
@@ -595,6 +597,10 @@ pub fn optsFromHints(arena: std.mem.Allocator, hints: []const ast.Hint) !Options
             if (iv) |n| o.max_pages = n;
         } else if (std.mem.eql(u8, h.key, "prefetch")) {
             if (iv) |n| o.prefetch = n;
+        } else if (std.mem.eql(u8, h.key, "sample")) {
+            if (iv) |n| if (n >= 1) {
+                o.sample = @intCast(n);
+            };
         } else if (std.mem.eql(u8, h.key, "stop_short")) {
             if (flagOf(h.value)) |b| o.stop_short = b;
         } else if (std.mem.eql(u8, h.key, "total_field")) {
@@ -672,6 +678,7 @@ fn takesOf(key: []const u8) ?Takes {
         .{ "page_size", .{ .int = 1 } },   .{ "max_pages", .{ .int = 1 } },     .{ "prefetch", .{ .int = 1 } },
         .{ "retries", .{ .int = 0 } },     .{ "retry_base_ms", .{ .int = 0 } }, .{ "timeout_ms", .{ .int = 1 } },
         .{ "progress_ms", .{ .int = 0 } }, .{ "paging_in", .paging_in },        .{ "total_rows_field", .text },
+        .{ "sample", .{ .int = 1 } },
     };
     for (table) |t| if (std.mem.eql(u8, t[0], key)) return t[1];
     return null;
@@ -920,10 +927,7 @@ pub const HttpSource = struct {
         };
         self.logger = opts.logger;
         self.slots = std.array_list.Managed(*Slot).init(gpa);
-        errdefer if (self.zombies == 0) {
-            client.deinit();
-            gpa.destroy(client);
-        };
+        errdefer self.close();
         if (cc.auth != .none) {
             var rcc = cc;
             rcc.login_url = try joinUrl(arena, cc.base_url, cc.login_url);
@@ -934,19 +938,27 @@ pub const HttpSource = struct {
 
         const first_req = try self.pageReq(arena);
         const page = try self.fetchParsed(arena, first_req);
-        const items = page.items;
-        const schema = try arena.create(types.Schema);
-        schema.* = try fjson.schemaOf(arena, items, (fjson.Options{}).sample);
-        self.schema = schema;
-        self.first = try fjson.batchOf(arena, self.schema, items);
-        self.noteProgress(items.len);
+        self.noteProgress(page.items.len);
         if (opts.total_field orelse opts.total_rows_field) |tf| {
             if (try fjson.field(arena, page.root, tf)) |tv| {
                 const n = try totalOf(arena, tf, tv);
-                self.total_pages = if (opts.total_field != null) n else pagesOf(n, items.len);
+                self.total_pages = if (opts.total_field != null) n else pagesOf(n, page.items.len);
             }
         }
-        self.advance(arena, page.root, items.len) catch |e| return e;
+        self.advance(arena, page.root, page.items.len) catch |e| return e;
+        var items = std.array_list.Managed([]const u8).init(arena);
+        try items.appendSlice(page.items);
+        while (items.items.len < opts.sample and !self.done) {
+            const more = try self.fetchParsed(arena, try self.pageReq(arena));
+            try self.advance(arena, more.root, more.items.len);
+            if (more.items.len == 0) break;
+            self.noteProgress(more.items.len);
+            try items.appendSlice(more.items);
+        }
+        const schema = try arena.create(types.Schema);
+        schema.* = try fjson.schemaOf(arena, items.items, opts.sample);
+        self.schema = schema;
+        self.first = try fjson.batchOf(arena, self.schema, items.items);
         return self;
     }
 
@@ -2024,7 +2036,7 @@ test "abort flag stops pagination between page requests" {
     defer srv.finish(th);
 
     const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
-    const s = try HttpSource.open(a, std.testing.allocator, url, .{ .paginate = .page });
+    const s = try HttpSource.open(a, std.testing.allocator, url, .{ .paginate = .page, .sample = 1 });
     defer s.close();
     _ = (try s.next(a)).?;
 
@@ -2336,6 +2348,7 @@ test "a black-holed page request times out instead of hanging the run" {
         .prefetch = 2,
         .retries = 0,
         .timeout_ms = 400,
+        .sample = 1,
     });
     defer s.close();
     _ = (try s.next(a)).?;
@@ -2462,7 +2475,7 @@ test "http source: a cursor token is URL-encoded; a later page's failure names i
     defer srv.finish(th);
 
     const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
-    const s = try HttpSource.open(a, std.testing.allocator, url, .{ .items = "data", .paginate = .cursor });
+    const s = try HttpSource.open(a, std.testing.allocator, url, .{ .items = "data", .paginate = .cursor, .sample = 1 });
     defer s.close();
     try std.testing.expectError(error.HttpBadRequest, drain(s, a));
     try std.testing.expect(std.mem.indexOf(u8, srv.captured[1][0..srv.captured_len[1]], "GET /items?cursor=c%202%26x%2By ") != null);
@@ -2619,4 +2632,49 @@ test "http source: a 501 fails at once, not retried, and not as transient" {
     if (got) |s| s.close() else |_| {}
     try std.testing.expectError(error.HttpRequestFailed, got);
     try std.testing.expectEqual(@as(usize, 1), srv.requests.load(.seq_cst));
+}
+
+test "http source: columns are typed from items across pages, so a key a later page brings is read; past the sample it fails" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const pages = [_][]const u8{
+        \\{"data":[{"id":1},{"id":2}]}
+        ,
+        \\{"data":[{"id":3,"note":"x"}]}
+        ,
+        \\{"data":[]}
+    };
+    for ([_]struct { sample: usize, ok: bool }{ .{ .sample = 3, .ok = true }, .{ .sample = 2, .ok = false } }) |c| {
+        const srv = try TestServer.start(&pages);
+        defer srv.deinit();
+        const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+        defer srv.finish(th);
+        const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+        const s = try HttpSource.open(a, std.testing.allocator, url, .{ .items = "data", .paginate = .page, .prefetch = 0, .sample = c.sample });
+        defer s.close();
+        if (c.ok) {
+            try std.testing.expectEqualStrings("note", s.schema.fields[1].name);
+            try std.testing.expectEqual(@as(usize, 3), try drain(s, a));
+        } else {
+            try std.testing.expectError(error.JsonPastSample, drain(s, a));
+        }
+    }
+}
+
+test "http source: a page that fails while the sample is read fails the open and frees what it made" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const srv = try TestServer.start(&.{
+        \\{"data":[{"id":1}]}
+        ,
+        \\{"err":"bad"}
+    });
+    srv.statuses = &.{ "200 OK", "400 Bad Request" };
+    defer srv.deinit();
+    const th = try std.Thread.spawn(.{}, TestServer.run, .{srv});
+    defer srv.finish(th);
+    const url = try msgfmt.allocPrint(a, "http://127.0.0.1:{d}/items", .{srv.port()});
+    try std.testing.expectError(error.HttpBadRequest, HttpSource.open(a, std.testing.allocator, url, .{ .items = "data", .paginate = .page, .retries = 0 }));
 }
