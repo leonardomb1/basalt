@@ -499,7 +499,10 @@ row, keyed by column name, one per line; `WITH (array = true)` writes one
 top-level array instead, as DuckDB's `COPY ... (ARRAY true)` does. Either reads
 back as the same rows, and `--format json` prints a `SELECT` the same way, as
 NDJSON. Decimals are written as strings, since most JSON readers hold a number
-as a double and would drop digits; a NaN or infinite float is `null`, dates,
+as a double and would drop digits; a NaN or infinite float is the string
+`"NaN"`, `"Infinity"` or `"-Infinity"`, as Spark and pandas read them, and a
+column of numbers and those strings reads back as `FLOAT` (inside a list or
+struct one is still `null`); dates,
 times and timestamps ISO text and bytes base64. Text that is not valid UTF-8 is
 repaired, each invalid byte U+FFFD. A `.gz` name gzips the file, and it goes to
 an object store, SFTP or SMB as a CSV does. `APPEND` adds rows to an NDJSON file

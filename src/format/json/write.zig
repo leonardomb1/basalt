@@ -171,7 +171,7 @@ test "the jsontext escaper, key and Text policy equal the copies this file held"
 
             pub fn float(_: OracleText, out: *std.Io.Writer, x: f64) !void {
                 if (std.math.isFinite(x)) return out.print("{d}", .{x});
-                return out.writeAll("null");
+                return out.writeAll(jsontext.nonFinite(x));
             }
 
             pub fn nested(_: OracleText, out: *std.Io.Writer, s: []const u8) !void {
@@ -219,7 +219,7 @@ test "JSON rows of every kind, NDJSON and as one array" {
     try celltext.expectGolden(&.{
         "{\"c\":true}\n{\"c\":false}\n{\"c\":null}\n",
         "{\"c\":0}\n{\"c\":-1}\n{\"c\":-9223372036854775808}\n{\"c\":9223372036854775807}\n{\"c\":null}\n",
-        "{\"c\":0.1}\n{\"c\":0}\n{\"c\":-0}\n{\"c\":" ++ tiny ++ "}\n{\"c\":1000000000000000000000}\n{\"c\":-2.25}\n{\"c\":null}\n{\"c\":null}\n{\"c\":null}\n{\"c\":null}\n",
+        "{\"c\":0.1}\n{\"c\":0}\n{\"c\":-0}\n{\"c\":" ++ tiny ++ "}\n{\"c\":1000000000000000000000}\n{\"c\":-2.25}\n{\"c\":\"NaN\"}\n{\"c\":\"Infinity\"}\n{\"c\":\"-Infinity\"}\n{\"c\":null}\n",
         "{\"c\":\"123.45\"}\n{\"c\":\"-0.0007\"}\n{\"c\":\"5\"}\n{\"c\":\"0.12345\"}\n{\"c\":\"-18446744073709.551615\"}\n{\"c\":\"0.00\"}\n{\"c\":null}\n",
         "{\"c\":\"\"}\n{\"c\":\"plain\"}\n{\"c\":\"tab\\there\"}\n{\"c\":\"line\\nbreak\"}\n{\"c\":\"cr\\rlf\\r\\n\"}\n{\"c\":\"say \\\"hi\\\"\"}\n{\"c\":\"O'Brien\"}\n{\"c\":\"back\\\\slash\\\\\"}\n{\"c\":\"a\\\\Nb\"}\n{\"c\":\"\\\\N \"}\n{\"c\":\"NULL\"}\n{\"c\":\"a\\u0001b\\u0002c\"}\n{\"c\":\"a,b;c:d.e-1 0\"}\n{\"c\":\"\xc3\xb3 \xf0\x9f\x98\x80\"}\n{\"c\":\"\\u0000nul\"}\n{\"c\":\"sixteen bytes and more\\u0001\"}\n{\"c\":null}\n",
         "{\"c\":\"\"}\n{\"c\":\"cGxhaW4=\"}\n{\"c\":\"AQIgXCAJCiI=\"}\n{\"c\":\"w7M=\"}\n{\"c\":null}\n",

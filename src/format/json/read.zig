@@ -76,12 +76,14 @@ pub const Infer = struct {
         }
     }
 
-    /// A value's kind, null for JSON null; strings and nested values are text.
+    /// A value's kind, null for JSON null; strings and nested values are text, but
+    /// for the strings the writer spells a float JSON has no number for.
     fn kindOf(raw: []const u8) ?types.TypeKind {
         return switch (raw[0]) {
             'n' => null,
             't', 'f' => .bool,
-            '"', '{', '[' => .string,
+            '"' => if (nonFiniteText(raw)) .float else .string,
+            '{', '[' => .string,
             else => switch (jt.number(raw)) {
                 .int => .int,
                 .float, .text => .float,
@@ -98,6 +100,12 @@ pub const Infer = struct {
         return .{ .fields = fields };
     }
 };
+
+/// `"NaN"`, `"Infinity"` or `"-Infinity"`, as `jsontext.nonFinite` writes them.
+fn nonFiniteText(raw: []const u8) bool {
+    for ([_][]const u8{ "\"NaN\"", "\"Infinity\"", "\"-Infinity\"" }) |t| if (std.mem.eql(u8, raw, t)) return true;
+    return false;
+}
 
 pub const Rows = struct {
     schema: types.Schema,

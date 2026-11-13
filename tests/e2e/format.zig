@@ -299,6 +299,27 @@ test "csv: a one-column file keeps its NULL rows through a write and a read, map
     try std.testing.expectEqualStrings("mapped,streamed,nulls,crlf\n4,4,2,3\n", got);
 }
 
+test "json: NaN and the infinities are written as the strings other readers take, and read back as floats" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t.json", .data = "{\"t\":\"NaN\"}\n{\"t\":\"none\"}\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc,
+        \\LOAD INTO '{0s}/f.json' AS SELECT * FROM (SELECT CAST(range AS DOUBLE) AS x FROM RANGE(2) UNION ALL SELECT CAST('NaN' AS DOUBLE) UNION ALL SELECT CAST('inf' AS DOUBLE) UNION ALL SELECT CAST('-inf' AS DOUBLE));
+        \\LOAD INTO '{0s}/out.csv' AS
+        \\SELECT x, x + 1 AS y, (SELECT max(t) FROM '{0s}/t.json') AS t FROM '{0s}/f.json';
+    , .{base});
+    defer alloc.free(script);
+    const got = try runScript(alloc, &tmp, script, &.{});
+    defer alloc.free(got);
+    try std.testing.expectEqualStrings("x,y,t\n0,1,none\n1,2,none\nnan,nan,none\ninf,inf,none\n-inf,-inf,none\n", got);
+    const written = try tmp.dir.readFileAlloc(alloc, "f.json", 1 << 16);
+    defer alloc.free(written);
+    try std.testing.expectEqualStrings("{\"x\":0}\n{\"x\":1}\n{\"x\":\"NaN\"}\n{\"x\":\"Infinity\"}\n{\"x\":\"-Infinity\"}\n", written);
+}
+
 const fx_logical = fixtures.logical_types_parquet;
 
 test "a parquet UINT64 is DECIMAL(20,0): it joins and compares against an INT, and keeps a value past 2^63-1" {

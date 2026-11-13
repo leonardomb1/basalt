@@ -86,6 +86,14 @@ pub const typed: Style = .{};
 /// `Cursor.json` and Parquet's `jsonValue`: decimals as bare numbers.
 pub const nested: Style = .{ .decimal = .number };
 
+/// A float a JSON row holds that JSON has no number for, as the string other
+/// readers take for it, so the value is not lost: `"NaN"`, `"Infinity"` or
+/// `"-Infinity"`. A nested value's JSON text keeps `null` for it.
+pub fn nonFinite(x: f64) []const u8 {
+    if (std.math.isNan(x)) return "\"NaN\"";
+    return if (x > 0) "\"Infinity\"" else "\"-Infinity\"";
+}
+
 /// `v` as one JSON scalar: null, a boolean, a number, or a string for text and
 /// the temporal kinds.
 pub fn scalar(w: *Writer, v: Value, comptime style: Style) Writer.Error!void {
@@ -178,7 +186,7 @@ pub const Text = struct {
 
     pub fn float(_: Text, out: *Writer, x: f64) !void {
         if (std.math.isFinite(x)) return out.print("{d}", .{x});
-        return out.writeAll("null");
+        return out.writeAll(nonFinite(x));
     }
 };
 
