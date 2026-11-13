@@ -91,7 +91,7 @@ pub fn cmdRun(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         try stderr.print("error: `-p {s}` given more than once\n", .{k});
         return 2;
     }
-    for (keys) |k| if (try paramProblem(arena.allocator(), prog, k)) |why| {
+    for (keys) |k| if (try paramProblem(arena.allocator(), prog, k, .flag)) |why| {
         try eo.report(.{ .msg = why });
         return 1;
     };

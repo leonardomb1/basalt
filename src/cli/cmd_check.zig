@@ -10,6 +10,7 @@ const include_fetch = @import("../net/include_fetch.zig");
 const loadSource = @import("args.zig").loadSource;
 const loadExit = @import("args.zig").loadExit;
 const nextVal = @import("args.zig").nextVal;
+const ParamVia = @import("args.zig").ParamVia;
 const paramProblem = @import("args.zig").paramProblem;
 const parser = @import("../lang/sql_parser.zig");
 const repeatedKey = @import("args.zig").repeatedKey;
@@ -23,14 +24,14 @@ pub const CheckOpts = struct {
     overrides: []const analyze.ParamOverride = &.{},
     known: []const analyze.KnownTable = &.{},
     declarations_only: bool = false,
-    strict_params: bool = false,
+    strict_params: ?ParamVia = null,
     remote: ?*remote.Resolver = null,
 };
 
 /// Every problem in `text`, in script order: each statement that does not parse
 /// (parsing resumes at the next), then each that does not check. Nothing runs or connects.
-/// `strict_params` holds each override to a PARAM of this script, as `-p` is; the
-/// kernel leaves it off, since a notebook's cells share their params.
+/// `strict_params` holds each override to a declared PARAM, naming the override as it
+/// was given.
 pub fn checkText(a: std.mem.Allocator, text: []const u8, label: []const u8, dir: []const u8, opts: CheckOpts) ![]CheckIssue {
     var issues = std.array_list.Managed(CheckIssue).init(a);
     var names = std.array_list.Managed([]const u8).init(a);
@@ -46,7 +47,7 @@ pub fn checkText(a: std.mem.Allocator, text: []const u8, label: []const u8, dir:
         },
     };
     for (perrs.items) |p| try issues.append(.{ .msg = p.msg, .pos = .{ .line = p.line, .col = p.col }, .end = if (p.end_line > 0) ast.Pos{ .line = p.end_line, .col = p.end_col } else null, .file = prog.fileOf(.{ .line = p.line, .col = p.col, .file = p.file }) });
-    if (opts.strict_params) for (opts.overrides) |o| if (try paramProblem(a, prog, o.name)) |why| try issues.append(.{ .msg = why });
+    if (opts.strict_params) |via| for (opts.overrides) |o| if (try paramProblem(a, prog, o.name, via)) |why| try issues.append(.{ .msg = why });
     for (prog.notes) |n| try issues.append(.{ .msg = n.msg, .pos = n.pos, .file = prog.fileOf(n.pos), .warning = true });
 
     var found = std.array_list.Managed(analyze.Issue).init(a);
@@ -142,7 +143,7 @@ pub fn cmdCheck(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     }
     const eo = ErrOut{ .w = if (json) stdout else stderr, .json = json, .bare = true, .label = src.label };
     var resolver = try remote.Resolver.init(a, src.dir, include_fetch.fetch(), pin);
-    const issues = try checkText(a, src.text, src.label, src.dir, .{ .overrides = overrides.items, .known = known.items, .strict_params = true, .remote = &resolver });
+    const issues = try checkText(a, src.text, src.label, src.dir, .{ .overrides = overrides.items, .known = known.items, .strict_params = .flag, .remote = &resolver });
     if (pin) {
         resolver.save() catch |e| {
             try stderr.print("error: cannot write `{s}`: {s}\n", .{ resolver.sum_path, @errorName(e) });

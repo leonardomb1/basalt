@@ -76,6 +76,7 @@ const pagecache = @import("../exec/pagecache.zig");
 const msgfmt = @import("../format/msgfmt.zig");
 const Flags = @import("args.zig").Flags;
 const sharedFlag = @import("args.zig").sharedFlag;
+const paramProblem = @import("args.zig").paramProblem;
 const cli = @import("cli.zig");
 const include = @import("../lang/include.zig");
 const ast = @import("../lang/ast.zig");
@@ -279,7 +280,7 @@ fn checkScript(a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, req
     for (params, overrides) |p, *o| o.* = .{ .name = p.key, .value = p.val };
 
     const st = try cli.sessionText(a, decls, script);
-    const issues = try cli.checkText(a, st.text, "<repl>", ".", .{ .overrides = overrides, .known = known, .declarations_only = true });
+    const issues = try cli.checkText(a, st.text, "<repl>", ".", .{ .overrides = overrides, .known = known, .declarations_only = true, .strict_params = .request });
 
     var aw = std.Io.Writer.Allocating.init(a);
     const w = &aw.writer;
@@ -723,6 +724,8 @@ fn runScript(
         },
         error.OutOfMemory => return error.OutOfMemory,
     };
+    for (params) |p| if (try paramProblem(a, entry.prog, p.key, .request)) |why|
+        return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = why } });
 
     for (entry.pending) |p| try decls.put(p.id, p.text);
     const declared = try a.alloc(Declared, entry.pending.len);

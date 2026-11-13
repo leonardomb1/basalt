@@ -102,6 +102,15 @@ def main(binary):
     report("params bind per script", st["ok"] and rows(data) == [{"v": 42}], (data, st))
     data, _ = k.run("SELECT $n AS v;")
     report("a bound param does not leak into the next script", rows(data) == [{"v": 3}], data)
+    data, st = k.run("SELECT $n AS v;", params={"m": 5})
+    report("a params key no PARAM declares is refused, not run on the default",
+           not st["ok"] and not data and "`params.m`" in st["error"]["msg"], (data, st))
+    _, st = k.run("SELECT 1 AS v;", params={"k": 5})
+    report("a params key naming a LET is refused", not st["ok"] and "is a LET" in st["error"]["msg"], st)
+    _, st = k.run("PARAM fresh INT DEFAULT 1;", params={"nope": 1})
+    _, st2 = k.run("SELECT $fresh AS f;")
+    report("a refused params key keeps the script's declarations out of the session",
+           not st["ok"] and not st2["ok"], (st, st2))
 
     # Several results in one script arrive in order, before the status.
     data, st = k.run("SELECT 1 AS a;\nSELECT 2 AS b;\nSELECT 3 AS c;")
@@ -299,6 +308,10 @@ def main(binary):
     k.send(op="check", id="ck2", script="SELECT anything FROM enrich;", tables=["enrich"])
     _, st = k.reply()
     report("check takes a table by name alone, its columns unresolved", st.get("diagnostics") == [], st)
+    k.send(op="check", id="ck4", script="SELECT $since AS s;", params={"sinse": "2026-01-01"})
+    _, st = k.reply()
+    report("check lists a params key no PARAM declares",
+           st["ok"] and [d["msg"] for d in st.get("diagnostics") or []] == ["`params.sinse`: neither the script nor the session declares a PARAM `sinse`"], st)
     _, st = k.run("SELECT $fresh AS f;")
     report("check leaves the session as it was", not st["ok"] and "fresh" in st["error"]["msg"], st)
     k.send(op="check", id="ck3", script="SELECT 1 AS x;", tables=[{"name": "t", "columns": [{"name": "x", "type": "nope"}]}])

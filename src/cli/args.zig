@@ -90,16 +90,22 @@ fn nextPositional(args: [][:0]u8, from: usize) ?usize {
     return null;
 }
 
-/// Why `-p name=…` cannot bind in `prog`: a LET, or no such PARAM (a typo would
+/// Where a binding came from: a `-p` flag, or a kernel request's `params` object.
+pub const ParamVia = enum { flag, request };
+
+/// Why a binding of `name` cannot bind in `prog`: a LET, or no such PARAM (a typo would
 /// otherwise run on the default). Null when a PARAM of that name is declared.
-pub fn paramProblem(arena: std.mem.Allocator, prog: ast.Program, name: []const u8) !?[]const u8 {
+pub fn paramProblem(arena: std.mem.Allocator, prog: ast.Program, name: []const u8, via: ParamVia) !?[]const u8 {
     for (prog.stmts) |s| switch (s) {
         .param => |p| if (std.mem.eql(u8, p.name, name)) return null,
         .let_const => |l| if (std.mem.eql(u8, l.name, name))
             return try msgfmt.allocPrint(arena, "`{s}` is a LET, not a PARAM — it cannot be bound externally", .{name}),
         else => {},
     };
-    return try msgfmt.allocPrint(arena, "`-p {s}`: the script declares no PARAM `{s}`", .{ name, name });
+    return switch (via) {
+        .flag => try msgfmt.allocPrint(arena, "`-p {s}`: the script declares no PARAM `{s}`", .{ name, name }),
+        .request => try msgfmt.allocPrint(arena, "`params.{s}`: neither the script nor the session declares a PARAM `{s}`", .{ name, name }),
+    };
 }
 
 /// The first `-p` key given twice, which would otherwise bind one of the values silently.
@@ -373,9 +379,10 @@ test "paramProblem and repeatedKey: -p must name a declared PARAM, once" {
     const a = ar.allocator();
     var diag: include.Diag = .{};
     const prog = try include.loadProgram(a, "PARAM d INT DEFAULT 0; LET k = 1; SELECT $d AS v;", "t.sql", ".", &diag);
-    try std.testing.expect((try paramProblem(a, prog, "d")) == null);
-    try std.testing.expect(std.mem.indexOf(u8, (try paramProblem(a, prog, "k")).?, "is a LET") != null);
-    try std.testing.expectEqualStrings("`-p zz`: the script declares no PARAM `zz`", (try paramProblem(a, prog, "zz")).?);
+    try std.testing.expect((try paramProblem(a, prog, "d", .flag)) == null);
+    try std.testing.expect(std.mem.indexOf(u8, (try paramProblem(a, prog, "k", .flag)).?, "is a LET") != null);
+    try std.testing.expectEqualStrings("`-p zz`: the script declares no PARAM `zz`", (try paramProblem(a, prog, "zz", .flag)).?);
+    try std.testing.expectEqualStrings("`params.zz`: neither the script nor the session declares a PARAM `zz`", (try paramProblem(a, prog, "zz", .request)).?);
     try std.testing.expectEqualStrings("d", repeatedKey(&.{ "d", "e", "d" }).?);
     try std.testing.expect(repeatedKey(&.{ "d", "e" }) == null);
 }
