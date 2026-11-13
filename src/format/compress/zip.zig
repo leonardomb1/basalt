@@ -23,6 +23,7 @@
 const std = @import("std");
 const HttpClient = @import("../../net/http_std.zig");
 const msgfmt = @import("../msgfmt.zig");
+const eval = @import("../../exec/eval.zig");
 const zip = std.zip;
 const pqdecode = @import("../parquet/read.zig");
 const sftp = @import("../../store/sftp.zig");
@@ -57,6 +58,7 @@ pub const Member = struct {
     },
     limited: std.Io.Reader.Limited,
     inflate: std.compress.flate.Decompress,
+    checked: Checked,
 
     pub fn close(self: *Member) void {
         switch (self.body) {
@@ -71,6 +73,8 @@ const Entry = struct {
     name: []const u8,
     method: zip.CompressionMethod,
     compressed_size: u64,
+    uncompressed_size: u64,
+    crc32: u32,
     local_offset: u64,
 };
 
@@ -144,6 +148,8 @@ fn directory(arena: std.mem.Allocator, src: pqdecode.Bytes) ![]const Entry {
             .name = name,
             .method = h.compression_method,
             .compressed_size = h.compressed_size,
+            .uncompressed_size = h.uncompressed_size,
+            .crc32 = h.crc32,
             .local_offset = h.local_file_header_offset,
         };
         if (isMax(h.uncompressed_size) or isMax(h.compressed_size) or isMax(h.local_file_header_offset)) {
@@ -153,7 +159,7 @@ fn directory(arena: std.mem.Allocator, src: pqdecode.Bytes) ![]const Entry {
                 const body = xr.take(len) catch return Error.ZipBadCentralDirectory;
                 if (id != @intFromEnum(zip.ExtraHeader.zip64_info)) continue;
                 var zr = std.Io.Reader.fixed(body);
-                if (isMax(h.uncompressed_size)) _ = zr.takeInt(u64, .little) catch return Error.ZipBadCentralDirectory;
+                if (isMax(h.uncompressed_size)) e.uncompressed_size = zr.takeInt(u64, .little) catch return Error.ZipBadCentralDirectory;
                 if (isMax(h.compressed_size)) e.compressed_size = zr.takeInt(u64, .little) catch return Error.ZipBadCentralDirectory;
                 if (isMax(h.local_file_header_offset)) e.local_offset = zr.takeInt(u64, .little) catch return Error.ZipBadCentralDirectory;
                 break;
@@ -241,8 +247,47 @@ pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8)
         },
         else => unreachable,
     }
+    m.checked = .{ .in = m.reader, .want_crc = e.crc32, .want_len = e.uncompressed_size, .name = e.name, .reader = .{
+        .vtable = &.{ .stream = Checked.stream },
+        .buffer = try arena.alloc(u8, 64 * 1024),
+        .seek = 0,
+        .end = 0,
+    } };
+    m.reader = &m.checked.reader;
     return m;
 }
+
+/// A member's bytes as read, held at their end to the CRC-32 and size its central
+/// directory entry records: a stored member has no other check, and a corrupt one
+/// would read as wrong bytes.
+const Checked = struct {
+    in: *std.Io.Reader,
+    crc: std.hash.Crc32 = .init(),
+    n: u64 = 0,
+    want_crc: u32,
+    want_len: u64,
+    name: []const u8,
+    reader: std.Io.Reader,
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *Checked = @alignCast(@fieldParentPtr("reader", r));
+        const data = limit.slice(try w.writableSliceGreedy(1));
+        var vec: [1][]u8 = .{data};
+        const k = self.in.readVec(&vec) catch |e| switch (e) {
+            error.EndOfStream => {
+                if (self.n == self.want_len and self.crc.final() == self.want_crc) return error.EndOfStream;
+                var buf: [320]u8 = undefined;
+                const msg = msgfmt.clipPrint(&buf, "zip member `{s}` does not match its CRC-32 and size: the archive is corrupt", .{self.name});
+                return @errorCast(eval.explain(error.ReadFailed, msg));
+            },
+            else => |x| return x,
+        };
+        self.crc.update(data[0..k]);
+        self.n += k;
+        w.advance(k);
+        return k;
+    }
+};
 
 /// One identity-encoded GET for the member's compressed extent, streamed, so a
 /// multi-gigabyte member costs a window of memory. A 200 (Range ignored) is skipped to `off`.
@@ -284,6 +329,22 @@ test "openMember: a stored member streams and stops at its own end" {
     defer m.close();
     const got = try m.reader.allocRemaining(a, .limited(1 << 20));
     try std.testing.expectEqualStrings("id,v\n1,x\n2,y\n", got);
+}
+
+test "openMember: a stored member whose bytes do not match its CRC-32 is refused at its end, not read wrong" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const bad = try a.dupe(u8, fx_two);
+    const at = std.mem.indexOf(u8, bad, "1,x\n2,y").?;
+    bad[at] = '9';
+    const m = try openMember(a, try writeFixture(a, &tmp, "bad.zip", bad), "a.csv");
+    defer m.close();
+    try std.testing.expectError(error.ReadFailed, m.reader.allocRemaining(a, .limited(1 << 20)));
+    try std.testing.expect(std.mem.indexOf(u8, @import("../../exec/eval.zig").takeFailure(error.ReadFailed).?, "a.csv") != null);
 }
 
 test "openMember: a deflated member inflates" {
