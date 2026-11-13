@@ -9,6 +9,23 @@ const parser = @import("../lang/sql_parser.zig");
 const std = @import("std");
 const Catalog = @import("repl/catalog.zig").Catalog;
 
+/// Just past the quoted text opening at `s[at]`, whose delimiter is doubled inside it
+/// (`'it''s'`, `"a""b"`) and a backslash is an ordinary character, as the lexer reads
+/// strings and quoted names; `s.len` when it never closes.
+fn pastQuoted(s: []const u8, at: usize) usize {
+    const q = s[at];
+    var i = at + 1;
+    while (i < s.len) : (i += 1) {
+        if (s[i] != q) continue;
+        if (i + 1 < s.len and s[i + 1] == q) {
+            i += 1;
+            continue;
+        }
+        return i + 1;
+    }
+    return s.len;
+}
+
 /// Next statement-level `;`, skipping strings, dollar quotes and comments by the
 /// lexer's own rules, so the REPL agrees with the parser on where a statement ends.
 pub fn nextTopSemi(s: []const u8, from: usize) ?usize {
@@ -16,29 +33,7 @@ pub fn nextTopSemi(s: []const u8, from: usize) ?usize {
     while (i < s.len) {
         switch (s[i]) {
             ';' => return i,
-            '\'' => {
-                i += 1;
-                while (i < s.len) : (i += 1) {
-                    if (s[i] != '\'') continue;
-                    if (i + 1 < s.len and s[i + 1] == '\'') {
-                        i += 1;
-                        continue;
-                    }
-                    break;
-                }
-                i += 1;
-            },
-            '"' => {
-                i += 1;
-                while (i < s.len) : (i += 1) {
-                    if (s[i] == '\\') {
-                        i += 1;
-                        continue;
-                    }
-                    if (s[i] == '"') break;
-                }
-                i += 1;
-            },
+            '\'', '"' => i = pastQuoted(s, i),
             '-' => {
                 if (i + 1 < s.len and s[i + 1] == '-') {
                     i = std.mem.indexOfScalarPos(u8, s, i, '\n') orelse s.len;
@@ -215,7 +210,9 @@ test "endsComplete sees only statement-level semicolons" {
     try std.testing.expect(endsComplete("SELECT ';' AS x;"));
     try std.testing.expect(!endsComplete("SELECT 'it''s;"));
     try std.testing.expect(endsComplete("SELECT 'it''s;' AS x;"));
-    try std.testing.expect(!endsComplete("SELECT \"a\\\";"));
+    try std.testing.expect(endsComplete("SELECT \"path\\\" FROM t;"));
+    try std.testing.expect(!endsComplete("SELECT \"a\"\";"));
+    try std.testing.expect(endsComplete("SELECT \"a\"\"b;\" AS x;"));
     try std.testing.expect(endsComplete("SELECT \"a;b\" AS x;"));
     try std.testing.expect(!endsComplete("SELECT 1 -- ;"));
     try std.testing.expect(!endsComplete("/* ; */"));
