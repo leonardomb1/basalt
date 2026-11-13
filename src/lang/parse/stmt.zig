@@ -9,6 +9,7 @@ const Pos = @import("../sql_parser.zig").Pos;
 const ast = @import("../ast.zig");
 const binOpText = @import("../sql_parser.zig").binOpText;
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
+const print = @import("../print.zig");
 const quote = @import("../quote.zig");
 const std = @import("std");
 
@@ -351,9 +352,9 @@ pub fn unparse(self: *Parser, buf: *std.array_list.Managed(u8), e: *const ast.Ex
         .float_lit => |v| try buf.writer().print("{e}", .{v}),
         .dec_lit => |v| try buf.writer().print("{f}", .{v}),
         .str_lit => |s| try quote.strLit(buf, s),
-        .field => |q| for (q.parts, 0..) |p, i| {
-            if (i > 0) try buf.append('.');
-            try buf.appendSlice(p);
+        .field => |q| {
+            var w = buf.writer().adaptToNewApi(&.{});
+            print.name(&w.new_interface, q) catch return error.OutOfMemory;
         },
         .call => |c| {
             try buf.appendSlice(c.name);
@@ -379,7 +380,9 @@ pub fn unparse(self: *Parser, buf: *std.array_list.Managed(u8), e: *const ast.Ex
                 .neg => "-",
                 .bit_not => "~",
             });
+            try buf.append('(');
             try self.unparse(buf, u.e);
+            try buf.append(')');
         },
         .cond => |c| {
             try buf.appendSlice("if(");
@@ -391,5 +394,30 @@ pub fn unparse(self: *Parser, buf: *std.array_list.Managed(u8), e: *const ast.Ex
             try buf.append(')');
         },
         else => return self.fail(self.curPos(), "expression too complex to use as a dynamic identifier or predicate", .{}),
+    }
+}
+
+test "unparse and print give text that parses back to the same expression: a negated negation, a quoted name, NOT over a sign" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const sql = @import("../sql_parser.zig");
+    for ([_][]const u8{ "-(-x)", "\"my col\" + 1", "NOT (-x > 1)", "~(~t.\"a b\")", "- -1" }) |src| {
+        var diag: sql.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const e = try sql.parseExprStr(a, src, &diag);
+        var p = Parser{ .arena = a, .toks = &.{}, .diag = &diag };
+        var buf = std.array_list.Managed(u8).init(a);
+        try p.unparse(&buf, e);
+        errdefer std.debug.print("{s} -> {s}\n", .{ src, buf.items });
+        const back = try sql.parseExprStr(a, buf.items, &diag);
+        var want = std.Io.Writer.Allocating.init(a);
+        try print.expr(&want.writer, e);
+        var got = std.Io.Writer.Allocating.init(a);
+        try print.expr(&got.writer, back);
+        try std.testing.expectEqualStrings(want.written(), got.written());
+        const printed = try sql.parseExprStr(a, want.written(), &diag);
+        var again = std.Io.Writer.Allocating.init(a);
+        try print.expr(&again.writer, printed);
+        try std.testing.expectEqualStrings(want.written(), again.written());
     }
 }

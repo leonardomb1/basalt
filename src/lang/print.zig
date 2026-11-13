@@ -111,16 +111,17 @@ pub fn expr(w: W, e: *const ast.Expr) Error!void {
 }
 
 /// A dotted name, each part double-quoted where a bare identifier could not spell it.
+/// An internal part (`\x00lateral`) stays as is, as rewrites find its holes by text.
 pub fn name(w: W, q: ast.QualName) Error!void {
     for (q.parts, 0..) |p, i| {
         if (i > 0) try w.writeByte('.');
-        if (bareIdent(p)) try w.writeAll(p) else try quote.ident(w, p);
+        if (bareIdent(p) or (p.len > 0 and p[0] == 0)) try w.writeAll(p) else try quote.ident(w, p);
     }
 }
 
 fn operand(w: W, e: *const ast.Expr) Error!void {
     const grouped = switch (e.*) {
-        .binary, .is_null, .let_in, .lambda => true,
+        .binary, .unary, .is_null, .let_in, .lambda => true,
         else => false,
     };
     if (grouped) try w.writeByte('(');
