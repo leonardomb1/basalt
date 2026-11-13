@@ -636,6 +636,7 @@ pub const Writer = struct {
             self.backend = .{ .file = try self.part.create(path) };
             self.fw = self.backend.file.writer(&self.write_buf);
         }
+        errdefer self.dropBackend();
         try self.emit(parquet.magic);
         return self;
     }
@@ -963,6 +964,13 @@ pub const Writer = struct {
 
     pub fn abort(self: *Writer) void {
         self.freeScratch();
+        self.dropBackend();
+        self.freeOwn();
+    }
+
+    /// Closes the destination and discards what it holds: the `.part` file, or the
+    /// object upload.
+    fn dropBackend(self: *Writer) void {
         switch (self.backend) {
             .file => |f| {
                 f.close();
@@ -971,7 +979,6 @@ pub const Writer = struct {
             .object => |o| o.abort(),
             .memory => {},
         }
-        self.freeOwn();
     }
 
     fn writeFileMetaData(self: *Writer, out: *List(u8)) !void {
