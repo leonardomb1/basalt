@@ -581,7 +581,7 @@ pub fn asExchange(gpa: std.mem.Allocator, cred: Credential) !Ticket {
     var salt: []const u8 = std.fmt.bufPrint(&salt_buf, "{s}{s}", .{ cred.realm, cred.user }) catch return error.KrbFailure;
     var etype: i32 = etype_aes256;
     var iterations: u32 = 4096;
-    const first = try asRequest(gpa, cred, null);
+    const first = try asRequest(gpa, cred, null, newNonce());
     defer gpa.free(first);
     const r1 = try exchange(gpa, cred, first);
     defer gpa.free(r1);
@@ -623,14 +623,15 @@ pub fn asExchange(gpa: std.mem.Allocator, cred: Credential) !Ticket {
     }
     const key = stringToKey(etype, cred.password, salt, iterations) catch return error.KrbFailure;
 
-    const second = try asRequest(gpa, cred, &key);
+    const nonce = newNonce();
+    const second = try asRequest(gpa, cred, &key, nonce);
     defer gpa.free(second);
     const r2 = try exchange(gpa, cred, second);
     defer gpa.free(r2);
-    return kdcReply(gpa, cred, r2, &key, 3, "the login");
+    return kdcReply(gpa, cred, r2, &key, 3, "the login", nonce);
 }
 
-fn asRequest(gpa: std.mem.Allocator, cred: Credential, key: ?*const Key) ![]u8 {
+fn asRequest(gpa: std.mem.Allocator, cred: Credential, key: ?*const Key, nonce: u31) ![]u8 {
     var b = B.init(gpa);
     defer b.deinit();
     var padata = std.array_list.Managed([]const u8).init(gpa);
@@ -642,7 +643,7 @@ fn asRequest(gpa: std.mem.Allocator, cred: Credential, key: ?*const Key) ![]u8 {
         const value = try b.encrypted(k.etype, null, enc);
         try padata.append(try b.seq(&.{ try b.ctx(1, try b.int(pa_enc_timestamp)), try b.ctx(2, try b.octets(value)) }));
     }
-    const body = try reqBody(&b, cred.realm, try b.principal(nt_principal, &.{cred.user}), try b.principal(nt_srv_inst, &.{ "krbtgt", cred.realm }));
+    const body = try reqBody(&b, cred.realm, try b.principal(nt_principal, &.{cred.user}), try b.principal(nt_srv_inst, &.{ "krbtgt", cred.realm }), nonce);
     var fields = std.array_list.Managed([]const u8).init(gpa);
     defer fields.deinit();
     try fields.append(try b.ctx(1, try b.int(pvno)));
@@ -652,9 +653,14 @@ fn asRequest(gpa: std.mem.Allocator, cred: Credential, key: ?*const Key) ![]u8 {
     return derOf(gpa, 0x6a, &.{try b.seq(fields.items)});
 }
 
-fn reqBody(b: *B, realm: []const u8, cname: ?[]const u8, sname: []const u8) ![]const u8 {
-    var nonce: u32 = undefined;
-    std.crypto.random.bytes(std.mem.asBytes(&nonce));
+/// A fresh KDC-REQ nonce; the reply's encrypted part must carry it back.
+fn newNonce() u31 {
+    var n: u32 = undefined;
+    std.crypto.random.bytes(std.mem.asBytes(&n));
+    return @truncate(n);
+}
+
+fn reqBody(b: *B, realm: []const u8, cname: ?[]const u8, sname: []const u8, nonce: u31) ![]const u8 {
     var etypes = [_][]const u8{ try b.int(etype_aes256), try b.int(etype_aes128) };
     var fields = std.array_list.Managed([]const u8).init(b.gpa);
     defer fields.deinit();
@@ -663,12 +669,14 @@ fn reqBody(b: *B, realm: []const u8, cname: ?[]const u8, sname: []const u8) ![]c
     try fields.append(try b.ctx(2, try b.str(realm)));
     try fields.append(try b.ctx(3, sname));
     try fields.append(try b.ctx(5, try b.time(std.time.timestamp() + 10 * 3600)));
-    try fields.append(try b.ctx(7, try b.int(nonce & 0x7fff_ffff)));
+    try fields.append(try b.ctx(7, try b.int(nonce)));
     try fields.append(try b.ctx(8, try b.seq(&etypes)));
     return b.seq(fields.items);
 }
 
-fn kdcReply(gpa: std.mem.Allocator, cred: Credential, r: []const u8, key: *const Key, usage: u32, what: []const u8) !Ticket {
+/// The ticket and session key of an AS-REP or TGS-REP, opened with `key`; one whose
+/// encrypted part does not carry back `nonce` answers another request, a replay.
+fn kdcReply(gpa: std.mem.Allocator, cred: Credential, r: []const u8, key: *const Key, usage: u32, what: []const u8, nonce: u31) !Ticket {
     const top = El.at(r, 0) orelse return fail(error.KrbProtocol, "the KDC's reply is not DER", .{});
     const rep = top.inner() orelse return error.KrbProtocol;
     if (top.tag == 0x7e) return kdcError(rep, cred, what);
@@ -683,6 +691,8 @@ fn kdcReply(gpa: std.mem.Allocator, cred: Credential, r: []const u8, key: *const
     };
     defer gpa.free(plain);
     const part = (El.at(plain, 0) orelse return error.KrbProtocol).inner() orelse return error.KrbProtocol;
+    if ((part.field(2) orelse return error.KrbProtocol).int() != nonce)
+        return fail(error.KrbProtocol, "the KDC's reply for {s} carries another request's nonce; refusing it as a replay", .{what});
     const ek = part.field(0) orelse return error.KrbProtocol;
     const kt: i32 = @intCast((ek.field(0) orelse return error.KrbProtocol).int());
     const kv = ek.field(1) orelse return error.KrbProtocol;
@@ -729,7 +739,8 @@ pub fn tgsExchange(gpa: std.mem.Allocator, cred: Credential, tgt: *const Ticket,
     defer parts.deinit();
     var it = std.mem.splitScalar(u8, spn, '/');
     while (it.next()) |p| try parts.append(p);
-    const body = try reqBody(&b, cred.realm, null, try b.principal(nt_srv_inst, parts.items));
+    const nonce = newNonce();
+    const body = try reqBody(&b, cred.realm, null, try b.principal(nt_srv_inst, parts.items), nonce);
     const ck = checksum(&tgt.key, 6, body);
     const cksum = try b.seq(&.{ try b.ctx(0, try b.int(if (tgt.key.etype == etype_aes256) cksum_aes256 else cksum_aes128)), try b.ctx(1, try b.octets(&ck)) });
     const ap = try apReq(&b, cred, tgt, 7, cksum, null, false);
@@ -743,7 +754,7 @@ pub fn tgsExchange(gpa: std.mem.Allocator, cred: Credential, tgt: *const Ticket,
     defer gpa.free(req);
     const r = try exchange(gpa, cred, req);
     defer gpa.free(r);
-    return kdcReply(gpa, cred, r, &tgt.key, 8, spn);
+    return kdcReply(gpa, cred, r, &tgt.key, 8, spn, nonce);
 }
 
 const oid_krb5 = [_]u8{ 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02 };
@@ -1196,5 +1207,40 @@ test "krb5: KerberosTime on civil writes and reads as the old code did over year
         const d = civil.daysFromCivil(std.fmt.parseInt(i64, s[0..4], 10) catch unreachable, std.fmt.parseInt(u32, s[4..6], 10) catch unreachable, std.fmt.parseInt(u32, s[6..8], 10) catch unreachable);
         try std.testing.expectEqual(d * 86400, parseTime(s));
         try std.testing.expect(OldTime.parse(s) != parseTime(s));
+    }
+}
+
+test "krb5: a KDC reply is taken only when its encrypted part carries back the request's nonce" {
+    const gpa = std.testing.allocator;
+    const cred = Credential{ .user = "me", .password = "p", .realm = "CORP.LOCAL" };
+    const key = try stringToKey(etype_aes256, "p", "CORP.LOCALme", 4096);
+    for ([_]struct { sent: u31, back: i64, ok: bool }{
+        .{ .sent = 4242, .back = 4242, .ok = true },
+        .{ .sent = 4242, .back = 4243, .ok = false },
+    }) |c| {
+        var b = B.init(gpa);
+        defer b.deinit();
+        const sk = [_]u8{0x11} ** 32;
+        const part = try b.tag(0x79, &.{try b.seq(&.{
+            try b.ctx(0, try b.seq(&.{ try b.ctx(0, try b.int(etype_aes256)), try b.ctx(1, try b.octets(&sk)) })),
+            try b.ctx(1, try b.seq(&.{})),
+            try b.ctx(2, try b.int(c.back)),
+            try b.ctx(3, try b.bits32(0)),
+        })});
+        const cipher = try b.keep(try encrypt(gpa, &key, 3, part));
+        const ticket = try b.tag(0x61, &.{try b.seq(&.{try b.ctx(0, try b.int(pvno))})});
+        const rep = try b.tag(0x6b, &.{try b.seq(&.{
+            try b.ctx(0, try b.int(pvno)),
+            try b.ctx(1, try b.int(11)),
+            try b.ctx(3, try b.str(cred.realm)),
+            try b.ctx(5, ticket),
+            try b.ctx(6, try b.encrypted(etype_aes256, null, cipher)),
+        })});
+        if (c.ok) {
+            const t = try kdcReply(gpa, cred, rep, &key, 3, "the login", c.sent);
+            defer gpa.free(t.der);
+            defer gpa.free(t.realm);
+            try std.testing.expectEqualSlices(u8, &sk, t.key.slice());
+        } else try std.testing.expectError(error.KrbProtocol, kdcReply(gpa, cred, rep, &key, 3, "the login", c.sent));
     }
 }
