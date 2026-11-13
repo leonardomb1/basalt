@@ -61,7 +61,7 @@ pub fn basaltType(e: parquet.SchemaElement) Error!types.Type {
         const want: parquet.PhysicalType = if (bits == 64) .int64 else .int32;
         if (phys != want) return unsignedOnWrongPhysical(e, bits, phys, want);
     }
-    var t = logicalBasaltType(e, phys) orelse try convertedBasaltType(e, phys);
+    var t = try logicalBasaltType(e, phys) orelse try convertedBasaltType(e, phys);
     if (e.repetition orelse .required != .required) t = t.asNullable();
     return t;
 }
@@ -77,7 +77,7 @@ fn unsignedOnWrongPhysical(e: parquet.SchemaElement, bits: u8, phys: parquet.Phy
 
 /// Null when the logical type is absent, says nothing basalt acts on, or does
 /// not fit its physical type, deferring to the converted type.
-fn logicalBasaltType(e: parquet.SchemaElement, phys: parquet.PhysicalType) ?types.Type {
+fn logicalBasaltType(e: parquet.SchemaElement, phys: parquet.PhysicalType) Error!?types.Type {
     const lt = e.logical_type orelse return null;
     const is_bytes = phys == .byte_array or phys == .fixed_len_byte_array;
     return switch (lt) {
@@ -90,7 +90,8 @@ fn logicalBasaltType(e: parquet.SchemaElement, phys: parquet.PhysicalType) ?type
         },
         .timestamp => if (phys == .int64) types.Type.init(.timestamp) else null,
         .decimal => |d| switch (phys) {
-            .int32, .int64, .byte_array, .fixed_len_byte_array => decimalOf(.{
+            .int32, .int64, .byte_array, .fixed_len_byte_array => try decimalOf(.{
+                .name = e.name,
                 .precision = d.precision,
                 .scale = d.scale,
             }),
@@ -109,7 +110,7 @@ fn convertedBasaltType(e: parquet.SchemaElement, phys: parquet.PhysicalType) Err
             if (conv) |c| {
                 if (c == conv_date) break :blk types.Type.init(.date);
                 if (c == conv_time_millis) break :blk types.Type.init(.time);
-                if (c == conv_decimal) break :blk decimalOf(e);
+                if (c == conv_decimal) break :blk try decimalOf(e);
             }
             break :blk intType(e);
         },
@@ -118,7 +119,7 @@ fn convertedBasaltType(e: parquet.SchemaElement, phys: parquet.PhysicalType) Err
                 if (c == conv_timestamp_millis or c == conv_timestamp_micros)
                     break :blk types.Type.init(.timestamp);
                 if (c == conv_time_micros) break :blk types.Type.init(.time);
-                if (c == conv_decimal) break :blk decimalOf(e);
+                if (c == conv_decimal) break :blk try decimalOf(e);
             }
             break :blk intType(e);
         },
@@ -128,7 +129,7 @@ fn convertedBasaltType(e: parquet.SchemaElement, phys: parquet.PhysicalType) Err
             if (conv) |c| {
                 if (c == conv_utf8 or c == conv_json or c == conv_bson)
                     break :blk types.Type.init(.string);
-                if (c == conv_decimal) break :blk decimalOf(e);
+                if (c == conv_decimal) break :blk try decimalOf(e);
             }
             break :blk types.Type.init(.bytes);
         },
@@ -159,10 +160,17 @@ fn intType(e: parquet.SchemaElement) types.Type {
     return types.unsignedType(bits);
 }
 
-fn decimalOf(e: parquet.SchemaElement) types.Type {
-    const p: u8 = if (e.precision) |x| @intCast(@max(1, @min(38, x))) else 38;
-    const s: u8 = if (e.scale) |x| @intCast(@max(0, @min(38, x))) else 0;
-    return types.Type.decimal(p, s);
+/// A decimal past basalt's 38 digits, or a scale outside its precision, is
+/// refused rather than clamped, which read every value at the wrong scale.
+fn decimalOf(e: parquet.SchemaElement) Error!types.Type {
+    const p = e.precision orelse 38;
+    const s = e.scale orelse 0;
+    if (p < 1 or p > 38 or s < 0 or s > p) {
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "parquet column `{s}` is DECIMAL({d}, {d}); basalt reads a decimal of 1 to 38 digits with a scale from 0 to its precision", .{ e.name, p, s }) catch "a parquet decimal past 38 digits";
+        return @errorCast(eval.explain(Error.UnsupportedParquetSchema, msg));
+    }
+    return types.Type.decimal(@intCast(p), @intCast(s));
 }
 
 /// A byte-array decimal's big-endian two's-complement unscaled value, unchecked
@@ -191,6 +199,26 @@ test "physical plus converted type maps onto a basalt type" {
     try testing.expect((try basaltType(.{ .ty = .int32, .repetition = .required })).nullable == false);
     try testing.expect((try basaltType(.{ .ty = .int32, .repetition = opt })).nullable);
     try testing.expectError(Error.UnsupportedParquetSchema, basaltType(.{ .num_children = 2 }));
+}
+
+test "a decimal past 38 digits, or with a scale outside its precision, is refused naming its column" {
+    const bad = [_]parquet.SchemaElement{
+        .{ .ty = .fixed_len_byte_array, .converted_type = conv_decimal, .precision = 76, .scale = 38 },
+        .{ .ty = .fixed_len_byte_array, .converted_type = conv_decimal, .precision = 50, .scale = 45 },
+        logical(.fixed_len_byte_array, .{ .decimal = .{ .precision = 45, .scale = 40 } }),
+        .{ .ty = .int64, .converted_type = conv_decimal, .precision = 10, .scale = 12 },
+        .{ .ty = .int32, .converted_type = conv_decimal, .precision = 9, .scale = -1 },
+    };
+    for (bad) |e| {
+        var named = e;
+        named.name = "amount";
+        try testing.expectError(Error.UnsupportedParquetSchema, basaltType(named));
+        const msg = eval.takeFailure(Error.UnsupportedParquetSchema) orelse return error.TestExpectedFailNote;
+        try testing.expect(std.mem.indexOf(u8, msg, "parquet column `amount` is DECIMAL(") != null);
+    }
+    const max = try basaltType(.{ .ty = .fixed_len_byte_array, .converted_type = conv_decimal, .precision = 38, .scale = 38 });
+    try testing.expectEqual(@as(u8, 38), max.precision);
+    try testing.expectEqual(@as(u8, 38), max.scale);
 }
 
 test "unsigned columns know their width; a UINT64 is DECIMAL(20,0) and a narrower one INT" {
