@@ -262,21 +262,17 @@ pub fn collectQuals(arena: std.mem.Allocator, e: *const ast.Expr, list: *std.arr
     _ = try collectQualsRecur(.{ .arena = arena, .list = list }, e);
 }
 
+/// Right-side key names to the left keys as written, qualifier and all: a left key
+/// from an earlier join (`c.region_id`) is not the scan's column of its last name.
 const KeySwap = struct {
     arena: std.mem.Allocator,
-    map: *const std.StringHashMap([]const u8),
+    map: *const std.StringHashMap(ast.QualName),
 };
 
 fn swapKeysRecur(cx: KeySwap, e: *const ast.Expr) error{OutOfMemory}!*ast.Expr {
     if (e.* == .field) {
-        {
-            const nm = e.field.last();
-            if (cx.map.get(nm)) |left| {
-                const parts = try cx.arena.alloc([]const u8, 1);
-                parts[0] = left;
-                return mkExpr(cx.arena, .{ .field = .{ .parts = parts } });
-            }
-        }
+        if (cx.map.get(e.field.last())) |left|
+            return mkExpr(cx.arena, .{ .field = .{ .parts = try cx.arena.dupe([]const u8, left.parts) } });
         return @constCast(e);
     }
     return ast.rebuildExpr(cx.arena, e, cx, swapKeysRecur);
@@ -301,9 +297,9 @@ fn deriveProbePredicate(
     if (j.kind != .inner) return null;
     if (j.left_keys.len == 0 or j.left_keys.len != j.right_keys.len) return null;
 
-    var map = std.StringHashMap([]const u8).init(gpa);
+    var map = std.StringHashMap(ast.QualName).init(gpa);
     defer map.deinit();
-    for (j.right_keys, j.left_keys) |r, l| try map.put(r.last(), l.last());
+    for (j.right_keys, j.left_keys) |r, l| try map.put(r.last(), l);
 
     const side = if (j.alias.len > 0) j.alias else j.binding;
     var list = std.array_list.Managed(ast.QualName).init(arena);

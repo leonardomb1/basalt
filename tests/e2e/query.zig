@@ -2239,3 +2239,16 @@ test "text_chunks cuts a text at whitespace past half its size, overlapping into
     try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT text_chunks(body, 0) AS c FROM '$B/t.csv';", 1, "text_chunks: size must be positive, got 0");
     try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT text_chunks(body, 10, 10) AS c FROM '$B/t.csv';", 1, "text_chunks: overlap must be from 0 to below size (10), got 10");
 }
+
+test "a filter on a later join's key keeps the earlier join's qualifier when restated for the probe side" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "orders.csv", .data = "id,cust_id,region_id\n1,10,5\n2,11,9\n3,12,9\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "customers.csv", .data = "id,region_id\n10,5\n11,5\n12,7\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "regions.csv", .data = "id\n5\n7\n9\n" });
+    for ([_]usize{ 1, 4 }) |j| {
+        try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT o.id FROM '$B/orders.csv' o JOIN '$B/customers.csv' c ON c.id = o.cust_id JOIN '$B/regions.csv' r ON r.id = c.region_id WHERE r.id = 5 ORDER BY o.id;", j, &.{});
+        try expectFile(&tmp, "o.csv", "id\n1\n2\n");
+    }
+}
