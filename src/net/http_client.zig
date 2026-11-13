@@ -397,10 +397,9 @@ pub const decompress_direct: []u8 = &.{};
 
 pub fn initClient(gpa: std.mem.Allocator) HttpClient {
     var client = HttpClient{ .allocator = gpa };
-    const path = std.process.getEnvVarOwned(gpa, "BASALT_CA_BUNDLE") catch return client;
+    const path = trust.envBundle(gpa) orelse return client;
     defer gpa.free(path);
-    client.ca_bundle.rescan(gpa) catch return client;
-    client.ca_bundle.addCertsFromFilePath(gpa, std.fs.cwd(), path) catch return client;
+    trust.roots(gpa, &client.ca_bundle, path) catch return client;
     client.next_https_rescan_certs = false;
     return client;
 }

@@ -12,7 +12,10 @@ The connection types are `postgres`, `mysql`, `sqlserver`, `starrocks`,
 `doris`, `http`, `sftp`, `smb` and `ftp`; any other `TYPE` is a plan-time error.
 
 - `postgres`, `mysql`, `sqlserver`: `host port database user password tls`
-  (`off`, `require` or `insecure`). `sqlserver` adds `auth` (`sql`, the default;
+  (`off`, `require` or `insecure`). `require` verifies the server's certificate
+  against the system's roots and, when `BASALT_CA_BUNDLE` names a PEM file, its
+  certificates too, as an internal CA needs; a file that cannot be read fails the
+  connection, naming it. `sqlserver` adds `auth` (`sql`, the default;
   `aad` with `client_id` `resource` `token`; `ntlm`; `kerberos`) and, for
   Windows authentication, `domain realm kdc spn` (below).
 - `starrocks` and `doris`: `fe_host`/`host`, `fe_port`/`port`, `user`

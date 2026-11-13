@@ -8,6 +8,7 @@ const aad = @import("../../db/sqlserver/aad.zig");
 const ast = @import("../../lang/ast.zig");
 const driver = @import("../../connect/driver.zig");
 const env_mod = @import("../env.zig");
+const eval = @import("../../exec/eval.zig");
 const RunCfg = @import("register.zig").RunCfg;
 const krb5 = @import("../../net/auth/krb5.zig");
 const ntlm = @import("../../net/auth/ntlm.zig");
@@ -32,6 +33,7 @@ pub fn connectWhy(arena: std.mem.Allocator, connector: []const u8, e: anyerror) 
         return driver.connectorNoteAlloc(arena, "", e, tds.lastError());
     if (e == error.AadTokenFailed) return driver.connectorNoteAlloc(arena, "", e, aad.lastError());
     if (e == error.MysqlAuthFailed) return driver.connectorNoteAlloc(arena, "", e, mysql.lastError());
+    if (eval.takeFailure(e)) |why| return arena.dupe(u8, why);
     return @errorName(e);
 }
 

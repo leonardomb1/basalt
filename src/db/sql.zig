@@ -37,6 +37,7 @@ const std = @import("std");
 const msgfmt = @import("../format/msgfmt.zig");
 const op = @import("../exec/op.zig");
 const TlsClient = @import("../net/tls_client.zig");
+const trust = @import("../net/trust.zig");
 const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const Value = @import("../exec/value.zig").Value;
@@ -64,8 +65,17 @@ pub const TlsState = struct {
 
     pub fn start(self: *TlsState, gpa: std.mem.Allocator, input: *std.Io.Reader, output: *std.Io.Writer, host: []const u8, mode: TlsMode) !void {
         self.bundle = .{};
-        if (mode == .require) try self.bundle.rescan(gpa);
         errdefer self.bundle.deinit(gpa);
+        if (mode == .require) {
+            const extra = trust.envBundle(gpa);
+            defer if (extra) |p| gpa.free(p);
+            trust.roots(gpa, &self.bundle, extra) catch |e| {
+                const p = extra orelse return e;
+                if (e == error.OutOfMemory) return e;
+                var buf: [480]u8 = undefined;
+                return eval.explain(error.CaBundleUnreadable, msgfmt.clipPrint(&buf, "BASALT_CA_BUNDLE `{s}` holds no readable PEM certificates ({s})", .{ p, @errorName(e) }));
+            };
+        }
         self.client = try TlsClient.init(input, output, .{
             .host = if (mode == .require) .{ .explicit = host } else .no_verification,
             .ca = if (mode == .require) .{ .bundle = self.bundle } else .no_verification,

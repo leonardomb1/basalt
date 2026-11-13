@@ -93,6 +93,18 @@ pub fn grow(gpa: std.mem.Allocator, bundle: *Certificate.Bundle, ders: []const [
     return added;
 }
 
+/// The roots a verifying connection trusts: the system's, and the PEM file
+/// `extra` names (BASALT_CA_BUNDLE), a private CA's, added to them.
+pub fn roots(gpa: std.mem.Allocator, bundle: *Certificate.Bundle, extra: ?[]const u8) !void {
+    try bundle.rescan(gpa);
+    if (extra) |path| try bundle.addCertsFromFilePath(gpa, std.fs.cwd(), path);
+}
+
+/// The PEM file BASALT_CA_BUNDLE names, or null when it is unset.
+pub fn envBundle(gpa: std.mem.Allocator) ?[]const u8 {
+    return std.process.getEnvVarOwned(gpa, "BASALT_CA_BUNDLE") catch null;
+}
+
 const testing = std.testing;
 const fixtures = struct {
     const root = @embedFile("testdata/root.der");
@@ -146,4 +158,33 @@ test "isCa refuses a basicConstraints whose lengths run past the certificate" {
     bad[at + basic_constraints_oid.len + 4] = 0x7F;
     const p = parseDer(&bad) catch return;
     try testing.expect(!isCa(p));
+}
+
+test "roots adds a private CA's PEM to the system's, and an unreadable one is an error" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pem = std.array_list.Managed(u8).init(testing.allocator);
+    defer pem.deinit();
+    try pem.appendSlice("-----BEGIN CERTIFICATE-----\n");
+    const enc = std.base64.standard.Encoder;
+    const b64 = try testing.allocator.alloc(u8, enc.calcSize(fixtures.root.len));
+    defer testing.allocator.free(b64);
+    _ = enc.encode(b64, fixtures.root);
+    try pem.appendSlice(b64);
+    try pem.appendSlice("\n-----END CERTIFICATE-----\n");
+    try tmp.dir.writeFile(.{ .sub_path = "ca.pem", .data = pem.items });
+    const path = try tmp.dir.realpathAlloc(testing.allocator, "ca.pem");
+    defer testing.allocator.free(path);
+
+    var system: Certificate.Bundle = .{};
+    defer system.deinit(testing.allocator);
+    try roots(testing.allocator, &system, null);
+    var with: Certificate.Bundle = .{};
+    defer with.deinit(testing.allocator);
+    try roots(testing.allocator, &with, path);
+    try testing.expectEqual(system.map.count() + 1, with.map.count());
+
+    var bad: Certificate.Bundle = .{};
+    defer bad.deinit(testing.allocator);
+    try testing.expectError(error.FileNotFound, roots(testing.allocator, &bad, "/nonexistent/ca.pem"));
 }
