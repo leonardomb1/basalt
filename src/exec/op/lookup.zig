@@ -40,12 +40,20 @@ pub const Caller = struct {
 const Span = struct { reply: usize, lo: usize, hi: usize };
 
 /// Rows waiting for their answers: a batch from below, its arguments, and each
-/// row's items once answered.
+/// row's items once answered, all owned by `arena`.
 const Pending = struct {
     batch: Batch,
     args: []const []const Value,
     spans: []?Span,
     answered: usize = 0,
+    arena: std.heap.ArenaAllocator,
+};
+
+/// A reply owned by its request's arena, freed once its `left` rows are emitted.
+const Reply = struct {
+    batch: Batch,
+    arena: std.heap.ArenaAllocator,
+    left: usize,
 };
 
 pub const Lookup = struct {
@@ -62,33 +70,39 @@ pub const Lookup = struct {
     list_ty: types.Type,
     out_schema: *const types.Schema,
     errctx: ?*ErrCtx = null,
+    gpa: std.mem.Allocator,
     state: ?*State = null,
 
+    /// Lives across pulls on `gpa`, since the driver resets the per-pull arena.
     const State = struct {
         pending: std.array_list.Managed(Pending),
         /// The next pending row not yet sent: its batch and row.
         at: [2]usize = .{ 0, 0 },
         done_below: bool = false,
-        /// Every reply so far, its items' columns typed as declared.
-        replies: std.array_list.Managed(Batch),
+        /// Replies still holding unemitted rows; a span's `reply` is `base` plus its index.
+        replies: std.array_list.Managed(Reply),
+        base: usize = 0,
         /// A one-row NULL item, which a row with none takes under `outer`.
-        none: []const Column,
+        none: []const Column = &.{},
+        keep: std.heap.ArenaAllocator,
     };
 
     pub fn next(self: *Lookup, arena: std.mem.Allocator) anyerror!?Batch {
         const st = self.state orelse blk: {
-            const s = try arena.create(State);
-            const none = try arena.alloc(Column, self.item_schema.fields.len);
-            for (none, self.item_schema.fields) |*c, f| c.* = try nullColumn(arena, f.ty, 1);
-            s.* = .{ .pending = .init(arena), .replies = .init(arena), .none = none };
+            const s = try self.gpa.create(State);
+            s.* = .{ .pending = .init(self.gpa), .replies = .init(self.gpa), .keep = .init(self.gpa) };
             self.state = s;
+            const none = try s.keep.allocator().alloc(Column, self.item_schema.fields.len);
+            for (none, self.item_schema.fields) |*c, f| c.* = try nullColumn(s.keep.allocator(), f.ty, 1);
+            s.none = none;
             break :blk s;
         };
         while (true) {
             if (st.pending.items.len > 0 and st.pending.items[0].answered == st.pending.items[0].batch.len) {
-                const p = st.pending.orderedRemove(0);
+                var p = st.pending.orderedRemove(0);
+                defer p.arena.deinit();
                 st.at[0] -|= 1;
-                return try self.emit(arena, st, p);
+                return try self.emit(arena, st, &p);
             }
             if (st.done_below and self.unsent(st) == 0) return null;
             try self.fill(arena, st);
@@ -118,28 +132,42 @@ pub const Lookup = struct {
                 break;
             };
             if (b.len == 0) continue;
-            const owned = try b.deepCopy(arena);
-            const args = try arena.alloc([]const Value, self.args.len);
+            var pa = std.heap.ArenaAllocator.init(self.gpa);
+            errdefer pa.deinit();
+            const own = pa.allocator();
+            const owned = try b.deepCopy(own);
+            const args = try own.alloc([]const Value, self.args.len);
             for (self.args, self.arg_types, args) |e, ty, *out| {
-                const col = try evalColumn(arena, e, owned, ty);
-                const vals = try arena.alloc(Value, owned.len);
+                const col = try evalColumn(own, e, owned, ty);
+                const vals = try own.alloc(Value, owned.len);
                 for (vals, 0..) |*v, r| v.* = col.getValue(r);
                 out.* = vals;
             }
-            const spans = try arena.alloc(?Span, owned.len);
+            const spans = try own.alloc(?Span, owned.len);
             @memset(spans, null);
-            try st.pending.append(.{ .batch = owned, .args = args, .spans = spans });
+            try st.pending.append(.{ .batch = owned, .args = args, .spans = spans, .arena = pa });
         }
     }
 
-    const Req = struct { rows: std.array_list.Managed([2]usize), args: []const []const Value, reply: ?Batch = null, err: ?anyerror = null, arena: std.heap.ArenaAllocator };
+    pub fn release(self: *Lookup) void {
+        const st = self.state orelse return;
+        for (st.pending.items) |*p| p.arena.deinit();
+        st.pending.deinit();
+        for (st.replies.items) |*r| r.arena.deinit();
+        st.replies.deinit();
+        st.keep.deinit();
+        self.gpa.destroy(st);
+        self.state = null;
+    }
+
+    const Req = struct { rows: std.array_list.Managed([2]usize), args: []const []const Value, reply: ?Batch = null, err: ?anyerror = null, arena: std.heap.ArenaAllocator, kept: bool = false };
 
     /// The window's whole requests (and a short last one once nothing is left
     /// below) sent at once, and their items filed under their rows in order.
     fn send(self: *Lookup, arena: std.mem.Allocator, st: *State) !void {
         const size = self.per();
         var reqs = std.array_list.Managed(Req).init(arena);
-        defer for (reqs.items) |*q| q.arena.deinit();
+        defer for (reqs.items) |*q| if (!q.kept) q.arena.deinit();
         while (reqs.items.len < self.concurrency) {
             const left = self.unsent(st);
             if (left == 0 or (left < size and !st.done_below)) break;
@@ -171,8 +199,9 @@ pub const Lookup = struct {
                 if (self.errctx) |c| c.set("the lookup's request of {d} rows got {d} items back; a batched function answers each input with one item", .{ q.rows.items.len, reply.len });
                 return error.LookupItemCount;
             }
-            const ri = st.replies.items.len;
-            try st.replies.append(try reply.deepCopy(arena));
+            const ri = st.base + st.replies.items.len;
+            try st.replies.append(.{ .batch = reply, .arena = q.arena, .left = q.rows.items.len });
+            q.kept = true;
             for (q.rows.items, 0..) |at, k| {
                 const p = &st.pending.items[at[0]];
                 p.spans[at[1]] = if (self.batch > 0) .{ .reply = ri, .lo = k, .hi = k + 1 } else .{ .reply = ri, .lo = 0, .hi = reply.len };
@@ -189,30 +218,45 @@ pub const Lookup = struct {
         q.reply = reply;
     }
 
-    /// `p`'s rows with their items as a list column.
-    fn emit(self: *Lookup, arena: std.mem.Allocator, st: *State, p: Pending) !Batch {
+    /// `p`'s rows with their items as a list column, copied onto `arena`; replies
+    /// whose rows are all emitted are freed.
+    fn emit(self: *Lookup, arena: std.mem.Allocator, st: *State, p: *const Pending) !Batch {
         const n = p.batch.len;
         const Ref = struct { chunk: usize, row: usize };
         const offsets = try arena.alloc(i32, n + 1);
         offsets[0] = 0;
         var refs = std.array_list.Managed(Ref).init(arena);
         var nulls = std.array_list.Managed(usize).init(arena);
-        const none_chunk = st.replies.items.len;
+        var first: usize = std.math.maxInt(usize);
+        var last: usize = 0;
+        for (p.spans) |sp| {
+            first = @min(first, sp.?.reply);
+            last = @max(last, sp.?.reply);
+        }
+        const used = st.replies.items[first - st.base .. last - st.base + 1];
+        const none_chunk = used.len;
         for (p.spans, 0..) |sp, r| {
             const s = sp.?;
             if (s.hi == s.lo and self.outer) {
                 try nulls.append(refs.items.len);
                 try refs.append(.{ .chunk = none_chunk, .row = 0 });
             }
-            for (s.lo..s.hi) |i| try refs.append(.{ .chunk = s.reply, .row = i });
+            for (s.lo..s.hi) |i| try refs.append(.{ .chunk = s.reply - first, .row = i });
             offsets[r + 1] = @intCast(refs.items.len);
         }
         const kids = try arena.alloc(Column, self.item_schema.fields.len);
         const srcs = try arena.alloc(Column, none_chunk + 1);
         for (kids, 0..) |*k, f| {
-            for (st.replies.items, 0..) |rb, i| srcs[i] = rb.columns[f];
+            for (used, 0..) |rb, i| srcs[i] = rb.batch.columns[f];
             srcs[none_chunk] = st.none[f];
             k.* = try column.takeAcross(arena, srcs, refs.items);
+        }
+        const rows = try p.batch.deepCopy(arena);
+        for (p.spans) |sp| st.replies.items[sp.?.reply - st.base].left -= 1;
+        while (st.replies.items.len > 0 and st.replies.items[0].left == 0) {
+            var done = st.replies.orderedRemove(0);
+            done.arena.deinit();
+            st.base += 1;
         }
         var vb = try column.Bitmap.initFull(arena, refs.items.len);
         for (nulls.items) |i| vb.setValid(i, false);
@@ -222,8 +266,8 @@ pub const Lookup = struct {
         const child = Column.derived(struct_ty, refs.items.len, vb, .{ .nested = st_node });
         const list_node = try arena.create(column.Nested);
         list_node.* = .{ .ty = self.list_ty, .body = .{ .list = .{ .offsets = offsets, .child = child } } };
-        const cols = try arena.alloc(Column, p.batch.columns.len + 1);
-        @memcpy(cols[0..p.batch.columns.len], p.batch.columns);
+        const cols = try arena.alloc(Column, rows.columns.len + 1);
+        @memcpy(cols[0..rows.columns.len], rows.columns);
         cols[cols.len - 1] = Column.derived(self.list_ty, n, try column.Bitmap.initFull(arena, n), .{ .nested = list_node });
         return .{ .schema = self.out_schema, .columns = cols, .len = n };
     }

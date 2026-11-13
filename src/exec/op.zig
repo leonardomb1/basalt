@@ -324,6 +324,10 @@ pub const Op = union(enum) {
                 g.release();
                 g.child.release();
             },
+            .lookup => |l| {
+                l.release();
+                l.child.release();
+            },
             inline else => |o| o.child.release(),
         }
     }

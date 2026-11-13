@@ -439,3 +439,24 @@ test "a lookup in each UNION branch sends each branch's rows once at any -j" {
     try std.testing.expectEqual(@as(usize, 6), srv.requests());
     try std.testing.expectEqualStrings("id,embedding\n0,\"[1,0]\"\n0,\"[1,0]\"\n1,\"[2,0]\"\n1,\"[2,0]\"\n2,\"[3,0]\"\n2,\"[3,0]\"\n", out);
 }
+
+test "a lookup over many input batches streams them all, each row with its own item" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = try inputCsv(a, 3000) });
+    var srv: EchoServer = undefined;
+    try srv.start(embeddings, 0);
+    defer srv.stop();
+    const script = try std.fmt.allocPrint(a, "{s}LOAD INTO '{s}/out.csv' AS SELECT t.id, e.embedding, e.index FROM '{s}/in.csv' t CROSS JOIN LATERAL embed(t.txt) e;", .{ try embedFn(a, try srv.url(a), ", batch = 1000"), base, base });
+    const out = try runScriptOpts(std.testing.allocator, &tmp, script, .{ .threads = 1 });
+    defer std.testing.allocator.free(out);
+    var want = std.Io.Writer.Allocating.init(a);
+    try want.writer.writeAll("id,embedding,index\n");
+    for (0..3000) |k| try want.writer.print("{d},\"[{d},97]\",{d}\n", .{ k, k % 26 + 1, k % 1000 });
+    try std.testing.expectEqualStrings(want.written(), out);
+    try std.testing.expectEqual(@as(usize, 3), srv.requests());
+}

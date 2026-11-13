@@ -99,6 +99,7 @@ pub fn build(env: *Env, lk: ast.Lookup, lp: analyze.LookupPlan, child: op.Op, ou
         .list_ty = lp.list_ty,
         .out_schema = out,
         .errctx = env.errctx,
+        .gpa = env.gpa,
     };
     return o;
 }
