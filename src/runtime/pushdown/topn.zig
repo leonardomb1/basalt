@@ -10,7 +10,7 @@ const msgfmt = @import("../../format/msgfmt.zig");
 const projectedFrom = @import("hoist.zig").projectedFrom;
 const translatePred = @import("translate.zig").translatePred;
 const types = @import("../../lang/types.zig");
-pub const topNStagesOf = @import("testing_util.zig").topNStagesOf;
+const topNStagesOf = @import("testing_util.zig").topNStagesOf;
 
 pub const TopN = struct {
     rows: u64,
