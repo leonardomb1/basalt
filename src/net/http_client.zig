@@ -96,6 +96,7 @@
 //! flat across pages.
 
 const std = @import("std");
+const HttpClient = @import("http_std.zig");
 const msgfmt = @import("../format/msgfmt.zig");
 const objstore = @import("../store/objstore.zig");
 const types = @import("../lang/types.zig");
@@ -107,6 +108,7 @@ const jt = @import("../exec/json.zig");
 const textconv = @import("../exec/textconv.zig");
 const eval = @import("../exec/eval.zig");
 const ChainCapture = @import("tls_client.zig").ChainCapture;
+const trust = @import("trust.zig");
 const init = @import("tls_client.zig").init;
 const obs = @import("../runtime/obs.zig");
 const trace = @import("../connect/trace.zig");
@@ -120,40 +122,19 @@ const max_page_bytes = 256 << 20;
 /// The longest a server's `Retry-After` stretches one wait between attempts.
 const max_retry_after_ms = 60_000;
 
-/// Adds to `bundle` each certificate the server presents that verifies against one
-/// already there, repeating to a fixpoint so order doesn't matter. Trusts nothing
-/// new that does not chain to an existing root; true if the bundle grew.
+/// Adds to `bundle` each CA certificate the server presents that chains to one
+/// already there (`trust.grow`); true if the bundle grew.
 pub fn repairBundle(gpa: std.mem.Allocator, bundle: *std.crypto.Certificate.Bundle, host: []const u8, port: u16) bool {
     var cap = ChainCapture{};
     harvestChain(gpa, host, port, &cap) catch return false;
-    const now = std.time.timestamp();
-    var added_any = false;
-    var progress = true;
-    while (progress) {
-        progress = false;
-        for (0..cap.count) |i| {
-            if (cap.used[i]) continue;
-            const der = cap.bufs[i][0..cap.lens[i]];
-            const cert = std.crypto.Certificate{ .buffer = der, .index = 0 };
-            const parsed = cert.parse() catch {
-                cap.used[i] = true;
-                continue;
-            };
-            bundle.verify(parsed, now) catch continue;
-            const start: u32 = @intCast(bundle.bytes.items.len);
-            bundle.bytes.appendSlice(gpa, der) catch return added_any;
-            bundle.parseCert(gpa, start, now) catch return added_any;
-            cap.used[i] = true;
-            progress = true;
-            added_any = true;
-        }
-    }
-    return added_any;
+    var ders: [cap.bufs.len][]const u8 = undefined;
+    for (0..cap.count) |i| ders[i] = cap.bufs[i][0..cap.lens[i]];
+    return trust.grow(gpa, bundle, ders[0..cap.count], std.time.timestamp());
 }
 
 /// After a failed TLS handshake, grows `client`'s CA bundle from the chain `uri`'s
 /// host presents (see `repairBundle`); true when a replay may now succeed.
-pub fn repairClient(client: *std.http.Client, uri: std.Uri) bool {
+pub fn repairClient(client: *HttpClient, uri: std.Uri) bool {
     const h = uriHost(uri) orelse return false;
     if (!repairBundle(client.allocator, &client.ca_bundle, h, uri.port orelse 443)) return false;
     client.next_https_rescan_certs = false;
@@ -161,7 +142,7 @@ pub fn repairClient(client: *std.http.Client, uri: std.Uri) bool {
 }
 
 /// `repairClient` for `url`, at most once per `done` flag, which it sets.
-pub fn repairOnce(client: *std.http.Client, done: *bool, url: []const u8) bool {
+pub fn repairOnce(client: *HttpClient, done: *bool, url: []const u8) bool {
     if (done.*) return false;
     done.* = true;
     const uri = std.Uri.parse(url) catch return false;
@@ -414,8 +395,8 @@ pub fn encodeSpaces(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
 
 pub const decompress_direct: []u8 = &.{};
 
-pub fn initClient(gpa: std.mem.Allocator) std.http.Client {
-    var client = std.http.Client{ .allocator = gpa };
+pub fn initClient(gpa: std.mem.Allocator) HttpClient {
+    var client = HttpClient{ .allocator = gpa };
     const path = std.process.getEnvVarOwned(gpa, "BASALT_CA_BUNDLE") catch return client;
     defer gpa.free(path);
     client.ca_bundle.rescan(gpa) catch return client;
@@ -479,7 +460,7 @@ pub const Reply = struct { code: u16, body: []u8 };
 /// The slot owns its client, so an abandoned worker frees both; the body is `gpa`'s.
 pub fn request(gpa: std.mem.Allocator, req: Request, dl: Deadline) !Reply {
     if (driver.aborting()) return error.Aborted;
-    const client = try gpa.create(std.http.Client);
+    const client = try gpa.create(HttpClient);
     client.* = initClient(gpa);
     const slot = HttpSource.makeSlot(gpa, client, req, dl, user_agent, 0) catch |e| {
         client.deinit();
@@ -825,7 +806,7 @@ fn statusesWhy(list: []const u8) ?[]const u8 {
 pub const HttpSource = struct {
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,
-    client: *std.http.Client,
+    client: *HttpClient,
     zombies: usize = 0,
     base_url: []const u8,
     opts: Options,
@@ -856,7 +837,7 @@ pub const HttpSource = struct {
         state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(SlotState.running)),
         gpa: std.mem.Allocator,
         snap: std.heap.ArenaAllocator,
-        client: *std.http.Client,
+        client: *HttpClient,
         method: Method,
         content_type: ?[]const u8,
         user_agent: []const u8,
@@ -886,7 +867,7 @@ pub const HttpSource = struct {
 
     /// A slot for `req` with everything it reads copied into its own arena, not yet
     /// started.
-    fn makeSlot(gpa: std.mem.Allocator, client: *std.http.Client, req: Request, dl: Deadline, ua: []const u8, gen: u32) !*Slot {
+    fn makeSlot(gpa: std.mem.Allocator, client: *HttpClient, req: Request, dl: Deadline, ua: []const u8, gen: u32) !*Slot {
         const slot = try gpa.create(Slot);
         slot.* = .{
             .gpa = gpa,
@@ -923,7 +904,7 @@ pub const HttpSource = struct {
         const url = try encodeSpaces(arena, try joinUrl(arena, cc.base_url, path));
         const headers = try buildHeaders(arena, opts);
         const self = try arena.create(HttpSource);
-        const client = try gpa.create(std.http.Client);
+        const client = try gpa.create(HttpClient);
         client.* = initClient(gpa);
         self.* = .{
             .arena = arena,
@@ -2577,7 +2558,7 @@ test "a URL in a log or message keeps no login and no query values" {
 }
 
 test "repairOnce tries once per flag, and a URL with no host repairs nothing" {
-    var client = std.http.Client{ .allocator = std.testing.allocator };
+    var client = HttpClient{ .allocator = std.testing.allocator };
     defer client.deinit();
     var done = false;
     try std.testing.expect(!repairOnce(&client, &done, "not a url"));

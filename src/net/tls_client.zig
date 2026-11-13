@@ -1,5 +1,9 @@
 //! Vendored from Zig 0.15.2 `std.crypto.tls.Client`, without upstream's inline
-//! comments or its unused `end`. Two functional changes:
+//! comments; `net/http_std.zig` runs HTTPS through it. Three functional changes:
+//!
+//! - Every issuer in a presented chain must be a CA (`trust.verifyIssuer`); std
+//!   checks only names, dates and the signature, so a trusted leaf could sign a
+//!   forged certificate for any host.
 //!
 //! - TLS 1.3 CertificateRequest handling: the `.certificate_request` branch and
 //!   the `client_cert_requested` uses around the client Finished. MySQL servers
@@ -14,7 +18,7 @@
 //! The rest, options no caller sets included, stays as upstream has it: the record
 //! layer compiles to the same code as std's and the linker folds the two copies, so
 //! trimming it costs binary size. Drop this vendor once std supports client
-//! certificates.
+//! certificates and checks issuers' basicConstraints.
 //!
 //! Scope: TLS 1.3 only. A TLS 1.2 server that requests a client certificate
 //! still fails (MySQL forced to `--tls-version=TLSv1.2`, which is rare); 1.2
@@ -30,6 +34,7 @@ const mem = std.mem;
 const crypto = std.crypto;
 const assert = std.debug.assert;
 const Certificate = std.crypto.Certificate;
+const trust = @import("trust.zig");
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
 
@@ -158,7 +163,6 @@ pub const Options = struct {
 pub const ChainCapture = struct {
     bufs: [8][4096]u8 = undefined,
     lens: [8]usize = @splat(0),
-    used: [8]bool = @splat(false),
     count: usize = 0,
 
     pub fn add(self: *ChainCapture, der: []const u8) void {
@@ -189,6 +193,7 @@ const InitError = error{
     CertificateExpired,
     CertificateFieldHasWrongDataType,
     CertificateIssuerMismatch,
+    CertificateIssuerNotCa,
     CertificateNotYetValid,
     CertificateSignatureAlgorithmMismatch,
     CertificateSignatureAlgorithmUnsupported,
@@ -677,7 +682,7 @@ pub fn init(input: *Reader, output: *Writer, options: Options) InitError!Client 
 
                                 try main_cert_pub_key.init(subject.pub_key_algo, subject.pubKey());
                             } else if (options.ca != .no_verification) {
-                                try prev_cert.verify(subject, now_sec);
+                                try trust.verifyIssuer(prev_cert, subject, now_sec);
                             }
 
                             switch (options.ca) {
@@ -1028,6 +1033,15 @@ fn flush(w: *Writer) Writer.Error!void {
     const prepared = prepareCiphertextRecord(c, ciphertext_buf, w.buffered(), .application_data);
     output.advance(prepared.ciphertext_end);
     w.end = 0;
+}
+
+/// Flushes and sends close_notify, as `net/http_std.zig` does on closing a connection.
+pub fn end(c: *Client) Writer.Error!void {
+    try flush(&c.writer);
+    const output = c.output;
+    const ciphertext_buf = try output.writableSliceGreedy(min_buffer_len);
+    const prepared = prepareCiphertextRecord(c, ciphertext_buf, &tls.close_notify_alert, .alert);
+    output.advance(prepared.ciphertext_end);
 }
 
 fn prepareCiphertextRecord(

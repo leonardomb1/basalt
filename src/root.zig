@@ -51,6 +51,7 @@ pub const postgres = @import("db/postgres.zig");
 pub const wire = @import("db/wire.zig");
 pub const typemap = @import("db/typemap.zig");
 pub const http_client = @import("net/http_client.zig");
+pub const trust = @import("net/trust.zig");
 pub const aad = @import("db/sqlserver/aad.zig");
 pub const ntlm = @import("net/auth/ntlm.zig");
 pub const azure = @import("store/azure.zig");

@@ -13,6 +13,7 @@
 //! same buffers, so a folder of any length reads in constant memory.
 
 const std = @import("std");
+const HttpClient = @import("../net/http_std.zig");
 const eval = @import("../exec/eval.zig");
 const http_client = @import("../net/http_client.zig");
 const msgfmt = @import("msgfmt.zig");
@@ -133,9 +134,9 @@ pub const Stream = struct {
         fr: std.fs.File.Reader,
     };
     const HttpFetch = struct {
-        client: std.http.Client,
-        req: std.http.Client.Request,
-        response: std.http.Client.Response,
+        client: HttpClient,
+        req: HttpClient.Request,
+        response: HttpClient.Response,
         decompress: std.http.Decompress = undefined,
         redirect_buf: [8 * 1024]u8 = undefined,
         transfer_buf: [LINE_BUF]u8 = undefined,

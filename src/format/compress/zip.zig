@@ -21,6 +21,7 @@
 //! other.
 
 const std = @import("std");
+const HttpClient = @import("../../net/http_std.zig");
 const msgfmt = @import("../msgfmt.zig");
 const zip = std.zip;
 const pqdecode = @import("../parquet/read.zig");
@@ -47,8 +48,8 @@ pub const Member = struct {
         file: std.fs.File.Reader,
         fixed: std.Io.Reader,
         http: struct {
-            req: std.http.Client.Request,
-            response: std.http.Client.Response,
+            req: HttpClient.Request,
+            response: HttpClient.Response,
             redirect_buf: [8 * 1024]u8,
         },
         sftp,

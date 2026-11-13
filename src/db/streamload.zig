@@ -37,6 +37,7 @@
 //! unit-tested; the network paths need a live server.
 
 const std = @import("std");
+const HttpClient = @import("../net/http_std.zig");
 const msgfmt = @import("../format/msgfmt.zig");
 const types = @import("../lang/types.zig");
 const ast = @import("../lang/ast.zig");
@@ -328,7 +329,7 @@ pub const StreamLoadSink = struct {
     buffer: std.array_list.Managed(u8),
     seq: u64 = 0,
     run_id: u64 = 0,
-    client: std.http.Client,
+    client: HttpClient,
     logger: ?*obs.Logger = null,
     errctx: ?*op.ErrCtx = null,
     url: []const u8 = "",
@@ -355,7 +356,7 @@ pub const StreamLoadSink = struct {
     why_len: usize = 0,
 
     const Txn = struct {
-        req: std.http.Client.Request,
+        req: HttpClient.Request,
         body: std.http.BodyWriter,
     };
 
@@ -378,7 +379,7 @@ pub const StreamLoadSink = struct {
             .buffer = std.array_list.Managed(u8).init(gpa),
             .headers = std.array_list.Managed(std.http.Header).init(gpa),
             .run_id = if (cfg.run_id != 0) cfg.run_id else @intCast(std.time.milliTimestamp()),
-            .client = std.http.Client{ .allocator = gpa },
+            .client = HttpClient{ .allocator = gpa },
             .opened = now,
             .txn_started = now,
         };

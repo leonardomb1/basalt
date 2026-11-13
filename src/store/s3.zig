@@ -41,6 +41,7 @@
 //! the consumer-facing interface) lives in `objstore.zig`.
 
 const std = @import("std");
+const HttpClient = @import("../net/http_std.zig");
 const msgfmt = @import("../format/msgfmt.zig");
 const objstore = @import("objstore.zig");
 const scheme = @import("scheme.zig");
@@ -397,7 +398,7 @@ fn bucketBase(arena: std.mem.Allocator, bucket: []const u8, region: []const u8, 
 
 const ListPage = struct {
     arena: std.mem.Allocator,
-    client: *std.http.Client,
+    client: *HttpClient,
     creds: Creds,
     region: []const u8,
     prefix: []const u8,
@@ -447,7 +448,7 @@ const ListPage = struct {
 /// `<Contents>`, and a flat listing has no CommonPrefixes.
 pub fn listPrefix(
     arena: std.mem.Allocator,
-    client: *std.http.Client,
+    client: *HttpClient,
     bucket: []const u8,
     prefix: []const u8,
     endpoint: ?[]const u8,
@@ -501,7 +502,7 @@ pub const MultipartWriter = struct {
 
     pub fn init(
         arena: std.mem.Allocator,
-        client: ?*std.http.Client,
+        client: ?*HttpClient,
         obj: Obj,
         content_type: []const u8,
     ) !*MultipartWriter {
@@ -1016,7 +1017,7 @@ fn testSleep(ns: u64) void {
     test_slept_ms += ns / std.time.ns_per_ms;
 }
 
-fn testWriter(a: std.mem.Allocator, client: *std.http.Client, srv: *http_fake.FakeServer) !MultipartWriter {
+fn testWriter(a: std.mem.Allocator, client: *HttpClient, srv: *http_fake.FakeServer) !MultipartWriter {
     return .{
         .interface = .{ .vtable = &MultipartWriter.vtable, .buffer = &.{} },
         .arena = a,
@@ -1046,7 +1047,7 @@ test "a listing page that meets SlowDown is fetched again" {
         reply("200 OK", "", "<ListBucketResult><Contents><Key>p/a.csv</Key></Contents></ListBucketResult>"),
     });
     defer srv.stop();
-    var client = std.http.Client{ .allocator = std.testing.allocator };
+    var client = HttpClient{ .allocator = std.testing.allocator };
     defer client.deinit();
 
     const base = try bucketBase(a, "lake", default_region, try srv.url(a, ""));
@@ -1071,7 +1072,7 @@ test "an upload part is re-put under its part number after a reset and a 502; a 
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var client = std.http.Client{ .allocator = std.testing.allocator };
+    var client = HttpClient{ .allocator = std.testing.allocator };
     defer client.deinit();
     {
         var srv: http_fake.FakeServer = undefined;
@@ -1108,7 +1109,7 @@ test "a complete whose answer was lost counts as done only when the object it ma
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var client = std.http.Client{ .allocator = std.testing.allocator };
+    var client = HttpClient{ .allocator = std.testing.allocator };
     defer client.deinit();
     const part = "\"9dd4e461268c8034f5c8564e155c67a6\"";
     const etag = (try multipartEtag(a, &.{part})).?;
@@ -1141,7 +1142,7 @@ test "abort sends a signed AbortMultipartUpload for a started upload and keeps t
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var client = std.http.Client{ .allocator = std.testing.allocator };
+    var client = HttpClient{ .allocator = std.testing.allocator };
     defer client.deinit();
     {
         var srv: http_fake.FakeServer = undefined;
@@ -1219,7 +1220,7 @@ fn vtParse(arena: std.mem.Allocator, url: []const u8) anyerror!objstore.Object {
     return .{ .provider = &provider, .url = o.url, .ptr = o };
 }
 
-fn vtListPrefix(arena: std.mem.Allocator, client: *std.http.Client, url: []const u8) anyerror![]const []const u8 {
+fn vtListPrefix(arena: std.mem.Allocator, client: *HttpClient, url: []const u8) anyerror![]const []const u8 {
     const p = try parsePrefix(url);
     const keys = try listPrefix(arena, client, p.bucket, p.prefix, endpointFromEnv(arena));
     const urls = try arena.alloc([]const u8, keys.len);
@@ -1235,11 +1236,11 @@ fn vtStatusToError(code: u16, body: []const u8) anyerror {
     return statusToError(code, body);
 }
 
-fn vtOpenWriter(ptr: *const anyopaque, arena: std.mem.Allocator, client: ?*std.http.Client, content_type: []const u8) anyerror!objstore.Writer {
+fn vtOpenWriter(ptr: *const anyopaque, arena: std.mem.Allocator, client: ?*HttpClient, content_type: []const u8) anyerror!objstore.Writer {
     return objstore.writer(try MultipartWriter.init(arena, client, objstore.cast(Obj, ptr).*, content_type));
 }
 
-fn vtPutIfAbsent(ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.http.Client, bytes: []const u8, content_type: []const u8, why: *[]const u8) anyerror!bool {
+fn vtPutIfAbsent(ptr: *const anyopaque, arena: std.mem.Allocator, client: *HttpClient, bytes: []const u8, content_type: []const u8, why: *[]const u8) anyerror!bool {
     var w = MultipartWriter{
         .interface = .{ .vtable = &MultipartWriter.vtable, .buffer = &.{} },
         .arena = arena,
@@ -1261,7 +1262,7 @@ test "putIfAbsent: 200 creates, 412 and 409 find one there, a 503 is retried, a 
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var client = std.http.Client{ .allocator = std.testing.allocator };
+    var client = HttpClient{ .allocator = std.testing.allocator };
     defer client.deinit();
     var srv: http_fake.FakeServer = undefined;
     try srv.start(&.{

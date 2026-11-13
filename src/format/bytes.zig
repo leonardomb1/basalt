@@ -10,6 +10,7 @@ const http_fake = @import("../testing/http_fake.zig");
 const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
 const std = @import("std");
+const HttpClient = @import("../net/http_std.zig");
 const msgfmt = @import("msgfmt.zig");
 const testing = std.testing;
 
@@ -122,7 +123,7 @@ pub const Bytes = union(enum) {
 
 pub const Remote = struct {
     arena: std.mem.Allocator,
-    client: *std.http.Client,
+    client: *HttpClient,
     url: []const u8,
     object: ?objstore.Object = null,
     total: u64,
@@ -137,7 +138,7 @@ pub const Remote = struct {
 
     /// `open`, taking the size when it is `known` rather than asking for it.
     pub fn openSized(arena: std.mem.Allocator, path: []const u8, known: ?u64) !*Remote {
-        const client = try arena.create(std.http.Client);
+        const client = try arena.create(HttpClient);
         client.* = http_client.initClient(arena);
         const self = try arena.create(Remote);
         self.* = .{ .arena = arena, .client = client, .url = path, .total = 0 };
@@ -334,7 +335,7 @@ test "a ranged read replays a 503, a reset and a 504 before the 206" {
         reply("404 Not Found", "", ""),
     });
     defer srv.stop();
-    var client = std.http.Client{ .allocator = testing.allocator };
+    var client = HttpClient{ .allocator = testing.allocator };
     defer client.deinit();
     var r = Remote{ .arena = a, .client = &client, .url = try srv.url(a, "/x.parquet"), .total = 100, .sleep = noSleep };
     try testing.expectEqualStrings("2345", try r.read(a, 2, 4));
@@ -361,7 +362,7 @@ test "a ranged read replays a 408 and a 507, fails a 501 at once, and a 408 that
         reply("408 Request Timeout", "", ""),
     });
     defer srv.stop();
-    var client = std.http.Client{ .allocator = testing.allocator };
+    var client = HttpClient{ .allocator = testing.allocator };
     defer client.deinit();
     var r = Remote{ .arena = a, .client = &client, .url = try srv.url(a, "/x.parquet"), .total = 100, .sleep = noSleep };
     try testing.expectEqualStrings("2345", try r.read(a, 2, 4));

@@ -12,6 +12,7 @@
 //! and read plain the folder would return the rows of files the table deleted.
 
 const std = @import("std");
+const HttpClient = @import("../../net/http_std.zig");
 const Bytes = @import("../bytes.zig").Bytes;
 const Layout = @import("../parquet/fit.zig").Layout;
 const Value = @import("../../exec/value.zig").Value;
@@ -117,7 +118,7 @@ fn isIcebergMetadata(name: []const u8) bool {
 /// When file `url` was last modified, in milliseconds since the epoch: a local
 /// file's from the file system, an object's from its `Last-Modified` (`client`
 /// made on first use); null when it is gone or the store gives no time.
-pub fn modifiedMs(arena: std.mem.Allocator, url: []const u8, client: *?std.http.Client) !?i64 {
+pub fn modifiedMs(arena: std.mem.Allocator, url: []const u8, client: *?HttpClient) !?i64 {
     const span = trace.begin(.stat, url);
     defer span.finish();
     if (objstore.isUrl(url)) {

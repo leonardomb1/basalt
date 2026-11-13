@@ -25,6 +25,7 @@
 //! carry on beside it.
 
 const std = @import("std");
+const HttpClient = @import("../../net/http_std.zig");
 const delta = @import("delta.zig");
 const ckpt = @import("delta_checkpoint.zig");
 const dvs = @import("delta_dv.zig");
@@ -70,7 +71,7 @@ pub fn vacuum(arena: std.mem.Allocator, root: []const u8, retain_ms: ?i64, now_m
     }
 
     const listed = try folder.listRaw(arena, root);
-    var client: ?std.http.Client = null;
+    var client: ?HttpClient = null;
     defer if (client) |*c| c.deinit();
     var out = Vacuumed{ .deleted = 0, .kept = 0 };
     for (listed) |u| {

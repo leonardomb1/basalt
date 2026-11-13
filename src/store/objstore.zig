@@ -41,6 +41,7 @@
 //! always a typo.
 
 const std = @import("std");
+const HttpClient = @import("../net/http_std.zig");
 const msgfmt = @import("../format/msgfmt.zig");
 const azure = @import("azure.zig");
 const xml = @import("../format/xml/token.zig");
@@ -135,7 +136,7 @@ pub const Call = struct {
 /// the head's strings. A request that fails before its response head arrives would
 /// leave its connection pooled (std keeps a `.ready` one), so the replay would write
 /// into the dead socket; a failure always drops it.
-pub fn exchange(arena: std.mem.Allocator, client: *std.http.Client, call: Call) !Response {
+pub fn exchange(arena: std.mem.Allocator, client: *HttpClient, call: Call) !Response {
     var hop = call;
     var hops: u8 = 0;
     while (true) {
@@ -183,7 +184,7 @@ fn resolveLocation(arena: std.mem.Allocator, base: []const u8, loc: []const u8) 
     return std.mem.concat(arena, u8, &.{ o, dir, "/", loc });
 }
 
-fn exchangeOnce(arena: std.mem.Allocator, client: *std.http.Client, call: Call, location: *?[]const u8) !Response {
+fn exchangeOnce(arena: std.mem.Allocator, client: *HttpClient, call: Call, location: *?[]const u8) !Response {
     const uri = try scheme.parseUri(call.url);
     var req = try client.request(call.method, uri, .{
         .redirect_behavior = .unhandled,
@@ -247,7 +248,7 @@ fn exchangeOnce(arena: std.mem.Allocator, client: *std.http.Client, call: Call, 
 /// flight, emptied before the next part, so memory stays flat however large the
 /// object grows.
 pub const Upload = struct {
-    client: *std.http.Client,
+    client: *HttpClient,
     owns_client: bool = false,
     req: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
     part: []u8 = &.{},
@@ -256,10 +257,10 @@ pub const Upload = struct {
     released: bool = false,
 
     /// Over `client`, or over a client of its own when null, freed by `release`.
-    pub fn init(arena: std.mem.Allocator, client: ?*std.http.Client, part_size: usize) !Upload {
+    pub fn init(arena: std.mem.Allocator, client: ?*HttpClient, part_size: usize) !Upload {
         const part = try arena.alloc(u8, part_size);
         if (client) |c| return .{ .client = c, .part = part };
-        const c = try arena.create(std.http.Client);
+        const c = try arena.create(HttpClient);
         c.* = http_client.initClient(std.heap.smp_allocator);
         return .{ .client = c, .owns_client = true, .part = part };
     }
@@ -423,11 +424,11 @@ pub const Provider = struct {
 
     pub const VTable = struct {
         parse: *const fn (arena: std.mem.Allocator, url: []const u8) anyerror!Object,
-        list_prefix: *const fn (arena: std.mem.Allocator, client: *std.http.Client, url: []const u8) anyerror![]const []const u8,
+        list_prefix: *const fn (arena: std.mem.Allocator, client: *HttpClient, url: []const u8) anyerror![]const []const u8,
         request_headers: *const fn (ptr: *const anyopaque, arena: std.mem.Allocator, method: []const u8, range: []const u8) anyerror![]const std.http.Header,
         status_to_error: *const fn (code: u16, body: []const u8) anyerror,
-        open_writer: *const fn (ptr: *const anyopaque, arena: std.mem.Allocator, client: ?*std.http.Client, content_type: []const u8) anyerror!Writer,
-        put_if_absent: *const fn (ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.http.Client, bytes: []const u8, content_type: []const u8, why: *[]const u8) anyerror!bool,
+        open_writer: *const fn (ptr: *const anyopaque, arena: std.mem.Allocator, client: ?*HttpClient, content_type: []const u8) anyerror!Writer,
+        put_if_absent: *const fn (ptr: *const anyopaque, arena: std.mem.Allocator, client: *HttpClient, bytes: []const u8, content_type: []const u8, why: *[]const u8) anyerror!bool,
     };
 };
 
@@ -449,13 +450,13 @@ pub const Object = struct {
     }
 
     /// A null `client` has the writer make its own, freed on `finish` or `abort`.
-    pub fn openWriter(self: Object, arena: std.mem.Allocator, client: ?*std.http.Client, content_type: []const u8) !Writer {
+    pub fn openWriter(self: Object, arena: std.mem.Allocator, client: ?*HttpClient, content_type: []const u8) !Writer {
         return self.provider.vtable.open_writer(self.ptr, arena, client, content_type);
     }
 
     /// When the object was last written, by a HEAD's `Last-Modified`; null when the
     /// store does not say.
-    pub fn modifiedMs(self: Object, arena: std.mem.Allocator, client: *std.http.Client) !?i64 {
+    pub fn modifiedMs(self: Object, arena: std.mem.Allocator, client: *HttpClient) !?i64 {
         const hdrs = try self.requestHeaders(arena, "HEAD", "");
         const r = try exchange(arena, client, .{ .method = .HEAD, .url = self.url, .headers = hdrs });
         if (r.code != 200) return self.statusToError(r.code, r.body);
@@ -464,7 +465,7 @@ pub const Object = struct {
 
     /// Deletes the object, one signed DELETE; one already gone is no error, as a
     /// cleanup that failed halfway is simply run again.
-    pub fn delete(self: Object, arena: std.mem.Allocator, client: *std.http.Client) !void {
+    pub fn delete(self: Object, arena: std.mem.Allocator, client: *HttpClient) !void {
         const hdrs = try self.requestHeaders(arena, "DELETE", "");
         const r = try exchange(arena, client, .{ .method = .DELETE, .url = self.url, .headers = hdrs });
         switch (r.code) {
@@ -476,7 +477,7 @@ pub const Object = struct {
     /// Writes `bytes` as the object only if none is there, in one request: true
     /// when it made it, false when one existed. `why` gets the store's message on
     /// failure.
-    pub fn putIfAbsent(self: Object, arena: std.mem.Allocator, client: *std.http.Client, bytes: []const u8, content_type: []const u8, why: *[]const u8) !bool {
+    pub fn putIfAbsent(self: Object, arena: std.mem.Allocator, client: *HttpClient, bytes: []const u8, content_type: []const u8, why: *[]const u8) !bool {
         return self.provider.vtable.put_if_absent(self.ptr, arena, client, bytes, content_type, why);
     }
 };
@@ -591,7 +592,7 @@ pub fn parse(arena: std.mem.Allocator, url: []const u8) !Object {
     return p.vtable.parse(arena, url);
 }
 
-pub fn listPrefix(arena: std.mem.Allocator, client: *std.http.Client, url: []const u8) ![]const []const u8 {
+pub fn listPrefix(arena: std.mem.Allocator, client: *HttpClient, url: []const u8) ![]const []const u8 {
     const p = find(url) orelse return Error.NotObjectUrl;
     const urls = try p.vtable.list_prefix(arena, client, url);
     if (urls.len == 0) return p.empty_prefix;
@@ -803,7 +804,7 @@ test "exchange surfaces ETag, Retry-After and the body, and a reset is a transie
         FakeServer.reply("200 OK", "ETag: \"abc\"\r\n", "hello"),
     });
     defer srv.stop();
-    var client = std.http.Client{ .allocator = std.testing.allocator };
+    var client = HttpClient{ .allocator = std.testing.allocator };
     defer client.deinit();
     const url = try srv.url(a, "/k");
 
@@ -910,7 +911,7 @@ test "exchange stops a body at max_body" {
         FakeServer.reply("200 OK", "", "x" ** 100),
     });
     defer srv.stop();
-    var client = std.http.Client{ .allocator = std.testing.allocator };
+    var client = HttpClient{ .allocator = std.testing.allocator };
     defer client.deinit();
     const url = try srv.url(a, "/k");
 

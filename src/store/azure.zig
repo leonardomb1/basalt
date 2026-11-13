@@ -38,6 +38,7 @@
 //! loop, the consumer-facing interface) lives in `objstore.zig`.
 
 const std = @import("std");
+const HttpClient = @import("../net/http_std.zig");
 const msgfmt = @import("../format/msgfmt.zig");
 const objstore = @import("objstore.zig");
 const scheme = @import("scheme.zig");
@@ -270,7 +271,7 @@ pub const BlockBlobWriter = struct {
 
     pub fn init(
         arena: std.mem.Allocator,
-        client: ?*std.http.Client,
+        client: ?*HttpClient,
         blob: Blob,
         content_type: []const u8,
     ) !*BlockBlobWriter {
@@ -470,7 +471,7 @@ test "block ids are the same width at every block number" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var client: std.http.Client = undefined;
+    var client: HttpClient = undefined;
     const blob = try parseUrl(a, "az://acct/c/f.csv", null);
     var w = BlockBlobWriter{
         .interface = .{ .vtable = undefined, .buffer = &.{} },
@@ -499,7 +500,7 @@ test "Put Block is re-put after a reset and waits out Retry-After; Put Block Lis
     defer ar.deinit();
     const a = ar.allocator();
     const reply = http_fake.FakeServer.reply;
-    var client = std.http.Client{ .allocator = std.testing.allocator };
+    var client = HttpClient{ .allocator = std.testing.allocator };
     defer client.deinit();
     var srv: http_fake.FakeServer = undefined;
     try srv.start(&.{
@@ -532,7 +533,7 @@ test "Put Block is re-put after a reset and waits out Retry-After; Put Block Lis
     try std.testing.expectEqualStrings(srv.line(3), srv.line(4));
 }
 
-fn testStagingWriter(a: std.mem.Allocator, client: *std.http.Client, srv: *http_fake.FakeServer, buf: []u8, block: []u8) !BlockBlobWriter {
+fn testStagingWriter(a: std.mem.Allocator, client: *HttpClient, srv: *http_fake.FakeServer, buf: []u8, block: []u8) !BlockBlobWriter {
     return .{
         .interface = .{ .vtable = &BlockBlobWriter.vtable, .buffer = buf },
         .arena = a,
@@ -551,7 +552,7 @@ test "writes gather into whole blocks however they are chunked" {
     defer ar.deinit();
     const a = ar.allocator();
     const reply = http_fake.FakeServer.reply;
-    var client = std.http.Client{ .allocator = std.testing.allocator };
+    var client = HttpClient{ .allocator = std.testing.allocator };
     defer client.deinit();
     var srv: http_fake.FakeServer = undefined;
     try srv.start(&([_]?[]const u8{reply("201 Created", "", "")} ** 5));
@@ -572,7 +573,7 @@ test "a long upload's memory does not grow with each block's request" {
     defer ar.deinit();
     const a = ar.allocator();
     const reply = http_fake.FakeServer.reply;
-    var client = std.http.Client{ .allocator = std.testing.allocator };
+    var client = HttpClient{ .allocator = std.testing.allocator };
     defer client.deinit();
     var srv: http_fake.FakeServer = undefined;
     try srv.start(&([_]?[]const u8{reply("201 Created", "", "")} ** 40));
@@ -594,7 +595,7 @@ test "putIfAbsent: 201 creates, 409 and 412 find one there, a missing container 
     defer ar.deinit();
     const a = ar.allocator();
     const reply = http_fake.FakeServer.reply;
-    var client = std.http.Client{ .allocator = std.testing.allocator };
+    var client = HttpClient{ .allocator = std.testing.allocator };
     defer client.deinit();
     var srv: http_fake.FakeServer = undefined;
     try srv.start(&.{
@@ -737,7 +738,7 @@ test "authHeader rejects a malformed key rather than signing with garbage" {
 
 const ListPage = struct {
     arena: std.mem.Allocator,
-    client: *std.http.Client,
+    client: *HttpClient,
     account: []const u8,
     prefix: []const u8,
     base: []const u8,
@@ -781,7 +782,7 @@ const ListPage = struct {
 /// markers, in Azure's lexicographic order. A flat listing returns only blobs.
 pub fn listPrefix(
     arena: std.mem.Allocator,
-    client: *std.http.Client,
+    client: *HttpClient,
     account: []const u8,
     container: []const u8,
     prefix: []const u8,
@@ -854,7 +855,7 @@ fn vtParse(arena: std.mem.Allocator, url: []const u8) anyerror!objstore.Object {
     return .{ .provider = &provider, .url = b.url, .ptr = b };
 }
 
-fn vtListPrefix(arena: std.mem.Allocator, client: *std.http.Client, url: []const u8) anyerror![]const []const u8 {
+fn vtListPrefix(arena: std.mem.Allocator, client: *HttpClient, url: []const u8) anyerror![]const []const u8 {
     const p = try parsePrefix(url);
     const names = try listPrefix(arena, client, p.account, p.container, p.prefix, endpointFromEnv(arena));
     const urls = try arena.alloc([]const u8, names.len);
@@ -870,11 +871,11 @@ fn vtStatusToError(code: u16, body: []const u8) anyerror {
     return statusToError(code, body);
 }
 
-fn vtOpenWriter(ptr: *const anyopaque, arena: std.mem.Allocator, client: ?*std.http.Client, content_type: []const u8) anyerror!objstore.Writer {
+fn vtOpenWriter(ptr: *const anyopaque, arena: std.mem.Allocator, client: ?*HttpClient, content_type: []const u8) anyerror!objstore.Writer {
     return objstore.writer(try BlockBlobWriter.init(arena, client, objstore.cast(Blob, ptr).*, content_type));
 }
 
-fn vtPutIfAbsent(ptr: *const anyopaque, arena: std.mem.Allocator, client: *std.http.Client, bytes: []const u8, content_type: []const u8, why: *[]const u8) anyerror!bool {
+fn vtPutIfAbsent(ptr: *const anyopaque, arena: std.mem.Allocator, client: *HttpClient, bytes: []const u8, content_type: []const u8, why: *[]const u8) anyerror!bool {
     var w = BlockBlobWriter{
         .interface = .{ .vtable = &BlockBlobWriter.vtable, .buffer = &.{} },
         .arena = arena,

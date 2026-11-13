@@ -31,6 +31,7 @@
 //! batch at a time; `Written` is what `_last_checkpoint` records.
 
 const std = @import("std");
+const HttpClient = @import("../../net/http_std.zig");
 const delta = @import("delta.zig");
 const dlog = @import("delta_log.zig");
 const dtypes = @import("delta_types.zig");
@@ -182,7 +183,7 @@ pub fn cleanLog(arena: std.mem.Allocator, root: []const u8, version: u64, keep_m
         }
     }.lt);
     var gone: usize = 0;
-    var client: ?std.http.Client = null;
+    var client: ?HttpClient = null;
     defer if (client) |*c| c.deinit();
     for (all.items) |d| {
         if (d.v >= floor) break;
