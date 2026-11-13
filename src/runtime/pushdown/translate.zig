@@ -53,6 +53,9 @@ pub const ColFacts = struct {
     byte_order: bool = false,
     pads: bool = true,
     wide: bool = false,
+    /// Two values are equal only when their bytes are, so a source GROUP BY or
+    /// DISTINCT forms the engine's groups.
+    eq_bytes: bool = false,
 };
 
 pub const Facts = std.StringHashMap(ColFacts);

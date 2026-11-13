@@ -10,6 +10,7 @@ pub const bin = @import("../../testing/ast_util.zig").bin;
 const classifyTopN = @import("topn.zig").classifyTopN;
 pub const fld = @import("../../testing/ast_util.zig").fld;
 const planWholeAggWhy = @import("../pushdown.zig").planWholeAggWhy;
+const Facts = @import("../pushdown.zig").Facts;
 const qual = @import("../pushdown.zig").qual;
 const std = @import("std");
 const testing = std.testing;
@@ -58,6 +59,15 @@ pub fn topNStagesOf(arena: std.mem.Allocator, sql: []const u8) ![]const ast.Stag
     return error.TestUnexpectedResult;
 }
 
+/// A catalog whose every text column of `schema` has byte equality, so a text
+/// group key passes and a test sees the gate it is about.
+pub fn byteEqualText(arena: std.mem.Allocator, schema: types.Schema) !*const Facts {
+    const f = try arena.create(Facts);
+    f.* = Facts.init(arena);
+    for (schema.fields) |fd| if (fd.ty.kind == .string) try f.put(fd.name, .{ .text = true, .eq_bytes = true });
+    return f;
+}
+
 pub fn planWholeAgg(
     arena: std.mem.Allocator,
     dialect: Dialect,
@@ -68,7 +78,7 @@ pub fn planWholeAgg(
     plan_schema: types.Schema,
 ) !?WholeAgg {
     var why: []const u8 = "";
-    return planWholeAggWhy(arena, dialect, base_sql, src_schema, prefix, ag, plan_schema, null, &why);
+    return planWholeAggWhy(arena, dialect, base_sql, src_schema, prefix, ag, plan_schema, try byteEqualText(arena, src_schema), &why);
 }
 
 pub fn testSchema() types.Schema {
@@ -128,7 +138,7 @@ pub fn byList(arena: std.mem.Allocator, names: []const []const u8) ![]ast.QualNa
 
 pub fn expectWholeAggRefused(a: std.mem.Allocator, d: Dialect, ag: ast.Aggregate, plan_schema: types.Schema, want: []const u8) !void {
     var why: []const u8 = "";
-    try testing.expect((try planWholeAggWhy(a, d, base_t, wholeSchema(), &.{}, ag, plan_schema, null, &why)) == null);
+    try testing.expect((try planWholeAggWhy(a, d, base_t, wholeSchema(), &.{}, ag, plan_schema, try byteEqualText(a, wholeSchema()), &why)) == null);
     if (!std.mem.startsWith(u8, why, want)) {
         std.debug.print("expected a refusal starting `{s}`, got `{s}`\n", .{ want, why });
         return error.TestUnexpectedResult;

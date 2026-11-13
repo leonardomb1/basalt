@@ -251,10 +251,15 @@ LOAD INTO '$pq' AS SELECT n, code FROM db.it_coll;"; then
   $B run --format csv -q -c "$decl SELECT n FROM db.it_coll WHERE code >= 'B' ORDER BY n DESC LIMIT 2;" >"$out/coll_got.csv" 2>&1
   $B run --format csv -q -c "SELECT n FROM '$pq' WHERE code >= 'B' ORDER BY n DESC LIMIT 2;" >"$out/coll_want.csv" 2>&1
   cmp -s "$out/coll_got.csv" "$out/coll_want.csv" || { bad=1; echo "  $1: top-N over code >= 'B'"; diff "$out/coll_want.csv" "$out/coll_got.csv" | head -4 || true; }
+  $B run --format csv -q -c "$decl SELECT code, count(*) AS c FROM db.it_coll GROUP BY code ORDER BY code;" >"$out/coll_got.csv" 2>&1
+  $B run --format csv -q -c "SELECT code, count(*) AS c FROM '$pq' GROUP BY code ORDER BY code;" >"$out/coll_want.csv" 2>&1
+  cmp -s "$out/coll_got.csv" "$out/coll_want.csv" || { bad=1; echo "  $1: group by code"; diff "$out/coll_want.csv" "$out/coll_got.csv" | head -4 || true; }
   # where the catalog proves byte order, the text range reaches the source
   if [ -n "${4:-}" ]; then
     $B run --format csv --log-level debug -c "$decl SELECT n FROM db.it_coll WHERE code >= 'B';" >"$out/coll_log.txt" 2>&1 || true
     grep "sql read" "$out/coll_log.txt" | grep -q ">= 'B'" || { bad=1; echo "  $1: the text range did not descend"; }
+    $B run --format csv --log-level debug -c "$decl SELECT code, count(*) AS c FROM db.it_coll GROUP BY code;" >"$out/coll_log.txt" 2>&1 || true
+    grep "sql read" "$out/coll_log.txt" | grep -q "GROUP BY" || { bad=1; echo "  $1: the text group key did not descend"; }
   fi
   if [ $bad = 0 ]; then report "$1-collation" ok; else report "$1-collation" bad; fi
 }

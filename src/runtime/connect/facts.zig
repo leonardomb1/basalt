@@ -57,6 +57,7 @@ fn probeFacts(env: *Env, ca: std.mem.Allocator, conn: ast.Connection, info: SqlC
                     .byte_order = flag(b.columns[2].getValue(r)),
                     .pads = flag(b.columns[3].getValue(r)),
                     .wide = flag(b.columns[4].getValue(r)),
+                    .eq_bytes = flag(b.columns[5].getValue(r)),
                 });
             }
         }
@@ -85,7 +86,8 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\ CASE WHEN c.collation_name LIKE '%[_]BIN2%' THEN 1
                 \\      WHEN c.collation_name LIKE '%[_]BIN' AND TYPE_NAME(c.system_type_id) IN ('char', 'varchar', 'text') THEN 1 ELSE 0 END,
                 \\ 1,
-                \\ CASE WHEN TYPE_NAME(c.system_type_id) IN ('nchar', 'nvarchar', 'ntext') THEN 1 ELSE 0 END
+                \\ CASE WHEN TYPE_NAME(c.system_type_id) IN ('nchar', 'nvarchar', 'ntext') THEN 1 ELSE 0 END,
+                \\ 0
                 \\FROM sys.columns c WHERE c.object_id = OBJECT_ID({s})
             , .{try split.catalogObjectLit(arena, dialect, parts)});
         },
@@ -101,7 +103,10 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\      WHEN locale IN ('C', 'POSIX', 'C.UTF-8', 'C.utf8') THEN 1
                 \\      ELSE 0 END,
                 \\ CASE WHEN t.typname = 'bpchar' THEN 1 ELSE 0 END,
-                \\ 0
+                \\ 0,
+                \\ CASE WHEN t.typcategory <> 'S' OR t.typname IN ('citext', 'bpchar') THEN 0
+                \\      WHEN coalesce((to_jsonb(co) ->> 'collisdeterministic')::boolean, true) THEN 1
+                \\      ELSE 0 END
                 \\FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
                 \\LEFT JOIN pg_collation co ON co.oid = a.attcollation
                 \\CROSS JOIN pg_database d
@@ -119,7 +124,8 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\ CASE WHEN c.COLLATION_NAME IS NULL THEN 0 ELSE 1 END,
                 \\ CASE WHEN c.COLLATION_NAME = 'binary' OR RIGHT(c.COLLATION_NAME, 4) = '_bin' THEN 1 ELSE 0 END,
                 \\ CASE WHEN co.PAD_ATTRIBUTE = 'NO PAD' THEN 0 ELSE 1 END,
-                \\ CASE WHEN c.CHARACTER_SET_NAME IN ('ucs2', 'utf16', 'utf16le', 'utf32') THEN 1 ELSE 0 END
+                \\ CASE WHEN c.CHARACTER_SET_NAME IN ('ucs2', 'utf16', 'utf16le', 'utf32') THEN 1 ELSE 0 END,
+                \\ CASE WHEN (c.COLLATION_NAME = 'binary' OR RIGHT(c.COLLATION_NAME, 4) = '_bin') AND co.PAD_ATTRIBUTE = 'NO PAD' THEN 1 ELSE 0 END
                 \\FROM information_schema.COLUMNS c LEFT JOIN information_schema.COLLATIONS co ON co.COLLATION_NAME = c.COLLATION_NAME
                 \\WHERE c.TABLE_SCHEMA = {s} AND c.TABLE_NAME = {s}
             , .{ schema, try split.catalogNameLit(arena, dialect, table) });
@@ -131,7 +137,8 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\ CASE WHEN LOWER(DATA_TYPE) IN ('varchar', 'char', 'string') THEN 1 ELSE 0 END,
                 \\ 1,
                 \\ CASE WHEN LOWER(DATA_TYPE) = 'char' THEN 1 ELSE 0 END,
-                \\ 0
+                \\ 0,
+                \\ CASE WHEN LOWER(DATA_TYPE) IN ('varchar', 'string') THEN 1 ELSE 0 END
                 \\FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s}
             , .{ schema, try split.catalogNameLit(arena, dialect, table) });
         },

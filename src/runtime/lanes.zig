@@ -154,7 +154,10 @@ pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: SinkShape, sr
         return null;
     };
 
-    const facts = try connect_mod.factsIfWanted(env, rd, desc.dialect, shape.prefix, src_schema, true, .source);
+    const facts = if (rd.form == .table and textKey(shape.agg.node.aggregate, src_schema))
+        try connect_mod.columnFacts(env, rd)
+    else
+        try connect_mod.factsIfWanted(env, rd, desc.dialect, shape.prefix, src_schema, true, .exact);
     const wa = (try pushdown.planWholeAggWhy(arena, desc.dialect, desc.base_sql, src_schema, shape.prefix, shape.agg.node.aggregate, apl.out.*, facts, why)) orelse return null;
 
     const out = try arena.alloc(ast.Stage, shape.tail.len + 2);
@@ -173,6 +176,19 @@ pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: SinkShape, sr
 /// Descend a `LIMIT` (with its `ORDER BY`) into the SQL read when `pushdown.planTopN`
 /// allows; the engine still sorts and cuts what arrives. Null leaves the pipeline as
 /// built, with `why` set when there was a limit to push.
+/// Whether a group key is a text or bytes source column, whose grouping the
+/// source's collation decides.
+fn textKey(ag: ast.Aggregate, schema: @import("../lang/types.zig").Schema) bool {
+    for (ag.by) |q| {
+        const i = schema.indexOf(q.parts[q.parts.len - 1]) orelse continue;
+        switch (schema.fields[i].ty.kind) {
+            .string, .bytes => return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
 pub fn topNStages(env: *Env, stages: []const ast.Stage, src_base: usize, why: *[]const u8) !?[]const ast.Stage {
     const arena = env.arena;
     const desc = env.pipe.sql_desc orelse return null;

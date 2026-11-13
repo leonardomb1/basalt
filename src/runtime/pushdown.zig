@@ -153,7 +153,13 @@ pub fn planWholeAggWhy(
             return refuse(why, try msgfmt.allocPrint(arena, "group key `{s}` is not a source column", .{col}));
         const out = plan_schema.fields[i];
         if (!std.mem.eql(u8, out.name, col)) return refuse(why, try msgfmt.allocPrint(arena, "group key `{s}` is renamed by the aggregate", .{col}));
-        if (out.ty.kind != src_schema.fields[idx].ty.kind) return refuse(why, try msgfmt.allocPrint(arena, "group key `{s}` changes type through the aggregate", .{col}));
+        const kind = src_schema.fields[idx].ty.kind;
+        if (out.ty.kind != kind) return refuse(why, try msgfmt.allocPrint(arena, "group key `{s}` changes type through the aggregate", .{col}));
+        if (kind == .string or kind == .bytes) {
+            const f = if (facts) |fs| fs.get(col) else null;
+            if (f == null or !f.?.eq_bytes)
+                return refuse(why, try msgfmt.allocPrint(arena, "text group key `{s}` has a collation that may group values the engine keeps apart (case, accents or trailing spaces)", .{col}));
+        }
         const qc = try sql.quoteName(arena, dialect, col);
         if (keys.items.len > 0) try keys.appendSlice(", ");
         try keys.appendSlice(qc);
@@ -610,8 +616,11 @@ test "planWholeAgg: grouped multi-aggregate renders with a CAST per dialect" {
         .{ .name = "n", .ty = types.Type.init(.int) },
         .{ .name = "total", .ty = types.Type.init(.int).withNull(true) },
     } };
+    var facts = Facts.init(a);
+    try facts.put("b", .{ .text = true, .eq_bytes = true });
+    var why: []const u8 = "";
 
-    const pg = (try planWholeAgg(a, .postgres, base_t, wholeSchema(), &.{filt}, ag, plan_schema)).?;
+    const pg = (try planWholeAggWhy(a, .postgres, base_t, wholeSchema(), &.{filt}, ag, plan_schema, &facts, &why)).?;
     try testing.expectEqualStrings(
         "SELECT \"b\" AS \"b\", CAST(COUNT(*) AS BIGINT) AS \"n\", CAST(SUM(\"c\") AS BIGINT) AS \"total\"" ++
             " FROM (SELECT * FROM t) _g WHERE (\"a\" >= 5) GROUP BY \"b\"",
@@ -619,19 +628,39 @@ test "planWholeAgg: grouped multi-aggregate renders with a CAST per dialect" {
     );
     try testing.expectEqualStrings("(\"a\" >= 5)", pg.where_sql.?);
 
-    const my = (try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{filt}, ag, plan_schema)).?;
+    const my = (try planWholeAggWhy(a, .mysql, base_t, wholeSchema(), &.{filt}, ag, plan_schema, &facts, &why)).?;
     try testing.expectEqualStrings(
         "SELECT `b` AS `b`, CAST(COUNT(*) AS SIGNED) AS `n`, CAST(SUM(`c`) AS SIGNED) AS `total`" ++
             " FROM (SELECT * FROM t) _g WHERE (`a` >= 5) GROUP BY `b`",
         my.sql,
     );
 
-    const ms = (try planWholeAgg(a, .sqlserver, base_t, wholeSchema(), &.{filt}, ag, plan_schema)).?;
+    const ms = (try planWholeAggWhy(a, .sqlserver, base_t, wholeSchema(), &.{filt}, ag, plan_schema, &facts, &why)).?;
     try testing.expectEqualStrings(
         "SELECT [b] AS [b], CAST(COUNT_BIG(*) AS BIGINT) AS [n], CAST(SUM(CAST([c] AS BIGINT)) AS BIGINT) AS [total]" ++
             " FROM (SELECT * FROM t) _g WHERE ([a] >= 5) GROUP BY [b]",
         ms.sql,
     );
+}
+
+test "planWholeAgg: a text group key stays in the engine unless the catalog says its equality is byte equality" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const aggs = try a.alloc(ast.AggItem, 1);
+    aggs[0] = .{ .name = "n", .func = .count, .arg = null };
+    const ag = ast.Aggregate{ .aggs = aggs, .by = try byList(a, &.{"b"}) };
+    const plan_schema = types.Schema{ .fields = &.{
+        .{ .name = "b", .ty = types.Type.init(.string) },
+        .{ .name = "n", .ty = types.Type.init(.int) },
+    } };
+    var ci = Facts.init(a);
+    try ci.put("b", .{ .text = true, .byte_order = false, .pads = true, .eq_bytes = false });
+    for ([_]?*const Facts{ null, &ci }) |f| for ([_]Dialect{ .postgres, .mysql, .sqlserver }) |d| {
+        var why: []const u8 = "";
+        try testing.expect((try planWholeAggWhy(a, d, base_t, wholeSchema(), &.{}, ag, plan_schema, f, &why)) == null);
+        try testing.expect(std.mem.startsWith(u8, why, "text group key `b` has a collation"));
+    };
 }
 
 test "planWholeAgg: ungrouped COUNT DISTINCT has no GROUP BY and no WHERE" {
