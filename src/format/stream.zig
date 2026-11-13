@@ -302,7 +302,7 @@ pub const Stream = struct {
     };
 
     fn startHttp(hf: *HttpFetch, uri: std.Uri, extra: []const std.http.Header) !void {
-        hf.req = try hf.client.request(.GET, uri, .{ .extra_headers = extra });
+        hf.req = try hf.client.request(.GET, uri, .{ .privileged_headers = extra });
         errdefer {
             if (hf.req.connection) |c| c.closing = true;
             hf.req.deinit();

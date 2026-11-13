@@ -5,6 +5,9 @@
 //!   that every issuer in a chain is a CA, which std's TLS client does not.
 //! - A connection opens through `driver.dial`, so its connect, reads and writes
 //!   fail after `io_timeout_s` of silence instead of hanging a lane forever.
+//! - `privileged_headers` are sent, which std never did, and survive a redirect
+//!   only to the same scheme, host and port, as `objstore.exchange` decides its
+//!   own; std kept them for a subdomain.
 //!
 //! Every other `std.http` type stays std's. Drop this vendor once std checks
 //! issuers' basicConstraints and takes socket deadlines; `dupscan` keeps
@@ -1037,14 +1040,14 @@ pub const Request = struct {
 
         if (try emitOverridableHeader("content-type: ", r.headers.content_type, w)) {}
 
-        for (r.extra_headers) |header| {
+        for ([_][]const http.Header{ r.extra_headers, r.privileged_headers }) |headers| for (headers) |header| {
             assert(header.name.len != 0);
 
             try w.writeAll(header.name);
             try w.writeAll(": ");
             try w.writeAll(header.value);
             try w.writeAll("\r\n");
-        }
+        };
 
         if (connection.proxied) proxy: {
             const proxy = switch (connection.protocol) {
@@ -1192,7 +1195,8 @@ pub const Request = struct {
         const new_host = try new_uri.getHost(&new_host_name_buffer);
         const keep_privileged_headers =
             std.ascii.eqlIgnoreCase(r.uri.scheme, new_uri.scheme) and
-            sameParentDomain(old_host, new_host);
+            std.ascii.eqlIgnoreCase(old_host, new_host) and
+            old_connection.port == (new_uri.port orelse protocol.port());
 
         r.client.connection_pool.release(old_connection);
         r.connection = null;
@@ -1828,4 +1832,57 @@ test sameParentDomain {
 
 test {
     _ = Response;
+}
+
+const RedirectProbe = struct {
+    seen: [2048]u8 = undefined,
+    seen_len: usize = 0,
+    first: [2048]u8 = undefined,
+    first_len: usize = 0,
+
+    fn redirectTo(self: *RedirectProbe, server: *net.Server, target_port: u16) void {
+        const conn = server.accept() catch return;
+        defer conn.stream.close();
+        self.first_len = conn.stream.read(&self.first) catch return;
+        var wb: [256]u8 = undefined;
+        const reply = std.fmt.bufPrint(&wb, "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{d}/b\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{target_port}) catch return;
+        conn.stream.writeAll(reply) catch return;
+    }
+
+    fn record(self: *RedirectProbe, server: *net.Server) void {
+        const conn = server.accept() catch return;
+        defer conn.stream.close();
+        self.seen_len = conn.stream.read(&self.seen) catch return;
+        conn.stream.writeAll("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n") catch return;
+    }
+};
+
+test "a redirect to another port drops the privileged headers, so a signing token never leaves its origin" {
+    const addr = try net.Address.parseIp("127.0.0.1", 0);
+    var a_srv = try addr.listen(.{});
+    defer a_srv.deinit();
+    var b_srv = try addr.listen(.{});
+    defer b_srv.deinit();
+    var probe = RedirectProbe{};
+    const ta = try std.Thread.spawn(.{}, RedirectProbe.redirectTo, .{ &probe, &a_srv, b_srv.listen_address.getPort() });
+    const tb = try std.Thread.spawn(.{}, RedirectProbe.record, .{ &probe, &b_srv });
+
+    var client = Client{ .allocator = testing.allocator };
+    defer client.deinit();
+    var ub: [64]u8 = undefined;
+    const url = try std.fmt.bufPrint(&ub, "http://127.0.0.1:{d}/a", .{a_srv.listen_address.getPort()});
+    var req = try client.request(.GET, try Uri.parse(url), .{
+        .privileged_headers = &.{.{ .name = "x-amz-security-token", .value = "secret" }},
+        .extra_headers = &.{.{ .name = "x-basalt-kept", .value = "yes" }},
+    });
+    defer req.deinit();
+    try req.sendBodiless();
+    var redirect_buf: [256]u8 = undefined;
+    _ = try req.receiveHead(&redirect_buf);
+    ta.join();
+    tb.join();
+    try testing.expect(std.mem.indexOf(u8, probe.first[0..probe.first_len], "x-amz-security-token: secret") != null);
+    const seen = probe.seen[0..probe.seen_len];
+    try testing.expect(std.mem.indexOf(u8, seen, "x-basalt-kept") != null);
+    try testing.expect(std.mem.indexOf(u8, seen, "x-amz-security-token") == null);
 }
