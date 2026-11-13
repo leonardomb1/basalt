@@ -432,7 +432,7 @@ pub fn branchWhere(env: *Env, rd: ast.Read, after: []const ast.Stage, tag_col: ?
     var conj = std.array_list.Managed(*const ast.Expr).init(arena);
     for (after) |st| {
         if (st.node != .filter) break;
-        try splitAnd(st.node.filter, &conj);
+        try ast.splitAnd(*const ast.Expr, st.node.filter, &conj);
     }
     if (conj.items.len == 0) return rd.where;
     const conn = env.connections.get(rd.connector) orelse return rd.where;
@@ -462,14 +462,6 @@ fn narrowed(arena: std.mem.Allocator, d: pushdown.Dialect, rd: ast.Read, conj: [
     const extra = (try pushdown.serialWhereWith(arena, d, stages.items, facts, null)) orelse return rd.where;
     if (rd.where.len == 0) return extra;
     return msgfmt.allocPrint(arena, "({s}) AND ({s})", .{ rd.where, extra });
-}
-
-fn splitAnd(e: *const ast.Expr, out: *std.array_list.Managed(*const ast.Expr)) !void {
-    if (e.* == .binary and e.binary.op == .@"and") {
-        try splitAnd(e.binary.l, out);
-        return splitAnd(e.binary.r, out);
-    }
-    try out.append(e);
 }
 
 const side_cols = [2][]const u8{ "__set_left", "__set_right" };
@@ -754,7 +746,7 @@ test "a union branch takes the filter's conjuncts over its own columns, folded a
         else => {},
     };
     var conj = std.array_list.Managed(*const ast.Expr).init(a);
-    for (stages[1..]) |st| if (st.node == .filter) try splitAnd(st.node.filter, &conj);
+    for (stages[1..]) |st| if (st.node == .filter) try ast.splitAnd(*const ast.Expr, st.node.filter, &conj);
     var facts = pushdown.Facts.init(a);
     try facts.put("updated_at", .{ .text = false });
     try facts.put("id", .{ .text = false });

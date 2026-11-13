@@ -410,6 +410,10 @@ pub const plan = [_]Rule{
     .{ .home = "http_std", .pattern = http_std_pattern, .exact = true },
     .{ .home = "csv.Quoting", .pattern = csv_quote_pattern, .under = "format/", .exact = true, .allow = &.{"format/csv.zig"} },
     .{ .home = "hoist.projectedFrom", .pattern = projected_pattern, .exact = true, .allow = &.{"runtime/pushdown/hoist.zig"} },
+    .{ .home = "ast.splitAnd", .pattern = split_and_pattern, .exact = true, .allow = &.{
+        "lang/ast.zig",
+        "lang/parse/tablefn.zig",
+    } },
 };
 
 pub const civil_pattern = "719_?468|146_?097|719_?16[23]|25_?56[789]|24_?107|2_?440_?588|86_400_000_000|std\\.time\\.epoch\\.";
@@ -462,6 +466,7 @@ pub const clamp_pattern = "dayMicros\\(|\\*\\| ?(civil\\.)?us_per_day";
 pub const http_std_pattern = "std\\.http\\.Client";
 pub const csv_quote_pattern = "\\[\\w+ \\+ 1\\] == '\"'";
 pub const projected_pattern = "\\.to, name\\)";
+pub const split_and_pattern = "\\.binary\\.op == \\.@\"and\"\\) \\{";
 pub const widen_pattern = "== \\.int and \\(\\S+ == \\.decimal or|== \\.decimal and \\S+ == \\.float";
 
 fn startsOf(pattern: []const u8, text: []const u8, span: Span) ![]usize {

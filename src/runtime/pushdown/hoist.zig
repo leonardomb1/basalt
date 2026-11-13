@@ -340,7 +340,7 @@ pub fn hoistThroughJoins(
             const own = try fromTableCols(arena, bindings, list.items[0..i], tables);
             const f = list.items[i];
             var parts = std.array_list.Managed(*ast.Expr).init(arena);
-            try splitAnd(f.node.filter, &parts);
+            try ast.splitAnd(*ast.Expr, f.node.filter, &parts);
             var below: ?*ast.Expr = null;
             var above: ?*ast.Expr = null;
             for (parts.items) |c| {
@@ -416,7 +416,7 @@ pub fn pushIntoJoinSides(arena: std.mem.Allocator, stages: []const ast.Stage) !?
             continue;
         }
         var parts = std.array_list.Managed(*ast.Expr).init(arena);
-        try splitAnd(list.items[i].node.filter, &parts);
+        try ast.splitAnd(*ast.Expr, list.items[i].node.filter, &parts);
         var stay: ?*ast.Expr = null;
         var moved = false;
         for (parts.items) |c| {
@@ -507,7 +507,7 @@ pub fn hoistThroughSelects(arena: std.mem.Allocator, stages: []const ast.Stage) 
             const f = list.items[i];
             const items = list.items[i - 1].node.select;
             var parts = std.array_list.Managed(*ast.Expr).init(arena);
-            try splitAnd(f.node.filter, &parts);
+            try ast.splitAnd(*ast.Expr, f.node.filter, &parts);
             var below: ?*ast.Expr = null;
             var above: ?*ast.Expr = null;
             for (parts.items) |c| {
@@ -529,13 +529,6 @@ pub fn hoistThroughSelects(arena: std.mem.Allocator, stages: []const ast.Stage) 
     }
     if (!changed) return null;
     return try list.toOwnedSlice();
-}
-
-fn splitAnd(e: *ast.Expr, out: *std.array_list.Managed(*ast.Expr)) !void {
-    if (e.* == .binary and e.binary.op == .@"and") {
-        try splitAnd(e.binary.l, out);
-        try splitAnd(e.binary.r, out);
-    } else try out.append(e);
 }
 
 fn andWith(arena: std.mem.Allocator, acc: ?*ast.Expr, e: *ast.Expr) !*ast.Expr {

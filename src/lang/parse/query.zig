@@ -30,7 +30,6 @@ const keyHome = @import("../sql_parser.zig").keyHome;
 const max_query_depth = Parser.max_query_depth;
 const qualHasPrefix = @import("../sql_parser.zig").qualHasPrefix;
 const sidesOf = @import("rewrite.zig").sidesOf;
-const splitAnd = @import("../sql_parser.zig").splitAnd;
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
 const decimal = @import("../../exec/decimal.zig");
@@ -233,7 +232,7 @@ fn sinkPastUnnests(self: *Parser, stages: *std.array_list.Managed(ast.Stage), fr
             try ats.append(try lowest(self, run, .{ .join = node.join }));
         } else {
             var conj = std.array_list.Managed(*ast.Expr).init(self.arena);
-            try splitAnd(node.filter, &conj);
+            try ast.splitAnd(*ast.Expr, node.filter, &conj);
             const at_of = try self.arena.alloc(usize, conj.items.len);
             for (conj.items, 0..) |c, k| at_of[k] = try lowest(self, run, .{ .expr = c });
             for (0..run.len + 1) |k| {
@@ -1288,7 +1287,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             const rname = jalias orelse binding;
             const on = try self.parseExpr();
             var conj = std.array_list.Managed(*ast.Expr).init(self.arena);
-            try splitAnd(on, &conj);
+            try ast.splitAnd(*ast.Expr, on, &conj);
             var narrow_l = std.array_list.Managed(*ast.Expr).init(self.arena);
             for (conj.items) |c| {
                 if (ast.hasSearch(c)) {

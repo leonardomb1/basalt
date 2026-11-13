@@ -37,7 +37,6 @@ const Error = sp.Error;
 const Pos = sp.Pos;
 const QualRef = Parser.QualRef;
 const Corr = Parser.Corr;
-const splitAnd = sp.splitAnd;
 const stripQual = sp.stripQual;
 const stageWord = @import("tablefn.zig").stageWord;
 
@@ -219,7 +218,7 @@ fn prepare(self: *Parser, cap: Captured, what: []const u8, residual_ok: bool) Er
             continue;
         }
         var conj = std.array_list.Managed(*ast.Expr).init(self.arena);
-        try splitAnd(st.node.filter, &conj);
+        try ast.splitAnd(*ast.Expr, st.node.filter, &conj);
         var keep = std.array_list.Managed(*ast.Expr).init(self.arena);
         for (conj.items) |c| {
             if (outer.first(c) == null) {
@@ -605,7 +604,7 @@ pub fn lowerWhere(
     for (scalars) |s| if (s.in_where) try where_names.appendSlice(s.hidden);
     if (remaining != null and where_names.items.len > 0) {
         var conj = std.array_list.Managed(*ast.Expr).init(self.arena);
-        try splitAnd(remaining.?, &conj);
+        try ast.splitAnd(*ast.Expr, remaining.?, &conj);
         var before = std.array_list.Managed(*ast.Expr).init(self.arena);
         var after = std.array_list.Managed(*ast.Expr).init(self.arena);
         for (conj.items) |c| {

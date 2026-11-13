@@ -16,7 +16,6 @@ const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const expand = @import("../expand.zig");
 const max_tvf_depth = @import("../sql_parser.zig").max_tvf_depth;
-const splitAnd = @import("../sql_parser.zig").splitAnd;
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
 const table_builtins = @import("../../connect/table_builtins.zig");
@@ -168,7 +167,7 @@ pub fn decorrelate(self: *Parser, name: []const u8, pos: Pos, stages: *std.array
             continue;
         }
         var parts = std.array_list.Managed(*ast.Expr).init(self.arena);
-        try splitAnd(st.node.filter, &parts);
+        try ast.splitAnd(*ast.Expr, st.node.filter, &parts);
         var keep = std.array_list.Managed(*ast.Expr).init(self.arena);
         for (parts.items) |cj| {
             if (eqOfMarker(cj, cor)) |m| {

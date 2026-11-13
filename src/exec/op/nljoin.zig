@@ -71,7 +71,7 @@ pub const Range = struct {
 pub fn rangeOf(arena: std.mem.Allocator, cond: ?*const ast.Expr, pair: types.Schema, nleft: usize) std.mem.Allocator.Error!?Range {
     const c = cond orelse return null;
     var conj = std.array_list.Managed(*const ast.Expr).init(arena);
-    try splitAnd(c, &conj);
+    try ast.splitAnd(*const ast.Expr, c, &conj);
     var out = Range{};
     for (conj.items) |e| {
         if (e.* != .binary) continue;
@@ -107,13 +107,6 @@ fn orderable(a: types.Type, b: types.Type) bool {
         .string, .date, .time, .timestamp => true,
         else => false,
     };
-}
-
-fn splitAnd(e: *const ast.Expr, out: *std.array_list.Managed(*const ast.Expr)) std.mem.Allocator.Error!void {
-    if (e.* == .binary and e.binary.op == .@"and") {
-        try splitAnd(e.binary.l, out);
-        try splitAnd(e.binary.r, out);
-    } else try out.append(e);
 }
 
 const Side = enum { none, left, right, both };

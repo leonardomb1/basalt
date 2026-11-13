@@ -1031,14 +1031,6 @@ pub fn binOpText(op: ast.BinOp) []const u8 {
     };
 }
 
-pub fn splitAnd(e: *ast.Expr, out: *std.array_list.Managed(*ast.Expr)) !void {
-    if (e.* == .binary and e.binary.op == .@"and") {
-        try splitAnd(e.binary.l, out);
-        return splitAnd(e.binary.r, out);
-    }
-    try out.append(e);
-}
-
 pub fn qualHasPrefix(q: ast.QualName, prefix: []const u8) bool {
     return q.parts.len > 1 and std.mem.eql(u8, q.parts[0], prefix);
 }

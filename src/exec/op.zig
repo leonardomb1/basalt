@@ -640,7 +640,7 @@ pub const Limit = struct {
 fn applyFilter(arena: std.mem.Allocator, scratch_opt: ?std.mem.Allocator, b: Batch, pred: *const ast.Expr) anyerror!Batch {
     const scratch = scratch_opt orelse arena;
     var conj = std.array_list.Managed(*const ast.Expr).init(scratch);
-    try conjuncts(&conj, pred);
+    try ast.splitAnd(*const ast.Expr, pred, &conj);
     var cur = b;
     var m = Mask{};
     for (conj.items, 0..) |c, ci| {
@@ -736,14 +736,6 @@ const Mask = struct {
         return k;
     }
 };
-
-/// `e`'s top-level AND operands, left to right.
-fn conjuncts(out: *std.array_list.Managed(*const ast.Expr), e: *const ast.Expr) !void {
-    if (e.* == .binary and e.binary.op == .@"and") {
-        try conjuncts(out, e.binary.l);
-        try conjuncts(out, e.binary.r);
-    } else try out.append(e);
-}
 
 /// The rows `keep` marks, every column gathered by one selection worked out once.
 fn gatherBatch(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usize) !Batch {

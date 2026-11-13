@@ -392,6 +392,16 @@ pub fn hasSearch(e: *const Expr) bool {
     return anyExpr(e, {}, S.hit);
 }
 
+/// The conjuncts of `e`, its `AND` chain flattened left to right; `P` is `*Expr` or
+/// `*const Expr`, as the caller's list holds.
+pub fn splitAnd(comptime P: type, e: P, out: *std.array_list.Managed(P)) std.mem.Allocator.Error!void {
+    if (e.* == .binary and e.binary.op == .@"and") {
+        try splitAnd(P, e.binary.l, out);
+        return splitAnd(P, e.binary.r, out);
+    }
+    try out.append(e);
+}
+
 /// Whether `pred` holds of `e` or of an expression inside it: `pred` answers true
 /// (found), false (not here, nor below) or null (look inside). With `rebuildExpr`,
 /// the one place that enumerates `Expr`'s children.
