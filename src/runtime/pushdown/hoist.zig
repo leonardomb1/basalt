@@ -544,8 +544,10 @@ fn andWith(arena: std.mem.Allocator, acc: ?*ast.Expr, e: *ast.Expr) !*ast.Expr {
 }
 
 /// The input column a projection outputs as `name`, or null when it computes it,
-/// drops it, or outputs two columns of that name (a reference to it is ambiguous).
-fn projectedFrom(arena: std.mem.Allocator, items: []const ast.SelectItem, name: []const u8) !?ast.QualName {
+/// drops it, fills it from a `$param`, or outputs two columns of that name (a
+/// reference to it is ambiguous). The one trace of a name through a SELECT that
+/// pushdown keeps, so filters and top-N keys descend by the same rule.
+pub fn projectedFrom(arena: std.mem.Allocator, items: []const ast.SelectItem, name: []const u8) !?ast.QualName {
     var named: usize = 0;
     var all = false;
     for (items) |it| switch (it) {

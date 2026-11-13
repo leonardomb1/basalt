@@ -7,6 +7,7 @@ const ast = @import("../../lang/ast.zig");
 const quoteName = @import("../../db/sql.zig").quoteName;
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
+const projectedFrom = @import("hoist.zig").projectedFrom;
 const translatePred = @import("translate.zig").translatePred;
 const types = @import("../../lang/types.zig");
 pub const topNStagesOf = @import("testing_util.zig").topNStagesOf;
@@ -68,7 +69,7 @@ pub fn classifyTopN(arena: std.mem.Allocator, stages: []const ast.Stage, why: *[
     const s = sort orelse return .{ .rows = rows };
     const keys = try arena.alloc(TopN.Key, s.keys.len);
     for (s.keys, keys) |k, *out| {
-        const col = sourceName(mid[sel_start..selects_end], k.field.last()) orelse {
+        const col = (try sourceName(arena, mid[sel_start..selects_end], k.field.last())) orelse {
             why.* = try msgfmt.allocPrint(arena, "ORDER BY `{s}` is not a plain source column", .{k.field.last()});
             return null;
         };
@@ -78,40 +79,15 @@ pub fn classifyTopN(arena: std.mem.Allocator, stages: []const ast.Stage, why: *[
 }
 
 /// The source column an output `name` carries through `selects` unchanged or
-/// renamed, or null when some select computes or drops it.
-fn sourceName(selects: []const ast.Stage, name_in: []const u8) ?[]const u8 {
+/// renamed (`hoist.projectedFrom`), or null when some select computes or drops it.
+fn sourceName(arena: std.mem.Allocator, selects: []const ast.Stage, name_in: []const u8) !?[]const u8 {
     var name = name_in;
     var i = selects.len;
     while (i > 0) {
         i -= 1;
-        name = selectSource(selects[i].node.select, name) orelse return null;
+        name = ((try projectedFrom(arena, selects[i].node.select, name)) orelse return null).last();
     }
     return name;
-}
-
-fn selectSource(items: []const ast.SelectItem, name: []const u8) ?[]const u8 {
-    for (items) |item| switch (item) {
-        .field => |q| if (std.mem.eql(u8, q.last(), name)) return q.last(),
-        .computed => |c| if (std.mem.eql(u8, c.name, name)) return switch (c.expr.*) {
-            .field => |q| q.last(),
-            else => null,
-        },
-        else => {},
-    };
-    for (items) |item| switch (item) {
-        .star => return name,
-        .star_except => |ex| {
-            for (ex) |x| if (std.mem.eql(u8, x, name)) return null;
-            return name;
-        },
-        .star_rename => |rs| {
-            for (rs) |r| if (std.mem.eql(u8, r.to, name)) return r.from;
-            for (rs) |r| if (std.mem.eql(u8, r.from, name)) return null;
-            return name;
-        },
-        else => {},
-    };
-    return null;
 }
 
 /// The filters before the limit as one exact source predicate ("" with none), or
@@ -246,4 +222,14 @@ test "top-N: each dialect's spelling of the keys' null placement and the row cap
     );
     try std.testing.expectEqualStrings("SELECT TOP (5) * FROM (SELECT * FROM t) _t", try renderTopN(a, .sqlserver, base, .{ .rows = 5 }));
     try std.testing.expectEqualStrings("SELECT * FROM (SELECT * FROM t) _t LIMIT 5", try renderTopN(a, .postgres, base, .{ .rows = 5 }));
+}
+
+test "top-N: a key renamed from a source column descends under its source name, one a $param fills does not" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var why: []const u8 = "";
+    const renamed = (try classifyTopN(a, try topNStagesOf(a, "SELECT id AS k FROM db.t ORDER BY k LIMIT 5"), &why)).?;
+    try std.testing.expectEqualStrings("id", renamed.keys[0].col);
+    try std.testing.expect((try classifyTopN(a, try topNStagesOf(a, "PARAM p INT DEFAULT 3; SELECT id, $p AS k FROM db.t ORDER BY k LIMIT 5"), &why)) == null);
 }

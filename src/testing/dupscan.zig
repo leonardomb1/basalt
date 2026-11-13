@@ -409,6 +409,7 @@ pub const plan = [_]Rule{
     .{ .home = "clamp", .pattern = clamp_pattern, .exact = true },
     .{ .home = "http_std", .pattern = http_std_pattern, .exact = true },
     .{ .home = "csv.Quoting", .pattern = csv_quote_pattern, .under = "format/", .exact = true, .allow = &.{"format/csv.zig"} },
+    .{ .home = "hoist.projectedFrom", .pattern = projected_pattern, .exact = true, .allow = &.{"runtime/pushdown/hoist.zig"} },
 };
 
 pub const civil_pattern = "719_?468|146_?097|719_?16[23]|25_?56[789]|24_?107|2_?440_?588|86_400_000_000|std\\.time\\.epoch\\.";
@@ -460,6 +461,7 @@ pub const unsigned_pattern = "decimal\\(20, ?0\\)";
 pub const clamp_pattern = "dayMicros\\(|\\*\\| ?(civil\\.)?us_per_day";
 pub const http_std_pattern = "std\\.http\\.Client";
 pub const csv_quote_pattern = "\\[\\w+ \\+ 1\\] == '\"'";
+pub const projected_pattern = "\\.to, name\\)";
 pub const widen_pattern = "== \\.int and \\(\\S+ == \\.decimal or|== \\.decimal and \\S+ == \\.float";
 
 fn startsOf(pattern: []const u8, text: []const u8, span: Span) ![]usize {

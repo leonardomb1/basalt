@@ -52,6 +52,7 @@ const op = @import("../../exec/op.zig");
 const pqdecode = @import("../../format/parquet/read.zig");
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
+const projectedFrom = @import("../pushdown/hoist.zig").projectedFrom;
 const translate = @import("../pushdown/translate.zig");
 const textconv = @import("../../exec/textconv.zig");
 const types = @import("../../lang/types.zig");
@@ -192,30 +193,14 @@ fn backRecur(cx: Back, e: *const ast.Expr) error{OutOfMemory}!*ast.Expr {
 }
 
 /// What output column `name` of a select list is made from: a computed item's
-/// expression, a listed column, or the same name through `*`.
+/// expression, else the input column `hoist.projectedFrom` traces it to.
 fn source(arena: std.mem.Allocator, items: []const ast.SelectItem, name: []const u8) !?*ast.Expr {
     for (items) |it| switch (it) {
         .computed => |c| if (std.mem.eql(u8, c.name, name)) return c.expr,
         else => {},
     };
-    for (items) |it| switch (it) {
-        .field => |q| if (std.mem.eql(u8, q.parts[q.parts.len - 1], name)) return try fieldOf(arena, name),
-        else => {},
-    };
-    for (items) |it| switch (it) {
-        .star => return try fieldOf(arena, name),
-        .star_except => |names| {
-            for (names) |n| if (std.mem.eql(u8, n, name)) return null;
-            return try fieldOf(arena, name);
-        },
-        .star_rename => |rs| {
-            for (rs) |r| if (std.mem.eql(u8, r.to, name)) return try fieldOf(arena, r.from);
-            for (rs) |r| if (std.mem.eql(u8, r.from, name)) return null;
-            return try fieldOf(arena, name);
-        },
-        else => {},
-    };
-    return null;
+    const q = (try projectedFrom(arena, items, name)) orelse return null;
+    return try fieldOf(arena, q.last());
 }
 
 fn fieldOf(arena: std.mem.Allocator, name: []const u8) !*ast.Expr {
