@@ -54,7 +54,7 @@ pub fn synthReconcile(arena: std.mem.Allocator, src: types.Schema, canon: types.
     return items.toOwnedSlice();
 }
 
-const UnionSpec = struct { read: ast.Read, tag: ?[]const u8, name: []const u8, pipeline: ?ast.Pipeline = null };
+pub const UnionSpec = struct { read: ast.Read, tag: ?[]const u8, name: []const u8, pipeline: ?ast.Pipeline = null };
 
 /// A union's branch list: explicit branches, or tables discovered via a
 /// `(table_name, tag)` query.
@@ -371,8 +371,9 @@ pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, after: []con
     for (specs) |*s| if (except.len > 0 and s.pipeline == null and s.read.cols.len == 0) {
         if (try exceptColumns(env, s.read, hints, except)) |cols| s.read.cols = cols;
     };
+    const canon_types = try canonOf(env, specs, canon_opt);
     if (!u.positional) for (specs) |*s| if (s.pipeline == null) {
-        s.read.where = try branchWhere(env, s.read, after, tag_col);
+        s.read.where = try branchWhere(env, s.read, after, tag_col, canon_types);
     };
     for (specs, 0..) |s, i| {
         if (s.pipeline) |p| {
@@ -420,14 +421,32 @@ pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, after: []con
     return buildSetOp(env, u.set, u.set_all, canon, .{ .union_ = un }, out_schema);
 }
 
+/// The types a union casts each branch's columns to: widened across the branches
+/// (`'first'`), which keeps every value, or those the catalog declares for the branch
+/// `schema_from` names, null when they cannot be learned.
+pub const Canon = union(enum) { widened, named: ?*const pushdown.Facts };
+
+pub fn canonOf(env: *Env, specs: []const UnionSpec, canon_opt: ?[]const u8) !Canon {
+    const c = canon_opt orelse return .widened;
+    if (std.mem.eql(u8, c, "first")) return .widened;
+    for (specs) |s| if (std.mem.eql(u8, s.name, c)) {
+        if (s.pipeline != null) return .{ .named = null };
+        return .{ .named = try columnFacts(env, s.read) };
+    };
+    return .{ .named = null };
+}
+
 /// Branch read `rd`'s WHERE with the part of the filters right after the union
 /// it can take: each conjunct whose every column is one of the branch's table
 /// (by its catalog, `columnFacts`; never the tag column, a computed one, or one
 /// the table lacks) translated into its own SQL as a plain read's leading WHERE
-/// descends. The filter stays above the union, so what does not descend still
-/// holds; a branch whose columns cannot be learned keeps its WHERE. A union by
-/// position is never narrowed, as a branch's column there may go by another name.
-pub fn branchWhere(env: *Env, rd: ast.Read, after: []const ast.Stage, tag_col: ?[]const u8) ![]const u8 {
+/// descends. Under a named `canon`, a column must also be declared as the canon
+/// branch declares it, since another type is cast and a value compared before the
+/// cast may not match after it. The filter stays above the union, so what does not
+/// descend still holds; a branch whose columns cannot be learned keeps its WHERE. A
+/// union by position is never narrowed, as a branch's column there may go by
+/// another name.
+pub fn branchWhere(env: *Env, rd: ast.Read, after: []const ast.Stage, tag_col: ?[]const u8, canon: Canon) ![]const u8 {
     const arena = env.arena;
     var conj = std.array_list.Managed(*const ast.Expr).init(arena);
     for (after) |st| {
@@ -439,12 +458,13 @@ pub fn branchWhere(env: *Env, rd: ast.Read, after: []const ast.Stage, tag_col: ?
     const d = (sqlConnInfo(conn) orelse return rd.where).dialect;
     if (!sql_read.pushableRead(d, rd)) return rd.where;
     const facts = (try columnFacts(env, rd)) orelse return rd.where;
-    return narrowed(arena, d, rd, conj.items, tag_col, facts);
+    return narrowed(arena, d, rd, conj.items, tag_col, facts, canon);
 }
 
 /// Read `rd`'s WHERE with each of conjuncts `conj` that reads only columns
-/// `facts` lists (never `tag_col`) translated to dialect `d` and added.
-fn narrowed(arena: std.mem.Allocator, d: pushdown.Dialect, rd: ast.Read, conj: []const *const ast.Expr, tag_col: ?[]const u8, facts: *const pushdown.Facts) ![]const u8 {
+/// `facts` lists (never `tag_col`), each declared as `canon` has it, translated to
+/// dialect `d` and added.
+fn narrowed(arena: std.mem.Allocator, d: pushdown.Dialect, rd: ast.Read, conj: []const *const ast.Expr, tag_col: ?[]const u8, facts: *const pushdown.Facts, canon: Canon) ![]const u8 {
     if (facts.count() == 0) return rd.where;
     var stages = std.array_list.Managed(ast.Stage).init(arena);
     try stages.append(.{ .node = .{ .read = rd }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } });
@@ -454,7 +474,14 @@ fn narrowed(arena: std.mem.Allocator, d: pushdown.Dialect, rd: ast.Read, conj: [
         var it = cols.keyIterator();
         const fits = while (it.next()) |c| {
             if (tag_col) |t| if (std.mem.eql(u8, c.*, t)) break false;
-            if (!facts.contains(c.*)) break false;
+            const f = facts.get(c.*) orelse break false;
+            switch (canon) {
+                .widened => {},
+                .named => |cf| {
+                    const want = (cf orelse break false).get(c.*) orelse break false;
+                    if (f.declared.len == 0 or !std.mem.eql(u8, f.declared, want.declared)) break false;
+                },
+            }
         } else true;
         if (fits) try stages.append(.{ .node = .{ .filter = @constCast(e) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } });
     }
@@ -751,10 +778,41 @@ test "a union branch takes the filter's conjuncts over its own columns, folded a
     try facts.put("updated_at", .{ .text = false });
     try facts.put("id", .{ .text = false });
     const rd = stages[0].node.read;
-    try std.testing.expectEqualStrings("([updated_at] >= CAST('2026-11-06 18:14:55' AS DATETIME2))", try narrowed(a, .sqlserver, rd, conj.items, "company", &facts));
+    try std.testing.expectEqualStrings("([updated_at] >= CAST('2026-11-06 18:14:55' AS DATETIME2))", try narrowed(a, .sqlserver, rd, conj.items, "company", &facts, .widened));
     var with = rd;
     with.where = "[x] = 1";
-    try std.testing.expectEqualStrings("([x] = 1) AND (([updated_at] >= CAST('2026-11-06 18:14:55' AS DATETIME2)))", try narrowed(a, .sqlserver, with, conj.items, "company", &facts));
+    try std.testing.expectEqualStrings("([x] = 1) AND (([updated_at] >= CAST('2026-11-06 18:14:55' AS DATETIME2)))", try narrowed(a, .sqlserver, with, conj.items, "company", &facts, .widened));
     var none = pushdown.Facts.init(a);
-    try std.testing.expectEqualStrings("", try narrowed(a, .sqlserver, rd, conj.items, "company", &none));
+    try std.testing.expectEqualStrings("", try narrowed(a, .sqlserver, rd, conj.items, "company", &none, .widened));
+}
+
+test "under schema_from a union branch takes only the conjuncts over columns declared as the canon branch declares them" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const parser = @import("../../lang/sql_parser.zig");
+    var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a,
+        \\CREATE CONNECTION db TYPE postgres OPTIONS (host = 'h', database = 'd', user = 'u', password = 'p');
+        \\SELECT * FROM db.public.u_b WHERE d = '2024-01-15' AND id > 1;
+    , &pd);
+    var stages: []const ast.Stage = &.{};
+    for (prog.stmts) |st| switch (st) {
+        .output => |o| stages = o.stages,
+        else => {},
+    };
+    var conj = std.array_list.Managed(*const ast.Expr).init(a);
+    for (stages[1..]) |st| if (st.node == .filter) try ast.splitAnd(*const ast.Expr, st.node.filter, &conj);
+    const rd = stages[0].node.read;
+    var branch = pushdown.Facts.init(a);
+    try branch.put("d", .{ .text = true, .declared = "character varying(30)" });
+    try branch.put("id", .{ .text = false, .declared = "integer" });
+    var canon = pushdown.Facts.init(a);
+    try canon.put("d", .{ .text = false, .declared = "date" });
+    try canon.put("id", .{ .text = false, .declared = "integer" });
+    try std.testing.expectEqualStrings("(\"id\" > 1)", try narrowed(a, .postgres, rd, conj.items, null, &branch, .{ .named = &canon }));
+    try std.testing.expectEqualStrings("", try narrowed(a, .postgres, rd, conj.items, null, &branch, .{ .named = null }));
+    var unknown = pushdown.Facts.init(a);
+    try unknown.put("id", .{ .text = false });
+    try std.testing.expectEqualStrings("", try narrowed(a, .postgres, rd, conj.items, null, &unknown, .{ .named = &canon }));
 }

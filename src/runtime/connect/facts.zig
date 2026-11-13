@@ -58,6 +58,10 @@ fn probeFacts(env: *Env, ca: std.mem.Allocator, conn: ast.Connection, info: SqlC
                     .pads = flag(b.columns[3].getValue(r)),
                     .wide = flag(b.columns[4].getValue(r)),
                     .eq_bytes = flag(b.columns[5].getValue(r)),
+                    .declared = switch (b.columns[6].getValue(r)) {
+                        .string => |t| try cx.ca.dupe(u8, t),
+                        else => "",
+                    },
                 });
             }
         }
@@ -74,7 +78,8 @@ fn flag(v: Value) bool {
 }
 
 /// One row per column: name, is text, compares by byte, ignores trailing spaces,
-/// multi-byte. Byte order is judged from the server's own collation data (C/POSIX,
+/// multi-byte, equal only by bytes, and its declared type as the catalog spells it.
+/// Byte order is judged from the server's own collation data (C/POSIX,
 /// builtin, `_bin`/`_BIN2`), never a locale's name; musl libc locales compare bytes.
 fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []const u8) ![]const u8 {
     const table = parts[parts.len - 1];
@@ -87,7 +92,8 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\      WHEN c.collation_name LIKE '%[_]BIN' AND TYPE_NAME(c.system_type_id) IN ('char', 'varchar', 'text') THEN 1 ELSE 0 END,
                 \\ 1,
                 \\ CASE WHEN TYPE_NAME(c.system_type_id) IN ('nchar', 'nvarchar', 'ntext') THEN 1 ELSE 0 END,
-                \\ 0
+                \\ 0,
+                \\ CONCAT(TYPE_NAME(c.user_type_id), '(', c.max_length, ',', c.precision, ',', c.scale, ')')
                 \\FROM sys.columns c WHERE c.object_id = OBJECT_ID({s})
             , .{try split.catalogObjectLit(arena, dialect, parts)});
         },
@@ -106,7 +112,8 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\ 0,
                 \\ CASE WHEN t.typcategory <> 'S' OR t.typname IN ('citext', 'bpchar') THEN 0
                 \\      WHEN coalesce((to_jsonb(co) ->> 'collisdeterministic')::boolean, true) THEN 1
-                \\      ELSE 0 END
+                \\      ELSE 0 END,
+                \\ format_type(a.atttypid, a.atttypmod)
                 \\FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
                 \\LEFT JOIN pg_collation co ON co.oid = a.attcollation
                 \\CROSS JOIN pg_database d
@@ -125,7 +132,8 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\ CASE WHEN c.COLLATION_NAME = 'binary' OR RIGHT(c.COLLATION_NAME, 4) = '_bin' THEN 1 ELSE 0 END,
                 \\ CASE WHEN co.PAD_ATTRIBUTE = 'NO PAD' THEN 0 ELSE 1 END,
                 \\ CASE WHEN c.CHARACTER_SET_NAME IN ('ucs2', 'utf16', 'utf16le', 'utf32') THEN 1 ELSE 0 END,
-                \\ CASE WHEN (c.COLLATION_NAME = 'binary' OR RIGHT(c.COLLATION_NAME, 4) = '_bin') AND co.PAD_ATTRIBUTE = 'NO PAD' THEN 1 ELSE 0 END
+                \\ CASE WHEN (c.COLLATION_NAME = 'binary' OR RIGHT(c.COLLATION_NAME, 4) = '_bin') AND co.PAD_ATTRIBUTE = 'NO PAD' THEN 1 ELSE 0 END,
+                \\ c.COLUMN_TYPE
                 \\FROM information_schema.COLUMNS c LEFT JOIN information_schema.COLLATIONS co ON co.COLLATION_NAME = c.COLLATION_NAME
                 \\WHERE c.TABLE_SCHEMA = {s} AND c.TABLE_NAME = {s}
             , .{ schema, try split.catalogNameLit(arena, dialect, table) });
@@ -138,7 +146,8 @@ fn factsQuery(arena: std.mem.Allocator, dialect: sql.Dialect, parts: []const []c
                 \\ 1,
                 \\ CASE WHEN LOWER(DATA_TYPE) = 'char' THEN 1 ELSE 0 END,
                 \\ 0,
-                \\ CASE WHEN LOWER(DATA_TYPE) IN ('varchar', 'string') THEN 1 ELSE 0 END
+                \\ CASE WHEN LOWER(DATA_TYPE) IN ('varchar', 'string') THEN 1 ELSE 0 END,
+                \\ COLUMN_TYPE
                 \\FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = {s} AND TABLE_NAME = {s}
             , .{ schema, try split.catalogNameLit(arena, dialect, table) });
         },

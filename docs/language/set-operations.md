@@ -42,6 +42,12 @@ where one holds the other (an int meeting a float is a float), as DuckDB's
 a string) are an error rather than cast to text: `CAST` one side, or `EXCEPT` the
 column. `UNION BY NAME` also deduplicates.
 
+A filter on the union descends into each database branch's query. Under a
+`schema_from` naming a branch, a condition descends into another branch only when
+every column it reads is declared there as the named branch declares it: a column
+of another type is cast first, and a value compared before the cast may not match
+after it. The filter still applies above the union, so this only moves work.
+
 ```sql
 -- explicit branches: the tag is just a literal column
 SELECT '01' AS CT2_EMPRESA, t.* FROM erp.dbo.CT2010 t

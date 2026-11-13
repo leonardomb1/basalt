@@ -798,6 +798,7 @@ pub fn readName(rd: ast.Read) []const u8 {
 pub const synthReconcile = @import("plan/union.zig").synthReconcile;
 pub const unionSpecs = @import("plan/union.zig").unionSpecs;
 pub const branchWhere = @import("plan/union.zig").branchWhere;
+pub const canonOf = @import("plan/union.zig").canonOf;
 pub const unionCanon = @import("plan/union.zig").unionCanon;
 pub const setOpName = @import("plan/union.zig").setOpName;
 const windowTopK = @import("plan/union.zig").windowTopK;

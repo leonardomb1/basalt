@@ -455,6 +455,27 @@ $q" >"$out/pg_unread.log" 2>&1; then
   done
 fi
 
+# A union under schema_from casts each branch to the named branch's types, so a
+# filter descends into a branch only over columns declared alike: compared as
+# varchar before the cast, '2024-01-15 00:00:00' would miss a date that matches.
+if runs postgres; then
+  pgq() { docker compose -f tests/integration/compose.yaml exec -T postgres psql -U postgres -d it -t -A -F, "$@"; }
+  pgq -c "DROP TABLE IF EXISTS it_ua, it_ub;
+          CREATE TABLE it_ua (id int, d date);
+          CREATE TABLE it_ub (id int, d varchar(30));
+          INSERT INTO it_ua VALUES (1, '2024-01-15');
+          INSERT INTO it_ub VALUES (2, '2024-01-15 00:00:00'), (3, '2024-01-15'), (4, '2024-02-01');" >/dev/null 2>&1
+  if brun run -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
+LOAD INTO '$out/pg_union_canon.csv' AS
+SELECT * FROM EACH TABLE OF (db.QUERY(\$\$SELECT 'it_ua', 'a' UNION ALL SELECT 'it_ub', 'b'\$\$)) AS (table_name, src)
+WITH (schema_from = 'it_ua') WHERE d = '2024-01-15' ORDER BY id;"; then
+    printf 'src,id,d\na,1,2024-01-15\nb,2,2024-01-15\nb,3,2024-01-15\n' >"$out/pg_union_canon_want.csv"
+    check postgres-union-canon-filter "$out/pg_union_canon.csv" "$out/pg_union_canon_want.csv"
+  else
+    report "postgres-union-canon-filter (run error)" bad
+  fi
+fi
+
 # Decimal aggregates against the source's own answer. A bare postgres `numeric`
 # has no typmod, so the column is typed decimal(38,6) while each value arrives at
 # its own dscale — summing raw unscaled integers scaled the total by 10^4, and
