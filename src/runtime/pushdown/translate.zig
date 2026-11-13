@@ -334,10 +334,43 @@ const Tx = struct {
             .cast => |c| if (c.ty.kind == .string) Kind{ .text = .{ .facts = null } } else .other,
             .call => |c| blk: {
                 if (!isTextFn(c.name)) break :blk .other;
+                if (std.mem.eql(u8, c.name, "coalesce") and !self.textArgs(c)) break :blk .other;
                 break :blk .{ .text = .{ .facts = self.textFnFacts(c), .fn_ = true } };
             },
             else => .unknown,
         };
+    }
+
+    /// Whether `e` is text the source holds as the engine does, so a text function
+    /// over it converts nothing.
+    fn isText(self: Tx, e: *const ast.Expr) bool {
+        return switch (e.*) {
+            .str_lit => true,
+            .field => switch (self.kind(e)) {
+                .text => true,
+                .unknown => blk: {
+                    self.want();
+                    break :blk false;
+                },
+                .other => false,
+            },
+            .cast => |c| c.ty.kind == .string and provablyText(c.e, self.o.schema),
+            .call => |c| isTextFn(c.name) and self.textArgs(c),
+            else => false,
+        };
+    }
+
+    /// The arguments a text function reads as text, the first of `left`, `right`,
+    /// `repeat` and `substr` and every one of the others, are all text.
+    fn textArgs(self: Tx, c: ast.Expr.Call) bool {
+        const first_only = for ([_][]const u8{ "left", "right", "repeat", "substr" }) |n| {
+            if (std.mem.eql(u8, n, c.name)) break true;
+        } else false;
+        for (c.args, 0..) |a, i| {
+            if (first_only and i > 0) break;
+            if (!self.isText(a)) return false;
+        }
+        return true;
     }
 
     fn textFnFacts(self: Tx, c: ast.Expr.Call) ?ColFacts {
@@ -428,6 +461,7 @@ const Tx = struct {
         if (isLikeFn(c.name)) return self.likePred(c, .exact);
         const p = lookupPushable(c.name) orelse return null;
         if (c.args.len < p.min_args or c.args.len > p.max_args) return null;
+        if (isTextFn(c.name) and !std.mem.eql(u8, c.name, "coalesce") and !self.textArgs(c)) return null;
         if (std.mem.eql(u8, c.name, "substr")) {
             if (c.args[1].* != .int_lit or c.args[1].int_lit != 1) return null;
         }
@@ -1079,12 +1113,12 @@ test "translateExpr: extended constructs (is empty, CASE, CAST, functions)" {
         .{ .src = "CAST(v AS INT) > 5", .want = null, .d = .mysql },
         .{ .src = "CAST(5 AS INT) > 1", .want = "(1=1)" },
         .{ .src = "CAST(v AS STRING) = 'x'", .want = null },
-        .{ .src = "lower(status) = 'ok'", .want = "(LOWER([status]) = 'ok')" },
+        .{ .src = "lower(status) = 'ok'", .want = null },
         .{ .src = "length(status) > 2", .want = null },
         .{ .src = "length(status) > 2", .want = null, .d = .mysql },
         .{ .src = "strpos(status, 'a') = 2", .want = null },
-        .{ .src = "trim(status) = 'x'", .want = "(LTRIM(RTRIM([status])) = 'x')" },
-        .{ .src = "substr(status, 1, 2) = 'AB'", .want = "(SUBSTRING([status], 1, 2) = 'AB')" },
+        .{ .src = "trim(status) = 'x'", .want = null },
+        .{ .src = "substr(status, 1, 2) = 'AB'", .want = null },
         .{ .src = "coalesce(status, 'n') = 'n'", .want = "(COALESCE([status], 'n') = 'n')" },
         .{ .src = "contains(status, 'ab')", .want = "([status] LIKE '%ab%')" },
         .{ .src = "starts_with(status, 'CT2')", .want = "([status] LIKE 'CT2%')" },
@@ -1338,4 +1372,43 @@ test "translateExpr: a cast to text is sent only over text, as other values prin
         const got = try translateExpr(a, e, .sqlserver, .{ .fields = &fields }, false);
         try std.testing.expectEqual(c.sent, got != null);
     }
+}
+
+test "a text function descends only over arguments the source holds as text, as it would convert anything else its own way" {
+    var arn = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arn.deinit();
+    const a = arn.allocator();
+    const sqlp = @import("../../lang/sql_parser.zig");
+    const schema = types.Schema{ .fields = &.{
+        .{ .name = "created_at", .ty = types.Type.init(.timestamp) },
+        .{ .name = "flag", .ty = types.Type.init(.bool) },
+        .{ .name = "n", .ty = types.Type.init(.int) },
+        .{ .name = "b", .ty = types.Type.init(.string) },
+    } };
+    const refused = [_][]const u8{
+        "left(created_at, 4) = '2024'",
+        "concat(flag, '') = 'true'",
+        "upper(n) = '5'",
+        "lower(trim(created_at)) = 'x'",
+    };
+    for (refused) |src| for ([_]Dialect{ .sqlserver, .postgres, .mysql }) |d| {
+        var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const e = try sqlp.parseExprStr(a, src, &diag);
+        const got = try translatePred(a, e, d, .{ .schema = schema, .check_fields = true, .need = .superset });
+        if (got) |g| {
+            std.debug.print("case: {s} on {s} gave {s}\n", .{ src, @tagName(d), g });
+            return error.TestUnexpectedResult;
+        }
+    };
+    var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const ok = try sqlp.parseExprStr(a, "lower(trim(b)) = 'x'", &diag);
+    try testing.expectEqualStrings("(LOWER(TRIM(\"b\")) = 'x')", (try translatePred(a, ok, .postgres, .{ .schema = schema, .check_fields = true, .need = .superset })).?);
+
+    const untyped = try sqlp.parseExprStr(a, "lower(status) = 'ok'", &diag);
+    var wants = false;
+    try testing.expect((try translatePred(a, untyped, .sqlserver, .{ .wants_facts = &wants })) == null);
+    try testing.expect(wants);
+    var facts = Facts.init(a);
+    try facts.put("status", .{ .text = true });
+    try testing.expectEqualStrings("(LOWER([status]) = 'ok')", (try translatePred(a, untyped, .sqlserver, .{ .facts = &facts })).?);
 }
