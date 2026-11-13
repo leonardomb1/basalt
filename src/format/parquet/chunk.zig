@@ -29,6 +29,7 @@ const temporalTick = @import("logical.zig").temporalTick;
 const types = @import("../../lang/types.zig");
 const unscaledOf = @import("logical.zig").unscaledOf;
 const unsignedBits = @import("logical.zig").unsignedBits;
+const decimal = @import("../../exec/decimal.zig");
 const eval = @import("../../exec/eval.zig");
 const Reader = @import("read.zig").Reader;
 const fx = @import("testing_util.zig").fx;
@@ -491,7 +492,15 @@ fn pushFloats(sink: anytype, cast: Cast, src: anytype, n: usize) Error!void {
 fn pushBytes(sink: anytype, cast: Cast, vals: []const []const u8) Error!void {
     switch (cast.ty.kind) {
         .string, .bytes => try sink.bytes(cast, vals),
-        .decimal => try sink.put(Decimal, cast, Cast.bytesDecimal, Items([]const u8){ .items = vals }, vals.len),
+        .decimal => {
+            const p = if (cast.ty.precision == 0) decimal.max_digits else cast.ty.precision;
+            for (vals) |v| if (decimal.bigEndianChecked(v, p) == null) {
+                var buf: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "a decimal holds more digits than its precision {d}", .{p}) catch "a decimal holds more digits than its precision";
+                return @errorCast(eval.explain(Error.CorruptParquetPage, msg));
+            };
+            try sink.put(Decimal, cast, Cast.bytesDecimal, Items([]const u8){ .items = vals }, vals.len);
+        },
         else => return Error.UnsupportedParquetEncoding,
     }
 }
@@ -729,6 +738,21 @@ test "ranged reads return the same values as an in-memory file" {
         try testing.expectEqual(want.len, got.columns[ci].len);
         for (0..want.len) |i| try testing.expectEqualDeep(want.getValue(i), got.columns[ci].getValue(i));
     }
+}
+
+test "a byte-array decimal with more digits than its precision is a corrupt page, never read wrapped or negated past i128" {
+    var buf: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var v: Value = .null;
+    const cast: Cast = .{ .ty = types.Type.decimal(4, 2), .tick = .us };
+    try pushPlain(fba.allocator(), One{ .out = &v }, cast, .fixed_len_byte_array, 2, &.{ 0x27, 0x0F }, 1);
+    try testing.expectEqual(@as(i128, 9999), v.decimal.unscaled);
+    try testing.expectError(Error.CorruptParquetPage, pushPlain(fba.allocator(), One{ .out = &v }, cast, .fixed_len_byte_array, 2, &.{ 0x27, 0x10 }, 1));
+    const wide: Cast = .{ .ty = types.Type.decimal(38, 0), .tick = .us };
+    const min = .{0x80} ++ .{0x00} ** 15;
+    try testing.expectError(Error.CorruptParquetPage, pushPlain(fba.allocator(), One{ .out = &v }, wide, .fixed_len_byte_array, 16, &min, 1));
+    const past = .{ 0x01, 0x00 } ++ .{0x00} ** 14 ++ .{0x05};
+    try testing.expectError(Error.CorruptParquetPage, pushPlain(fba.allocator(), One{ .out = &v }, wide, .fixed_len_byte_array, 17, &past, 1));
 }
 
 test "a PLAIN count the page body cannot hold is refused before it is allocated" {

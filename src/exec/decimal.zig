@@ -621,6 +621,13 @@ pub fn formatDecimal(arena: std.mem.Allocator, unscaled: i128, scale: u8) ![]con
     return arena.dupe(u8, w.buffered());
 }
 
+/// A big-endian two's complement integer as an unscaled decimal of `precision`
+/// digits; null when it is wider or has more digits, as only a corrupt file holds.
+pub fn bigEndianChecked(b: []const u8, precision: u8) ?i128 {
+    const v = bigEndianDecimal(b) orelse return null;
+    return if (withinPrecision(v, precision)) v else null;
+}
+
 /// A big-endian two's complement integer as an unscaled decimal; null when it is
 /// wider than an i128 holds. Eight bytes or fewer take a 64-bit path.
 pub fn bigEndianDecimal(b: []const u8) ?i128 {
@@ -1244,12 +1251,11 @@ test "pow10f_table matches the exact double literals up to exact_pow10f" {
     for (exact, 0..) |x, i| try testing.expectEqual(x, pow10f_table[i]);
 }
 
-test "found, not fixed (skipped): negate traps on the minimum i128 decimal, which a 16-byte binary decimal reads unchecked" {
-    const min = bigEndianDecimal(&(.{0x80} ++ .{0x00} ** 15)).?;
-    try testing.expectEqual(@as(i128, std.math.minInt(i128)), min);
-    try testing.expect(!fitsPrecision(min, max_digits));
-    try testing.expectEqual(min, 0 -% min);
-    return error.SkipZigTest;
+test "the minimum i128, which negate cannot take, never reads as a decimal: it has more than 38 digits" {
+    const bytes = .{0x80} ++ .{0x00} ** 15;
+    try testing.expectEqual(@as(i128, std.math.minInt(i128)), bigEndianDecimal(&bytes).?);
+    try testing.expect(bigEndianChecked(&bytes, max_digits) == null);
+    try testing.expectEqual(@as(?i128, -(pow10_i128[max_digits] - 1)), bigEndianChecked(&std.mem.toBytes(std.mem.nativeToBig(i128, -(pow10_i128[max_digits] - 1))), max_digits));
 }
 
 test "found, not fixed: AVG adds a decimal it cannot rescale to its float part, where SUM fails with IntOverflow" {

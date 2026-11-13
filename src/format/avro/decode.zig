@@ -125,9 +125,7 @@ pub const Cursor = struct {
 /// A two's complement big-endian integer as an unscaled decimal; one wider than
 /// an i128 or with more digits than `precision` is corrupt.
 pub fn unscaledOf(b: []const u8, precision: u8) Error!i128 {
-    const v = decimal.bigEndianDecimal(b) orelse return corrupt("a decimal wider than its precision", .{});
-    if (!decimal.withinPrecision(v, precision)) return corrupt("a decimal holds more digits than its precision {d}", .{precision});
-    return v;
+    return decimal.bigEndianChecked(b, precision) orelse corrupt("a decimal holds more digits than its precision {d}", .{precision});
 }
 
 pub fn decimalOf(b: []const u8, precision: u8, scale: u8) Error!Value {
