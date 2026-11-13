@@ -1011,18 +1011,30 @@ pub inline fn toF64ByPow(unscaled: i128, scale: u8) f64 {
 }
 
 /// Adds `d` to an AVG's exact total `sum` at `scale`, or to its float part `frac`
-/// when it has more places than `scale` or does not fit it. The add is unchecked,
-/// as `addAtScale` argues it may be.
-pub inline fn addAvg(sum: *align(8) i256, frac: *f64, d: Decimal, scale: u8) void {
-    if (d.scale > scale) {
-        frac.* += d.toF64();
-        return;
+/// when it has more places than `scale` or does not fit it; true when exact. The add
+/// is unchecked, as `addAtScale` argues it may be.
+pub inline fn addAvg(sum: *align(8) i256, frac: *f64, d: Decimal, scale: u8) bool {
+    if (avgExact(d, scale)) |u| {
+        sum.* += u;
+        return true;
     }
-    const r = rescaleTo(d, scale) orelse {
-        frac.* += d.toF64();
-        return;
-    };
-    sum.* += r.unscaled;
+    frac.* += d.toF64();
+    return false;
+}
+
+/// Takes back an `addAvg` of `d`, from the part it went to; true when exact.
+pub inline fn removeAvg(sum: *align(8) i256, frac: *f64, d: Decimal, scale: u8) bool {
+    if (avgExact(d, scale)) |u| {
+        sum.* -= u;
+        return true;
+    }
+    frac.* -= d.toF64();
+    return false;
+}
+
+inline fn avgExact(d: Decimal, scale: u8) ?i128 {
+    if (d.scale > scale) return null;
+    return (rescaleTo(d, scale) orelse return null).unscaled;
 }
 
 /// The mean of `n` decimals summed by `addAvg` into `sum` at `scale` and `frac`.
@@ -1224,16 +1236,30 @@ test "found, not fixed: AVG adds a decimal it cannot rescale to its float part, 
     try testing.expectError(error.IntOverflow, addAtScale(&sum, d, 2));
     var avg: i256 align(8) = 0;
     var frac: f64 = 0;
-    addAvg(&avg, &frac, d, 2);
+    _ = addAvg(&avg, &frac, d, 2);
     try testing.expectEqual(@as(i256, 0), avg);
     try testing.expectEqual(d.toF64(), frac);
+}
+
+test "removeAvg takes a value back from the part addAvg put it in" {
+    var sum: i256 align(8) = 0;
+    var frac: f64 = 0;
+    const exact = Decimal{ .unscaled = 15, .scale = 1 };
+    const wide = Decimal{ .unscaled = 125, .scale = 3 };
+    try testing.expect(addAvg(&sum, &frac, exact, 2));
+    try testing.expect(!addAvg(&sum, &frac, wide, 2));
+    try testing.expectEqual(@as(i256, 150), sum);
+    try testing.expect(!removeAvg(&sum, &frac, wide, 2));
+    try testing.expectEqual(@as(f64, 0), frac);
+    try testing.expect(removeAvg(&sum, &frac, exact, 2));
+    try testing.expectEqual(@as(i256, 0), sum);
 }
 
 test "AVG's unchecked i256 total cannot overflow: an i64 count of i128 addends stays far inside it" {
     var sum: i256 align(8) = 0;
     var frac: f64 = 0;
     const big = Decimal{ .unscaled = pow10_i128[38] - 1, .scale = 0 };
-    for (0..1000) |_| addAvg(&sum, &frac, big, 0);
+    for (0..1000) |_| _ = addAvg(&sum, &frac, big, 0);
     try testing.expectEqual(@as(i256, big.unscaled) * 1000, sum);
     try testing.expectEqual(@as(f64, 0), frac);
     _ = try std.math.mul(i256, std.math.maxInt(i64), std.math.maxInt(i128));

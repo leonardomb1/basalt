@@ -189,7 +189,7 @@ pub const AvgDecimal = struct {
     pub const State = struct { n: i64 = 0, s: i256 align(8) = 0, f: f64 = 0 };
     pub fn add(s: *State, x: Decimal, cx: Ctx) !void {
         s.n += 1;
-        decimal.addAvg(&s.s, &s.f, x, cx.ty.scale);
+        _ = decimal.addAvg(&s.s, &s.f, x, cx.ty.scale);
     }
     pub fn merge(d: *State, s: *const State, _: Ctx) !void {
         d.s += s.s;

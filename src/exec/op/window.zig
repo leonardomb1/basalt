@@ -55,6 +55,8 @@ const par = @import("../par.zig");
 const errLabel = @import("../op.zig").errLabel;
 const eval = @import("../eval.zig");
 const floatord = @import("../floatord.zig");
+const Decimal = @import("../decimal.zig").Decimal;
+const decimal = @import("../decimal.zig");
 const rescaleTo = @import("../decimal.zig").rescaleTo;
 const keyhash = @import("../keyhash.zig");
 const aggFuncs = @import("aggregate/funcs.zig");
@@ -676,6 +678,29 @@ pub const Window = struct {
         }
     };
 
+    /// AVG of decimals as the AVG aggregate has it, exact at the argument's scale. A
+    /// value of wider scale goes to a float part, zeroed once none is left in the
+    /// frame, so a row that left leaves no rounding behind.
+    const AvgDecimal = struct {
+        pub const In = Decimal;
+        pub const keeps_arg_type = true;
+        pub const State = struct { n: i64 = 0, wide: i64 = 0, s: i256 align(8) = 0, f: f64 = 0 };
+        pub fn add(s: *State, x: Decimal, cx: Ctx) !void {
+            s.n += 1;
+            if (!decimal.addAvg(&s.s, &s.f, x, cx.ty.scale)) s.wide += 1;
+        }
+        pub fn remove(s: *State, x: Decimal, cx: Ctx) !void {
+            s.n -= 1;
+            if (decimal.removeAvg(&s.s, &s.f, x, cx.ty.scale)) return;
+            s.wide -= 1;
+            if (s.wide == 0) s.f = 0;
+        }
+        pub fn finish(s: *const State, cx: Ctx) !Value {
+            if (s.n == 0) return .null;
+            return .{ .float = decimal.avgOf(s.s, s.f, s.n, cx.ty.scale) };
+        }
+    };
+
     /// MIN (`want` .lt) or MAX by a monotonic deque of the values that can still win,
     /// in `aggregate/funcs.zig`'s `order`, a later equal value displacing an earlier one.
     fn Deque(comptime T: type, comptime want: std.math.Order) type {
@@ -828,7 +853,8 @@ pub const Window = struct {
 
     /// The one loop every window aggregate runs, generated per aggregate `A` (a
     /// `State` with `add`, `remove` and `finish`, each optionally taking the row's
-    /// position, and an optional `init` from the call's `agg`) and the column kind its
+    /// position, an optional `init` from the call's `agg`, and `keeps_arg_type` to read
+    /// `cx.ty` as the argument's type rather than `In`'s) and the column kind its
     /// argument reads as directly, or null for a kind read as a value (`valueAt`): per
     /// partition, rows enter at the frame's end edge and leave at its start edge, as
     /// the file header describes.
@@ -836,7 +862,7 @@ pub const Window = struct {
         return struct {
             fn run(col: ?column.Column, fr: Frames, l: Layout, given: Ctx, agg: ast.AggFunc, bd: *column.Builder) anyerror!void {
                 var cx = given;
-                cx.ty = read.inType(A.In, cx.out);
+                if (!@hasDecl(A, "keeps_arg_type")) cx.ty = read.inType(A.In, cx.out);
                 var s: A.State = if (@hasDecl(A, "init")) A.init(cx, agg) else .{};
                 const n = fr.fs.len;
                 var k: usize = 0;
@@ -915,7 +941,11 @@ pub const Window = struct {
             .count => if (f.distinct) runOf(CountDistinct, kind) else runOf(aggFuncs.Count, kind),
             .count_if => runOf(aggFuncs.CountIf, kind),
             .sum => if (out.kind == .decimal) runOf(aggFuncs.SumDecimal, kind) else if (kind == .int) runAt(SumInt, .int) else runOf(FloatSum, kind),
-            .avg => if (kind == .int) runAt(aggFuncs.AvgInt, .int) else runOf(FloatSum, kind),
+            .avg => switch (kind) {
+                .int => runAt(aggFuncs.AvgInt, .int),
+                .decimal => runAt(AvgDecimal, .decimal),
+                else => runOf(FloatSum, kind),
+            },
             inline .min, .max => |m| switch (kind) {
                 inline else => |k| runAt(Deque(read.Phys(k) orelse Value, if (m == .min) .lt else .gt), k),
             },

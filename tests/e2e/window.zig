@@ -332,6 +332,24 @@ test "window SUM over a DECIMAL is an exact DECIMAL in every frame, as the SUM a
     }
 }
 
+test "window AVG over a DECIMAL sums exactly, as the AVG aggregate does, in a sliding frame too" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const input = "g,v\na,0.10\na,0.20\nb,0.20\nb,0.70\n";
+    const cases = [_][2][]const u8{
+        .{ "AVG(d) OVER (PARTITION BY g)", "g,d,s\na,0.10,0.15\na,0.20,0.15\nb,0.20,0.45\nb,0.70,0.45\n" },
+        .{ "AVG(d) OVER (PARTITION BY g ORDER BY d ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)", "g,d,s\na,0.10,0.1\na,0.20,0.15\nb,0.20,0.2\nb,0.70,0.45\n" },
+    };
+    for (cases) |c| {
+        const q = try std.fmt.allocPrint(alloc, "SELECT g, d, {s} AS s FROM (SELECT g, CAST(v AS DECIMAL(10,2)) AS d FROM '$IN') x ORDER BY g, d", .{c[0]});
+        defer alloc.free(q);
+        const got = try runToString(alloc, &tmp, input, q);
+        defer alloc.free(got);
+        try std.testing.expectEqualStrings(c[1], got);
+    }
+}
+
 test "window columns come out where the SELECT list puts them, beside *, t.* or other items" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
