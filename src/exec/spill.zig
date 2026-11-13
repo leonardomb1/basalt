@@ -100,9 +100,9 @@ pub const Writer = struct {
         };
         errdefer self.abort();
         try space.charge(ALIGN);
+        self.bytes = ALIGN;
         try self.put(MAGIC);
         try self.zeros(ALIGN - MAGIC.len);
-        self.bytes = ALIGN;
         return self;
     }
 
