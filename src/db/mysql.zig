@@ -70,6 +70,7 @@ pub const Conn = struct {
     cur_schema: *types.Schema = undefined,
     done: bool = false,
     ld_seq: u8 = 0,
+    no_backslash: bool = false,
 
     /// The login phase runs from the dial through the session's time zone.
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
@@ -103,7 +104,10 @@ pub const Conn = struct {
             const p = self.wire.msg.items;
             if (p.len == 0) return error.MysqlProtocol;
             switch (p[0]) {
-                0x00 => break,
+                0x00 => {
+                    self.no_backslash = noBackslashEscapes(p);
+                    break;
+                },
                 0xff => {
                     try self.wire.setError(errMessage(p));
                     return error.MysqlAuthFailed;
@@ -147,6 +151,7 @@ pub const Conn = struct {
             }
         }
         try self.exec(session_time_zone);
+        if (self.no_backslash) try self.exec("SET SESSION sql_mode = REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', '')");
     }
 
     /// Run a statement that returns no result set (DDL). Errors on an ERR packet.
@@ -497,6 +502,19 @@ const LoadDataProto = struct {
 };
 
 pub const LoadDataSink = sql.BulkSink(LoadDataProto);
+
+/// Whether an OK packet's status says the session reads `\\` as an ordinary character
+/// (`SERVER_STATUS_NO_BACKSLASH_ESCAPES`), which every literal basalt sends escapes.
+fn noBackslashEscapes(p: []const u8) bool {
+    if (p.len < 2 or p[0] != 0x00) return false;
+    var r: Pkt = .{ .p = p, .i = 1 };
+    _ = lenencInt(&r) catch return false;
+    _ = lenencInt(&r) catch return false;
+    const status = r.int(u16) catch return false;
+    return status & server_status_no_backslash_escapes != 0;
+}
+
+const server_status_no_backslash_escapes = 0x0200;
 
 /// OK packet to affected-rows count (header 0x00, then affected_rows lenenc).
 fn parseOkAffected(p: []const u8) ?u64 {
@@ -902,4 +920,12 @@ test "a session is set to UTC before connect returns, so a TIMESTAMP reads as Po
     t.join();
     _ = try c;
     try std.testing.expectEqualStrings("\x03SET time_zone = '+00:00'", first[0..n]);
+}
+
+test "noBackslashEscapes reads the OK packet's status, past its two lenenc counts" {
+    try std.testing.expect(noBackslashEscapes(&.{ 0x00, 0x00, 0x00, 0x02, 0x02, 0x00, 0x00 }));
+    try std.testing.expect(!noBackslashEscapes(&.{ 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00 }));
+    try std.testing.expect(noBackslashEscapes(&.{ 0x00, 0xfc, 0x10, 0x27, 0x05, 0x00, 0x02 }));
+    try std.testing.expect(!noBackslashEscapes(&.{ 0xff, 0x00, 0x00, 0x02, 0x02 }));
+    try std.testing.expect(!noBackslashEscapes(&.{ 0x00, 0x00 }));
 }

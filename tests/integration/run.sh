@@ -280,6 +280,23 @@ LOAD INTO db.it_utf8mb4 REPLACE AS SELECT CAST(n AS INT) AS n, CAST(s AS STRING)
     report mysql-utf8mb4 bad; cat "$out/utf8mb4_got.csv"
   fi
 fi
+# A server whose sql_mode has NO_BACKSLASH_ESCAPES reads `\\` as two characters; the
+# session clears the mode, so a backslash is written once and a filter on it matches.
+if runs mysql; then
+  decl="CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"
+  myq() { docker compose -f tests/integration/compose.yaml exec -T mysql mysql -uroot -pit -N -e "$1" 2>/dev/null; }
+  myq "SET GLOBAL sql_mode = CONCAT(@@GLOBAL.sql_mode, ',NO_BACKSLASH_ESCAPES')"
+  printf 'id,p\n1,C:\\temp\\x\n' >"$out/bs.csv"
+  if brun run -c "$decl
+LOAD INTO db.it_bs REPLACE AS SELECT CAST(id AS INT) AS id, p FROM '$out/bs.csv';" &&
+     $B run --format csv -q -c "$decl SELECT p FROM db.it_bs; SELECT count(*) AS hit FROM db.it_bs WHERE p = 'C:\\temp\\x';" >"$out/bs_got.csv" 2>&1 &&
+     printf 'p\nC:\\temp\\x\nhit\n1\n' | cmp -s - "$out/bs_got.csv"; then
+    report mysql-no-backslash-escapes ok
+  else
+    report mysql-no-backslash-escapes bad; cat "$out/bs_got.csv"
+  fi
+  myq "SET GLOBAL sql_mode = REPLACE(@@GLOBAL.sql_mode, 'NO_BACKSLASH_ESCAPES', '')"
+fi
 # A table the load creates keeps every microsecond of a timestamp and a time: a
 # DATETIME or TIME without fsp rounds them away, with no warning.
 if runs mysql; then
