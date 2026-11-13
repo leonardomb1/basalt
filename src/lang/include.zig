@@ -327,6 +327,23 @@ fn blankPrefix(ctx: *Ctx, text: []const u8, body_at: usize, n_directives: usize)
     return buf;
 }
 
+/// Whether a trimmed line belongs to a script's leading block: blank, a `--`
+/// comment, or an `@include` directive.
+fn inDirectives(trimmed: []const u8) bool {
+    return trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "--") or std.mem.startsWith(u8, trimmed, "@include");
+}
+
+/// The offset where `text`'s leading `@include` block ends, as `scanDirectives` cuts it.
+pub fn directivesEnd(text: []const u8) usize {
+    var off: usize = 0;
+    while (off < text.len) {
+        const nl = std.mem.indexOfScalarPos(u8, text, off, '\n') orelse text.len;
+        if (!inDirectives(std.mem.trim(u8, text[off..nl], " \t\r"))) break;
+        off = if (nl == text.len) text.len else nl + 1;
+    }
+    return off;
+}
+
 /// Collects the leading `@include` directives and returns the offset where the
 /// rest of the script starts; the first line that is not blank, `--` or a directive ends the scan.
 fn scanDirectives(ctx: *Ctx, text: []const u8, label: []const u8, out: *std.array_list.Managed(Directive)) Error!usize {
@@ -336,8 +353,8 @@ fn scanDirectives(ctx: *Ctx, text: []const u8, label: []const u8, out: *std.arra
         const nl = std.mem.indexOfScalarPos(u8, text, off, '\n') orelse text.len;
         const raw = text[off..nl];
         const trimmed = std.mem.trim(u8, raw, " \t\r");
-        if (trimmed.len != 0 and !std.mem.startsWith(u8, trimmed, "--")) {
-            if (!std.mem.startsWith(u8, trimmed, "@include")) break;
+        if (!inDirectives(trimmed)) break;
+        if (std.mem.startsWith(u8, trimmed, "@include")) {
             const col: u32 = @intCast((std.mem.indexOfScalar(u8, raw, '@') orelse 0) + 1);
             const pd = try parseDirective(ctx, trimmed, label, line, col);
             try out.append(.{ .path = pd.path, .alias = pd.alias, .line = line, .col = col });

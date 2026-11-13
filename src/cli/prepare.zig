@@ -28,9 +28,15 @@ pub const Prepared = struct {
 
 pub const PrepareError = error{ ParseFailed, OutOfMemory };
 
-/// A declaration the entry makes again is left out of the prelude, so no name is declared twice.
+/// A declaration the entry makes again is left out of the prelude, so no name is declared
+/// twice. The entry's own `@include` lines lead the text, as an include must precede
+/// every statement, and are blanked where they stood so the entry's lines keep their
+/// numbers.
 fn withPrelude(a: std.mem.Allocator, decls: *const DeclStore, pending: []const Pending, block: []const u8) !struct { text: []const u8, entry_at: usize } {
     var buf = std.array_list.Managed(u8).init(a);
+    const cut = include.directivesEnd(block);
+    try buf.appendSlice(block[0..cut]);
+    if (cut > 0 and block[cut - 1] != '\n') try buf.append('\n');
     for (decls.items.items) |e| {
         var shadowed = false;
         for (pending) |p| {
@@ -41,7 +47,8 @@ fn withPrelude(a: std.mem.Allocator, decls: *const DeclStore, pending: []const P
         try buf.appendSlice(";\n");
     }
     const entry_at = buf.items.len;
-    try buf.appendSlice(block);
+    for (block[0..cut]) |c| try buf.append(if (c == '\n') '\n' else ' ');
+    try buf.appendSlice(block[cut..]);
     return .{ .text = buf.items, .entry_at = entry_at };
 }
 
@@ -170,4 +177,24 @@ test "letLiteral: every value folds back to itself" {
         if (v != .null) try std.testing.expectEqual(std.math.Order.eq, eval.compareValues(v, back).?);
     }
     try std.testing.expect((try letLiteral(a, .{ .bytes = "\x00" })) == null);
+}
+
+test "an entry's @include runs after the session has declarations, its lines keeping their numbers" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "lib.sql", .data = "CREATE FUNCTION twice(x) AS x * 2;\n" });
+    const lib = try std.fs.path.join(a, &.{ try tmp.dir.realpathAlloc(a, "."), "lib.sql" });
+
+    var decls = DeclStore.init(std.testing.allocator);
+    defer decls.deinit();
+    const param = "PARAM n INT DEFAULT 1";
+    try decls.put(declOf(param).?, param);
+
+    const block = try std.fmt.allocPrint(a, "@include '{s}';\nSELECT twice($n) AS m;", .{lib});
+    var diag: include.Diag = .{};
+    const p = try prepareEntry(a, &decls, block, &diag, null);
+    try std.testing.expectEqual(std.mem.count(u8, block[0..std.mem.indexOf(u8, block, "SELECT").?], "\n"), std.mem.count(u8, p.text[p.entry_at..std.mem.indexOf(u8, p.text, "SELECT").?], "\n"));
 }
