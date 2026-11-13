@@ -118,8 +118,8 @@ const mysql_rows = [_]Row{
     .{ .kind = .string, .ddl = n("VARCHAR(255)"), .cast = n("CHAR"), .echo = .{ .code = 0xfd } },
     .{ .kind = .bytes, .ddl = n("BLOB"), .cast = null, .echo = .{ .code = 0xfc, .binary = true }, .wire = my_bytes },
     .{ .kind = .date, .ddl = n("DATE"), .cast = n("DATE"), .echo = .{ .code = 0x0a }, .wire = my_date },
-    .{ .kind = .time, .ddl = n("TIME"), .cast = n("TIME"), .echo = .{ .code = 0x0b } },
-    .{ .kind = .timestamp, .ddl = n("DATETIME"), .cast = n("DATETIME"), .echo = .{ .code = 0x0c }, .wire = my_timestamp },
+    .{ .kind = .time, .ddl = n("TIME(6)"), .cast = n("TIME(6)"), .echo = .{ .code = 0x0b } },
+    .{ .kind = .timestamp, .ddl = n("DATETIME(6)"), .cast = n("DATETIME(6)"), .echo = .{ .code = 0x0c }, .wire = my_timestamp },
     .{ .kind = .array, .ddl = n("TEXT"), .cast = null, .echo = .{ .code = 0xfc } },
     .{ .kind = .@"struct", .ddl = n("TEXT"), .cast = null, .echo = .{ .code = 0xfc } },
     .{ .kind = .map, .ddl = n("TEXT"), .cast = null, .echo = .{ .code = 0xfc } },
@@ -250,7 +250,8 @@ pub const sqlserver_bulk_column = "nvarchar(4000)";
 
 const testing = std.testing;
 
-/// sql.zig:428 `Dialect.ddlType` at 7f890a1, verbatim but for the dialect parameter.
+/// sql.zig:428 `Dialect.ddlType` at 7f890a1, verbatim but for the dialect parameter
+/// and MySQL's six fractional digits, which the engine's microseconds need (0.14).
 fn pinnedDdl(self: Dialect, arena: std.mem.Allocator, ty: types.Type, is_key: bool) ![]const u8 {
     return switch (ty.kind) {
         .bool => switch (self) {
@@ -280,13 +281,14 @@ fn pinnedDdl(self: Dialect, arena: std.mem.Allocator, ty: types.Type, is_key: bo
         },
         .date => "DATE",
         .time => switch (self) {
-            .postgres, .mysql, .sqlserver => "TIME",
+            .postgres, .sqlserver => "TIME",
+            .mysql => "TIME(6)",
             .starrocks, .doris => "VARCHAR(32)",
         },
         .timestamp => switch (self) {
             .postgres => "TIMESTAMP",
-            .mysql, .starrocks => "DATETIME",
-            .doris => "DATETIME(6)",
+            .starrocks => "DATETIME",
+            .mysql, .doris => "DATETIME(6)",
             .sqlserver => "DATETIME2",
         },
         .array => switch (self) {
@@ -300,7 +302,8 @@ fn pinnedDdl(self: Dialect, arena: std.mem.Allocator, ty: types.Type, is_key: bo
     };
 }
 
-/// sql.zig:480 `Dialect.castType` at 7f890a1, verbatim but for the dialect parameter.
+/// sql.zig:480 `Dialect.castType` at 7f890a1, verbatim but for the dialect parameter
+/// and MySQL's six fractional digits, a bare CAST to DATETIME rounding them (0.14).
 fn pinnedCast(self: Dialect, arena: std.mem.Allocator, ty: types.Type) !?[]const u8 {
     return switch (ty.kind) {
         .int => switch (self) {
@@ -319,10 +322,11 @@ fn pinnedCast(self: Dialect, arena: std.mem.Allocator, ty: types.Type) !?[]const
             .sqlserver => "VARCHAR(MAX)",
         },
         .date => "DATE",
-        .time => "TIME",
+        .time => if (self == .mysql) "TIME(6)" else "TIME",
         .timestamp => switch (self) {
             .postgres => "TIMESTAMP",
-            .mysql, .starrocks, .doris => "DATETIME",
+            .mysql => "DATETIME(6)",
+            .starrocks, .doris => "DATETIME",
             .sqlserver => "DATETIME2",
         },
         .bool, .bytes, .array, .@"struct", .map => null,

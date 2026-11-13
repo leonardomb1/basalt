@@ -280,6 +280,20 @@ LOAD INTO db.it_utf8mb4 REPLACE AS SELECT CAST(n AS INT) AS n, CAST(s AS STRING)
     report mysql-utf8mb4 bad; cat "$out/utf8mb4_got.csv"
   fi
 fi
+# A table the load creates keeps every microsecond of a timestamp and a time: a
+# DATETIME or TIME without fsp rounds them away, with no warning.
+if runs mysql; then
+  decl="CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"
+  printf 'ts,t\n2024-01-05 10:20:30.123456,10:20:30.654321\n' >"$out/fsp.csv"
+  if brun run -c "$decl
+LOAD INTO db.it_fsp REPLACE AS SELECT CAST(ts AS TIMESTAMP) AS ts, CAST(t AS TIME) AS t FROM '$out/fsp.csv';" &&
+     $B run --format csv -q -c "$decl SELECT ts, t FROM db.it_fsp;" >"$out/fsp_got.csv" 2>&1 &&
+     grep -q '2024-01-05 10:20:30.123456' "$out/fsp_got.csv" && grep -q '10:20:30.654321' "$out/fsp_got.csv"; then
+    report mysql-fractional-seconds ok
+  else
+    report mysql-fractional-seconds bad; cat "$out/fsp_got.csv"
+  fi
+fi
 runs postgres  && collrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      db.it_coll descends  # 16-alpine: musl, byte order
 runs sqlserver && collrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" db.it_coll
 

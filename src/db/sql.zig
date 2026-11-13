@@ -1636,7 +1636,7 @@ test "DDL and CAST spell each kind the way each dialect declares it" {
     const Case = struct { d: Dialect, ts: []const u8, str: []const u8, str_key: []const u8, str_cast: []const u8 };
     const cases = [_]Case{
         .{ .d = .postgres, .ts = "TIMESTAMP", .str = "TEXT", .str_key = "VARCHAR(255)", .str_cast = "TEXT" },
-        .{ .d = .mysql, .ts = "DATETIME", .str = "VARCHAR(255)", .str_key = "VARCHAR(255)", .str_cast = "CHAR" },
+        .{ .d = .mysql, .ts = "DATETIME(6)", .str = "VARCHAR(255)", .str_key = "VARCHAR(255)", .str_cast = "CHAR" },
         .{ .d = .sqlserver, .ts = "DATETIME2", .str = "NVARCHAR(4000)", .str_key = "NVARCHAR(255)", .str_cast = "VARCHAR(MAX)" },
         .{ .d = .starrocks, .ts = "DATETIME", .str = "VARCHAR(65533)", .str_key = "VARCHAR(65533)", .str_cast = "CHAR" },
         .{ .d = .doris, .ts = "DATETIME(6)", .str = "STRING", .str_key = "VARCHAR(65533)", .str_cast = "CHAR" },
