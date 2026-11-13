@@ -192,6 +192,9 @@ pub const Session = struct {
     signing_key: [16]u8 = undefined,
     signing: bool = false,
     preauth: [64]u8 = [_]u8{0} ** 64,
+    /// The message id of the NEGOTIATE or SESSION_SETUP in flight, the only response
+    /// that may come unsigned; a response's own command field is the server's to forge.
+    preauth_mid: ?u64 = null,
 
     enc_key: [16]u8 = undefined,
     dec_key: [16]u8 = undefined,
@@ -292,7 +295,10 @@ pub const Session = struct {
             const sig = self.sign(msg);
             @memcpy(msg[48..64], &sig);
         }
-        if (cmd == .negotiate or cmd == .session_setup) self.preauthAdd(msg);
+        if (cmd == .negotiate or cmd == .session_setup) {
+            self.preauthAdd(msg);
+            self.preauth_mid = id;
+        }
         self.credits -|= @max(credit_charge, 1);
         const w = &self.sw.interface;
         var nb: [4]u8 = undefined;
@@ -345,13 +351,13 @@ pub const Session = struct {
                 .tree_id = std.mem.readInt(u32, bytes[36..40], .little),
                 .bytes = bytes,
             };
-            self.credits += std.mem.readInt(u16, bytes[14..16], .little);
+            self.credits +|= std.mem.readInt(u16, bytes[14..16], .little);
             const mid = std.mem.readInt(u64, bytes[24..32], .little);
             if (m.flags & flag_async != 0 and m.status == Status.pending) {
                 self.gpa.free(bytes);
                 continue;
             }
-            const pre_auth = m.command == @intFromEnum(Command.negotiate) or m.command == @intFromEnum(Command.session_setup);
+            const pre_auth = self.preauth_mid == mid;
             if (!was_sealed and !pre_auth and self.sealedTree(m.tree_id))
                 return fail(error.SmbSignature, "a response came unencrypted on an encrypted session or share — the message may have been altered", .{});
             if (self.signing and !was_sealed and !pre_auth and m.flags & flag_signed == 0)
@@ -1496,4 +1502,34 @@ test "a server that accepts and never answers fails the SMB login within connect
     try std.testing.expectError(error.ConnectionTimedOut, Session.connect(std.testing.allocator, cfg));
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}: negotiate did not answer within 1 s", .{port}), lastError());
+}
+
+test "smb: a response claiming to be NEGOTIATE does not skip the signature check on a signed session" {
+    const gpa = std.testing.allocator;
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    const stream = try std.net.tcpConnectToAddress(server.listen_address);
+    const peer = try server.accept();
+    defer peer.stream.close();
+    var frame = [_]u8{0} ** (4 + header_len);
+    std.mem.writeInt(u32, frame[0..4], header_len, .big);
+    @memcpy(frame[4..8], "\xfeSMB");
+    std.mem.writeInt(u16, frame[8..10], 64, .little);
+    std.mem.writeInt(u16, frame[16..18], @intFromEnum(Command.negotiate), .little);
+    std.mem.writeInt(u64, frame[28..36], 5, .little);
+    try peer.stream.writeAll(&frame);
+
+    const s = try gpa.create(Session);
+    defer gpa.destroy(s);
+    s.* = .{ .gpa = gpa, .stream = stream, .sr = undefined, .sw = undefined, .cfg = .{ .host = "h", .port = 445, .user = "u", .password = "p" }, .held = .init(gpa), .trees = .init(gpa) };
+    defer s.held.deinit();
+    defer s.trees.deinit();
+    defer stream.close();
+    s.sr = stream.reader(&s.rbuf);
+    s.sw = stream.writer(&s.wbuf);
+    s.dialect = dialect_300;
+    s.signing = true;
+    s.signing_key = [_]u8{7} ** 16;
+    try std.testing.expectError(error.SmbSignature, s.wait(5));
 }
