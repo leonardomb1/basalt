@@ -19,7 +19,10 @@
 //! leaves no rounding behind. MEDIAN keeps the frame's lower half in a max-heap and
 //! its upper half in a min-heap (`Halves`), a row that left dropped when it surfaces
 //! at a top, or when such rows outnumber a heap's live ones, so the heaps stay
-//! O(frame). Every frame thus costs O(1) amortized per row, MEDIAN O(log frame). IGNORE
+//! O(frame). Every frame thus costs O(1) amortized per row, MEDIAN O(log frame). An
+//! EXCLUDE takes its rows out of a sliding state and puts them back, O(excluded) a row,
+//! where the state takes any row back (`takesAnyOut`); any other rebuilds each frame,
+//! O(frame) a row. IGNORE
 //! NULLS reads through the positions of the non-null values and their prefix counts.
 //! Each aggregate is a state with `add`, `remove` and `finish` (the invertible ones
 //! are `aggregate/funcs.zig`'s own), and `Slider` generates the one loop that slides
@@ -864,33 +867,54 @@ pub const Window = struct {
                 var cx = given;
                 if (!@hasDecl(A, "keeps_arg_type")) cx.ty = read.inType(A.In, cx.out);
                 var s: A.State = if (@hasDecl(A, "init")) A.init(cx, agg) else .{};
+                if (fr.exclude == .none) return slide(false, col, fr, l, cx, &s, bd);
+                if (comptime takesAnyOut(A)) return slide(true, col, fr, l, cx, &s, bd);
+                for (0..fr.fs.len) |k| {
+                    if (@hasDecl(A, "reset")) A.reset(&s) else s = .{};
+                    for (fr.fs[k]..fr.fe[k]) |j| {
+                        if (fr.excluded(l, k, j)) continue;
+                        if (try at(col, j, cx)) |x| try step(A.add, &s, x, j, cx);
+                    }
+                    try bd.append(try A.finish(&s, cx));
+                }
+            }
+
+            /// Rows enter at each frame's end edge and leave at its start edge. With
+            /// `excl`, the rows the frame excludes are taken out for the answer and put
+            /// back, which only an aggregate `takesAnyOut` allows.
+            fn slide(comptime excl: bool, col: ?column.Column, fr: Frames, l: Layout, cx: Ctx, s: *A.State, bd: *column.Builder) anyerror!void {
                 const n = fr.fs.len;
                 var k: usize = 0;
-                if (fr.exclude != .none) {
-                    while (k < n) : (k += 1) {
-                        if (@hasDecl(A, "reset")) A.reset(&s) else s = .{};
-                        for (fr.fs[k]..fr.fe[k]) |j| {
-                            if (fr.excluded(l, k, j)) continue;
-                            if (try at(col, j, cx)) |x| try step(A.add, &s, x, j, cx);
-                        }
-                        try bd.append(try A.finish(&s, cx));
-                    }
-                    return;
-                }
                 while (k < n) {
                     const pe = l.pend[k];
-                    if (@hasDecl(A, "reset")) A.reset(&s) else s = .{};
+                    if (@hasDecl(A, "reset")) A.reset(s) else s.* = .{};
                     var lo = k;
                     var hi = k;
                     while (k < pe) : (k += 1) {
                         while (hi < fr.fe[k]) : (hi += 1) {
-                            if (try at(col, hi, cx)) |x| try step(A.add, &s, x, hi, cx);
+                            if (try at(col, hi, cx)) |x| try step(A.add, s, x, hi, cx);
                         }
                         while (lo < fr.fs[k]) : (lo += 1) {
-                            if (lo < hi) if (try at(col, lo, cx)) |x| try step(A.remove, &s, x, lo, cx);
+                            if (lo < hi) if (try at(col, lo, cx)) |x| try step(A.remove, s, x, lo, cx);
                         }
                         if (hi < lo) hi = lo;
-                        try bd.append(try A.finish(&s, cx));
+                        if (!excl) {
+                            try bd.append(try A.finish(s, cx));
+                            continue;
+                        }
+                        const e0 = @max(lo, if (fr.exclude == .current_row) k else l.gstart[k]);
+                        const e1 = @min(hi, if (fr.exclude == .current_row) k + 1 else l.gend[k]);
+                        var j = e0;
+                        while (j < e1) : (j += 1) {
+                            if (fr.exclude == .ties and j == k) continue;
+                            if (try at(col, j, cx)) |x| try step(A.remove, s, x, j, cx);
+                        }
+                        try bd.append(try A.finish(s, cx));
+                        j = e0;
+                        while (j < e1) : (j += 1) {
+                            if (fr.exclude == .ties and j == k) continue;
+                            if (try at(col, j, cx)) |x| try step(A.add, s, x, j, cx);
+                        }
                     }
                 }
             }
@@ -917,6 +941,16 @@ pub const Window = struct {
     noinline fn valueAt(comptime In: type, c: column.Column, p: usize, cx: Ctx) anyerror!?In {
         if (!c.validity.get(p)) return null;
         return try read.fromValue(In, c.getValue(p), cx);
+    }
+
+    /// Whether `A` takes any row back out of its state, not only the frame's oldest:
+    /// exact sums, counts and BIT_XOR, as an EXCLUDE takes rows from mid-frame. MIN,
+    /// MAX, MEDIAN and the two-stack aggregates leave in order, so an EXCLUDE rebuilds
+    /// their every frame.
+    fn takesAnyOut(comptime A: type) bool {
+        return A == aggFuncs.Count or A == aggFuncs.CountIf or A == aggFuncs.SumDecimal or A == SumInt or
+            A == aggFuncs.AvgInt or A == AvgDecimal or A == CountDistinct or A == aggFuncs.Bits(.xor) or
+            A == aggFuncs.BoolFold(true) or A == aggFuncs.BoolFold(false);
     }
 
     /// `A`'s loop over a column of kind `k`: one per lane of kinds `A.In` reads alike,
@@ -1382,6 +1416,16 @@ fn inFrame(rows: []const BruteRow, k: usize, j: usize, fr: Window.Frame, dir: Di
     return lo_ok and hi_ok;
 }
 
+fn bruteExcluded(rows: []const BruteRow, k: usize, j: usize, ex: ast.FrameExclude) bool {
+    const peer = sameP(rows[j].o, rows[k].o);
+    return switch (ex) {
+        .none => false,
+        .current_row => j == k,
+        .group => peer,
+        .ties => peer and j != k,
+    };
+}
+
 fn partitionOf(rows: []const BruteRow, k: usize) [2]usize {
     var ps = k;
     while (ps > 0 and sameP(rows[ps - 1].p, rows[k].p)) ps -= 1;
@@ -1393,7 +1437,7 @@ fn partitionOf(rows: []const BruteRow, k: usize) [2]usize {
 fn bruteValue(a: std.mem.Allocator, rows: []const BruteRow, k: usize, f: Window.Func, dir: Dir) !Value {
     const ps, const pe = partitionOf(rows, k);
     var frame = std.array_list.Managed(?i64).init(a);
-    for (ps..pe) |j| if (inFrame(rows, k, j, f.frame, dir)) try frame.append(rows[j].v);
+    for (ps..pe) |j| if (inFrame(rows, k, j, f.frame, dir) and !bruteExcluded(rows, k, j, f.frame.exclude)) try frame.append(rows[j].v);
     var nn = std.array_list.Managed(?i64).init(a);
     for (frame.items) |x| if (x != null) try nn.append(x);
     var xs = std.array_list.Managed(i64).init(a);
@@ -1636,6 +1680,42 @@ test "window frames: every bound pair, ROWS and RANGE, ties, nulls and edges mat
             };
             try testing.expectEqual(n, at);
         }
+    };
+}
+
+test "window EXCLUDE: CURRENT ROW, GROUP and TIES take their rows out of every aggregate's frame, as a brute-force reference does" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var prng = std.Random.DefaultPrng.init(0xe8c1);
+    const rnd = prng.random();
+    const aggs = [_]ast.AggFunc{ .sum, .count, .avg, .min, .max, .median, .var_samp, .bit_and, .bit_xor, .product };
+    const bounds = [_][2]Window.Bound{
+        .{ .unbounded_preceding, .current_row },
+        .{ .unbounded_preceding, .unbounded_following },
+        .{ .{ .preceding = .{ .rows = 2, .int = 2 } }, .{ .following = .{ .rows = 1, .int = 1 } } },
+        .{ .current_row, .{ .following = .{ .rows = 3, .int = 3 } } },
+    };
+    for ([_]usize{ 1, 2, 9, 60 }) |n| for (dirs) |dir| for ([_]bool{ false, true }) |range| {
+        const rows = try randomRows(a, rnd, n);
+        const sorted = try bruteSort(a, rows, dir);
+        var funcs = std.array_list.Managed(Window.Func).init(a);
+        for (bounds) |b| for ([_]ast.FrameExclude{ .current_row, .group, .ties }) |ex| {
+            const fr = Window.Frame{ .range = range, .start = b[0], .end = b[1], .exclude = ex };
+            for (aggs) |agg| try funcs.append(.{ .func = .{ .agg = agg }, .arg = 2, .frame = fr });
+            try funcs.append(.{ .func = .{ .agg = .count }, .frame = fr });
+            try funcs.append(.{ .func = .{ .agg = .count }, .arg = 2, .distinct = true, .frame = fr });
+        };
+        const out = try runWindow(a, rows, funcs.items, dir, true, null);
+        var at: usize = 0;
+        for (out) |bt| for (0..bt.len) |r| {
+            for (funcs.items, 0..) |f, fi| {
+                errdefer std.debug.print("n={d} row {d}: {s} {s} {any}\n", .{ n, at, @tagName(f.func.agg), @tagName(f.frame.exclude), f.frame });
+                try expectSameValue(try bruteValue(a, sorted, at, f, dir), bt.columns[3 + fi].getValue(r));
+            }
+            at += 1;
+        };
+        try testing.expectEqual(n, at);
     };
 }
 
