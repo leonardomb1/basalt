@@ -797,7 +797,7 @@ pub const Interner = struct {
 /// itself for one INT-like key), the words a row hashes by (`hkeys`, a string's hash
 /// where `keys` holds its id; `keys` itself when no key is a string), a null mask a
 /// row (none when no key is NULL), and `absent` for a row whose string a frozen table
-/// cannot hold.
+/// cannot hold, or whose key has no word of the kind it meets, on either side.
 pub const Encoded = struct {
     nk: usize,
     keys: []i64,
@@ -878,7 +878,7 @@ pub const Encoder = struct {
             .keys = keys,
             .hkeys = if (self.has_str) try a.alloc(i64, n * nk) else keys,
             .masks = if (nulls) try a.alloc(u64, n) else &.{},
-            .absent = if (frozen and (self.has_str or self.want != null)) try a.alloc(bool, n) else &.{},
+            .absent = if ((frozen and self.has_str) or self.want != null) try a.alloc(bool, n) else &.{},
         };
         @memset(e.masks, 0);
         @memset(e.absent, false);
@@ -1207,4 +1207,22 @@ test "hashBatch: each row's boxed keys and their MultiKeyCtx hash" {
         try std.testing.expect(keyhash.MultiKeyCtx.eql(.{}, &want, probes[2 * r ..][0..2]));
         try std.testing.expectEqual(keyhash.MultiKeyCtx.hash(.{}, &want), hashes[r]);
     }
+}
+
+test "encode: a key with no word of the kind it meets is absent on a building side too, not written past an empty slice" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var b = try column.Builder.initCapacity(a, types.Type.decimal(10, 1), 2);
+    try b.append(.{ .decimal = .{ .unscaled = 30, .scale = 1 } });
+    try b.append(.{ .decimal = .{ .unscaled = 35, .scale = 1 } });
+    const cols = [_]column.Column{try b.finish()};
+    var enc = try Encoder.init(a, &.{0}, &.{.i64k});
+    enc.want = &.{.int};
+    var table: ?*StrTable = null;
+    var cache: std.StringHashMapUnmanaged(StrId) = .empty;
+    const in = Interner{ .table = &table, .cache = &cache, .alloc = a };
+    const e = try enc.encode(a, &cols, 2, in, false);
+    try std.testing.expectEqual(@as(i64, 3), e.keys[0]);
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, e.absent);
 }

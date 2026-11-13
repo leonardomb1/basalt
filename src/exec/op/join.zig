@@ -507,7 +507,8 @@ pub const JoinIndex = struct {
         b.order = try state.alloc(u32, at);
         par.each(threads, b.nc, &b, Build.scatterChunk);
 
-        var tsa = std.heap.ThreadSafeAllocator{ .child_allocator = state };
+        const tsa = try state.create(std.heap.ThreadSafeAllocator);
+        tsa.* = .{ .child_allocator = state };
         b.alloc = tsa.allocator();
         self.parts = try state.alloc(Part, nparts);
         par.each(threads, nparts, &b, Build.fillPart);
@@ -559,13 +560,22 @@ pub const JoinIndex = struct {
             return if (b.nparts == 1) 0 else keytable.partOf(h);
         }
 
+        /// A row that never matches and is not indexed: a NULL key, or one whose
+        /// value has no word of the kind the probe side meets it as. Only the first
+        /// makes the index hold a NULL key.
+        fn dropped(b: *const Build, r: usize) bool {
+            if (b.nulls[r]) return true;
+            const e = b.enc orelse return false;
+            return e.absent.len > 0 and e.absent[r];
+        }
+
         fn hashChunk(b: *Build, c: usize) void {
             const r0, const r1 = par.bounds(b.n, b.nc, c);
             const cols = b.ix.build_batch.columns;
             const nk = b.ix.keys.len;
             for (r0..r1) |r| {
                 b.nulls[r] = anyNullKey(cols, b.ix.keys, r);
-                if (b.nulls[r]) continue;
+                if (b.dropped(r)) continue;
                 b.hashes[r] = if (b.enc) |e| e.hash(r) else blk: {
                     const v = b.vals[c * nk ..][0..nk];
                     for (b.ix.keys, v) |k, *x| x.* = cols[k].getValue(r);
@@ -579,7 +589,7 @@ pub const JoinIndex = struct {
             const r0, const r1 = par.bounds(b.n, b.nc, c);
             const offs = b.offs[c * b.nparts ..][0..b.nparts];
             for (r0..r1) |r| {
-                if (b.nulls[r]) continue;
+                if (b.dropped(r)) continue;
                 const p = b.part(b.hashes[r]);
                 b.order[offs[p]] = @intCast(r);
                 offs[p] += 1;
