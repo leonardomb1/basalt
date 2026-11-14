@@ -179,16 +179,12 @@ const TypeTag = enum(u8) {
     _,
 };
 
-/// How deep a field's children may nest; deeper is refused, so this parse and
-/// every walk over the tree after it stay within the stack.
-const max_depth = 64;
-
 fn parseField(arena: std.mem.Allocator, f: Fb, why: *[]const u8) Error!Field {
     return parseFieldAt(arena, f, why, 0);
 }
 
 fn parseFieldAt(arena: std.mem.Allocator, f: Fb, why: *[]const u8, depth: usize) Error!Field {
-    if (depth > max_depth) {
+    if (depth > types.max_nesting) {
         why.* = "the schema nests fields more than 64 deep";
         return Error.UnsupportedArrow;
     }

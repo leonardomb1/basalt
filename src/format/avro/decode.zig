@@ -523,7 +523,7 @@ pub const Machine = struct {
     /// a union's branch as the branch, and a part held as JSON text (a recursing
     /// record, a union of several types) rendered as `json` writes it.
     fn decodeInto(m: *Machine, b: *column.Builder, n: *const Node, depth: usize) Error!void {
-        if (depth > schema.max_depth) return corrupt("a value nests deeper than {d}", .{schema.max_depth});
+        if (depth > types.max_nesting) return corrupt("a value nests deeper than {d}", .{types.max_nesting});
         const c = &m.cur;
         if (n.kind == .@"union") {
             const i = try c.long();
@@ -578,7 +578,7 @@ pub const Machine = struct {
 
     /// The value at the cursor as compact JSON, as basalt's JSON writer writes one.
     pub fn json(m: *Machine, n: *const Node, w: *std.Io.Writer, depth: usize) Error!void {
-        if (depth > schema.max_depth) return corrupt("a value nests deeper than {d}", .{schema.max_depth});
+        if (depth > types.max_nesting) return corrupt("a value nests deeper than {d}", .{types.max_nesting});
         const c = &m.cur;
         switch (n.kind) {
             .record => {

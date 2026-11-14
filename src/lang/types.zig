@@ -41,6 +41,11 @@ pub const TypeKind = enum {
     }
 };
 
+/// How deep a nested type may nest. A reader taking a type from a file's schema
+/// (Arrow, Avro, Delta) refuses one deeper, so every walk over a `Type` stays
+/// within the stack.
+pub const max_nesting = 64;
+
 pub const Type = struct {
     kind: TypeKind,
     nullable: bool = false,

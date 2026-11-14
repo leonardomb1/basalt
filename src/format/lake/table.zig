@@ -75,9 +75,6 @@ pub const Resolved = struct {
 
 pub const Error = error{LakeTableRefused};
 
-/// How deep a table's schema may nest structs; `collectLeaves` reads no deeper.
-pub const max_depth = 64;
-
 /// A table found in a folder; `listed` is its log's listing when finding it took
 /// one, which resolving it then reads rather than listing again.
 pub const Found = struct { kind: Kind, listed: ?[]const []const u8 = null };

@@ -783,7 +783,7 @@ fn parseSchema(arena: std.mem.Allocator, name: []const u8, text: []const u8, by:
 /// A type of `schemaString` as the mapping of what it nests: a struct's fields,
 /// each found by its physical name or id, a list's element, a map's key and value.
 fn mapType(arena: std.mem.Allocator, name: []const u8, by: Mapping.By, col: []const u8, t: std.json.Value, depth: usize) !Mapping.Node {
-    if (depth >= table.max_depth) return refuse("{s} has a schemaString nested deeper than {d} levels", .{ name, table.max_depth });
+    if (depth >= types.max_nesting) return refuse("{s} has a schemaString nested deeper than {d} levels", .{ name, types.max_nesting });
     if (t != .object) return .{};
     const kind = str(t.object.get("type")) orelse "";
     if (std.mem.eql(u8, kind, "array")) {
@@ -828,7 +828,7 @@ fn addFields(arena: std.mem.Allocator, name: []const u8, out: *std.array_list.Ma
 /// A schemaString struct's fields as basalt's, each nullable as the table's
 /// files may hold nulls anywhere; `col` names the struct in messages.
 fn structFields(arena: std.mem.Allocator, name: []const u8, col: []const u8, v: std.json.Value, depth: usize) anyerror![]const types.Type.Field {
-    if (depth >= table.max_depth) return refuse("{s} has a schemaString nested deeper than {d} levels", .{ name, table.max_depth });
+    if (depth >= types.max_nesting) return refuse("{s} has a schemaString nested deeper than {d} levels", .{ name, types.max_nesting });
     const fields = switch (try dtypes.fields(arena, v, .reading)) {
         .fields => |fs| fs,
         .problem => |p| return switch (p) {
@@ -868,7 +868,7 @@ pub fn tableType(arena: std.mem.Allocator, name: []const u8, col: []const u8, t:
 /// A schemaString type as basalt's: a primitive, a struct of its fields, an array
 /// as a list of its element and a map of its key (never null) and value.
 fn typeOf(arena: std.mem.Allocator, name: []const u8, col: []const u8, t: std.json.Value, depth: usize) anyerror!types.Type {
-    if (depth >= table.max_depth) return refuse("{s} has a schemaString nested deeper than {d} levels", .{ name, table.max_depth });
+    if (depth >= types.max_nesting) return refuse("{s} has a schemaString nested deeper than {d} levels", .{ name, types.max_nesting });
     switch (t) {
         .string => |s| return if (std.mem.eql(u8, s, "variant")) types.Type.init(.string) else primitive(name, col, s),
         .object => |o| {

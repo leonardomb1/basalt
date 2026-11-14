@@ -26,10 +26,6 @@ const stream = @import("../stream.zig");
 
 pub const Error = error{ BadAvroSchema, UnsupportedAvro, OutOfMemory };
 
-/// How deep a schema, and a value it decodes, may nest: an untrusted file is an
-/// error past it, never a stack overflow.
-pub const max_depth = 64;
-
 pub const Logical = enum { none, date, time_millis, time_micros, timestamp_millis, timestamp_micros, timestamp_nanos, decimal, uuid };
 
 pub const Node = struct {
@@ -71,7 +67,7 @@ const Parser = struct {
     fn node(self: *Parser, v: std.json.Value, space: []const u8) Error!*const Node {
         self.depth += 1;
         defer self.depth -= 1;
-        if (self.depth > max_depth) return bad("types nest deeper than {d}", .{max_depth});
+        if (self.depth > types.max_nesting) return bad("types nest deeper than {d}", .{types.max_nesting});
         return switch (v) {
             .string => |s| self.byName(s, space),
             .array => |a| self.unionOf(a.items, space),

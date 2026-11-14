@@ -648,7 +648,7 @@ fn createCol(arena: std.mem.Allocator, name: []const u8, f: types.Schema.Field, 
 /// fields, an array's element and a map's value each nullable, every primitive
 /// named as a top-level column of its type would be.
 fn createdJson(w: *std.Io.Writer, col: []const u8, t_in: types.Type, depth: usize) !void {
-    if (depth >= table.max_depth) return refuse("column `{s}` is nested deeper than {d} levels", .{ col, table.max_depth });
+    if (depth >= types.max_nesting) return refuse("column `{s}` is nested deeper than {d} levels", .{ col, types.max_nesting });
     const t = if (t_in.unknown and t_in.kind == .string) t_in.sinkType() else t_in;
     switch (t.kind) {
         .@"struct" => {
