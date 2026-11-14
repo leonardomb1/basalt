@@ -11,7 +11,6 @@ const GroupTable = Aggregate.GroupTable;
 const Layout = Aggregate.Layout;
 const Pairs = @import("pairs.zig").Pairs;
 const Value = @import("../../value.zig").Value;
-const dupeValue = @import("../aggregate.zig").dupeValue;
 const keyhash = @import("../../keyhash.zig");
 const keytable = @import("../../keytable.zig");
 const par = @import("../../par.zig");
@@ -191,7 +190,7 @@ pub const GroupMerge = struct {
                 }
                 const nr = try dst.push(h);
                 if (self.own) {
-                    for (nr.keys, sr.keys) |*o, v| o.* = try dupeValue(self.alloc, v);
+                    for (nr.keys, sr.keys) |*o, v| o.* = try v.own(self.alloc);
                 } else @memcpy(nr.keys, sr.keys);
                 try self.adoptTail(dst.payload, nr.tail, sr.tail, f.slot);
                 return f.slot;

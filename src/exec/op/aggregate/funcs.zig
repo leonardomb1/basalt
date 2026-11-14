@@ -290,7 +290,7 @@ pub fn ExtremeValue(comptime want: std.math.Order) type {
             s.v = switch (x) {
                 .string => |b| .{ .string = try keep(s, b, cx) },
                 .bytes => |b| .{ .bytes = try keep(s, b, cx) },
-                .nested => |r| .{ .nested = try @import("../../nested.zig").own(cx.alloc, r) },
+                .nested => try x.own(cx.alloc),
                 else => x,
             };
         }
@@ -305,7 +305,7 @@ pub fn ExtremeValue(comptime want: std.math.Order) type {
             if (!s.v.isNull()) try add(d, s.v, cx);
         }
         pub fn own(s: *State, cx: Ctx) !void {
-            s.v = try dupeValue(cx.alloc, s.v);
+            s.v = try s.v.own(cx.alloc);
             s.buf = switch (s.v) {
                 .string, .bytes => |b| @constCast(b),
                 else => &.{},
@@ -450,12 +450,7 @@ fn keepOf(comptime T: type) fn (T, Ctx) anyerror!T {
         fn keep(x: T, cx: Ctx) anyerror!T {
             if (T == []const u8) return cx.alloc.dupe(u8, x);
             if (T != Value) return x;
-            return switch (x) {
-                .string => |b| .{ .string = try cx.alloc.dupe(u8, b) },
-                .bytes => |b| .{ .bytes = try cx.alloc.dupe(u8, b) },
-                .nested => |r| .{ .nested = try @import("../../nested.zig").own(cx.alloc, r) },
-                else => x,
-            };
+            return x.own(cx.alloc);
         }
     }.keep;
 }
@@ -467,14 +462,14 @@ pub const AnyValue = struct {
     pub const State = struct { has: bool = false, v: Value = .null };
     pub fn add(s: *State, x: Value, cx: Ctx) !void {
         if (s.has) return;
-        s.v = try dupeValue(cx.alloc, x);
+        s.v = try x.own(cx.alloc);
         s.has = true;
     }
     pub fn merge(d: *State, s: *const State, cx: Ctx) !void {
         if (s.has) try add(d, s.v, cx);
     }
     pub fn own(s: *State, cx: Ctx) !void {
-        if (s.has) s.v = try dupeValue(cx.alloc, s.v);
+        if (s.has) s.v = try s.v.own(cx.alloc);
     }
     pub fn finish(s: *const State, _: Ctx) !Value {
         return s.v;
@@ -869,15 +864,6 @@ pub fn Spread(comptime func: ast.AggFunc, comptime exact: bool) type {
             const m2 = if (exact) (s.sq.m2(s.n) orelse s.m2) else s.m2;
             return spreadOf(func, s.n, m2);
         }
-    };
-}
-
-pub fn dupeValue(alloc: std.mem.Allocator, v: Value) !Value {
-    return switch (v) {
-        .string => |s| .{ .string = try alloc.dupe(u8, s) },
-        .bytes => |s| .{ .bytes = try alloc.dupe(u8, s) },
-        .nested => |r| .{ .nested = try @import("../../nested.zig").own(alloc, r) },
-        else => v,
     };
 }
 

@@ -704,10 +704,10 @@ pub fn GroupStore(comptime P: type) type {
             switch (copy) {
                 .alias => @memcpy(nr.keys, key),
                 .dupe => for (nr.keys, key) |*o, v| {
-                    o.* = try keyhash.ownValue(self.recs.alloc, v);
+                    o.* = try v.own(self.recs.alloc);
                 },
                 .canon => for (nr.keys, key) |*o, v| {
-                    o.* = try keyhash.ownValue(self.recs.alloc, keyhash.canonValue(v));
+                    o.* = try keyhash.canonValue(v).own(self.recs.alloc);
                 },
             }
             return nr;

@@ -243,7 +243,7 @@ pub fn ownDetached(arena: std.mem.Allocator, r: @import("value.zig").NestedRef) 
 pub fn detach(a: std.mem.Allocator, v: @import("value.zig").Value) error{OutOfMemory}!@import("value.zig").Value {
     return switch (v) {
         .nested => |r| .{ .nested = try ownDetached(a, r) },
-        else => @import("op/aggregate/funcs.zig").dupeValue(a, v),
+        else => v.own(a),
     };
 }
 

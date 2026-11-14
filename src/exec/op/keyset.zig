@@ -111,7 +111,7 @@ pub fn collect(arena: std.mem.Allocator, batches: []const Batch, cols: []const u
                     }
                     continue;
                 }
-                const o = try keyhash.ownValue(arena, v);
+                const o = try v.own(arena);
                 try seen.put(o, {});
                 try vals.append(o);
             }

@@ -562,7 +562,7 @@ fn metaShortcut(env: *Env, stages: []const ast.Stage) anyerror!?PipeRes {
                 const arg = ra.arg orelse return null;
                 if (arg.* != .field) return null;
                 const mm = pqdecode.fileMinMax(rdr, arg.field.last()) orelse return null;
-                out.* = try op.dupeValue(env.arena, if (ra.func == .min) mm.min else mm.max);
+                out.* = try (if (ra.func == .min) mm.min else mm.max).own(env.arena);
             },
             else => return null,
         }

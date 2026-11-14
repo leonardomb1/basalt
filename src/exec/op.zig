@@ -445,7 +445,6 @@ pub const SortPart = @import("op/sort.zig").Part;
 pub const TopN = @import("op/topn.zig").TopN;
 pub const keyOrder = @import("op/sort.zig").keyOrder;
 pub const Aggregate = @import("op/aggregate.zig").Aggregate;
-pub const dupeValue = @import("op/aggregate.zig").dupeValue;
 pub var join_build_byte_cap: usize = 4 << 30;
 pub const KeyClass = @import("op/join.zig").KeyClass;
 pub const JoinIndex = @import("op/join.zig").JoinIndex;

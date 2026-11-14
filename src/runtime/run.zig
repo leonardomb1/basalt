@@ -453,7 +453,7 @@ fn runScalarLet(env: *Env, l: ast.LetConst, of_explain: bool) !void {
     var cur = pipe.op;
     while (try cur.next(scratch.allocator())) |b| {
         if (b.len > 0 and rows == 0) {
-            v = try op.dupeValue(env.arena, b.columns[0].getValue(0));
+            v = try b.columns[0].getValue(0).own(env.arena);
         }
         rows += b.len;
         if (rows > 1)

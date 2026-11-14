@@ -412,6 +412,7 @@ pub const plan = [_]Rule{
     .{ .home = "ast.mk", .pattern = expr_alloc_pattern, .exact = true, .allow = &.{"lang/ast.zig"} },
     .{ .home = "ast.fieldsOf", .pattern = fields_of_pattern, .exact = true, .allow = &.{"lang/ast.zig"} },
     .{ .home = "varint", .pattern = varint_pattern, .exact = true, .allow = &.{"format/varint.zig"} },
+    .{ .home = "Value.own", .pattern = own_value_pattern, .exact = true, .allow = &.{"exec/value.zig"} },
     .{ .home = "csv.Quoting", .pattern = csv_quote_pattern, .under = "format/", .exact = true, .allow = &.{"format/csv.zig"} },
     .{ .home = "hoist.projectedFrom", .pattern = projected_pattern, .exact = true, .allow = &.{"runtime/pushdown/hoist.zig"} },
     .{ .home = "ast.splitAnd", .pattern = split_and_pattern, .exact = true, .allow = &.{
@@ -473,6 +474,7 @@ pub const big_endian_pattern = "acc = \\(acc << 8\\) \\|";
 pub const expr_alloc_pattern = "create\\((ast\\.)?Expr\\)";
 pub const fields_of_pattern = "\\.append\\(n\\.field\\)|try cx\\.list\\.append\\(e\\.field\\)";
 pub const varint_pattern = "0x7[Ff]\\) <<";
+pub const own_value_pattern = "\\.string => \\|\\w+\\| \\.\\{ \\.string = try \\w+\\.dupe\\(u8, \\w+\\) \\}";
 pub const csv_quote_pattern = "\\[\\w+ \\+ 1\\] == '\"'";
 pub const projected_pattern = "\\.to, name\\)";
 pub const split_and_pattern = "\\.binary\\.op == \\.@\"and\"\\) \\{";

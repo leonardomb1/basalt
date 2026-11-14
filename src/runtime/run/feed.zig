@@ -134,10 +134,7 @@ fn largest(env: *Env, w: ast.Write, pos: ast.Pos, col: []const u8, opts: RunOpti
         });
     };
     const ms = try runToMemory(env, opts, stages, "$since", lanes_used, batch_arena);
-    for (ms.batches.items) |b| if (b.len > 0) return switch (b.columns[0].getValue(0)) {
-        .string => |s| .{ .string = try a.dupe(u8, s) },
-        else => |v| v,
-    };
+    for (ms.batches.items) |b| if (b.len > 0) return b.columns[0].getValue(0).own(a);
     return .null;
 }
 

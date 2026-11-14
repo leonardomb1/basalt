@@ -127,7 +127,6 @@ pub const Aggregate = struct {
 };
 
 pub const selectNth = @import("aggregate/funcs.zig").selectNth;
-pub const dupeValue = @import("aggregate/funcs.zig").dupeValue;
 
 test {
     _ = @import("aggregate/spill.zig");

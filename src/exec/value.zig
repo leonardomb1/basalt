@@ -13,6 +13,7 @@
 //! must be strict, since a region whose extreme equals the bound may hold ties.
 
 pub const Decimal = @import("decimal.zig").Decimal;
+const std = @import("std");
 
 pub const Threshold = struct {
     column: []const u8 = "",
@@ -35,6 +36,17 @@ pub const Value = union(enum) {
     timestamp: i64,
     nested: NestedRef,
 
+    /// `self` with its text, bytes or nested storage copied into `a`, so it outlives
+    /// the batch it was read from.
+    pub fn own(self: Value, a: std.mem.Allocator) error{OutOfMemory}!Value {
+        return switch (self) {
+            .string => |s| .{ .string = try a.dupe(u8, s) },
+            .bytes => |s| .{ .bytes = try a.dupe(u8, s) },
+            .nested => |r| .{ .nested = try @import("nested.zig").own(a, r) },
+            else => self,
+        };
+    }
+
     pub fn isNull(self: Value) bool {
         return self == .null;
     }
@@ -42,5 +54,5 @@ pub const Value = union(enum) {
 
 /// Row `row` of a nested column's storage, borrowed: valid while the batch that
 /// holds `node` is. Whatever keeps a value past its batch copies it
-/// (`Builder.append`, `dupeValue`).
+/// (`Builder.append`, `Value.own`).
 pub const NestedRef = struct { node: *const @import("column.zig").Nested, row: usize };

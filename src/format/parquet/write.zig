@@ -484,8 +484,8 @@ const ColBuf = struct {
             self.max = null;
             return;
         }
-        if (self.min == null or (eval.compareValues(v, self.min.?) orelse .eq) == .lt) self.min = try own(arena, v);
-        if (self.max == null or (eval.compareValues(v, self.max.?) orelse .eq) == .gt) self.max = try own(arena, v);
+        if (self.min == null or (eval.compareValues(v, self.min.?) orelse .eq) == .lt) self.min = try v.own(arena);
+        if (self.max == null or (eval.compareValues(v, self.max.?) orelse .eq) == .gt) self.max = try v.own(arena);
     }
 
     fn pushBit(self: *ColBuf, b: bool) !void {
@@ -508,15 +508,7 @@ const ColBuf = struct {
 };
 
 fn ownOpt(arena: std.mem.Allocator, v: ?Value) !?Value {
-    return if (v) |x| try own(arena, x) else null;
-}
-
-fn own(arena: std.mem.Allocator, v: Value) !Value {
-    return switch (v) {
-        .string => |x| .{ .string = try arena.dupe(u8, x) },
-        .bytes => |x| .{ .bytes = try arena.dupe(u8, x) },
-        else => v,
-    };
+    return if (v) |x| try x.own(arena) else null;
 }
 
 const ChunkMeta = struct {
@@ -898,8 +890,8 @@ pub const Writer = struct {
                 c.bounded = false;
                 continue;
             };
-            if (c.min == null or (eval.compareValues(mn, c.min.?) orelse .eq) == .lt) c.min = try own(out, mn);
-            if (c.max == null or (eval.compareValues(mx, c.max.?) orelse .eq) == .gt) c.max = try own(out, mx);
+            if (c.min == null or (eval.compareValues(mn, c.min.?) orelse .eq) == .lt) c.min = try mn.own(out);
+            if (c.max == null or (eval.compareValues(mx, c.max.?) orelse .eq) == .gt) c.max = try mx.own(out);
         }
         if (!c.bounded) {
             c.min = null;

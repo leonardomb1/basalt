@@ -182,16 +182,6 @@ pub fn valueEq(a: Value, b: Value) bool {
     };
 }
 
-/// A text, bytes or nested value copied into `a`, out of a batch that may be freed.
-pub fn ownValue(a: std.mem.Allocator, v: Value) !Value {
-    return switch (v) {
-        .string => |s| .{ .string = try a.dupe(u8, s) },
-        .bytes => |s| .{ .bytes = try a.dupe(u8, s) },
-        .nested => |r| .{ .nested = try @import("nested.zig").own(a, r) },
-        else => v,
-    };
-}
-
 /// The running MIN and MAX of the non-null values folded, in `compareValues` order,
 /// owned in the fold's allocator. A NaN is kept apart (`nan`, the first one seen), so
 /// `min`/`max` bound the other values; `lo`/`hi` are the total order's own answer,
@@ -207,8 +197,8 @@ pub const MinMax = struct {
             if (self.nan == null) self.nan = v.float;
             return;
         }
-        if (self.min == null or (eval.compareValues(v, self.min.?) orelse .eq) == .lt) self.min = try ownValue(a, v);
-        if (self.max == null or (eval.compareValues(v, self.max.?) orelse .eq) == .gt) self.max = try ownValue(a, v);
+        if (self.min == null or (eval.compareValues(v, self.min.?) orelse .eq) == .lt) self.min = try v.own(a);
+        if (self.max == null or (eval.compareValues(v, self.max.?) orelse .eq) == .gt) self.max = try v.own(a);
     }
 
     pub fn lo(self: MinMax) ?Value {

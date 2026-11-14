@@ -98,8 +98,8 @@ pub const Bounds = struct {
 
     fn widen(self: *Bounds, a: std.mem.Allocator, j: usize, v: Value) !void {
         if (v == .null) return;
-        if (self.lo[j] == .null or before(v, self.lo[j])) self.lo[j] = try own(a, v);
-        if (self.hi[j] == .null or before(self.hi[j], v)) self.hi[j] = try own(a, v);
+        if (self.lo[j] == .null or before(v, self.lo[j])) self.lo[j] = try v.own(a);
+        if (self.hi[j] == .null or before(self.hi[j], v)) self.hi[j] = try v.own(a);
     }
 
     /// Whether a file with these partition values and statistics may hold a key
@@ -138,14 +138,6 @@ pub const Bounds = struct {
 
 fn before(a: Value, b: Value) bool {
     return (pqstats.cmp(a, b) orelse return false) == .lt;
-}
-
-fn own(a: std.mem.Allocator, v: Value) !Value {
-    return switch (v) {
-        .string => |s| .{ .string = try a.dupe(u8, s) },
-        .bytes => |s| .{ .bytes = try a.dupe(u8, s) },
-        else => v,
-    };
 }
 
 /// The files an UPSERT rewrote and the ones it read, for its commit.
