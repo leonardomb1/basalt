@@ -64,16 +64,9 @@ pub const Cursor = struct {
     }
 
     fn longUnrolled(c: *Cursor) Error!i64 {
-        const b = c.buf[c.pos..][0..10];
-        var v: u64 = 0;
-        inline for (0..10) |i| {
-            v |= @as(u64, b[i] & 0x7F) << @as(u6, 7 * i);
-            if (b[i] < 0x80) {
-                c.pos += i + 1;
-                return varint.unzigzag(v);
-            }
-        }
-        return short();
+        const t = varint.readTen(c.buf[c.pos..][0..10]) orelse return short();
+        c.pos += t.len;
+        return varint.unzigzag(t.v);
     }
 
     pub fn int(c: *Cursor) Error!i32 {

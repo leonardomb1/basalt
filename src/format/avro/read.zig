@@ -74,18 +74,11 @@ fn ended(e: std.Io.Reader.Error, comptime what: []const u8) Error {
 /// The zigzag varint at the stream's position; null when the stream ends before its
 /// first byte and `at_end` allows it.
 fn takeLong(in: *std.Io.Reader, comptime what: []const u8, at_end: bool) Error!?i64 {
-    var v: u64 = 0;
-    var shift: u7 = 0;
-    while (true) {
-        const b = in.takeByte() catch |e| {
-            if (at_end and shift == 0 and e == error.EndOfStream) return null;
-            return ended(e, what);
-        };
-        v |= @as(u64, b & 0x7F) << @intCast(shift);
-        if (b & 0x80 == 0) return varint.unzigzag(v);
-        shift += 7;
-        if (shift > 63) return corrupt("a number in " ++ what ++ " runs past ten bytes", .{});
-    }
+    const v = varint.take(in) catch |e| switch (e) {
+        error.CorruptVarint => return corrupt("a number in " ++ what ++ " runs past ten bytes", .{}),
+        error.EndOfStream, error.ReadFailed => |x| return ended(x, what),
+    } orelse return if (at_end) null else ended(error.EndOfStream, what);
+    return varint.unzigzag(v);
 }
 
 fn takeBytes(in: *std.Io.Reader, arena: std.mem.Allocator, comptime what: []const u8) Error![]u8 {
