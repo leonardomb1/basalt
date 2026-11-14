@@ -980,6 +980,10 @@ pub const Writer = struct {
         return .{ .ptr = self, .vtable = &sink_vtable };
     }
 
+    /// The rows a parallel run's unit should hold: a row group's, twice what a unit
+    /// waits for before it encodes on its lane rather than on the writer's thread.
+    pub const unit_rows = row_group_rows;
+
     pub fn openUnit(self: *Writer, arena: std.mem.Allocator) !driver.UnitEncoder {
         const u = try arena.create(UnitEnc);
         u.* = .{ .parent = self, .arena = arena, .held = List(Batch).init(arena) };

@@ -36,6 +36,8 @@ const max_csv_morsels: usize = 1 << 16;
 
 const coarse_min: usize = 32;
 
+const head_bytes: usize = 1 << 20;
+
 pub const Morsels = union(enum) {
     csv: struct { mapped: *csv.MappedCsv, schema: *const types.Schema, count: usize },
     parquet: PqMorsels,
@@ -52,6 +54,22 @@ pub const Morsels = union(enum) {
     pub fn coarser(self: *const Morsels) Morsels {
         var m = self.*;
         if (m == .csv and m.csv.count / 4 >= coarse_min) m.csv.count /= 4;
+        return m;
+    }
+
+    /// A file cut so a range holds about `rows` rows, judged by the bytes a row takes in
+    /// the file's first `head_bytes`, for a sink that encodes each unit on the lane that
+    /// read it; never finer than it was, nor under `coarse_min` ranges unless it already
+    /// was. The cut stays the file's alone, not -j's.
+    pub fn perUnit(self: *const Morsels, rows: usize) Morsels {
+        var m = self.*;
+        if (m != .csv) return m;
+        const body = m.csv.mapped.body;
+        const head = body[0..@min(body.len, head_bytes)];
+        const lines = std.mem.count(u8, head, "\n");
+        if (lines == 0) return m;
+        const want = body.len / @max(rows * (head.len / lines), 1) + 1;
+        m.csv.count = std.math.clamp(want, @min(coarse_min, m.csv.count), m.csv.count);
         return m;
     }
 

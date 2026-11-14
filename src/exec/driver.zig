@@ -176,11 +176,14 @@ pub const Sink = struct {
         renderBatch: ?*const fn (*anyopaque, std.mem.Allocator, Batch) anyerror![]const u8 = null,
         writeRendered: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
         openUnit: ?*const fn (*anyopaque, std.mem.Allocator) anyerror!UnitEncoder = null,
+        /// The rows a unit should hold for `openUnit` to encode it on its lane.
+        unit_rows: usize = 0,
     };
 
-    /// Whether the sink encodes an ordered unit on the lane that read it (`openUnit`).
-    pub fn encodesUnits(self: Sink) bool {
-        return self.vtable.openUnit != null;
+    /// The rows a unit should hold when the sink encodes an ordered unit on the lane
+    /// that read it (`openUnit`), else 0.
+    pub fn unitRows(self: Sink) usize {
+        return if (self.vtable.openUnit != null) @max(self.vtable.unit_rows, 1) else 0;
     }
 
     pub fn openUnit(self: Sink, arena: std.mem.Allocator) ?anyerror!UnitEncoder {
@@ -279,6 +282,7 @@ pub fn sinkVTable(comptime T: type) Sink.VTable {
                 return @as(*T, @ptrCast(@alignCast(p))).openUnit(arena);
             }
         }.f else null,
+        .unit_rows = if (@hasDecl(T, "unit_rows")) T.unit_rows else 0,
         .writeBatch = struct {
             fn f(p: *anyopaque, arena: std.mem.Allocator, b: Batch) anyerror!void {
                 return @as(*T, @ptrCast(@alignCast(p))).writeBatch(arena, b);
