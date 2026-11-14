@@ -5,7 +5,7 @@
 //! statistic's value goes through the same kernel into `One`.
 
 const Decimal = @import("../../exec/value.zig").Decimal;
-const Dec64 = @import("../../exec/decimal.zig").Dec64;
+const Dec64 = @import("../../base/decimal.zig").Dec64;
 const Value = @import("../../exec/value.zig").Value;
 const Error = @import("read.zig").Error;
 const Levels = struct {
@@ -22,13 +22,13 @@ const decodeDeltaByteArray = @import("encoding.zig").decodeDeltaByteArray;
 const decodeDeltaLengthByteArray = @import("encoding.zig").decodeDeltaLengthByteArray;
 const decodeRleHybrid = @import("encoding.zig").decodeRleHybrid;
 const int96Wrapping = @import("encoding.zig").int96Wrapping;
-const civil = @import("../../exec/civil.zig");
+const civil = @import("../../base/civil.zig");
 const parquet = @import("footer.zig");
 const std = @import("std");
 const temporalTick = @import("logical.zig").temporalTick;
 const types = @import("../../lang/types.zig");
 const unsignedBits = @import("logical.zig").unsignedBits;
-const decimal = @import("../../exec/decimal.zig");
+const decimal = @import("../../base/decimal.zig");
 const bigEndianDecimal = decimal.bigEndianDecimal;
 const eval = @import("../../exec/eval.zig");
 const Reader = @import("read.zig").Reader;

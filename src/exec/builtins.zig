@@ -23,6 +23,11 @@ pub const table = &eval.builtins;
 
 pub const lookup = eval.lookupBuiltin;
 
+/// Whether `name` is a scalar builtin, the check `lang/expand.zig` is handed.
+pub fn isBuiltin(name: []const u8) bool {
+    return lookup(name) != null;
+}
+
 test "builtins: every entry has a unique name and resolves through lookup" {
     for (table, 0..) |b, i| {
         for (table[0..i]) |prev| try std.testing.expect(!std.mem.eql(u8, prev.name, b.name));

@@ -17,14 +17,15 @@
 //! The data connection is opened before RETR and drained before the final reply
 //! is read, which some servers need to send it. A 4xx reply is transient, a 5xx
 //! permanent (550 is a missing file); both carry the server's text in the thread's
-//! `driver.LoginNote`.
+//! `netconn.LoginNote`.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
-const driver = @import("../connect/driver.zig");
+const msgfmt = @import("../base/msgfmt.zig");
+const driver = @import("../exec/driver.zig");
+const netconn = @import("../net/conn.zig");
 const remotefs = @import("remotefs.zig");
 const scheme = @import("scheme.zig");
-const percentDecode = @import("../net/percent.zig").decode;
+const percentDecode = @import("../base/percent.zig").decode;
 
 pub const default_port = 21;
 const timeout_s = 60;
@@ -85,7 +86,7 @@ pub fn parseUrl(arena: std.mem.Allocator, url: []const u8) !Url {
 }
 
 /// A refusal by its code: 4xx is worth retrying, 530 is the login, 550 a missing
-/// file or folder. The reply, as `550 text`, is the thread's `driver.LoginNote`.
+/// file or folder. The reply, as `550 text`, is the thread's `netconn.LoginNote`.
 fn refusal(code: u16, text: []const u8) anyerror {
     const e: anyerror = if (code >= 400 and code < 500)
         error.FtpServerBusy
@@ -95,7 +96,7 @@ fn refusal(code: u16, text: []const u8) anyerror {
         error.FileNotFound
     else
         error.FtpRefused;
-    driver.explainf(e, "{d} {s}", .{ code, text });
+    netconn.explainf(e, "{d} {s}", .{ code, text });
     return e;
 }
 
@@ -112,7 +113,7 @@ pub const Session = struct {
     text_buf: [256]u8 = undefined,
 
     pub fn open(gpa: std.mem.Allocator, u: Url) !*Session {
-        const stream = try driver.dial(gpa, u.host, u.port, .{ .io_timeout_s = timeout_s });
+        const stream = try netconn.dial(gpa, u.host, u.port, .{ .io_timeout_s = timeout_s });
         errdefer stream.close();
         const self = try gpa.create(Session);
         errdefer gpa.destroy(self);
@@ -175,7 +176,7 @@ pub const Session = struct {
             if (p.code != 227) return refusal(p.code, p.text);
             break :blk pasvPort(p.text) orelse return error.FtpProtocol;
         };
-        return driver.dial(self.gpa, self.host, port, .{ .io_timeout_s = timeout_s });
+        return netconn.dial(self.gpa, self.host, port, .{ .io_timeout_s = timeout_s });
     }
 
     /// Opens the data connection, sends `verb path`, and returns it once the
@@ -235,7 +236,7 @@ pub const Session = struct {
             while (it.next()) |l| if (mlsdEntry(l)) |en| try out.append(en);
             return out.items;
         }
-        driver.clearNote();
+        netconn.clearNote();
         const data = try self.transfer("NLST", path);
         const body = try drain(arena, data);
         try self.finish();
@@ -332,7 +333,7 @@ pub fn localize(arena: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
 
 fn fetch(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
     const gpa = std.heap.page_allocator;
-    driver.clearNote();
+    netconn.clearNote();
     const u = try parseUrl(arena, url);
     if (local.dir == null) {
         const base = std.process.getEnvVarOwned(arena, "TMPDIR") catch try arena.dupe(u8, "/tmp");
@@ -387,7 +388,7 @@ const Lister = struct {
 };
 
 fn note(e: anyerror, text: []const u8) anyerror {
-    driver.explain(e, text);
+    netconn.explain(e, text);
     return e;
 }
 
@@ -684,7 +685,7 @@ test "PASV's advertised host is ignored, a folder is walked by NLST and CWD with
     try std.testing.expectEqualStrings("x\n9\n", try readLocal(a, p));
     try expectFolder(a, try localize(a, srv.url(&ub, "/d/")));
     try std.testing.expectError(error.FileNotFound, localize(a, srv.url(&ub, "/nope.csv")));
-    try std.testing.expectEqualStrings("550 No such file or directory", driver.noteFor(error.FileNotFound));
+    try std.testing.expectEqualStrings("550 No such file or directory", netconn.noteFor(error.FileNotFound));
 }
 
 test "the downloads stay until the last of two overlapping runs ends" {

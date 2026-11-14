@@ -10,14 +10,14 @@ const Error = @import("../analyze.zig").Error;
 const ast = @import("../../lang/ast.zig");
 const env_mod = @import("../env.zig");
 const fail = @import("../analyze.zig").fail;
-const registry = @import("../../connect/registry.zig");
+const registry = @import("../connect/registry.zig");
 const schema = @import("../connect/options_schema.zig");
 const http_client = @import("../../net/http_client.zig");
 const httpAttrUsed = @import("../connect.zig").httpAttrUsed;
 const sql = @import("../../db/sql.zig");
 const textconv = @import("../../exec/textconv.zig");
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const streamload = @import("../../db/streamload.zig");
 
 const sftp_keys = schema.keyNames(&schema.sftp);

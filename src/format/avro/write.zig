@@ -23,7 +23,7 @@
 
 const std = @import("std");
 const pagecache = @import("../../exec/pagecache.zig");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Value = @import("../../exec/value.zig").Value;
@@ -31,16 +31,17 @@ const Column = @import("../../exec/column.zig").Column;
 const decimals = @import("../../exec/column.zig").decimals;
 const codecs = @import("../compress/codecs.zig");
 const deflate = @import("../compress/deflate.zig");
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const jsontext = @import("../../exec/jsontext.zig");
 const column_mod = @import("../../exec/column.zig");
-const civil = @import("../../exec/civil.zig");
+const civil = @import("../../base/civil.zig");
 const read = @import("read.zig");
 const schema_mod = @import("schema.zig");
 const stream = @import("../stream.zig");
-const varint = @import("../varint.zig");
+const varint = @import("../../base/varint.zig");
 const eval = @import("../../exec/eval.zig");
-const decimal = @import("../../exec/decimal.zig");
+const decimal = @import("../../base/decimal.zig");
+const decimal_ops = @import("../../exec/decimal_ops.zig");
 const Decimal = @import("../../exec/value.zig").Decimal;
 const pow10_i128 = decimal.pow10_i128;
 const Output = @import("../output.zig").Output;
@@ -288,7 +289,7 @@ fn nestedBody(out: *std.array_list.Managed(u8), col: *const Column, row: usize) 
 /// than the schema's precision fails naming the column, as a reader would refuse it.
 fn decimalBytes(out: *std.array_list.Managed(u8), d: Decimal, f: types.Schema.Field) !void {
     const p = precisionOf(f.ty);
-    const exact = decimal.exactAt(d, f.ty.scale) catch return decimal.dropsDigitsFailure(f.name, f.ty);
+    const exact = decimal.exactAt(d, f.ty.scale) catch return decimal_ops.dropsDigitsFailure(f.name, f.ty);
     const r = exact orelse return decimalTooWide(f, p);
     if (!decimal.withinPrecision(r.unscaled, p)) return decimalTooWide(f, p);
     const be = decimal.minimalBigEndian(r.unscaled);

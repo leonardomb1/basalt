@@ -12,7 +12,7 @@
 //! `full` (the heap holds K entries) every region can contribute, and comparisons
 //! must be strict, since a region whose extreme equals the bound may hold ties.
 
-pub const Decimal = @import("decimal.zig").Decimal;
+pub const Decimal = @import("../base/decimal.zig").Decimal;
 const std = @import("std");
 
 pub const Threshold = struct {

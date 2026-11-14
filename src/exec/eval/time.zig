@@ -5,7 +5,7 @@
 const EvalError = @import("../eval.zig").EvalError;
 const Value = @import("../value.zig").Value;
 const std = @import("std");
-const civil = @import("../civil.zig");
+const civil = @import("../../base/civil.zig");
 
 pub const TimeUnit = civil.Part;
 const formatTimestamp = @import("format.zig").formatTimestamp;

@@ -11,13 +11,13 @@ const options = @import("../analyze/options.zig");
 const ast = @import("../../lang/ast.zig");
 const azure = @import("../../store/azure.zig");
 const connectWhy = @import("dbconfig.zig").connectWhy;
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const env_mod = @import("../env.zig");
 const eval = @import("../../exec/eval.zig");
 const RunCfg = @import("register.zig").RunCfg;
-const folder = @import("../../connect/folder.zig");
+const folder = @import("../../store/folder.zig");
 const ftp = @import("../../store/ftp.zig");
-const gen = @import("../../connect/gen.zig");
+const gen = @import("../../exec/gen.zig");
 const guardFileFormat = @import("sink.zig").guardFileFormat;
 const httpAttrUsed = @import("../connect.zig").httpAttrUsed;
 const http_client = @import("../../net/http_client.zig");
@@ -35,9 +35,9 @@ const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const sqlDescFor = @import("sql_read.zig").sqlDescFor;
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const types = @import("../../lang/types.zig");
-const table_builtins = @import("../../connect/table_builtins.zig");
+const table_builtins = @import("table_builtins.zig");
 const formats = @import("../../format/formats.zig");
 const formats_open = @import("formats_open.zig");
 const lake = @import("../../format/lake/table.zig");
@@ -46,8 +46,9 @@ const observe = @import("observe.zig");
 const op = @import("../../exec/op.zig");
 const readLabel = @import("../connect.zig").readLabel;
 const changes = @import("changes.zig");
-const trace = @import("../../connect/trace.zig");
+const trace = @import("../../base/iotrace.zig");
 const scheme = @import("../../store/scheme.zig");
+const urls = @import("../../base/url.zig");
 
 pub const ConstSource = struct {
     batch: Batch,
@@ -229,7 +230,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         if (try http_client.optionProblem(env.arena, hints, false, true)) |p| return planErr(env.diag, p.msg);
         var hopts = try http_client.optsFromHints(env.arena, hints);
         hopts.logger = env.log;
-        const req = if (env.profile != null) try noteRequest(env, rd, hints, try msgfmt.allocPrint(env.arena, "{f}", .{scheme.fmtShown(rd.form.path)})) else null;
+        const req = if (env.profile != null) try noteRequest(env, rd, hints, try msgfmt.allocPrint(env.arena, "{f}", .{urls.fmtShown(rd.form.path)})) else null;
         if (req) |r| hopts.page_count = &r.pages;
         const clock = observe.Clock.start();
         const s = http_client.HttpSource.open(env.arena, env.gpa, rd.form.path, hopts) catch |e|
@@ -273,7 +274,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         var hopts = try http_client.optsFromHints(env.arena, all);
         hopts.logger = env.log;
         const path = try http_client.withQuery(env.arena, rd.form.path, try queryParams(env.arena, all));
-        const req = if (env.profile != null) try noteRequest(env, rd_eff, hints, try msgfmt.allocPrint(env.arena, "{f}", .{scheme.fmtShown(path)})) else null;
+        const req = if (env.profile != null) try noteRequest(env, rd_eff, hints, try msgfmt.allocPrint(env.arena, "{f}", .{urls.fmtShown(path)})) else null;
         if (req) |r| hopts.page_count = &r.pages;
         const clock = observe.Clock.start();
         const s = http_client.HttpSource.openConn(env.arena, env.gpa, cc, path, hopts) catch |e|
@@ -374,9 +375,9 @@ fn httpOpenFailed(env: *Env, e: anyerror, url: []const u8) anyerror {
 pub fn builtinArgs(env: *Env, call: ast.BuiltinRead) ![]Value {
     const b = table_builtins.of(call);
     const vals = try env.arena.alloc(Value, call.args.len);
-    for (call.args, b.args[0..call.args.len], vals) |e, kind, *v| {
+    for (call.args, b.sig.args[0..call.args.len], vals) |e, kind, *v| {
         const r = try analyze.substExpr(env.arena, e, env.params_expr);
-        v.* = try table_builtins.argValue(env.arena, kind, r) orelse return planErr(env.diag, b.arg_msg);
+        v.* = try table_builtins.argValue(env.arena, kind, r) orelse return planErr(env.diag, b.sig.arg_msg);
     }
     return vals;
 }

@@ -15,7 +15,7 @@
 //! and may not climb out of it; it can never include a local path.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 
 pub const Spec = struct {
     host: []const u8,

@@ -7,8 +7,8 @@ const Pos = @import("../sql_parser.zig").Pos;
 const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
-const table_builtins = @import("../../connect/table_builtins.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
+const table_builtins = @import("../table_builtins.zig");
 const types = @import("../types.zig");
 
 pub fn parseConnection(self: *Parser, pos: Pos) Error!ast.Connection {

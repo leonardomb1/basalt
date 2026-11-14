@@ -40,12 +40,13 @@ const Space = @import("../../exec/space.zig").Space;
 const Value = @import("../../exec/value.zig").Value;
 const cast = @import("../../exec/eval/cast.zig");
 const ast = @import("../../lang/ast.zig");
-const decimal = @import("../../exec/decimal.zig");
+const decimal = @import("../../base/decimal.zig");
+const decimal_ops = @import("../../exec/decimal_ops.zig");
 const column = @import("../../exec/column.zig");
 const delta = @import("delta.zig");
 const dlog = @import("delta_log.zig");
 const dtypes = @import("delta_types.zig");
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const fit = @import("../parquet/fit.zig");
 const dvs = @import("delta_dv.zig");
@@ -54,7 +55,7 @@ const vcol = @import("variant_col.zig");
 const fmtnum = @import("../../exec/eval/format.zig");
 const join = @import("../../exec/op/join.zig");
 const minmax = @import("../../exec/minmax.zig");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const op = @import("../../exec/op.zig");
 const pqstats = @import("../parquet/stats.zig");
 const spill = @import("../../exec/spill.zig");
@@ -305,7 +306,7 @@ pub const Merge = struct {
                 continue;
             }
             const exact = decimal.exactAt(v.decimal, c.ty.scale) catch
-                return decimal.dropsDigitsFailure(c.name, c.ty);
+                return decimal_ops.dropsDigitsFailure(c.name, c.ty);
             const d = exact orelse
                 return self.fail(write.Error.DeltaValueOutOfRange, "column `{s}` is `{s}` in {s}, which cannot hold a value of the rows' scale {d}", .{ c.name, c.delta_type, self.plan.name, v.decimal.scale });
             try bd.append(.{ .decimal = d });

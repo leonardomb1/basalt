@@ -56,7 +56,7 @@
 //! `write.zig` is the writer, `footer.zig` the file metadata, `thrift.zig` its codec.
 
 const std = @import("std");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const parquet = @import("footer.zig");
 const types = @import("../../lang/types.zig");
 const column = @import("../../exec/column.zig");
@@ -124,7 +124,7 @@ const chunkEnd = @import("folder.zig").chunkEnd;
 const chunkBoundaries = @import("folder.zig").chunkBoundaries;
 const parseFooterOf = @import("folder.zig").parseFooterOf;
 
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 
 pub const Output = union(enum) {

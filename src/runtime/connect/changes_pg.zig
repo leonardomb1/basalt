@@ -29,11 +29,11 @@ const types = @import("../../lang/types.zig");
 const column = @import("../../exec/column.zig");
 const cell = @import("../../exec/cell.zig");
 const sql = @import("../../db/sql.zig");
-const split = @import("../../connect/split.zig");
-const msgfmt = @import("../../format/msgfmt.zig");
+const split = @import("split.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const fmtnum = @import("../../exec/eval/format.zig");
 const pgType = @import("../../db/postgres.zig").pgType;
-const hex = @import("../../format/hex.zig");
+const hex = @import("../../base/hex.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Env = @import("../env.zig").Env;
 const SqlConnInfo = @import("../connect.zig").SqlConnInfo;
@@ -427,7 +427,7 @@ pub const Decoder = struct {
     }
 };
 
-const Reader = @import("../../format/cursor.zig").Reader(.big, error.CorruptChangeStream);
+const Reader = @import("../../base/cursor.zig").Reader(.big, error.CorruptChangeStream);
 
 const Msg = struct {
     buf: std.array_list.Managed(u8),

@@ -67,7 +67,7 @@ const lexer = @import("sql_lexer.zig");
 const ast = @import("ast.zig");
 pub const ColUses = @import("parse/textcols.zig").ColUses;
 const quote = @import("quote.zig");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const types = @import("types.zig");
 
 pub const Token = token.Token;

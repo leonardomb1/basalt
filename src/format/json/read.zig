@@ -24,11 +24,12 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const Value = @import("../../exec/value.zig").Value;
 const column = @import("../../exec/column.zig");
 const cell = @import("../../exec/cell.zig");
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const jt = @import("../../exec/json.zig");
 const stream = @import("../stream.zig");
 const std = @import("std");
+const filemap = @import("../../base/filemap.zig");
 const types = @import("../../lang/types.zig");
 
 pub const Error = error{ InvalidJson, JsonPastSample, OutOfMemory } || std.Io.Reader.ShortError;
@@ -297,7 +298,7 @@ pub const Scan = struct {
     const release_every = 4 << 20;
 
     /// A scan of `text`, a slice of a file mapping read in place: nothing is copied,
-    /// and the pages behind the scan are released as it goes (`stream.release`).
+    /// and the pages behind the scan are released as it goes (`filemap.dropPages`).
     pub fn ofMapped(gpa: std.mem.Allocator, text: []const u8) Scan {
         var sc = Scan{ .in = null, .gpa = gpa, .chunk = 0, .eof = true, .mapped = true };
         sc.buf.items = @constCast(text);
@@ -385,7 +386,7 @@ pub const Scan = struct {
             if (valueEnd(t, self.eof)) |end| {
                 self.at += end;
                 if (self.mapped and self.at - self.released >= release_every) {
-                    stream.release(self.buf.items[self.released..self.at]);
+                    filemap.dropPages(self.buf.items[self.released..self.at]);
                     self.released = self.at;
                 }
                 return t[0..end];

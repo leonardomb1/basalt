@@ -39,12 +39,12 @@
 
 const std = @import("std");
 const HttpClient = @import("../net/http_std.zig");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const objstore = @import("objstore.zig");
-const percent = @import("../net/percent.zig");
+const percent = @import("../base/percent.zig");
 const scheme = @import("scheme.zig");
 const http_fake = @import("../testing/http_fake.zig");
-const civil = @import("../exec/civil.zig");
+const civil = @import("../base/civil.zig");
 
 pub const api_version = "2021-08-06";
 

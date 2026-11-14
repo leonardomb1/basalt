@@ -27,13 +27,13 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const column = @import("../../exec/column.zig");
 const codecs = @import("../compress/codecs.zig");
 const conform = @import("../../lang/conform.zig");
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const decode = @import("decode.zig");
 const schema_mod = @import("schema.zig");
 const std = @import("std");
 const stream = @import("../stream.zig");
 const types = @import("../../lang/types.zig");
-const varint = @import("../varint.zig");
+const varint = @import("../../base/varint.zig");
 
 pub const Node = schema_mod.Node;
 

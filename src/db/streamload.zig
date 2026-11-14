@@ -39,22 +39,23 @@
 
 const std = @import("std");
 const HttpClient = @import("../net/http_std.zig");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const explain = @import("../exec/eval/support.zig").explain;
 const types = @import("../lang/types.zig");
 const ast = @import("../lang/ast.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const Column = @import("../exec/column.zig").Column;
 const celltext = @import("../exec/celltext.zig");
-const driver = @import("../connect/driver.zig");
-const retry = @import("../connect/retry.zig");
+const driver = @import("../exec/driver.zig");
+const netconn = @import("../net/conn.zig");
+const retry = @import("../net/retry.zig");
 const mysql = @import("mysql.zig");
 const sql = @import("sql.zig");
-const obs = @import("../runtime/obs.zig");
+const obs = @import("../exec/obs.zig");
 const op = @import("../exec/op.zig");
 const Space = @import("../exec/space.zig").Space;
 const deflate = @import("../format/compress/deflate.zig");
-const percent = @import("../net/percent.zig");
+const percent = @import("../base/percent.zig");
 
 const TIMEOUT_S = 600;
 const MAX_AGE_NS = TIMEOUT_S / 2 * std.time.ns_per_s;
@@ -125,7 +126,7 @@ pub const Config = struct {
     password: []const u8 = "",
     /// TLS on the FE's MySQL port, for its DDL and catalog queries.
     tls: sql.TlsMode = .off,
-    connect_timeout: u32 = driver.default_connect_timeout_s,
+    connect_timeout: u32 = netconn.default_connect_timeout_s,
     query_timeout: u32 = 0,
     buckets: u32 = 4,
     replication_num: u32 = 1,
@@ -645,7 +646,7 @@ pub const StreamLoadSink = struct {
         errdefer self.dropTxn();
         const t = &self.txn.?;
         const fd = t.req.connection.?.stream_writer.getStream().handle;
-        driver.tuneSocket(fd);
+        netconn.tuneSocket(fd);
         const tv = std.posix.timeval{ .sec = TIMEOUT_S, .usec = 0 };
         std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv)) catch {};
         std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
@@ -661,7 +662,7 @@ pub const StreamLoadSink = struct {
         var buf: [std.Uri.host_name_max]u8 = undefined;
         const host = try uri.getHost(&buf);
         const port = uri.port orelse if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) @as(u16, 443) else 80;
-        const probe = try driver.dial(self.gpa, host, port, .{ .tune = false, .io_timeout_s = self.cfg.connect_timeout });
+        const probe = try netconn.dial(self.gpa, host, port, .{ .tune = false, .io_timeout_s = self.cfg.connect_timeout });
         probe.close();
     }
 
@@ -904,7 +905,7 @@ test "a stream-load commit pause wakes within one slice of an abort and otherwis
 test "stream-load transient errors are the old list: the shared wire set, a closing server, and a timeout" {
     const errs = [_]anyerror{ error.ConnectionResetByPeer, error.BrokenPipe, error.EndOfStream, error.ServerClosedConnection, error.HttpConnectionClosing, error.WouldBlock, error.OutOfMemory, error.StreamLoadFailed, error.Aborted, error.UnknownHostName };
     for (errs) |e| {
-        const old = driver.transientNet(e) or e == error.WouldBlock or e == error.HttpConnectionClosing;
+        const old = netconn.transientNet(e) or e == error.WouldBlock or e == error.HttpConnectionClosing;
         try std.testing.expectEqual(old, transient(e));
     }
 }
@@ -988,10 +989,10 @@ fn classify(body: []const u8) Outcome {
 }
 
 /// `classify`, except that an answer with no `Status` under an HTTP error that
-/// `driver.transientStatus` does not retry (a proxy's 401, 404, 413 or 501) is a
+/// `netconn.transientStatus` does not retry (a proxy's 401, 404, 413 or 501) is a
 /// failure, not a resend, as on every other HTTP path.
 fn settle(code: u16, body: []const u8) Outcome {
-    if (jsonField(body, "Status") == null and code >= 400 and !driver.transientStatus(code)) return .fail;
+    if (jsonField(body, "Status") == null and code >= 400 and !netconn.transientStatus(code)) return .fail;
     return classify(body);
 }
 
@@ -1026,7 +1027,7 @@ test "settle resends a bare answer only under a status every HTTP path retries" 
     try std.testing.expectEqual(Outcome.fail, settle(503, "{\"Status\": \"Fail\", \"Message\": \"refused\"}"));
     for (0..1000) |c| {
         const code: u16 = @intCast(c);
-        const want: Outcome = if (code >= 400 and !driver.transientStatus(code)) .fail else .resend;
+        const want: Outcome = if (code >= 400 and !netconn.transientStatus(code)) .fail else .resend;
         try std.testing.expectEqual(want, settle(code, "not json"));
     }
 }
@@ -1322,7 +1323,7 @@ test "a stream-load host that never completes the connect fails within connect_t
     var n: usize = 0;
     defer for (held[0..n]) |h| h.close();
     while (n < held.len) : (n += 1) {
-        held[n] = driver.dial(std.testing.allocator, "127.0.0.1", port, .{ .tune = false, .io_timeout_s = 1 }) catch break;
+        held[n] = netconn.dial(std.testing.allocator, "127.0.0.1", port, .{ .tune = false, .io_timeout_s = 1 }) catch break;
     }
     var url: [64]u8 = undefined;
     const schema = types.Schema{ .fields = &.{.{ .name = "a", .ty = types.Type.init(.int) }} };

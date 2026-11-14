@@ -65,16 +65,17 @@
 
 const std = @import("std");
 const pagecache = @import("../../exec/pagecache.zig");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const parquet = @import("footer.zig");
 const logical = @import("logical.zig");
 const pqdecode = @import("read.zig");
 const thrift = @import("thrift.zig");
-const varint = @import("../varint.zig");
+const varint = @import("../../base/varint.zig");
 const codec = @import("../compress/codecs.zig");
 const eval = @import("../../exec/eval.zig");
-const decimal = @import("../../exec/decimal.zig");
-const driver = @import("../../connect/driver.zig");
+const decimal = @import("../../base/decimal.zig");
+const decimal_ops = @import("../../exec/decimal_ops.zig");
+const driver = @import("../../exec/driver.zig");
 const Output = @import("../output.zig").Output;
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
@@ -619,7 +620,7 @@ pub const Writer = struct {
             const end = start + @max(1, @min(room / row_bytes, self.group_rows - self.rows, batch.len - start));
             for (batch.columns, self.lays, self.schema.fields) |col, lay, f| {
                 self.writeSpan(sa, col, lay, start, end) catch |e| {
-                    if (e == Error.DecimalDropsDigits) return decimal.dropsDigitsFailure(f.name, f.ty);
+                    if (e == Error.DecimalDropsDigits) return decimal_ops.dropsDigitsFailure(f.name, f.ty);
                     return e;
                 };
             }

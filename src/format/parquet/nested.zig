@@ -157,7 +157,7 @@ fn keepIn(arena: std.mem.Allocator, n: *NNode, path: []const u8, want: []const [
     if (kids.items.len > 0) n.children = kids.items;
 }
 
-const reaches = @import("../../connect/driver.zig").wantsColumn;
+const reaches = @import("../../exec/driver.zig").wantsColumn;
 
 fn number(n: *NNode, next: *usize) void {
     n.first_leaf = next.*;

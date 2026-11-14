@@ -14,7 +14,7 @@
 const std = @import("std");
 const celltext = @import("../../exec/celltext.zig");
 const token = @import("token.zig");
-const hex = @import("../hex.zig");
+const hex = @import("../../base/hex.zig");
 
 pub const Mode = struct { ooxml: bool = false, attr: bool = false };
 
@@ -176,7 +176,7 @@ test "names are encoded as FOR XML does and decode back" {
     }
 }
 
-test "the _xHHHH_ recognizers on format/hex equal their parseInt bodies" {
+test "the _xHHHH_ recognizers on base/hex equal their parseInt bodies" {
     const Orig = struct {
         fn oracleDecodedAt(s: []const u8) ?Decoded {
             if (s.len < 7 or s[0] != '_' or s[1] != 'x') return null;

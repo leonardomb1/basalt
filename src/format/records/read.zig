@@ -17,12 +17,13 @@
 //! between records differ, or a `split` on a longer terminator, stays on one lane.
 
 const std = @import("std");
+const filemap = @import("../../base/filemap.zig");
 const pagecache = @import("../../exec/pagecache.zig");
 const types = @import("../../lang/types.zig");
 const column = @import("../../exec/column.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const eval = @import("../../exec/eval.zig");
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const stream = @import("../stream.zig");
 const par = @import("../../exec/par.zig");
 const explainf = stream.explainf;
@@ -237,7 +238,7 @@ pub const RecordSource = struct {
         }
         if (self.stream == null) {
             const r = self.split.reader;
-            stream.release(r.buffer[self.released..r.seek]);
+            filemap.dropPages(r.buffer[self.released..r.seek]);
             self.released = r.seek;
         }
         if (len == 0) return null;
@@ -286,11 +287,11 @@ pub const Mapped = struct {
                     while (at + m.eol < data.len) : (at += m.stride) {
                         if (eolLen(data[at..]) != m.eol) return error.NotMappable;
                         if (at - freed >= scan_window) {
-                            stream.release(data[freed..at]);
+                            filemap.dropPages(data[freed..at]);
                             freed = at;
                         }
                     }
-                    stream.release(data[freed..]);
+                    filemap.dropPages(data[freed..]);
                 }
             },
         }
@@ -371,7 +372,7 @@ fn countReleasing(data: []const u8, term: u8) u64 {
     while (at < data.len) {
         const end = @min(data.len, at + scan_window);
         n += std.mem.count(u8, data[at..end], &.{term});
-        stream.release(data[at..end]);
+        filemap.dropPages(data[at..end]);
         at = end;
     }
     return n;

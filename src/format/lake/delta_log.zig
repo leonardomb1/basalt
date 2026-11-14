@@ -34,7 +34,7 @@
 //! link, a failure there being `DeltaCommitUnsynced`, as the version is visible.
 
 const std = @import("std");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const delta = @import("delta.zig");
 const eval = @import("../../exec/eval.zig");
 const objstore = @import("../../store/objstore.zig");

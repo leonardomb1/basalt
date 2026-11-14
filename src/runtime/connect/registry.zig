@@ -9,7 +9,7 @@
 //! `ftp://name/…`).
 
 const std = @import("std");
-const sql = @import("../db/sql.zig");
+const sql = @import("../../db/sql.zig");
 
 pub const SqlKind = enum {
     postgres,

@@ -34,7 +34,7 @@
 //! type is an error, never a quiet 0 or a different value.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const op = @import("../exec/op.zig");
 const TlsClient = @import("../net/tls_client.zig");
 const trust = @import("../net/trust.zig");
@@ -43,13 +43,14 @@ const Batch = @import("../exec/batch.zig").Batch;
 const Value = @import("../exec/value.zig").Value;
 const column = @import("../exec/column.zig");
 const celltext = @import("../exec/celltext.zig");
-const civil = @import("../exec/civil.zig");
+const civil = @import("../base/civil.zig");
 const eval = @import("../exec/eval.zig");
-const driver = @import("../connect/driver.zig");
-const retry = @import("../connect/retry.zig");
+const driver = @import("../exec/driver.zig");
+const netconn = @import("../net/conn.zig");
+const retry = @import("../net/retry.zig");
 const ast = @import("../lang/ast.zig");
 const typemap = @import("typemap.zig");
-const hexfmt = @import("../format/hex.zig");
+const hexfmt = @import("../base/hex.zig");
 
 pub const STREAM_ROWS = 4096;
 
@@ -615,7 +616,7 @@ pub const Sink = struct {
         const stmt = self.stmt.items;
         self.conn.exec(stmt) catch |e| {
             const rd = self.redial orelse return refused(self.errctx, self.dialect, self.conn.lastError(), e);
-            if (!driver.transientNet(e)) return refused(self.errctx, self.dialect, self.conn.lastError(), e);
+            if (!netconn.transientNet(e)) return refused(self.errctx, self.dialect, self.conn.lastError(), e);
             self.conn.close();
             self.conn_alive = false;
             if (!retry.pauseWith(std.Thread.sleep, 500)) return e;
@@ -712,7 +713,7 @@ pub fn BulkSink(comptime Proto: type) type {
             }
             self.sendSegment() catch |e| {
                 const rd = self.redial orelse return refused(self.errctx, Proto.dialect, self.conn.wire.last_error, e);
-                if (!driver.transientNet(e)) return refused(self.errctx, Proto.dialect, self.conn.wire.last_error, e);
+                if (!netconn.transientNet(e)) return refused(self.errctx, Proto.dialect, self.conn.wire.last_error, e);
                 const fresh = try rd.dial(rd.ctx, self.gpa);
                 self.conn.close();
                 self.conn = @ptrCast(@alignCast(fresh.ptr));

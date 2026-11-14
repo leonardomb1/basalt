@@ -24,10 +24,10 @@ const op = @import("../../exec/op.zig");
 const openTailSink = @import("agg.zig").openTailSink;
 const profile = @import("../../exec/profile.zig");
 const resolveAt = @import("../plan.zig").resolveAt;
-const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
+const SinkGuard = @import("../../exec/guard.zig").SinkGuard;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const writeTailOver = @import("agg.zig").writeTailOver;
 
 const SortShape = @import("shape.zig").SortShape;

@@ -20,19 +20,19 @@
 //! the last write error.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const trace = @import("../exec/trace.zig");
-const obs = @import("obs.zig");
-const driver = @import("../connect/driver.zig");
+const obs = @import("../exec/obs.zig");
+const driver = @import("../exec/driver.zig");
 const op = @import("../exec/op.zig");
 const profile = @import("../exec/profile.zig");
-const spans = @import("../connect/trace.zig");
+const spans = @import("../base/iotrace.zig");
 const Profile = profile.Profile;
 const Batch = @import("../exec/batch.zig").Batch;
 const eval = @import("../exec/eval.zig");
 const connectorNote = @import("env.zig").connectorNote;
-const SinkGuard = @import("../connect/guard.zig").SinkGuard;
-const Guard = @import("../connect/guard.zig").Guard;
+const SinkGuard = @import("../exec/guard.zig").SinkGuard;
+const Guard = @import("../exec/guard.zig").Guard;
 
 pub const OpenSplitFn = *const fn (ctx: *anyopaque, gpa: std.mem.Allocator, pred: []const u8) anyerror!driver.Source;
 

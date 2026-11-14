@@ -9,13 +9,13 @@
 //! file of each.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const formats = @import("../format/formats.zig");
 const http_client = @import("../net/http_client.zig");
-const objstore = @import("../store/objstore.zig");
-const sftp = @import("../store/sftp.zig");
-const smb = @import("../store/smb.zig");
-const trace = @import("trace.zig");
+const objstore = @import("objstore.zig");
+const sftp = @import("sftp.zig");
+const smb = @import("smb.zig");
+const trace = @import("../base/iotrace.zig");
 
 pub fn isFolder(path: []const u8) bool {
     return path.len > 0 and path[path.len - 1] == '/';

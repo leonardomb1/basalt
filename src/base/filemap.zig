@@ -2,6 +2,7 @@
 //! lanes, the Arrow IPC reader and spill runs read their bytes in place through it.
 //! An empty file maps to an empty slice, as `mmap` refuses a zero length, so a
 //! caller judges the size on what it gets back and releases it either way.
+//! `dropPages` lets a reader that walks a mapping once give back what it passed.
 
 const std = @import("std");
 
@@ -15,6 +16,18 @@ pub fn whole(file: std.fs.File) !Map {
 
 pub fn release(m: Map) void {
     if (m.len > 0) std.posix.munmap(m);
+}
+
+/// Drops the pages wholly inside `bytes`, which must lie in a file mapping, from the
+/// process, so what was read once stops counting as resident; touched again, they
+/// fault back in from the file (anonymous memory would come back zeroed).
+pub fn dropPages(bytes: []const u8) void {
+    const page = std.heap.page_size_min;
+    const lo = std.mem.alignForward(usize, @intFromPtr(bytes.ptr), page);
+    const hi = std.mem.alignBackward(usize, @intFromPtr(bytes.ptr) + bytes.len, page);
+    if (hi <= lo) return;
+    const at: [*]align(page) u8 = @ptrFromInt(lo);
+    std.posix.madvise(at, hi - lo, std.posix.MADV.DONTNEED) catch {};
 }
 
 test "an empty file maps to an empty slice and a full one to its bytes" {

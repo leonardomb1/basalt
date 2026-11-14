@@ -10,8 +10,9 @@ const http_fake = @import("../testing/http_fake.zig");
 const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
 const std = @import("std");
+const driver = @import("../exec/driver.zig");
 const HttpClient = @import("../net/http_std.zig");
-const msgfmt = @import("msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const testing = std.testing;
 
 /// Whether `path` is read over HTTP: a URL or an object-store path.
@@ -23,6 +24,31 @@ pub fn isRemote(path: []const u8) bool {
 /// offset from a file's own header would wrap.
 pub fn fits(off: u64, len: u64, total: u64) bool {
     return off <= total and len <= total - off;
+}
+
+/// `Bytes.open` as the ranged-file opener `exec/driver.zig` reads `read_bytes` and
+/// `file_size` through, which the run installs.
+pub fn openRanged(arena: std.mem.Allocator, path: []const u8) anyerror!driver.RangedFile {
+    const b = try arena.create(Bytes);
+    b.* = try Bytes.open(arena, path);
+    return .{ .ptr = b, .vtable = &ranged_vtable };
+}
+
+const ranged_vtable = driver.RangedFile.VTable{ .size = rangedSize, .range = rangedRange, .close = rangedClose };
+
+fn rangedSize(p: *anyopaque) u64 {
+    const b: *Bytes = @ptrCast(@alignCast(p));
+    return b.size();
+}
+
+fn rangedRange(p: *anyopaque, arena: std.mem.Allocator, off: u64, len: usize) anyerror![]const u8 {
+    const b: *Bytes = @ptrCast(@alignCast(p));
+    return b.range(arena, off, len);
+}
+
+fn rangedClose(p: *anyopaque) void {
+    const b: *Bytes = @ptrCast(@alignCast(p));
+    b.close();
 }
 
 pub const Bytes = union(enum) {

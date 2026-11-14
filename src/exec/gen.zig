@@ -6,9 +6,9 @@
 
 const std = @import("std");
 const types = @import("../lang/types.zig");
-const Bitmap = @import("../exec/column.zig").Bitmap;
-const Column = @import("../exec/column.zig").Column;
-const Batch = @import("../exec/batch.zig").Batch;
+const Bitmap = @import("column.zig").Bitmap;
+const Column = @import("column.zig").Column;
+const Batch = @import("batch.zig").Batch;
 const driver = @import("driver.zig");
 
 pub const UnitSource = struct {

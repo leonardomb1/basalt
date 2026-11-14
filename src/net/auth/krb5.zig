@@ -15,14 +15,15 @@
 //! resolves to its domain controllers). The realm is kept upper-cased, as AD
 //! writes it. Tickets are kept in-process per principal and service until they
 //! expire, so a parallel read's lanes do not each go back to the KDC.
-//! A failure's words go to the thread's `driver.LoginNote`, never with a secret.
+//! A failure's words go to the thread's `conn.LoginNote`, never with a secret.
 //! The live test against a real domain never tries a wrong password: each one
 //! counts toward the account's lockout.
 
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
-const driver = @import("../../connect/driver.zig");
-const civil = @import("../../exec/civil.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
+const driver = @import("../../exec/driver.zig");
+const conn = @import("../conn.zig");
+const civil = @import("../../base/civil.zig");
 
 pub const Error = error{
     KrbProtocol,
@@ -59,7 +60,7 @@ pub fn credential(user_in: []const u8, password: []const u8, realm_in: []const u
 }
 
 fn fail(e: Error, comptime fmt: []const u8, args: anytype) Error {
-    driver.explainf(e, fmt, args);
+    conn.explainf(e, fmt, args);
     return e;
 }
 
@@ -476,7 +477,7 @@ const err_preauth_required = 25;
 const err_skew = 37;
 
 /// One AS or TGS round-trip, trying each KDC in turn; each socket read and write is
-/// bounded by `driver.request_timeout_ms`, so a silent KDC moves on to the next one
+/// bounded by `conn.request_timeout_ms`, so a silent KDC moves on to the next one
 /// and, if none answers, fails naming the timeout instead of hanging the connect.
 fn exchange(gpa: std.mem.Allocator, cred: Credential, req: []const u8) ![]u8 {
     var hosts_buf: [16][]const u8 = undefined;
@@ -500,7 +501,7 @@ fn exchange(gpa: std.mem.Allocator, cred: Credential, req: []const u8) ![]u8 {
             host = hp[0..c];
             port = std.fmt.parseInt(u16, hp[c + 1 ..], 10) catch 88;
         }
-        const stream = driver.dial(gpa, host, port, .{ .tune = false, .io_timeout_s = kdc_timeout_s }) catch |e| {
+        const stream = conn.dial(gpa, host, port, .{ .tune = false, .io_timeout_s = kdc_timeout_s }) catch |e| {
             last = e;
             continue;
         };
@@ -543,7 +544,7 @@ fn readFull(stream: std.net.Stream, buf: []u8) !void {
     }
 }
 
-const kdc_timeout_s: u31 = @intCast(@divTrunc(driver.request_timeout_ms, std.time.ms_per_s));
+const kdc_timeout_s: u31 = @intCast(@divTrunc(conn.request_timeout_ms, std.time.ms_per_s));
 
 fn kdcError(e: El, cred: Credential, what: []const u8) Error {
     const code = if (e.field(6)) |c| c.int() else -1;
@@ -840,7 +841,7 @@ fn remember(key: []const u8, t: Ticket) void {
 }
 
 pub fn serviceTicket(gpa: std.mem.Allocator, cred: Credential, spn: []const u8) !Ticket {
-    driver.clearNote();
+    conn.clearNote();
     var kb: [512]u8 = undefined;
     const skey = cacheKey(&kb, cred, spn);
     if (cached(skey)) |t| return t;
@@ -1121,7 +1122,7 @@ test "krb5: a live login and service ticket (BASALT_KRB_REALM, _USER, _PASS, _SP
     };
     const spn = std.posix.getenv("BASALT_KRB_SPN") orelse return error.SkipZigTest;
     const tgt = asExchange(gpa, cred) catch |e| {
-        std.debug.print("AS exchange: {s}: {s}\n", .{ @errorName(e), driver.lastNote() });
+        std.debug.print("AS exchange: {s}: {s}\n", .{ @errorName(e), conn.lastNote() });
         return e;
     };
     defer {
@@ -1129,7 +1130,7 @@ test "krb5: a live login and service ticket (BASALT_KRB_REALM, _USER, _PASS, _SP
         gpa.free(tgt.realm);
     }
     const st = tgsExchange(gpa, cred, &tgt, spn) catch |e| {
-        std.debug.print("TGS exchange: {s}: {s}\n", .{ @errorName(e), driver.lastNote() });
+        std.debug.print("TGS exchange: {s}: {s}\n", .{ @errorName(e), conn.lastNote() });
         return e;
     };
     defer {

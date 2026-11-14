@@ -8,7 +8,7 @@ const ast = @import("../lang/ast.zig");
 const analyze = @import("analyze.zig");
 const maint = @import("../format/lake/delta_maint.zig");
 const eval = @import("../exec/eval.zig");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const env_mod = @import("env.zig");
 const Value = @import("../exec/value.zig").Value;
 

@@ -10,7 +10,7 @@
 //! the TDS type byte. StarRocks and Doris speak the MySQL protocol.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const types = @import("../lang/types.zig");
 
 const TypeKind = types.TypeKind;

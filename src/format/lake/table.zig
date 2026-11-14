@@ -20,12 +20,12 @@ const azure = @import("../../store/azure.zig");
 const cast = @import("../../exec/eval/cast.zig");
 const delta = @import("delta.zig");
 const eval = @import("../../exec/eval.zig");
-const folder = @import("../../connect/folder.zig");
+const folder = @import("../../store/folder.zig");
 const formats = @import("../formats.zig");
 const s3 = @import("../../store/s3.zig");
 const scheme = @import("../../store/scheme.zig");
 const stream = @import("../stream.zig");
-const trace = @import("../../connect/trace.zig");
+const trace = @import("../../base/iotrace.zig");
 const types = @import("../../lang/types.zig");
 const objstore = @import("../../store/objstore.zig");
 const http_client = @import("../../net/http_client.zig");
@@ -289,7 +289,7 @@ pub fn readWhole(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
 }
 
 /// `%XX` escapes decoded, as a log's URI paths need; a malformed escape is kept.
-pub const percentDecode = @import("../../net/percent.zig").decode;
+pub const percentDecode = @import("../../base/percent.zig").decode;
 
 /// A path a log names as one basalt reads: relative ones under `root`, `file:` URIs
 /// as local paths, Hadoop's `s3a://` and `s3n://` as `s3://`, and an ADLS

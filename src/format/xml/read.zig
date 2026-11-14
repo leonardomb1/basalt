@@ -23,14 +23,14 @@
 //! repaired (a name is repaired). The input streams, a row at a time.
 
 const std = @import("std");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const column = @import("../../exec/column.zig");
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const csv = @import("../csv.zig");
-const charset = @import("../charset.zig");
+const charset = @import("../../exec/charset.zig");
 const jsontext = @import("../../exec/jsontext.zig");
 const textconv = @import("../../exec/textconv.zig");
 const texttype = @import("../texttype.zig");

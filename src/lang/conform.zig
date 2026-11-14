@@ -12,7 +12,7 @@
 //! against a CSV file's header (`csv_append`).
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const types = @import("types.zig");
 const Type = types.Type;
 const Schema = types.Schema;

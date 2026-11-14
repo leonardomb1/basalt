@@ -7,7 +7,7 @@ const std = @import("std");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Profile = @import("../../exec/profile.zig").Profile;
 const Request = @import("../../exec/profile.zig").Request;
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const sql = @import("../../db/sql.zig");
 const types = @import("../../lang/types.zig");
 

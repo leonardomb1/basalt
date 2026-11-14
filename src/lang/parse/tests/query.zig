@@ -9,7 +9,7 @@ const firstPipelineStages = @import("../testing_util.zig").firstPipelineStages;
 const parseSource = @import("../../sql_parser.zig").parseSource;
 const parseTest = @import("../testing_util.zig").parseTest;
 const std = @import("std");
-const msgfmt = @import("../../../format/msgfmt.zig");
+const msgfmt = @import("../../../base/msgfmt.zig");
 const testing = std.testing;
 
 test "sql: terminal select from csv becomes read+write stdout" {
@@ -145,7 +145,7 @@ test "sql: LIMIT, OFFSET and FETCH FIRST take constants, in either order" {
     }
 }
 
-test "sql: a FLOAT LIMIT through textconv.floatToInt takes the count and refusal the old rounding did" {
+test "sql: a FLOAT LIMIT through decimal.floatToInt takes the count and refusal the old rounding did" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();

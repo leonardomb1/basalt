@@ -11,7 +11,7 @@
 //! MySQL read them: lossless, so every byte decodes and encodes back to itself.
 
 const std = @import("std");
-const celltext = @import("../exec/celltext.zig");
+const celltext = @import("celltext.zig");
 
 pub const Charset = enum {
     utf8,

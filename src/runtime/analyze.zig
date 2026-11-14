@@ -41,6 +41,7 @@
 //! EXPLAIN. Whole-program tests are in `analyze/tests.zig`.
 
 const std = @import("std");
+const builtins = @import("../exec/builtins.zig");
 const pagecache = @import("../exec/pagecache.zig");
 const ast = @import("../lang/ast.zig");
 const expand = @import("../lang/expand.zig");
@@ -50,14 +51,14 @@ const options_schema = @import("connect/options_schema.zig");
 const types = @import("../lang/types.zig");
 const pushdown = @import("pushdown.zig");
 const Dialect = @import("../db/sql.zig").Dialect;
-const decimal = @import("../exec/decimal.zig");
+const decimal = @import("../base/decimal.zig");
 const eval = @import("../exec/eval.zig");
 const textconv = @import("../exec/textconv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
 const s3 = @import("../store/s3.zig");
 const ftp = @import("../store/ftp.zig");
-const registry = @import("../connect/registry.zig");
-const table_builtins = @import("../connect/table_builtins.zig");
+const registry = @import("connect/registry.zig");
+const table_builtins = @import("connect/table_builtins.zig");
 const keypush = @import("plan/keypush.zig");
 const joinorder = @import("plan/joinorder.zig");
 const op = @import("../exec/op.zig");
@@ -67,7 +68,7 @@ const env_mod = @import("env.zig");
 const Value = @import("../exec/value.zig").Value;
 const sql = @import("../db/sql.zig");
 const holes = @import("analyze/holes.zig");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const pathmod = @import("path.zig");
 const splitMayCut = @import("connect/sql_read.zig").splitMayCut;
 const connect = @import("connect.zig");
@@ -190,7 +191,7 @@ pub fn limitValue(arena: std.mem.Allocator, e: *const ast.Expr, params: *const P
         .null => null,
         .int => |n| if (n < 0) fail(diag, "{s} must not be negative, got {d}", .{ what, n }) else @intCast(n),
         .string => |t| std.fmt.parseInt(u64, std.mem.trim(u8, t, " "), 10) catch fail(diag, "{s} must be a whole number of rows, got '{s}'", .{ what, t }),
-        .float => |f| roundedRows(diag, what, textconv.floatToInt(f, .half_even) orelse return fail(diag, "{s} {d} is out of range", .{ what, f })),
+        .float => |f| roundedRows(diag, what, decimal.floatToInt(f, .half_even) orelse return fail(diag, "{s} {d} is out of range", .{ what, f })),
         .decimal => |d| blk: {
             const q = decimal.roundedWhole(d, .half_away) orelse break :blk fail(diag, "{s} is out of range", .{what});
             break :blk roundedRows(diag, what, q);
@@ -349,7 +350,7 @@ const downloaded = @import("analyze/targets.zig").downloaded;
 const offlineSchema = @import("analyze/targets.zig").offlineSchema;
 const offlineTable = @import("analyze/targets.zig").offlineTable;
 pub const lakeAt = @import("analyze/targets.zig").lakeAt;
-const folder = @import("../connect/folder.zig");
+const folder = @import("../store/folder.zig");
 
 pub const Source = struct {
     connector: []const u8,
@@ -908,7 +909,7 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     const json_args = try arena.alloc(expand.JsonArg, cli.len);
     for (cli, json_args) |o, *ja| ja.* = .{ .name = o.name, .text = o.value };
     var expand_at: ?ast.Pos = null;
-    const program = expand.expandProgramAt(arena, raw_program, json_args, &expand_msg, &expand_at) catch |e| switch (e) {
+    const program = expand.expandProgramAt(arena, raw_program, json_args, &expand_msg, &expand_at, builtins.isBuiltin) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.ExpandFailed => return failPos(diag, expand_at, "{s}", .{expand_msg}),
     };
@@ -1030,7 +1031,7 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     try ctx.checkStmts(program.stmts[1..], &out_plans, true);
     for (raw_program.stmts) |s| if (s == .func) if (s.func.table_check) |tc| {
         var tc_at: ?ast.Pos = null;
-        const etc = expand.expandTableCheck(arena, raw_program, tc, &expand_msg, &tc_at) catch |e| switch (e) {
+        const etc = expand.expandTableCheck(arena, raw_program, tc, &expand_msg, &tc_at, builtins.isBuiltin) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             error.ExpandFailed => return failPos(diag, tc_at orelse s.func.pos, "{s}", .{expand_msg}),
         };
@@ -1603,9 +1604,9 @@ const Ctx = struct {
                     return fail(self.diag, "{s}", .{why});
                 if (rd.form == .builtin) {
                     const tb = table_builtins.of(rd.form.builtin);
-                    for (rd.form.builtin.args, tb.args[0..rd.form.builtin.args.len]) |e, kind| {
+                    for (rd.form.builtin.args, tb.sig.args[0..rd.form.builtin.args.len]) |e, kind| {
                         if ((try dollarRefs(self.arena, e)).len == 0 and try table_builtins.argValue(self.arena, kind, e) == null)
-                            return fail(self.diag, "{s}", .{tb.arg_msg});
+                            return fail(self.diag, "{s}", .{tb.sig.arg_msg});
                     }
                 }
                 if (rd.form == .path and std.mem.eql(u8, connector, "csv") and std.mem.indexOf(u8, rd.form.path, "${") == null) {
@@ -2143,9 +2144,9 @@ test "a float LIMIT rounds half to even through textconv.floatToInt as the old f
         }
     };
     const specials = [_]f64{ 0, -0.0, 0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 0.49999999999999994, 4503599627370495.5, 4503599627370497, 9007199254740994, 0x1p62, 0x1p63, -0x1p63 + 1024, 1e300, std.math.inf(f64), -std.math.inf(f64), std.math.nan(f64), 9.223372036854775e18 };
-    for (specials) |f| try std.testing.expectEqual(old.rows(f), textconv.floatToInt(f, .half_even));
+    for (specials) |f| try std.testing.expectEqual(old.rows(f), decimal.floatToInt(f, .half_even));
     try std.testing.expectEqual(@as(?i64, null), old.rows(-0x1p63));
-    try std.testing.expectEqual(@as(?i64, std.math.minInt(i64)), textconv.floatToInt(-0x1p63, .half_even));
+    try std.testing.expectEqual(@as(?i64, std.math.minInt(i64)), decimal.floatToInt(-0x1p63, .half_even));
     var prng = std.Random.DefaultPrng.init(0x6c696d6974);
     const rand = prng.random();
     for (0..20000) |_| {
@@ -2155,7 +2156,7 @@ test "a float LIMIT rounds half to even through textconv.floatToInt as the old f
             else => @as(f64, @bitCast(rand.int(u64))),
         };
         if (f == -0x1p63) continue;
-        try std.testing.expectEqual(old.rows(f), textconv.floatToInt(f, .half_even));
+        try std.testing.expectEqual(old.rows(f), decimal.floatToInt(f, .half_even));
     }
 }
 

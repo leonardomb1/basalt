@@ -20,11 +20,11 @@ const op = @import("../../exec/op.zig");
 const openTailSink = @import("agg.zig").openTailSink;
 const parallel = @import("../parallel.zig");
 const resolveAt = @import("../plan.zig").resolveAt;
-const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
+const SinkGuard = @import("../../exec/guard.zig").SinkGuard;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
 const pagecache = @import("../../exec/pagecache.zig");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 
 const TopNTail = struct { keys: []const ast.SortKey, n: usize };

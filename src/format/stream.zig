@@ -16,7 +16,7 @@ const std = @import("std");
 const HttpClient = @import("../net/http_std.zig");
 const eval = @import("../exec/eval.zig");
 const http_client = @import("../net/http_client.zig");
-const msgfmt = @import("msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const objstore = @import("../store/objstore.zig");
 const scheme = @import("../store/scheme.zig");
 const sftp = @import("../store/sftp.zig");
@@ -318,18 +318,6 @@ pub fn explainf(e: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
     @branchHint(.cold);
     var buf: [480]u8 = undefined;
     return eval.explain(e, msgfmt.clipPrint(&buf, fmt, args));
-}
-
-/// Drops the pages wholly inside `bytes`, which must lie in a file mapping, from the
-/// process, so what was read once stops counting as resident; touched again, they
-/// fault back in from the file (anonymous memory would come back zeroed).
-pub fn release(bytes: []const u8) void {
-    const page = std.heap.page_size_min;
-    const lo = std.mem.alignForward(usize, @intFromPtr(bytes.ptr), page);
-    const hi = std.mem.alignBackward(usize, @intFromPtr(bytes.ptr) + bytes.len, page);
-    if (hi <= lo) return;
-    const at: [*]align(page) u8 = @ptrFromInt(lo);
-    std.posix.madvise(at, hi - lo, std.posix.MADV.DONTNEED) catch {};
 }
 
 test "splitCodec / splitArchive / dataName walk the container chain" {

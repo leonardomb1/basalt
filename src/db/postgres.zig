@@ -15,14 +15,15 @@
 //! does not track; a `bytea` therefore reads in either `bytea_output` format.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
 const cell = @import("../exec/cell.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const sql = @import("sql.zig");
 const wire = @import("wire.zig");
-const driver = @import("../connect/driver.zig");
+const driver = @import("../exec/driver.zig");
+const netconn = @import("../net/conn.zig");
 const typemap = @import("typemap.zig");
 
 pub const Error = error{ PgProtocol, PgAuthFailed, PgQueryFailed, PgAuthUnsupported, PgTlsRefused } || std.mem.Allocator.Error;
@@ -35,7 +36,7 @@ pub const Conn = struct {
     done: bool = false,
 
     /// The login phase runs from the dial to the first ReadyForQuery.
-    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
+    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: netconn.Timeouts) !*Conn {
         const self = try wire.Conn.dial(Conn, gpa, host, port, to);
         errdefer self.close();
         self.login(host, user, password, database, tls_mode) catch |e| return self.wire.loginFailed(e, host, port);

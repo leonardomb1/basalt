@@ -26,11 +26,11 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const driver = @import("../connect/driver.zig");
-const msgfmt = @import("../format/msgfmt.zig");
-const jsontext = @import("../exec/jsontext.zig");
+const driver = @import("driver.zig");
+const msgfmt = @import("../base/msgfmt.zig");
+const jsontext = @import("jsontext.zig");
 const types = @import("../lang/types.zig");
-const Batch = @import("../exec/batch.zig").Batch;
+const Batch = @import("batch.zig").Batch;
 
 pub const Format = enum { auto, text, json };
 
@@ -810,7 +810,7 @@ test "Logger.log: min=info writes err, warn and info and drops debug; only expli
 }
 
 const test_empty_schema = types.Schema{ .fields = &.{} };
-var test_no_cols: [0]@import("../exec/column.zig").Column = .{};
+var test_no_cols: [0]@import("column.zig").Column = .{};
 
 const FakeSource = struct {
     batches: []const usize,

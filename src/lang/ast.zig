@@ -63,7 +63,7 @@
 //! there is no cost model.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const types = @import("types.zig");
 const token = @import("token.zig");
 

@@ -7,7 +7,7 @@
 //! thread-local read. A span opened inside another is its child.
 
 const std = @import("std");
-const scheme = @import("../store/scheme.zig");
+const url = @import("url.zig");
 
 pub const Kind = enum { list, replay, log_read, footer, stat, download, login };
 
@@ -41,7 +41,7 @@ pub const Span = struct {
 pub fn begin(kind: Kind, what: []const u8) Span {
     const t = current orelse return .{};
     var buf: [2048]u8 = undefined;
-    const token = t.begin(t.ptr, kind, scheme.shown(&buf, what), parent) orelse return .{};
+    const token = t.begin(t.ptr, kind, url.shown(&buf, what), parent) orelse return .{};
     const outer = parent;
     parent = token;
     return .{ .tracer = t, .token = token, .outer = outer, .t0 = std.time.Instant.now() catch null };
@@ -51,6 +51,6 @@ pub fn begin(kind: Kind, what: []const u8) Span {
 pub fn record(kind: Kind, what: []const u8, ns: u64, items: u64) void {
     const t = current orelse return;
     var buf: [2048]u8 = undefined;
-    const token = t.begin(t.ptr, kind, scheme.shown(&buf, what), parent) orelse return;
+    const token = t.begin(t.ptr, kind, url.shown(&buf, what), parent) orelse return;
     t.end(t.ptr, token, ns, items);
 }

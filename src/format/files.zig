@@ -10,7 +10,7 @@
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
-const driver = @import("../connect/driver.zig");
+const driver = @import("../exec/driver.zig");
 const Stream = @import("stream.zig").Stream;
 
 pub fn Files(comptime R: type, comptime O: type) type {

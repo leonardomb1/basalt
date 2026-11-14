@@ -31,12 +31,12 @@ const footerOf = @import("../../format/parquet/folder.zig").parseFooterOf;
 const inlineHeadBindings = @import("../plan.zig").inlineHeadBindings;
 const pqread = @import("../../format/parquet/read.zig");
 const resolveDbConfig = @import("../connect/dbconfig.zig").resolveDbConfig;
-const split = @import("../../connect/split.zig");
+const split = @import("../connect/split.zig");
 const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
 const pagecache = @import("../../exec/pagecache.zig");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 
 pub const Estimate = struct {
     rows: ?u64 = null,
@@ -325,7 +325,7 @@ test "estimate: a SQL table whose catalog cannot be asked is unknown, asked once
     const a = ar.allocator();
     const parser = @import("../../lang/sql_parser.zig");
     const env_mod = @import("../env.zig");
-    const obs = @import("../obs.zig");
+    const obs = @import("../../exec/obs.zig");
     const op = @import("../../exec/op.zig");
 
     var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
@@ -340,7 +340,7 @@ test "estimate: a SQL table whose catalog cannot be asked is unknown, asked once
         .connection => |c| try connections.put(c.name, c),
         else => {},
     };
-    var sources = std.array_list.Managed(@import("../../connect/driver.zig").Source).init(a);
+    var sources = std.array_list.Managed(@import("../../exec/driver.zig").Source).init(a);
     var diag = env_mod.Diag{};
     var log = obs.Logger.init(0, .text, .err);
     var params_expr = std.StringHashMap(*const ast.Expr).init(a);

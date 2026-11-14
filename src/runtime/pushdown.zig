@@ -1,7 +1,7 @@
 //! Predicate, projection, aggregate and top-N pushdown into SQL sources.
 //!
 //! A split-parallel `read <sqltable> | (filter)* | aggregate … by …` reads one key
-//! range per lane (see `connect/split.zig`). Without pushdown each lane runs
+//! range per lane (see `runtime/connect/split.zig`). Without pushdown each lane runs
 //! `SELECT * FROM (base) WHERE <key range>` and ships every column of every row.
 //! `planAgg` and `planMap` narrow each lane's query to the source columns that are
 //! actually consumed and translate the leading filters into a WHERE AND-ed onto
@@ -45,7 +45,7 @@
 //! moves filters through joins and selects toward the sources.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const sql = @import("../db/sql.zig");

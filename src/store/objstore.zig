@@ -4,14 +4,14 @@
 //!
 //! Shared pieces: the XML tag scraping both REST APIs need, the error-body parser
 //! (`<Code>`/`<Message>`, shown as `Code: Message (HTTP nnn)` instead of a bare
-//! status), the retry policy (re-exported from connect/retry.zig), the streaming
+//! status), the retry policy (re-exported from net/retry.zig), the streaming
 //! `Upload` (part buffering, the part list, single PUT or commit, abort) behind
 //! which a provider supplies only its requests, and the paginated listing loop. Signing stays per provider: Shared Key
 //! and SigV4 have nothing in common past "put a header on the request", and query
 //! parameter names and encoding stay with each provider's page function because
 //! they are signed and the services canonicalise a query string differently.
 //!
-//! Retry: a transport failure or a `driver.transientStatus` code (408, 429 and every
+//! Retry: a transport failure or a `netconn.transientStatus` code (408, 429 and every
 //! 5xx but 501, 505 and 511), at most five attempts
 //! and about 30 s of sleep, exponential backoff with jitter so parallel lanes
 //! throttled at the same instant do not retry in lockstep, stretched to any
@@ -42,11 +42,12 @@
 
 const std = @import("std");
 const HttpClient = @import("../net/http_std.zig");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const azure = @import("azure.zig");
 const xml = @import("../format/xml/token.zig");
-const driver = @import("../connect/driver.zig");
-const retry_mod = @import("../connect/retry.zig");
+const driver = @import("../exec/driver.zig");
+const netconn = @import("../net/conn.zig");
+const retry_mod = @import("../net/retry.zig");
 const scheme = @import("scheme.zig");
 const http_client = @import("../net/http_client.zig");
 const FakeServer = @import("../testing/http_fake.zig").FakeServer;
@@ -111,7 +112,7 @@ pub fn httpDateMs(text: []const u8) ?i64 {
     var hms: [3]i64 = undefined;
     for (&hms) |*x| x.* = std.fmt.parseInt(i64, it.next() orelse return null, 10) catch return null;
     if (day < 1 or day > 31 or hms[0] > 23 or hms[1] > 59 or hms[2] > 60) return null;
-    const days = @import("../exec/civil.zig").daysFromCivil(year, mon, day);
+    const days = @import("../base/civil.zig").daysFromCivil(year, mon, day);
     return ((days * 24 + hms[0]) * 60 + hms[1]) * 60_000 + hms[2] * 1000;
 }
 
@@ -759,7 +760,7 @@ test "a listing page gives every item, entities decoded, and nothing else" {
 
 test "the re-exported retry classifies, backs off and loops exactly as objstore's own did" {
     const Orig = struct {
-        /// objstore's own retry loop before it moved to connect/retry.zig, kept as the
+        /// objstore's own retry loop before it moved to net/retry.zig, kept as the
         /// oracle the re-exported one must match call for call and sleep for sleep.
         const Oracle = struct {
             fn retriableOld(code: u16) bool {
@@ -770,7 +771,7 @@ test "the re-exported retry classifies, backs off and loops exactly as objstore'
             }
 
             fn transientOld(e: anyerror) bool {
-                return driver.transientNet(e) or e == error.HttpConnectionClosing;
+                return netconn.transientNet(e) or e == error.HttpConnectionClosing;
             }
 
             fn retryAfterOld(value: []const u8) ?u64 {

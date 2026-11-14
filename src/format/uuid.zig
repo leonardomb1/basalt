@@ -3,8 +3,8 @@
 //! UNIQUEIDENTIFIER, whose first three groups are stored little-endian.
 
 const std = @import("std");
-const msgfmt = @import("msgfmt.zig");
-const hex = @import("hex.zig");
+const msgfmt = @import("../base/msgfmt.zig");
+const hex = @import("../base/hex.zig");
 
 pub const Order = enum { canonical, mixed };
 

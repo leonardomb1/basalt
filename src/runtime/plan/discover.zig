@@ -14,7 +14,7 @@ const openSource = @import("../connect.zig").openSource;
 const planErr = @import("../env.zig").planErr;
 const planErrT = @import("../env.zig").planErrT;
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const noteStep = @import("../run/explain.zig").noteStep;
 
 /// Append a discovery batch's first `ncols` columns as text (null → ""), shared by

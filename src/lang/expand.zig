@@ -19,9 +19,9 @@
 //! a 64-deep chain is 2^64 nodes, hence the `max_nodes` cap on the total.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
-const builtins = @import("../exec/builtins.zig");
-const eval = @import("../exec/eval.zig");
+const msgfmt = @import("../base/msgfmt.zig");
+const civil = @import("../base/civil.zig");
+const test_host = @import("../testing/expand_host.zig");
 const aggregates = @import("aggregates.zig");
 const stats = @import("parse/stats.zig");
 const parser = @import("sql_parser.zig");
@@ -59,21 +59,25 @@ const Subst = std.StringHashMap(*ast.Expr);
 /// A JSON PARAM's value given as text, by `-p name=...` or a kernel's `params`.
 pub const JsonArg = struct { name: []const u8, text: []const u8 };
 
-pub fn expandProgram(arena: std.mem.Allocator, program: ast.Program, msg: *[]const u8) Error!ast.Program {
+/// Whether `name` is a scalar builtin, which a `CREATE FUNCTION` may not shadow; the
+/// engine's registry lives above this layer, so the caller hands it in.
+pub const IsBuiltin = *const fn (name: []const u8) bool;
+
+fn expandProgram(arena: std.mem.Allocator, program: ast.Program, msg: *[]const u8) Error!ast.Program {
     return expandProgramWith(arena, program, &.{}, msg);
 }
 
 /// A JSON PARAM binds from its `args` text first, then a string DEFAULT; with
 /// neither (offline `check`) its paths read as null.
-pub fn expandProgramWith(arena: std.mem.Allocator, program: ast.Program, args: []const JsonArg, msg: *[]const u8) Error!ast.Program {
+fn expandProgramWith(arena: std.mem.Allocator, program: ast.Program, args: []const JsonArg, msg: *[]const u8) Error!ast.Program {
     var at: ?ast.Pos = null;
-    return expandProgramAt(arena, program, args, msg, &at);
+    return expandProgramAt(arena, program, args, msg, &at, test_host.isBuiltin);
 }
 
 /// `expandProgramWith`, with `at` set on failure to where the problem is: the failing
 /// call, else the statement or declaration holding it.
-pub fn expandProgramAt(arena: std.mem.Allocator, program: ast.Program, args: []const JsonArg, msg: *[]const u8, at: *?ast.Pos) Error!ast.Program {
-    var fns = try collectFns(arena, program, msg, at);
+pub fn expandProgramAt(arena: std.mem.Allocator, program: ast.Program, args: []const JsonArg, msg: *[]const u8, at: *?ast.Pos, is_builtin: IsBuiltin) Error!ast.Program {
+    var fns = try collectFns(arena, program, msg, at, is_builtin);
 
     at.* = null;
     var json = std.StringHashMap(?std.json.Value).init(arena);
@@ -108,11 +112,11 @@ pub fn expandProgramAt(arena: std.mem.Allocator, program: ast.Program, args: []c
 
 /// The program's `CREATE FUNCTION`s by name, a redefinition of a builtin, or of a
 /// name without `OR REPLACE`, refused.
-fn collectFns(arena: std.mem.Allocator, program: ast.Program, msg: *[]const u8, at: *?ast.Pos) Error!std.StringHashMap(ast.FnDecl) {
+fn collectFns(arena: std.mem.Allocator, program: ast.Program, msg: *[]const u8, at: *?ast.Pos, is_builtin: IsBuiltin) Error!std.StringHashMap(ast.FnDecl) {
     var fns = std.StringHashMap(ast.FnDecl).init(arena);
     for (program.stmts) |s| if (s == .func) {
         at.* = s.func.pos;
-        if (builtins.lookup(s.func.name) != null or aggregates.lookup(s.func.name) != null or stats.isStat(s.func.name)) {
+        if (is_builtin(s.func.name) or aggregates.lookup(s.func.name) != null or stats.isStat(s.func.name)) {
             msg.* = msgfmt.allocPrint(arena, "`{s}` is a built-in function and cannot be redefined", .{s.func.name}) catch "CREATE FUNCTION shadows a builtin";
             return error.ExpandFailed;
         }
@@ -127,8 +131,8 @@ fn collectFns(arena: std.mem.Allocator, program: ast.Program, msg: *[]const u8, 
 
 /// A table function's body as declared, with the scalar functions it calls inlined,
 /// so `check` types it as each call, expanded, will be.
-pub fn expandTableCheck(arena: std.mem.Allocator, program: ast.Program, tc: ast.TableCheck, msg: *[]const u8, at: *?ast.Pos) Error!ast.TableCheck {
-    var fns = try collectFns(arena, program, msg, at);
+pub fn expandTableCheck(arena: std.mem.Allocator, program: ast.Program, tc: ast.TableCheck, msg: *[]const u8, at: *?ast.Pos, is_builtin: IsBuiltin) Error!ast.TableCheck {
+    var fns = try collectFns(arena, program, msg, at, is_builtin);
     var json = std.StringHashMap(?std.json.Value).init(arena);
     at.* = null;
     var cx = Ctx{ .arena = arena, .fns = &fns, .json = &json, .msg = msg, .at = at };
@@ -489,7 +493,7 @@ pub fn bindArg(arena: std.mem.Allocator, fd: ast.FnDecl, i: usize, a: **ast.Expr
     if (!acceptsLiteral(want, got))
         return try msgfmt.allocPrint(arena, "`{s}`: argument {d} (`{s}`) expects {s}, got {s}", .{ fd.name, i + 1, p.name, typeWord(want), typeWord(got) });
     if (!isTemporalText(ty, a.*)) return null;
-    if (!temporalTextOk(arena, ty, a.*.str_lit))
+    if (!temporalTextOk(ty, a.*.str_lit))
         return try msgfmt.allocPrint(arena, "`{s}`: argument {d} (`{s}`) expects {s}, got `{s}`", .{ fd.name, i + 1, p.name, typeWord(want), a.*.str_lit });
     const cast = try ast.mk(arena, .{ .cast = .{ .e = a.*, .ty = ty } });
     a.* = cast;
@@ -501,9 +505,15 @@ pub fn isTemporalText(ty: types.Type, e: *const ast.Expr) bool {
     return e.* == .str_lit and (ty.kind == .date or ty.kind == .time or ty.kind == .timestamp);
 }
 
-pub fn temporalTextOk(arena: std.mem.Allocator, ty: types.Type, text: []const u8) bool {
-    _ = eval.castValueTyped(arena, .{ .string = text }, ty) catch return false;
-    return true;
+/// Whether `text` reads as `ty` the way CAST reads it: a date or timestamp as
+/// PostgreSQL text, a time as ISO.
+pub fn temporalTextOk(ty: types.Type, text: []const u8) bool {
+    return switch (ty.kind) {
+        .date => civil.Text(.pg_text).date(text) != null,
+        .timestamp => civil.Text(.pg_text).timestamp(text) != null,
+        .time => civil.Text(.iso).time(text) != null,
+        else => true,
+    };
 }
 
 /// The type of a literal argument, else null; a `null` literal reports null too,
@@ -600,10 +610,10 @@ test "expandProgram rejects recursion and arity mismatch" {
     try std.testing.expect(std.mem.indexOf(u8, m2, "expects 1 argument(s), got 2") != null);
 
     var at: ?ast.Pos = null;
-    try std.testing.expectError(error.ExpandFailed, expandProgramAt(a, p2, &.{}, &m2, &at));
+    try std.testing.expectError(error.ExpandFailed, expandProgramAt(a, p2, &.{}, &m2, &at, test_host.isBuiltin));
     try std.testing.expectEqual(@as(u32, 2), at.?.line);
     try std.testing.expectEqual(@as(u32, 8), at.?.col);
-    try std.testing.expectError(error.ExpandFailed, expandProgramAt(a, p1, &.{}, &m1, &at));
+    try std.testing.expectError(error.ExpandFailed, expandProgramAt(a, p1, &.{}, &m1, &at, test_host.isBuiltin));
     try std.testing.expectEqual(@as(u32, 1), at.?.line);
 }
 

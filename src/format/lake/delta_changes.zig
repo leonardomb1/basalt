@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const HttpClient = @import("../../net/http_std.zig");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const Layout = @import("../parquet/fit.zig").Layout;
 const Value = @import("../../exec/value.zig").Value;
 const delta = @import("delta.zig");

@@ -7,8 +7,8 @@
 //! cell shows when its column is text.
 
 const std = @import("std");
-const msgfmt = @import("../msgfmt.zig");
-const civil = @import("../../exec/civil.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
+const civil = @import("../../base/civil.zig");
 
 pub const day_ms: i64 = 86_400_000;
 

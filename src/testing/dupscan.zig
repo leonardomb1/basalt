@@ -353,39 +353,39 @@ pub fn mask(gpa: std.mem.Allocator, source: [:0]const u8, tests: bool) ![]u8 {
 /// modules that may legitimately hold one, some not yet written. Wave 2 shrinks
 /// each list to its homes and switches to `.exact`.
 pub const plan = [_]Rule{
-    .{ .home = "civil", .pattern = civil_pattern, .exact = true, .allow = &.{"exec/civil.zig"} },
-    .{ .home = "civil.Part", .pattern = part_pattern, .exact = true, .allow = &.{"exec/civil.zig"} },
+    .{ .home = "civil", .pattern = civil_pattern, .exact = true, .allow = &.{"base/civil.zig"} },
+    .{ .home = "civil.Part", .pattern = part_pattern, .exact = true, .allow = &.{"base/civil.zig"} },
     .{ .home = "textconv", .pattern = textconv_pattern, .exact = true, .allow = &textconv_allow },
     .{ .home = "floatord", .pattern = floatord_pattern, .exact = true, .allow = &.{"exec/floatord.zig"} },
-    .{ .home = "decimal", .pattern = decimal_pattern, .exact = true, .allow = &.{"exec/decimal.zig"} },
-    .{ .home = "decimal.Digits", .pattern = digits_pattern, .exact = true, .allow = &.{"exec/decimal.zig"} },
+    .{ .home = "decimal", .pattern = decimal_pattern, .exact = true, .allow = &.{ "base/decimal.zig", "exec/decimal_ops.zig" } },
+    .{ .home = "decimal.Digits", .pattern = digits_pattern, .exact = true, .allow = &.{"base/decimal.zig"} },
     .{ .home = "jsontext", .pattern = jsontext_pattern, .exact = true, .allow = &.{
         "exec/jsontext.zig",
     } },
     .{ .home = "hex", .pattern = hex_pattern, .exact = true, .allow = &.{
-        "format/hex.zig",
+        "base/hex.zig",
         "format/uuid.zig",
     } },
     .{ .home = "utf16", .pattern = utf16_pattern, .exact = true, .allow = &.{
-        "format/utf16.zig",
+        "base/utf16.zig",
     } },
     .{ .home = "charset", .pattern = charset_pattern, .exact = true, .allow = &.{
-        "format/charset.zig",
+        "exec/charset.zig",
     } },
     .{ .home = "cursor", .pattern = cursor_pattern, .exact = true, .allow = &.{
-        "format/cursor.zig",
+        "base/cursor.zig",
     } },
     .{ .home = "typemap", .pattern = typemap_pattern, .exact = true, .allow = &.{
         "db/typemap.zig",
     } },
     .{ .home = "scheme", .pattern = scheme_pattern, .exact = true },
     .{ .home = "dial", .pattern = dial_pattern, .exact = true, .allow = &.{
-        "connect/driver.zig",
+        "net/conn.zig",
     } },
     .{ .home = "options", .pattern = options_pattern, .exact = true, .allow = &options_allow },
     .{ .home = "retry", .pattern = retry_pattern, .exact = true, .allow = &retry_allow },
     .{ .home = "transient", .pattern = transient_pattern, .exact = true, .allow = &.{
-        "connect/driver.zig",
+        "net/conn.zig",
     } },
     .{ .home = "queue", .pattern = queue_pattern, .exact = true, .allow = &.{
         "runtime/parallel.zig",
@@ -394,7 +394,7 @@ pub const plan = [_]Rule{
         "db/sql.zig",
     } },
     .{ .home = "guard", .pattern = guard_pattern, .span = .file, .exact = true, .allow = &.{
-        "connect/guard.zig",
+        "exec/guard.zig",
     } },
     .{ .home = "delta_types", .pattern = delta_types_pattern, .exact = true, .allow = &.{
         "format/lake/delta_types.zig",
@@ -407,14 +407,14 @@ pub const plan = [_]Rule{
     } },
     .{ .home = "clamp", .pattern = clamp_pattern, .exact = true },
     .{ .home = "http_std", .pattern = http_std_pattern, .exact = true },
-    .{ .home = "percent", .pattern = percent_pattern, .exact = true, .allow = &.{ "net/percent.zig", "format/lake/delta_write.zig" } },
-    .{ .home = "decimal.bigEndianDecimal", .pattern = big_endian_pattern, .exact = true, .allow = &.{"exec/decimal.zig"} },
+    .{ .home = "percent", .pattern = percent_pattern, .exact = true, .allow = &.{ "base/percent.zig", "format/lake/delta_write.zig" } },
+    .{ .home = "decimal.bigEndianDecimal", .pattern = big_endian_pattern, .exact = true, .allow = &.{"base/decimal.zig"} },
     .{ .home = "ast.mk", .pattern = expr_alloc_pattern, .exact = true, .allow = &.{"lang/ast.zig"} },
     .{ .home = "ast.fieldsOf", .pattern = fields_of_pattern, .exact = true, .allow = &.{"lang/ast.zig"} },
-    .{ .home = "varint", .pattern = varint_pattern, .exact = true, .allow = &.{"format/varint.zig"} },
+    .{ .home = "varint", .pattern = varint_pattern, .exact = true, .allow = &.{"base/varint.zig"} },
     .{ .home = "Value.own", .pattern = own_value_pattern, .exact = true, .allow = &.{"exec/value.zig"} },
     .{ .home = "minmax", .pattern = minmax_pattern, .exact = true, .allow = &.{"exec/minmax.zig"} },
-    .{ .home = "decimal.roundTo", .pattern = round_to_pattern, .exact = true, .allow = &.{"exec/decimal.zig"} },
+    .{ .home = "decimal.roundTo", .pattern = round_to_pattern, .exact = true, .allow = &.{"base/decimal.zig"} },
     .{ .home = "csv.Quoting", .pattern = csv_quote_pattern, .under = "format/", .exact = true, .allow = &.{"format/csv.zig"} },
     .{ .home = "hoist.projectedFrom", .pattern = projected_pattern, .exact = true, .allow = &.{"runtime/pushdown/hoist.zig"} },
     .{ .home = "ast.splitAnd", .pattern = split_and_pattern, .exact = true, .allow = &.{
@@ -428,8 +428,8 @@ pub const plan = [_]Rule{
     } },
     .{ .home = "print", .pattern = print_pattern, .exact = true, .allow = &.{"lang/print.zig"} },
     .{ .home = "objstore.Upload", .pattern = upload_pattern, .exact = true, .allow = &.{"store/objstore.zig"} },
-    .{ .home = "filemap", .pattern = filemap_pattern, .exact = true, .allow = &.{"exec/filemap.zig"} },
-    .{ .home = "driver.LoginNote", .pattern = login_note_pattern, .exact = true, .allow = &.{"connect/driver.zig"} },
+    .{ .home = "filemap", .pattern = filemap_pattern, .exact = true, .allow = &.{"base/filemap.zig"} },
+    .{ .home = "conn.LoginNote", .pattern = login_note_pattern, .exact = true, .allow = &.{"net/conn.zig"} },
     .{ .home = "formats_open", .pattern = format_arm_pattern, .exact = true },
     .{ .home = "output", .pattern = output_pattern, .under = "format/", .exact = true, .allow = &.{
         "format/lake/delta_checkpoint.zig",
@@ -462,6 +462,7 @@ pub const transient_pattern = "== (408|429|50[0234])([^0-9]|$)|!= (408|429|50[02
 /// testing_util.zig's option oracle reads `true`/`false` as it did before the
 /// homes, for the same reason it keeps its own option readers (`options_allow`).
 const textconv_allow = [_][]const u8{
+    "base/decimal.zig",
     "exec/textconv.zig",
     "runtime/connect/testing_util.zig",
 };
@@ -469,7 +470,7 @@ const textconv_allow = [_][]const u8{
 /// postgres_fake.zig sleeps a configured delay before answering a query, so tests
 /// can hold a result past a timeout; it waits, it does not retry.
 const retry_allow = [_][]const u8{
-    "connect/retry.zig",
+    "net/retry.zig",
     "testing/postgres_fake.zig",
 };
 
@@ -512,7 +513,7 @@ pub const upload_pattern = "\\.part_len([^a-zA-Z0-9_]|$)";
 /// unmaps it, an empty file included.
 pub const filemap_pattern = "posix\\.mmap\\([^\\n]*PROT\\.READ, ";
 /// A connector's own thread-local failure note: every connector explains its
-/// failures through the one `driver.LoginNote`.
+/// failures through the one `conn.LoginNote`.
 pub const login_note_pattern = "threadlocal var \\w+: [^=]*(ThreadNote\\(|LoginNote )";
 /// A switch arm naming a file format: what a format opens with is its entry in
 /// `runtime/connect/formats_open.zig`, looked up by tag.

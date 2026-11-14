@@ -23,7 +23,7 @@
 const std = @import("std");
 const pagecache = @import("../../exec/pagecache.zig");
 const deflate = @import("deflate.zig");
-const varint = @import("../varint.zig");
+const varint = @import("../../base/varint.zig");
 
 pub const Codec = enum(i32) {
     uncompressed = 0,

@@ -7,24 +7,25 @@ const Decimal = @import("../value.zig").Decimal;
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
 const Value = @import("../value.zig").Value;
-const decimal = @import("../decimal.zig");
-const asDecimal = decimal.asDecimal;
+const decimal = @import("../../base/decimal.zig");
+const decimal_ops = @import("../decimal_ops.zig");
+const asDecimal = decimal_ops.asDecimal;
 const ast = @import("../../lang/ast.zig");
 const cast = @import("cast.zig");
 const cmpResult = @import("row.zig").cmpResult;
 const column = @import("../column.zig");
 const nested_json = @import("../nested.zig");
-const decimalArithType = @import("../decimal.zig").decimalArithType;
-const decimalOp = @import("../decimal.zig").decimalOp;
+const decimalArithType = @import("../decimal_ops.zig").decimalArithType;
+const decimalOp = @import("../decimal_ops.zig").decimalOp;
 const evalRow = @import("row.zig").evalRow;
 const fieldColumn = @import("support.zig").fieldColumn;
 const forgetFailure = @import("support.zig").forgetFailure;
-const rescaleTo = @import("../decimal.zig").rescaleTo;
-const addAtScale = @import("../decimal.zig").addAtScale;
-const cmpBound = @import("../decimal.zig").cmpBound;
+const rescaleTo = @import("../../base/decimal.zig").rescaleTo;
+const addAtScale = @import("../decimal_ops.zig").addAtScale;
+const cmpBound = @import("../decimal_ops.zig").cmpBound;
 const intOp = @import("row.zig").intOp;
 const lookupBuiltin = @import("functions.zig").lookupBuiltin;
-const max_digits = @import("../decimal.zig").max_digits;
+const max_digits = @import("../../base/decimal.zig").max_digits;
 const floatord = @import("../floatord.zig");
 const parseDateText = @import("time.zig").parseDateText;
 const parseTimestampText = @import("time.zig").parseTimestampText;
@@ -979,10 +980,10 @@ fn decApply(op: ast.BinOp, l: Vec, r: Vec, sink: anytype, valid: Bitmap, any: bo
             inline else => |lk| switch (lane.rk) {
                 inline else => |rk| if (comptime !laneShape(cop, lk, rk))
                     unreachable
-                else if ((comptime decimal.narrowable(cop, lk, rk)) and lane.narrow)
-                    decimal.laneLoop(VecError, cop, lk, rk, true, lane, sink, valid, any)
+                else if ((comptime decimal_ops.narrowable(cop, lk, rk)) and lane.narrow)
+                    decimal_ops.laneLoop(VecError, cop, lk, rk, true, lane, sink, valid, any)
                 else
-                    decimal.laneLoop(VecError, cop, lk, rk, false, lane, sink, valid, any),
+                    decimal_ops.laneLoop(VecError, cop, lk, rk, false, lane, sink, valid, any),
             },
         },
         else => unreachable,
@@ -993,7 +994,7 @@ fn decApply(op: ast.BinOp, l: Vec, r: Vec, sink: anytype, valid: Bitmap, any: bo
     }
 }
 
-const Side = decimal.Side;
+const Side = decimal_ops.Side;
 
 /// The operand shapes `decLane` hands out for `op`: never two constants or two INT
 /// columns, and for a commutative `+` or `*` a decimal column first, or an INT
@@ -1025,8 +1026,8 @@ fn sideScale(v: Vec) u8 {
 const DecLane = struct {
     l: Vec,
     r: Vec,
-    a: decimal.LaneSrc,
-    b: decimal.LaneSrc,
+    a: decimal_ops.LaneSrc,
+    b: decimal_ops.LaneSrc,
     s: u8,
     lk: Side,
     rk: Side,
@@ -1050,7 +1051,7 @@ noinline fn decLane(op: ast.BinOp, l0: Vec, r0: Vec) ?DecLane {
     if (lk == .one and rk == .one or lk == .int and rk == .int) return null;
     const ls = sideScale(l);
     const rs = sideScale(r);
-    const plan = decimal.lanePlan(op, ls, rs) orelse return null;
+    const plan = decimal_ops.lanePlan(op, ls, rs) orelse return null;
     const lc: i128 = if (lk == .one) std.math.mul(i128, asDecimal(l.scalar).?.unscaled, plan.fl) catch return null else 0;
     const rc: i128 = if (rk == .one) std.math.mul(i128, asDecimal(r.scalar).?.unscaled, plan.fr) catch return null else 0;
     return .{
@@ -1061,7 +1062,7 @@ noinline fn decLane(op: ast.BinOp, l0: Vec, r0: Vec) ?DecLane {
         .s = plan.s,
         .lk = lk,
         .rk = rk,
-        .narrow = op == .mul and lk != .dec and rk != .dec and decimal.narrowLane(lc, rc),
+        .narrow = op == .mul and lk != .dec and rk != .dec and decimal_ops.narrowLane(lc, rc),
     };
 }
 
@@ -1071,7 +1072,7 @@ noinline fn decRow(op: ast.BinOp, l: *const Vec, r: *const Vec, i: usize) VecErr
     return try (decimalOp(op, decAt(l.*, i), decAt(r.*, i)) orelse unreachable);
 }
 
-fn laneSrc(v: Vec, scale: u8, f: i128, c: i128) decimal.LaneSrc {
+fn laneSrc(v: Vec, scale: u8, f: i128, c: i128) decimal_ops.LaneSrc {
     return switch (v) {
         .scalar => .{ .scale = scale, .f = f, .c = c },
         .col => |col| if (col.ty.kind == .int) .{ .ints = col.data.i64, .scale = scale, .f = f, .c = c } else switch (column.decimals(col)) {
@@ -1113,7 +1114,7 @@ fn decOpCmpVec(arena: std.mem.Allocator, b: ast.Expr.Binary, batch: Batch) VecEr
     _ = decimalArithType(a.op, vecType(l) orelse return null, vecType(r) orelse return null) orelse return null;
     const n = batch.len;
     const d = asDecimal(lit) orelse return null;
-    const sc = decimal.resultScale(a.op, sideScale(l), sideScale(r));
+    const sc = decimal_ops.resultScale(a.op, sideScale(l), sideScale(r));
     const pick = if (sc <= max_digits) cmpBound(b.op, flip, d, @intCast(sc), std.math.minInt(i128)) else null;
     var f = try Filled(bool).masked(arena, n, try bothValid(arena, l, r, n));
     var sink = CmpSink{
@@ -1166,7 +1167,7 @@ const CmpSink = struct {
     bound: i128,
 
     pub inline fn put(self: *CmpSink, i: usize, d: Decimal) VecError!void {
-        self.out[i] = decimal.cmpAtScale(d, self.fast_op, self.bound, self.scale, self.op, self.flip, self.lit, cmpResult);
+        self.out[i] = decimal_ops.cmpAtScale(d, self.fast_op, self.bound, self.scale, self.op, self.flip, self.lit, cmpResult);
     }
 };
 
@@ -1184,12 +1185,12 @@ fn decColCmpVec(arena: std.mem.Allocator, op: ast.BinOp, l: Vec, r: Vec, n: usiz
     switch (pick.op) {
         inline .eq, .ne, .lt, .le, .gt, .ge => |cop| switch (column.decimals(c)) {
             .wide => |v| for (v[0..n], f.d) |x, *o| {
-                o.* = decimal.cmpAtScale(x, cop, pick.bound, c.ty.scale, op, flip, d, cmpResult);
+                o.* = decimal_ops.cmpAtScale(x, cop, pick.bound, c.ty.scale, op, flip, d, cmpResult);
             },
             .narrow => |nw| if (nw.scale == c.ty.scale) {
                 for (nw.cells[0..n], f.d) |x, *o| o.* = cmpResult(cop, std.math.order(@as(i128, x.int()), pick.bound));
             } else for (nw.cells[0..n], f.d) |x, *o| {
-                o.* = decimal.cmpAtScale(x.at(nw.scale), cop, pick.bound, c.ty.scale, op, flip, d, cmpResult);
+                o.* = decimal_ops.cmpAtScale(x.at(nw.scale), cop, pick.bound, c.ty.scale, op, flip, d, cmpResult);
             },
         },
         else => unreachable,

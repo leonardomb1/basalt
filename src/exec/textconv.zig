@@ -13,7 +13,9 @@ const column = @import("column.zig");
 const value = @import("value.zig");
 
 const Decimal = value.Decimal;
-const decimal = @import("decimal.zig");
+const decimal = @import("../base/decimal.zig");
+const floatToInt = decimal.floatToInt;
+const floatToIntScaled = decimal.floatToIntScaled;
 const pow10_i128 = decimal.pow10_i128;
 
 /// A spelling that reads as one truth value. Input matches when it is a prefix of
@@ -65,7 +67,7 @@ pub const Words = struct {
     pub const runtime_filter: Words = .{ .yes = &.{}, .no = &.{ .whole("false"), .whole("off") }, .fold = true, .otherwise = true };
 
     /// A BOOL cell as the engine printed it, read back by the terminal grid
-    /// (connect/table.zig, cli/repl/view.zig): exactly `true`, else false.
+    /// (format/table.zig, cli/repl/view.zig): exactly `true`, else false.
     pub const printed: Words = .{ .yes = &.{.whole("true")}, .otherwise = false };
 
     /// An `xsi:nil` attribute (xml/read.zig:518): exactly `true` or `1`, else false.
@@ -112,30 +114,6 @@ inline fn sameByte(comptime fold: bool, a: u8, b: u8) bool {
 /// cast (column.floatToInt), `half_away` is `@round` and the decimal cast
 /// (eval/cast.zig rescaleTo), and `exact` refuses any fraction (keytable intOf).
 pub const Round = decimal.Round;
-
-/// `x` rounded by `r`, or null when it is NaN, infinite or outside i64.
-pub fn floatToInt(x: f64, comptime r: Round) ?i64 {
-    const v = switch (r) {
-        .half_even => halfEven(x),
-        .half_away => @round(x),
-        .exact => if (@trunc(x) == x) x else return null,
-    };
-    if (!(v >= -0x1p63 and v < 0x1p63)) return null;
-    return @intFromFloat(v);
-}
-
-/// `x * factor` rounded by `r`, as a count of a smaller unit (micros of a day
-/// offset, milliseconds of an Excel serial, a decimal's unscaled digits); the
-/// product is taken in f64, so an integer factor past 2^53 is not exact.
-pub fn floatToIntScaled(x: f64, factor: f64, comptime r: Round) ?i64 {
-    return floatToInt(x * factor, r);
-}
-
-fn halfEven(x: f64) f64 {
-    const f = @floor(x);
-    const d = x - f;
-    return if (d < 0.5) f else if (d > 0.5) f + 1 else if (@mod(f, 2) == 0) f else f + 1;
-}
 
 const testing = std.testing;
 
@@ -308,7 +286,7 @@ const dec_corpus = [_]Decimal{
 };
 
 test "decimalToInt half_away is the CAST(decimal AS INT) path" {
-    const rescaleTo = @import("decimal.zig").rescaleTo;
+    const rescaleTo = @import("../base/decimal.zig").rescaleTo;
     for (dec_corpus) |d| {
         const want: ?i64 = if (rescaleTo(d, 0)) |z| std.math.cast(i64, z.unscaled) else null;
         try testing.expectEqual(want, decimal.intOf(d, .half_away));

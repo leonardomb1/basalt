@@ -8,8 +8,9 @@ pub const SqlKind = @import("../env.zig").SqlKind;
 const ast = @import("../../lang/ast.zig");
 const connectSql = @import("../connect.zig").connectSql;
 const connectWhy = @import("dbconfig.zig").connectWhy;
-const driver = @import("../../connect/driver.zig");
-const obs = @import("../obs.zig");
+const driver = @import("../../exec/driver.zig");
+const netconn = @import("../../net/conn.zig");
+const obs = @import("../../exec/obs.zig");
 const op = @import("../../exec/op.zig");
 const parallel = @import("../parallel.zig");
 const planErr = @import("../env.zig").planErr;
@@ -20,7 +21,7 @@ const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const srOpenErr = @import("../env.zig").srOpenErr;
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const replace = @import("../../db/replace.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const streamload = @import("../../db/streamload.zig");
@@ -217,7 +218,7 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
         return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} sink connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, e) }));
     const setup = sql.Sink.open(env.gpa, setup_conn, dialect, w.target, schema, if (w.mode == .overwrite) .append else w.mode, null) catch |e| {
         defer setup_conn.close();
-        const why = try driver.connectorNoteAlloc(env.arena, "", e, setup_conn.lastError());
+        const why = try netconn.connectorNoteAlloc(env.arena, "", e, setup_conn.lastError());
         return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} sink setup failed: {s}", .{ conn.connector, why }));
     };
     setup.sink().close() catch |e|

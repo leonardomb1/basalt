@@ -4,19 +4,20 @@ const Decimal = @import("../value.zig").Decimal;
 const EvalError = @import("../eval.zig").EvalError;
 const Value = @import("../value.zig").Value;
 const ast = @import("../../lang/ast.zig");
-const civil = @import("../civil.zig");
+const civil = @import("../../base/civil.zig");
 const textconv = @import("../textconv.zig");
 const parseDateText = @import("time.zig").parseDateText;
 const parseIsoTime = @import("time.zig").parseIsoTime;
 const parseTimestampText = @import("time.zig").parseTimestampText;
-const decimal = @import("../decimal.zig");
+const decimal = @import("../../base/decimal.zig");
+const decimal_ops = @import("../decimal_ops.zig");
 const rescaleTo = decimal.rescaleTo;
 const fitsPrecision = decimal.fitsPrecision;
 const max_digits = decimal.max_digits;
-const asDecimalValue = decimal.asDecimalValue;
+const asDecimalValue = decimal_ops.asDecimalValue;
 const std = @import("std");
 const clip = @import("support.zig").clip;
-const decimalOverflow = decimal.decimalOverflow;
+const decimalOverflow = decimal_ops.decimalOverflow;
 const failWith = @import("support.zig").failWith;
 const trim = @import("support.zig").trim;
 const types = @import("../../lang/types.zig");
@@ -145,7 +146,7 @@ pub inline fn castElem(comptime from: types.TypeKind, comptime to: types.TypeKin
     if (comptime !hasElemCast(from, to)) @compileError("no element cast from " ++ @tagName(from) ++ " to " ++ @tagName(to));
     return switch (to) {
         .int => switch (from) {
-            .float => textconv.floatToInt(x, .half_even) orelse error.CastFailed,
+            .float => decimal.floatToInt(x, .half_even) orelse error.CastFailed,
             .bool => @intFromBool(x),
             .string => parseIntStrict(trim(x)) orelse error.CastFailed,
             .decimal => decimal.toInt(x) orelse error.IntOverflow,
@@ -499,7 +500,7 @@ test "the vector cast and the row cast agree bit for bit, per row, over random v
         try qb.append(.{ .decimal = q });
         try xb.append(.{ .int = if (i < big.len) @truncate(big[i]) else r.int(i64) >> r.uintLessThan(u6, 63) });
         try fb.append(.{ .float = if (i < floats.len) floats[i] else (r.float(f64) - 0.5) * std.math.pow(f64, 10, @floatFromInt(r.uintLessThan(u8, 40))) });
-        try sb.append(.{ .string = if (i % 3 == 0) texts[r.uintLessThan(usize, texts.len)] else try decimal.formatDecimal(a, q.unscaled, q.scale) });
+        try sb.append(.{ .string = if (i % 3 == 0) texts[r.uintLessThan(usize, texts.len)] else try decimal_ops.formatDecimal(a, q.unscaled, q.scale) });
         try tb.append(.{ .date = r.intRangeAtMost(i32, -800_000, 800_000) });
     }
     var cols = [_]column.Column{ try db.finish(), try qb.finish(), try xb.finish(), try fb.finish(), try sb.finish(), try tb.finish() };

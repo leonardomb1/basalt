@@ -6,9 +6,9 @@ const std = @import("std");
 const schema = @import("schema.zig");
 const read = @import("read.zig");
 const write = @import("write.zig");
-const varint = @import("../varint.zig");
-const pow10_i128 = @import("../../exec/decimal.zig").pow10_i128;
-const civil = @import("../../exec/civil.zig");
+const varint = @import("../../base/varint.zig");
+const pow10_i128 = @import("../../base/decimal.zig").pow10_i128;
+const civil = @import("../../base/civil.zig");
 
 const Node = schema.Node;
 

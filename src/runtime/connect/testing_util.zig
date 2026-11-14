@@ -9,7 +9,7 @@ const ast = @import("../../lang/ast.zig");
 const env_mod = @import("../env.zig");
 const eqlAny = @import("../env.zig").eqlAny;
 const ftp = @import("../../store/ftp.zig");
-const obs = @import("../obs.zig");
+const obs = @import("../../exec/obs.zig");
 const op = @import("../../exec/op.zig");
 const options = @import("../analyze/options.zig");
 const planErr = @import("../env.zig").planErr;
@@ -43,7 +43,7 @@ pub fn testEnv(a: std.mem.Allocator) !*Env {
     bindings.* = .init(a);
     const connections = try a.create(std.StringHashMap(ast.Connection));
     connections.* = .init(a);
-    const sources = try a.create(std.array_list.Managed(@import("../../connect/driver.zig").Source));
+    const sources = try a.create(std.array_list.Managed(@import("../../exec/driver.zig").Source));
     sources.* = .init(a);
     const diag = try a.create(env_mod.Diag);
     diag.* = .{};

@@ -13,10 +13,10 @@
 //! kept as they are and pinned by the tests below.
 
 const std = @import("std");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const Value = @import("../../exec/value.zig").Value;
-const civil = @import("../../exec/civil.zig");
-const decimal = @import("../../exec/decimal.zig");
+const civil = @import("../../base/civil.zig");
+const decimal = @import("../../base/decimal.zig");
 const jsontext = @import("../../exec/jsontext.zig");
 const pqwrite = @import("../parquet/write.zig");
 const table = @import("table.zig");

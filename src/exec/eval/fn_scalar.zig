@@ -4,18 +4,19 @@
 
 const Cx = @import("scalar.zig").Cx;
 const Decimal = @import("../value.zig").Decimal;
-const decimal = @import("../decimal.zig");
+const decimal = @import("../../base/decimal.zig");
+const decimal_ops = @import("../decimal_ops.zig");
 const Numeric = @import("scalar.zig").Numeric;
 const Overload = @import("scalar.zig").Overload;
 const Type = @import("../../lang/types.zig").Type;
 const TypeKind = @import("../../lang/types.zig").TypeKind;
 const ast = @import("../../lang/ast.zig");
-const roundDecimal = @import("../decimal.zig").roundDecimal;
+const roundDecimal = @import("../../base/decimal.zig").roundDecimal;
 const roundFloat = @import("strings.zig").roundFloat;
-const Rounding = @import("../decimal.zig").Rounding;
-const roundOutScale = @import("../decimal.zig").roundOutScale;
+const Rounding = @import("../../base/decimal.zig").Rounding;
+const roundOutScale = @import("../decimal_ops.zig").roundOutScale;
 const time = @import("time.zig");
-const civil = @import("../civil.zig");
+const civil = @import("../../base/civil.zig");
 const TimeUnit = time.TimeUnit;
 const clip = @import("support.zig").clip;
 const regex = @import("../regex.zig");
@@ -39,7 +40,7 @@ const simd = @import("../simd.zig");
 const max_str_bytes = @import("functions.zig").max_str_bytes;
 const padChars = @import("strings.zig").padChars;
 const parseHexI64 = @import("support.zig").parseHexI64;
-const percent = @import("../../net/percent.zig");
+const percent = @import("../../base/percent.zig");
 const reverseChars = @import("strings.zig").reverseChars;
 const std = @import("std");
 const substrChars = @import("strings.zig").substrChars;
@@ -350,7 +351,7 @@ pub fn Whole(comptime down: bool) type {
             return decimal.whole(down, d);
         }
         pub fn decType(t: Type) Type {
-            return decimal.wholeType(t);
+            return decimal_ops.wholeType(t);
         }
     });
 }

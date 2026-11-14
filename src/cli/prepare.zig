@@ -9,6 +9,7 @@ const ast = @import("../lang/ast.zig");
 const declOf = @import("entry.zig").declOf;
 const entryStatements = @import("repl/repl.zig").entryStatements;
 const include = @import("../lang/include.zig");
+const include_fetch = @import("../net/include_fetch.zig");
 const runtime = @import("../runtime/run.zig");
 const splitStatements = @import("entry.zig").splitStatements;
 const std = @import("std");
@@ -79,7 +80,7 @@ pub fn prepareEntry(a: std.mem.Allocator, decls: *const DeclStore, block: []cons
     const entry_at = joined.entry_at;
     if (text_out) |t| t.* = text;
 
-    const prog = include.loadProgram(a, text, "<repl>", ".", diag) catch |e| switch (e) {
+    const prog = include.loadProgramOpts(a, text, "<repl>", ".", diag, .{ .fetch = include_fetch.fetch() }) catch |e| switch (e) {
         error.ParseFailed => return error.ParseFailed,
         error.OutOfMemory => return error.OutOfMemory,
     };

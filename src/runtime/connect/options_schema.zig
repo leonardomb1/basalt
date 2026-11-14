@@ -8,9 +8,9 @@
 const ast = @import("../../lang/ast.zig");
 const options = @import("../analyze/options.zig");
 const textconv = @import("../../exec/textconv.zig");
-const registry = @import("../../connect/registry.zig");
+const registry = @import("registry.zig");
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 
 pub const Kind = enum {
@@ -31,7 +31,7 @@ pub const Kind = enum {
 pub const Opt = struct { key: []const u8, kind: Kind = .text };
 
 /// Seconds the login may go without an answer, and each read or write after it
-/// (`driver.Timeouts`); 0 is no limit.
+/// (`conn.Timeouts`); 0 is no limit.
 pub const timeouts = [_]Opt{ .{ .key = "connect_timeout", .kind = .count }, .{ .key = "query_timeout", .kind = .count } };
 
 pub const sftp = [_]Opt{
@@ -361,7 +361,7 @@ const Fx = struct {
     const analyze = @import("../analyze.zig");
     const dbconfig = @import("dbconfig.zig");
     const env_mod = @import("../env.zig");
-    const obs = @import("../obs.zig");
+    const obs = @import("../../exec/obs.zig");
     const op = @import("../../exec/op.zig");
     const parser = @import("../../lang/sql_parser.zig");
     const old = @import("testing_util.zig").old;

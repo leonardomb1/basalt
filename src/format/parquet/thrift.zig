@@ -21,7 +21,7 @@
 //! `readBinary` slices borrow the input buffer.
 
 const std = @import("std");
-const varint = @import("../varint.zig");
+const varint = @import("../../base/varint.zig");
 
 pub const Error = error{
     CorruptThrift,
@@ -49,7 +49,7 @@ pub const ListHeader = struct { elem: Type, size: usize };
 
 pub const max_depth = 32;
 
-const Cursor = @import("../cursor.zig").Reader(.little, Error.CorruptThrift);
+const Cursor = @import("../../base/cursor.zig").Reader(.little, Error.CorruptThrift);
 
 pub const Reader = struct {
     c: Cursor,

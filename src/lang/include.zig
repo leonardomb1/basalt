@@ -28,8 +28,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const parser = @import("sql_parser.zig");
 const remote = @import("remote.zig");
-const msgfmt = @import("../format/msgfmt.zig");
-const include_fetch = @import("../net/include_fetch.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 
 pub const Error = parser.Error;
 
@@ -58,10 +57,12 @@ pub fn loadProgram(
 /// The root script's parse options, of which `known_tables` apply throughout and
 /// `errors` (keep parsing past an error) to the root alone, since an included file
 /// that does not parse fails outright; and the resolver remote includes go through,
-/// without which they are refused.
+/// or the fetch one is made over at the first remote include. With neither, remote
+/// includes are refused: the network is the caller's to hand in.
 pub const Options = struct {
     parse: parser.Options = .{},
     remote: ?*remote.Resolver = null,
+    fetch: ?remote.Fetch = null,
 };
 
 pub fn loadProgramOpts(
@@ -82,6 +83,7 @@ pub fn loadProgramOpts(
         .files = std.array_list.Managed([]const u8).init(arena),
         .aliases = std.StringHashMap([]const u8).init(arena),
         .remote = opts.remote,
+        .fetch = opts.fetch,
         .root_dir = base_dir,
     };
     if (std.fs.cwd().realpathAlloc(arena, label)) |canon| {
@@ -113,14 +115,16 @@ const Ctx = struct {
     files: std.array_list.Managed([]const u8),
     aliases: std.StringHashMap([]const u8),
     remote: ?*remote.Resolver,
+    fetch: ?remote.Fetch,
     root_dir: []const u8,
 
     /// The resolver remote includes go through: the caller's, else one made at the
-    /// first remote include, over HTTPS and `basalt.sum` beside the root script.
+    /// first remote include, over the caller's fetch and `basalt.sum` beside the root
+    /// script.
     fn resolver(self: *Ctx) Error!*remote.Resolver {
         if (self.remote) |r| return r;
         const r = try self.arena.create(remote.Resolver);
-        r.* = remote.Resolver.init(self.arena, self.root_dir, include_fetch.fetch(), false) catch |e| switch (e) {
+        r.* = remote.Resolver.init(self.arena, self.root_dir, self.fetch, false) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
             else => return self.fail(self.root_dir, 0, 0, "cannot read basalt.sum: {s}", .{@errorName(e)}),
         };

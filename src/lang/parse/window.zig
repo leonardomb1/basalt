@@ -39,7 +39,7 @@ const Error = @import("../sql_parser.zig").Error;
 const Pos = @import("../sql_parser.zig").Pos;
 const aggregates = @import("../aggregates.zig");
 const ast = @import("../ast.zig");
-const civil = @import("../../exec/civil.zig");
+const civil = @import("../../base/civil.zig");
 const std = @import("std");
 
 pub const OrderExpr = struct { e: *ast.Expr, desc: bool, nulls_first: bool };

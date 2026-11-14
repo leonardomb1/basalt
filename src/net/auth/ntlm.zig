@@ -25,7 +25,7 @@
 //! a broken primitive; it is not exported and must not be used elsewhere.
 
 const std = @import("std");
-const utf16 = @import("../../format/utf16.zig");
+const utf16 = @import("../../base/utf16.zig");
 
 pub const Error = error{ NtlmBadMessage, NtlmUnsupported } || std.mem.Allocator.Error;
 

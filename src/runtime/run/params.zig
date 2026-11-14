@@ -14,7 +14,7 @@ const options_schema = @import("../connect/options_schema.zig");
 const mkLit = @import("../env.zig").mkLit;
 const planErr = @import("../env.zig").planErr;
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 
 /// A default takes the declared type: `PARAM d DATE DEFAULT '2026-01-01'` is a DATE.

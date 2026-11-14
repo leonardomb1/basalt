@@ -22,7 +22,7 @@
 
 const std = @import("std");
 const HttpClient = @import("../../net/http_std.zig");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const eval = @import("../../exec/eval.zig");
 const zip = std.zip;
 const pqdecode = @import("../parquet/read.zig");

@@ -42,8 +42,9 @@
 //! `env.space` with `env.op_memory`, and removed when the run ends.
 
 const std = @import("std");
+const builtins = @import("../exec/builtins.zig");
 const pagecache = @import("../exec/pagecache.zig");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const ast = @import("../lang/ast.zig");
 const expand = @import("../lang/expand.zig");
 const ftp = @import("../store/ftp.zig");
@@ -52,10 +53,10 @@ const op = @import("../exec/op.zig");
 const csv = @import("../format/csv.zig");
 const arrow = @import("../format/arrow/write.zig");
 const eval = @import("../exec/eval.zig");
-const driver = @import("../connect/driver.zig");
+const driver = @import("../exec/driver.zig");
 const analyze = @import("analyze.zig");
 const lake = @import("../format/lake/table.zig");
-const obs = @import("obs.zig");
+const obs = @import("../exec/obs.zig");
 const Value = @import("../exec/value.zig").Value;
 
 pub const aborting = @import("env.zig").aborting;
@@ -93,7 +94,7 @@ const registerSftp = @import("connect.zig").registerSftp;
 const registerFtp = @import("connect.zig").registerFtp;
 const registerSmb = @import("connect.zig").registerSmb;
 const openSink = @import("connect.zig").openSink;
-const SinkGuard = @import("../connect/guard.zig").SinkGuard;
+const SinkGuard = @import("../exec/guard.zig").SinkGuard;
 const env_mod = @import("env.zig");
 
 const buildPipeline = @import("plan.zig").buildPipeline;
@@ -115,6 +116,7 @@ const Scratch = @import("scratch.zig").Scratch;
 /// `gpa` must be thread-safe: the pipelined writer, lanes and parallel operators
 /// allocate from it alongside the reading thread, so an `ArenaAllocator` will not do.
 pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions, diag: *Diag) !Stats {
+    driver.installRangedOpener(@import("../format/bytes.zig").openRanged);
     const opts = opts_in;
     pagecache.setCap(opts.op_memory);
     ftp.beginRun();
@@ -143,7 +145,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     const json_args = try arena.alloc(expand.JsonArg, opts.params.len);
     for (opts.params, json_args) |kv, *ja| ja.* = .{ .name = kv.key, .text = kv.val };
     var expand_at: ?ast.Pos = null;
-    const program = expand.expandProgramAt(arena, raw_program, json_args, &expand_msg, &expand_at) catch |e| switch (e) {
+    const program = expand.expandProgramAt(arena, raw_program, json_args, &expand_msg, &expand_at, builtins.isBuiltin) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.ExpandFailed => {
             const err = planErr(diag, expand_msg);

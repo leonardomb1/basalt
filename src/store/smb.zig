@@ -32,11 +32,12 @@
 //! Not here: DFS referrals, oplocks and leases, multichannel.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
-const driver = @import("../connect/driver.zig");
+const msgfmt = @import("../base/msgfmt.zig");
+const driver = @import("../exec/driver.zig");
+const netconn = @import("../net/conn.zig");
 const remotefs = @import("remotefs.zig");
 const scheme = @import("scheme.zig");
-const utf16 = @import("../format/utf16.zig");
+const utf16 = @import("../base/utf16.zig");
 const ntlm = @import("../net/auth/ntlm.zig");
 const krb5 = @import("../net/auth/krb5.zig");
 const spnego = @import("../net/auth/spnego.zig");
@@ -67,13 +68,13 @@ pub const Config = struct {
     realm: []const u8 = "",
     kdc: []const u8 = "",
     spn: []const u8 = "",
-    timeouts: driver.Timeouts = .{},
+    timeouts: netconn.Timeouts = .{},
 };
 
 pub const Auth = enum { ntlm, kerberos };
 
 fn fail(e: Error, comptime fmt: []const u8, args: anytype) Error {
-    driver.explainf(e, fmt, args);
+    netconn.explainf(e, fmt, args);
     return e;
 }
 
@@ -212,7 +213,7 @@ pub const Session = struct {
         errdefer gpa.free(own.host);
         own.user = try gpa.dupe(u8, cfg.user);
         errdefer gpa.free(own.user);
-        const stream = driver.dial(gpa, cfg.host, cfg.port, cfg.timeouts.dialOpts()) catch |e|
+        const stream = netconn.dial(gpa, cfg.host, cfg.port, cfg.timeouts.dialOpts()) catch |e|
             return fail(error.SmbDisconnected, "cannot reach {s}:{d}: {s}", .{ cfg.host, cfg.port, @errorName(e) });
         self.* = .{
             .gpa = gpa,
@@ -234,7 +235,7 @@ pub const Session = struct {
 
     /// `e`, or `ConnectionTimedOut` naming the host and `phase` when the login deadline fired.
     fn loginFailed(self: *Session, e: anytype, phase: []const u8) (@TypeOf(e) || error{ConnectionTimedOut}) {
-        return driver.loginFailed(e, driver.ioTimedOut(&self.sr, &self.sw), self.cfg.host, self.cfg.port, phase, self.cfg.timeouts.connect_s);
+        return netconn.loginFailed(e, netconn.ioTimedOut(&self.sr, &self.sw), self.cfg.host, self.cfg.port, phase, self.cfg.timeouts.connect_s);
     }
 
     fn release(self: *Session) void {
@@ -980,7 +981,7 @@ pub const Conn = struct {
     realm: ?[]const u8 = null,
     kdc: ?[]const u8 = null,
     spn: ?[]const u8 = null,
-    connect_timeout: u32 = driver.default_connect_timeout_s,
+    connect_timeout: u32 = netconn.default_connect_timeout_s,
     query_timeout: u32 = 0,
 };
 
@@ -1067,7 +1068,7 @@ const Proto = struct {
     }
 
     pub fn clearNotes() void {
-        driver.clearNote();
+        netconn.clearNote();
     }
 
     pub fn connect(cfg: Config) !*Session {
@@ -1090,7 +1091,7 @@ const Proto = struct {
     }
 
     pub fn why(_: *Session) []const u8 {
-        return driver.lastNote();
+        return netconn.lastNote();
     }
 
     pub fn openRead(s: *Session, t: Target) !Handle {
@@ -1230,7 +1231,7 @@ pub fn ccmDecrypt(msg: []u8, ct: []const u8, tag: [16]u8, aad: []const u8, nonce
 }
 
 fn krbFailed(e: anyerror) Error {
-    const why = driver.lastNote();
+    const why = netconn.lastNote();
     return switch (e) {
         error.OutOfMemory => error.SmbFailure,
         else => fail(error.SmbLogonFailure, "kerberos: {s}: {s}", .{ @errorName(e), if (why.len > 0) why else "no further detail" }),
@@ -1450,7 +1451,7 @@ test "smb: a live login, share, listing and read (BASALT_SMB_TEST_PORT)" {
         const s = try Session.connect(gpa, .{ .host = "127.0.0.1", .port = try std.fmt.parseInt(u16, port_s, 10), .user = "basalt", .password = "it", .max_dialect = dialect_210 });
         defer s.close();
         try std.testing.expectError(error.SmbAccessDenied, s.tree("secure"));
-        try std.testing.expect(std.mem.indexOf(u8, driver.lastNote(), "requires encryption") != null);
+        try std.testing.expect(std.mem.indexOf(u8, netconn.lastNote(), "requires encryption") != null);
     }
     try std.testing.expectError(error.SmbLogonFailure, Session.connect(gpa, .{ .host = "127.0.0.1", .port = try std.fmt.parseInt(u16, port_s, 10), .user = "basalt", .password = "wrong" }));
 }
@@ -1492,7 +1493,7 @@ test "a server that accepts and never answers fails the SMB login within connect
     const cfg = Config{ .host = "127.0.0.1", .port = port, .user = "u", .password = "p", .timeouts = .{ .connect_s = 1 } };
     try std.testing.expectError(error.ConnectionTimedOut, Session.connect(std.testing.allocator, cfg));
     var buf: [128]u8 = undefined;
-    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}: negotiate did not answer within 1 s", .{port}), driver.noteFor(error.ConnectionTimedOut));
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}: negotiate did not answer within 1 s", .{port}), netconn.noteFor(error.ConnectionTimedOut));
 }
 
 test "smb: a response claiming to be NEGOTIATE does not skip the signature check on a signed session" {

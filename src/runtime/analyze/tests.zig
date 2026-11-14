@@ -14,7 +14,7 @@ const parser = @import("../../lang/sql_parser.zig");
 const pushdown = @import("../pushdown.zig");
 const Stage = @import("../analyze.zig").Stage;
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const substFilterParams = @import("../analyze.zig").substFilterParams;
 const types = @import("../../lang/types.zig");
 

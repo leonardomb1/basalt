@@ -3,13 +3,13 @@
 
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
-const asDecimal = @import("../decimal.zig").asDecimal;
-const asDecimalValue = @import("../decimal.zig").asDecimalValue;
+const asDecimal = @import("../decimal_ops.zig").asDecimal;
+const asDecimalValue = @import("../decimal_ops.zig").asDecimalValue;
 const parseIntStrict = @import("cast.zig").parseIntStrict;
 const Value = @import("../value.zig").Value;
 const ast = @import("../../lang/ast.zig");
 const fmt_bound = @import("format.zig").fmt_bound;
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const parseDateText = @import("time.zig").parseDateText;
 const parseTimestampText = @import("time.zig").parseTimestampText;
 const regex = @import("../regex.zig");

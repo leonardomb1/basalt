@@ -14,7 +14,7 @@
 const std = @import("std");
 const celltext = @import("celltext.zig");
 const format = @import("eval/format.zig");
-const decimal = @import("decimal.zig");
+const decimal = @import("../base/decimal.zig");
 const Value = @import("value.zig").Value;
 
 const Writer = std.Io.Writer;

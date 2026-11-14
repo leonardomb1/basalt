@@ -3,9 +3,10 @@
 //! the JSON array functions use.
 
 const Batch = @import("../batch.zig").Batch;
-const decimal = @import("../decimal.zig");
-const asDecimal = decimal.asDecimal;
-const decimalOp = @import("../decimal.zig").decimalOp;
+const decimal = @import("../../base/decimal.zig");
+const decimal_ops = @import("../decimal_ops.zig");
+const asDecimal = decimal_ops.asDecimal;
+const decimalOp = @import("../decimal_ops.zig").decimalOp;
 const EvalError = @import("../eval.zig").EvalError;
 const Type = @import("../../lang/types.zig").Type;
 const TypeCtx = @import("../eval.zig").TypeCtx;

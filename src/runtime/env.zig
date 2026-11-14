@@ -13,7 +13,7 @@
 //! a bare name is a column and a same-named param must not displace it.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
@@ -21,17 +21,18 @@ const eval = @import("../exec/eval.zig");
 const csv = @import("../format/csv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
 const lake = @import("../format/lake/table.zig");
-const driver = @import("../connect/driver.zig");
+const driver = @import("../exec/driver.zig");
+const netconn = @import("../net/conn.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const sql = @import("../db/sql.zig");
-const registry = @import("../connect/registry.zig");
+const registry = @import("connect/registry.zig");
 const azure = @import("../store/azure.zig");
 const s3 = @import("../store/s3.zig");
 const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
 const ftp = @import("../store/ftp.zig");
 const analyze = @import("analyze.zig");
-const obs = @import("obs.zig");
+const obs = @import("../exec/obs.zig");
 const pushdown = @import("pushdown.zig");
 const Value = @import("../exec/value.zig").Value;
 const arrow = @import("../format/arrow/write.zig");
@@ -340,7 +341,7 @@ pub const Pipe = struct {
 /// A folder's format and files; for a lake table, the files its log keeps live and
 /// the table they were resolved from.
 pub const FolderRead = struct {
-    kind: @import("../connect/folder.zig").Kind,
+    kind: @import("../store/folder.zig").Kind,
     files: []const []const u8,
     table: ?*const lake.Resolved = null,
 };
@@ -672,10 +673,10 @@ pub const DbConfig = struct {
     client_id: []const u8 = "",
     resource: []const u8 = "",
     token: []const u8 = "",
-    connect_timeout: u32 = driver.default_connect_timeout_s,
+    connect_timeout: u32 = netconn.default_connect_timeout_s,
     query_timeout: u32 = 0,
 
-    pub fn timeouts(self: DbConfig) driver.Timeouts {
+    pub fn timeouts(self: DbConfig) netconn.Timeouts {
         return .{ .connect_s = self.connect_timeout, .query_s = self.query_timeout };
     }
 };
@@ -748,7 +749,7 @@ pub fn pathFail(arena: std.mem.Allocator, path: []const u8, e: anyerror) ![]cons
 /// is, both shown as `layer: Error: words`.
 pub const ConnectorNote = struct { layer: []const u8, why: []const u8 };
 
-/// The thread's `driver.LoginNote` for `e`, laid at the connector `path` names when
+/// The thread's `netconn.LoginNote` for `e`, laid at the connector `path` names when
 /// there is a path, else at the one the error's name belongs to (a lane reports
 /// without its path); null for any other connector or when no words were kept.
 pub fn connectorNote(e: anyerror, path: ?[]const u8) ?ConnectorNote {
@@ -762,7 +763,7 @@ pub fn connectorNote(e: anyerror, path: ?[]const u8) ?ConnectorNote {
         break :blk .none;
     };
     if (which == .none) return null;
-    const why = driver.lastNote();
+    const why = netconn.lastNote();
     if (why.len == 0) return null;
     return .{ .layer = @tagName(which), .why = why };
 }

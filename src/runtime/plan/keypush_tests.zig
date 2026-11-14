@@ -3,12 +3,12 @@
 //! every query), and the row groups a Parquet side skips.
 
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const FakePg = @import("../../testing/postgres_fake.zig").FakePg;
 const Table = @import("../../testing/postgres_fake.zig").Table;
 const column = @import("../../exec/column.zig");
 const env_mod = @import("../env.zig");
-const obs = @import("../obs.zig");
+const obs = @import("../../exec/obs.zig");
 const parser = @import("../../lang/sql_parser.zig");
 const pqwrite = @import("../../format/parquet/write.zig");
 const run = @import("../run.zig").run;

@@ -38,11 +38,12 @@ const types = @import("../../lang/types.zig");
 const column = @import("../../exec/column.zig");
 const Column = column.Column;
 const Batch = @import("../../exec/batch.zig").Batch;
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const Output = @import("../output.zig").Output;
 const flatbuf = @import("flatbuf.zig");
-const decimal = @import("../../exec/decimal.zig");
-const littleEndian128 = @import("../../exec/decimal.zig").littleEndian128;
+const decimal = @import("../../base/decimal.zig");
+const decimal_ops = @import("../../exec/decimal_ops.zig");
+const littleEndian128 = @import("../../base/decimal.zig").littleEndian128;
 
 comptime {
     if (builtin.cpu.arch.endian() != .little)
@@ -185,7 +186,7 @@ pub const StreamWriter = struct {
             }
             const c = if (col.data == .nested) try column.copy(arena, col.*) else col.*;
             pushColumn(arena, &body, &nodes, &c, n) catch |e| {
-                if (e == error.DecimalDropsDigits) return decimal.dropsDigitsFailure(f.name, f.ty);
+                if (e == error.DecimalDropsDigits) return decimal_ops.dropsDigitsFailure(f.name, f.ty);
                 return e;
             };
         }

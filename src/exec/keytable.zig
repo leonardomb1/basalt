@@ -10,7 +10,7 @@
 
 const Decimal = @import("value.zig").Decimal;
 const Value = @import("value.zig").Value;
-const decimal = @import("decimal.zig");
+const decimal = @import("../base/decimal.zig");
 const column = @import("column.zig");
 const keyhash = @import("keyhash.zig");
 const textconv = @import("textconv.zig");
@@ -937,7 +937,7 @@ pub const Encoder = struct {
             if (!col.validity.get(r)) continue;
             const w: ?i64 = switch (kk) {
                 .i64k => switch (col.ty.kind) {
-                    .float => textconv.floatToInt(col.data.f64[r], .exact),
+                    .float => decimal.floatToInt(col.data.f64[r], .exact),
                     .decimal => decimal.intOf(column.decimals(col).at(r), .exact),
                     else => null,
                 },
@@ -1183,14 +1183,14 @@ test "cross: a FLOAT read as an INT word is textconv's exact float-to-int, as th
         -std.math.nan(f64),    std.math.floatMax(f64), -std.math.floatMax(f64), std.math.floatMin(f64),     1e300,              123456789.0,
         9223372036854774784.0, -123456789.25,          -9223372036854775808.0,  std.math.floatTrueMin(f64),
     };
-    for (edge) |x| try std.testing.expectEqual(Old.intOf(x), textconv.floatToInt(x, .exact));
+    for (edge) |x| try std.testing.expectEqual(Old.intOf(x), decimal.floatToInt(x, .exact));
     var prng = std.Random.DefaultPrng.init(0x1d0f);
     const rand = prng.random();
     for (0..100_000) |_| {
         const x: f64 = @bitCast(rand.int(u64));
-        try std.testing.expectEqual(Old.intOf(x), textconv.floatToInt(x, .exact));
+        try std.testing.expectEqual(Old.intOf(x), decimal.floatToInt(x, .exact));
         const y = @trunc(@as(f64, @floatFromInt(rand.int(i64))) / @as(f64, @floatFromInt(@as(u64, 1) << rand.int(u6))));
-        try std.testing.expectEqual(Old.intOf(y), textconv.floatToInt(y, .exact));
+        try std.testing.expectEqual(Old.intOf(y), decimal.floatToInt(y, .exact));
     }
 }
 

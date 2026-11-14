@@ -14,7 +14,7 @@ const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const celltext = @import("../../exec/celltext.zig");
 const jsontext = @import("../../exec/jsontext.zig");
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const Output = @import("../output.zig").Output;
 
 pub const Shape = enum { ndjson, array };

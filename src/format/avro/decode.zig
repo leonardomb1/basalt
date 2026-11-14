@@ -18,15 +18,15 @@ const std = @import("std");
 const Value = @import("../../exec/value.zig").Value;
 const Decimal = @import("../../exec/value.zig").Decimal;
 const column = @import("../../exec/column.zig");
-const civil = @import("../../exec/civil.zig");
-const decimal = @import("../../exec/decimal.zig");
+const civil = @import("../../base/civil.zig");
+const decimal = @import("../../base/decimal.zig");
 const eval = @import("../../exec/eval.zig");
 const format = @import("../../exec/eval/format.zig");
 const jsontext = @import("../../exec/jsontext.zig");
 const schema = @import("schema.zig");
 const stream = @import("../stream.zig");
 const types = @import("../../lang/types.zig");
-const varint = @import("../varint.zig");
+const varint = @import("../../base/varint.zig");
 
 const Node = schema.Node;
 

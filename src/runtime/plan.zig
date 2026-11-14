@@ -29,7 +29,7 @@
 //! rows in `plan/discover.zig`.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
@@ -42,7 +42,7 @@ const pushdown = @import("pushdown.zig");
 const keypush = @import("plan/keypush.zig");
 const runtime_filters = @import("plan/runtime_filters.zig");
 const joinorder = @import("plan/joinorder.zig");
-const obs = @import("obs.zig");
+const obs = @import("../exec/obs.zig");
 const Threshold = @import("../exec/value.zig").Threshold;
 const Value = @import("../exec/value.zig").Value;
 
@@ -629,7 +629,7 @@ fn rightTakesParquet(env: *Env, j: ast.Join, hints: []const ast.Hint) !bool {
     return keypush.parquetSide(env, try inlineHeadBindings(env, try j.rightStages(env.arena, b.stages)));
 }
 
-const Taken = struct { src: @import("../connect/driver.zig").Source, taker: ?keypush.Taker };
+const Taken = struct { src: @import("../exec/driver.zig").Source, taker: ?keypush.Taker };
 
 /// The pipeline's read opened to take a join's keys: a SQL read late, a Parquet one
 /// as usual with its reader or folder kept. No taker when it did not open as Parquet.
@@ -1241,7 +1241,7 @@ test "prepareJoinSide: a CTE joined in reads its table with its own WHERE, its c
         .binding => |b| try bindings.put(b.name, b.pipeline),
         else => {},
     };
-    var sources = std.array_list.Managed(@import("../connect/driver.zig").Source).init(a);
+    var sources = std.array_list.Managed(@import("../exec/driver.zig").Source).init(a);
     var diag = env_mod.Diag{};
     var log = obs.Logger.init(0, .text, .err);
     var params_expr = std.StringHashMap(*const ast.Expr).init(a);
@@ -1284,7 +1284,7 @@ test "a WHERE over a join of SQL reads: the FROM table's conjunct reaches its qu
         .output => |o| stages = o.stages,
         else => {},
     };
-    var sources = std.array_list.Managed(@import("../connect/driver.zig").Source).init(a);
+    var sources = std.array_list.Managed(@import("../exec/driver.zig").Source).init(a);
     var diag = env_mod.Diag{};
     var log = obs.Logger.init(0, .text, .err);
     var params_expr = std.StringHashMap(*const ast.Expr).init(a);
@@ -1333,7 +1333,7 @@ test "projectedColumns and rightNeeds: computed and deferred join keys narrow bo
     var params = std.StringHashMap(Value).init(a);
     var bindings = std.StringHashMap(ast.Pipeline).init(a);
     var connections = std.StringHashMap(ast.Connection).init(a);
-    var sources = std.array_list.Managed(@import("../connect/driver.zig").Source).init(a);
+    var sources = std.array_list.Managed(@import("../exec/driver.zig").Source).init(a);
     var diag = env_mod.Diag{};
     var log = obs.Logger.init(0, .text, .err);
     var params_expr = std.StringHashMap(*const ast.Expr).init(a);

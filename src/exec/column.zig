@@ -32,7 +32,8 @@
 const std = @import("std");
 const types = @import("../lang/types.zig");
 const value = @import("value.zig");
-const decimal = @import("decimal.zig");
+const decimal = @import("../base/decimal.zig");
+const decimal_ops = @import("decimal_ops.zig");
 pub const Dec64 = decimal.Dec64;
 const par = @import("par.zig");
 const textconv = @import("textconv.zig");
@@ -100,7 +101,7 @@ pub fn checkSpan(n: usize) error{OutOfMemory}!usize {
 /// Float to int rounding half to even, as PostgreSQL casts float8; NaN, the
 /// infinities and anything outside i64 are CastFailed, as for a string.
 pub fn floatToInt(x: f64) error{CastFailed}!i64 {
-    return textconv.floatToInt(x, .half_even) orelse error.CastFailed;
+    return decimal.floatToInt(x, .half_even) orelse error.CastFailed;
 }
 
 pub const Bytes = struct {
@@ -1738,7 +1739,7 @@ pub const Builder = struct {
 
     /// An INT read as a scale-0 decimal, as an INT arm beside a DECIMAL one types.
     fn asDec(self: *Builder, v: Value) value.Decimal {
-        return decimal.asDecimal(v) orelse .{ .unscaled = 0, .scale = self.ty.scale };
+        return decimal_ops.asDecimal(v) orelse .{ .unscaled = 0, .scale = self.ty.scale };
     }
 
     /// The missing `.decimal` arm once made `ROUND(AVG(CAST(x AS DECIMAL(p,s))), n)`

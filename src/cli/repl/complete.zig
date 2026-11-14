@@ -23,7 +23,7 @@
 //! ways, so a builtin added there cannot go missing from Tab.
 
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const hilite = @import("hilite.zig");
 const eval = @import("../../exec/eval.zig");
 const sql_lexer = @import("../../lang/sql_lexer.zig");

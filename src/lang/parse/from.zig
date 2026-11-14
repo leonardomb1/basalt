@@ -10,8 +10,8 @@ const ast = @import("../ast.zig");
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const hasLiteralExt = @import("../sql_parser.zig").hasLiteralExt;
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
-const table_builtins = @import("../../connect/table_builtins.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
+const table_builtins = @import("../table_builtins.zig");
 
 /// A FROM source: a path, `IDENTIFIER(<expr>)`, HTTP('url'), a CTE, or a
 /// connection's table or QUERY. Registers the alias.

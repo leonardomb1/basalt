@@ -11,11 +11,11 @@
 //! gzipped or uploaded, but not appended to, as its root closes on its last line.
 
 const std = @import("std");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const celltext = @import("../../exec/celltext.zig");
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const Output = @import("../output.zig").Output;
 const escape = @import("escape.zig");
 

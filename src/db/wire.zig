@@ -19,8 +19,9 @@
 
 const std = @import("std");
 const sql = @import("sql.zig");
-const driver = @import("../connect/driver.zig");
-const msgfmt = @import("../format/msgfmt.zig");
+const driver = @import("../exec/driver.zig");
+const netconn = @import("../net/conn.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 
 const SOCK_BUF = 64 * 1024;
 
@@ -35,15 +36,15 @@ pub const Conn = struct {
     last_error: []const u8 = "",
     tls: ?*sql.TlsState = null,
     carrier: *std.Io.Writer = undefined,
-    timeouts: driver.Timeouts = .{},
+    timeouts: netconn.Timeouts = .{},
     phase: []const u8 = "login",
-    peer: driver.ThreadNote(288) = .{},
+    peer: netconn.ThreadNote(288) = .{},
 
     /// A heap `T` whose `wire` is connected to `host:port`, its login deadline set;
     /// every other field of `T` takes its default. Built in place: the readers point
     /// into the buffers.
-    pub fn dial(comptime T: type, gpa: std.mem.Allocator, host: []const u8, port: u16, to: driver.Timeouts) !*T {
-        const stream = try driver.dial(gpa, host, port, to.dialOpts());
+    pub fn dial(comptime T: type, gpa: std.mem.Allocator, host: []const u8, port: u16, to: netconn.Timeouts) !*T {
+        const stream = try netconn.dial(gpa, host, port, to.dialOpts());
         errdefer stream.close();
         const self = try gpa.create(T);
         self.* = .{ .wire = .{ .gpa = gpa, .stream = stream, .msg = .init(gpa), .timeouts = to } };
@@ -56,7 +57,7 @@ pub const Conn = struct {
     /// A login failure as the caller sees it: `ConnectionTimedOut`, naming `host:port`
     /// and the phase, when the login deadline fired, else `e`.
     pub fn loginFailed(self: *const Conn, e: anytype, host: []const u8, port: u16) (@TypeOf(e) || error{ConnectionTimedOut}) {
-        return driver.loginFailed(e, driver.ioTimedOut(&self.sr, &self.sw), host, port, self.phase, self.timeouts.connect_s);
+        return netconn.loginFailed(e, netconn.ioTimedOut(&self.sr, &self.sw), host, port, self.phase, self.timeouts.connect_s);
     }
 
     /// The session is up: the login deadline gives way to the query one.
@@ -67,7 +68,7 @@ pub const Conn = struct {
     /// `e` from a query or fetch; when the `query_timeout` deadline fired, `last_error`
     /// says so with the host, e.g. `db:5432: no reply within query_timeout (300 s)`.
     pub fn queryFailed(self: *Conn, e: anyerror) anyerror {
-        if (self.timeouts.query_s > 0 and driver.ioTimedOut(&self.sr, &self.sw))
+        if (self.timeouts.query_s > 0 and netconn.ioTimedOut(&self.sr, &self.sw))
             self.printError("{s}: no reply within query_timeout ({d} s)", .{ self.peer.get(), self.timeouts.query_s }) catch {};
         return e;
     }
@@ -132,8 +133,8 @@ pub const Conn = struct {
     }
 };
 
-/// The bounds-checked body cursor, `format/cursor.zig`'s.
-pub const Reader = @import("../format/cursor.zig").Reader;
+/// The bounds-checked body cursor, `base/cursor.zig`'s.
+pub const Reader = @import("../base/cursor.zig").Reader;
 
 test "the last error frees the message it replaces" {
     var c: Conn = .{ .gpa = std.testing.allocator, .stream = undefined, .msg = .init(std.testing.allocator) };

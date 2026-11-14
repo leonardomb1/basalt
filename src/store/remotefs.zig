@@ -15,7 +15,7 @@
 //! `closeHandle`, `freeHandle`, `commit`, `discard` and `listDir`.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const objstore = @import("objstore.zig");
 
 /// Connection names, process-wide as the pools are. A later registration of a name

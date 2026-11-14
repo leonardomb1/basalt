@@ -73,7 +73,7 @@
 
 const std = @import("std");
 const pagecache = @import("../exec/pagecache.zig");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const Flags = @import("args.zig").Flags;
 const sharedFlag = @import("args.zig").sharedFlag;
 const paramProblem = @import("args.zig").paramProblem;
@@ -84,9 +84,9 @@ const runtime = @import("../runtime/run.zig");
 const analyze = @import("../runtime/analyze.zig");
 const types = @import("../lang/types.zig");
 const parser = @import("../lang/sql_parser.zig");
-const obs = @import("../runtime/obs.zig");
+const obs = @import("../exec/obs.zig");
 const jsontext = @import("../exec/jsontext.zig");
-const utf16 = @import("../format/utf16.zig");
+const utf16 = @import("../base/utf16.zig");
 
 const Request = struct {
     op: []const u8,

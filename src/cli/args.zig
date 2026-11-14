@@ -3,12 +3,13 @@
 
 const ast = @import("../lang/ast.zig");
 const include = @import("../lang/include.zig");
-const obs = @import("../runtime/obs.zig");
+const include_fetch = @import("../net/include_fetch.zig");
+const obs = @import("../exec/obs.zig");
 const env = @import("../runtime/env.zig");
 const parseByteSize = @import("../runtime/env.zig").parseByteSize;
 const jsontext = @import("../exec/jsontext.zig");
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 
 const Source = struct { label: []const u8, text: []const u8, dir: []const u8 = "." };
 
@@ -225,7 +226,7 @@ test "wantsJsonLog: the last --log-format wins" {
 /// it. An error in an included file names that file's path and lines.
 pub fn parseSrcTo(arena: std.mem.Allocator, src: Source, eo: ErrOut) !?ast.Program {
     var diag: include.Diag = .{};
-    return include.loadProgram(arena, src.text, src.label, src.dir, &diag) catch |e| switch (e) {
+    return include.loadProgramOpts(arena, src.text, src.label, src.dir, &diag, .{ .fetch = include_fetch.fetch() }) catch |e| switch (e) {
         error.ParseFailed => {
             const p = diag.parse;
             try eo.report(.{

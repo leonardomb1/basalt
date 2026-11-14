@@ -17,7 +17,7 @@ const exceptColumns = @import("../connect.zig").exceptColumns;
 const forHintIdent = @import("../env.zig").forHintIdent;
 const forHintName = @import("../env.zig").forHintName;
 const mk = @import("../env.zig").mk;
-const obs = @import("../obs.zig");
+const obs = @import("../../exec/obs.zig");
 const op = @import("../../exec/op.zig");
 const openSource = @import("../connect.zig").openSource;
 const columnFacts = @import("../connect.zig").columnFacts;
@@ -28,7 +28,7 @@ const planErr = @import("../env.zig").planErr;
 const analyze = @import("../analyze.zig");
 const sourceLabel = @import("../connect.zig").sourceLabel;
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 
 /// The per-branch reconcile projection: an optional tag literal, then every canon
@@ -737,7 +737,7 @@ test "a set operation's column is nullable when any branch's is, wherever the NU
             .output => |o| stages = o.stages,
             else => {},
         };
-        var sources = std.array_list.Managed(@import("../../connect/driver.zig").Source).init(a);
+        var sources = std.array_list.Managed(@import("../../exec/driver.zig").Source).init(a);
         var diag = env_mod.Diag{};
         var log = obs.Logger.init(0, .text, .err);
         var params_expr = std.StringHashMap(*const ast.Expr).init(a);

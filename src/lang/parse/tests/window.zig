@@ -8,7 +8,7 @@ const firstPipelineStages = @import("../testing_util.zig").firstPipelineStages;
 const parseSource = @import("../../sql_parser.zig").parseSource;
 const parseTest = @import("../testing_util.zig").parseTest;
 const std = @import("std");
-const msgfmt = @import("../../../format/msgfmt.zig");
+const msgfmt = @import("../../../base/msgfmt.zig");
 const testing = std.testing;
 
 fn windows(stages: []const ast.Stage, out: *std.array_list.Managed(ast.Window)) !void {

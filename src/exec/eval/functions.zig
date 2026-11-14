@@ -223,7 +223,7 @@ const testing_util = @import("testing_util.zig");
 const column = @import("../column.zig");
 const types = @import("../../lang/types.zig");
 const Decimal = @import("../value.zig").Decimal;
-const civil = @import("../civil.zig");
+const civil = @import("../../base/civil.zig");
 
 fn testBatch(a: std.mem.Allocator) !Batch {
     const nan = std.math.nan(f64);

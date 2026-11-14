@@ -14,7 +14,7 @@ const types = @import("../../lang/types.zig");
 const Limit = @import("../op.zig").Limit;
 const Scan = @import("../op.zig").Scan;
 const TestSource = @import("testing_util.zig").TestSource;
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../driver.zig");
 const kvBatch = @import("testing_util.zig").kvBatch;
 const testing = std.testing;
 

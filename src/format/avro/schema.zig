@@ -20,7 +20,7 @@
 //! the spec asks.
 
 const std = @import("std");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const stream = @import("../stream.zig");
 

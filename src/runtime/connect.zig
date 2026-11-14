@@ -29,26 +29,26 @@
 //! `register.zig` registers SFTP and SMB connections.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
 const op = @import("../exec/op.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const csv = @import("../format/csv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
-const table_builtins = @import("../connect/table_builtins.zig");
-const folder = @import("../connect/folder.zig");
+const table_builtins = @import("connect/table_builtins.zig");
+const folder = @import("../store/folder.zig");
 const lake = @import("../format/lake/table.zig");
 const pqwrite = @import("../format/parquet/write.zig");
 const arrowread = @import("../format/arrow/read.zig");
-const driver = @import("../connect/driver.zig");
-const registry = @import("../connect/registry.zig");
+const driver = @import("../exec/driver.zig");
+const registry = @import("connect/registry.zig");
 const tds = @import("../db/sqlserver/tds.zig");
 const mysql = @import("../db/mysql.zig");
 const postgres = @import("../db/postgres.zig");
 const sql = @import("../db/sql.zig");
 const http_client = @import("../net/http_client.zig");
-const split = @import("../connect/split.zig");
+const split = @import("connect/split.zig");
 const analyze = @import("analyze.zig");
 
 pub const DbAuth = @import("env.zig").DbAuth;
@@ -262,7 +262,7 @@ pub fn readLabel(env: *Env, rd: ast.Read, hints: []const ast.Hint) ![]const u8 {
     const w = &out.writer;
     try w.writeAll(sourceLabel(env, rd, hints));
     switch (rd.form) {
-        .path => |p| try w.print(" {f}", .{@import("../store/scheme.zig").fmtShown(p)}),
+        .path => |p| try w.print(" {f}", .{@import("../base/url.zig").fmtShown(p)}),
         .table => |q| {
             try w.writeAll(" table ");
             try @import("../lang/print.zig").name(w, q);

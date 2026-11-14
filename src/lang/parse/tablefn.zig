@@ -17,8 +17,8 @@ const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const expand = @import("../expand.zig");
 const max_tvf_depth = @import("../sql_parser.zig").max_tvf_depth;
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
-const table_builtins = @import("../../connect/table_builtins.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
+const table_builtins = @import("../table_builtins.zig");
 
 fn findTableFn(self: *Parser, name: []const u8) ?ast.FnDecl {
     var i = self.table_fns.items.len;

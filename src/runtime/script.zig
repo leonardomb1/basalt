@@ -14,16 +14,16 @@
 //! counters and the first-error buffer are shared, under atomics and a mutex.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const lake = @import("../format/lake/table.zig");
 const parser = @import("../lang/sql_parser.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
-const obs = @import("obs.zig");
+const obs = @import("../exec/obs.zig");
 const op = @import("../exec/op.zig");
 
 const eval = @import("../exec/eval.zig");
-const driver = @import("../connect/driver.zig");
+const driver = @import("../exec/driver.zig");
 const parallel = @import("parallel.zig");
 const analyze = @import("analyze.zig");
 const procedures = @import("procedures.zig");

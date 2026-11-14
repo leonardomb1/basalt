@@ -32,7 +32,8 @@ const column = @import("../../column.zig");
 const eval = @import("../../eval.zig");
 const fmtnum = @import("../../eval/format.zig");
 const floatord = @import("../../floatord.zig");
-const decimal = @import("../../decimal.zig");
+const decimal = @import("../../../base/decimal.zig");
+const decimal_ops = @import("../../decimal_ops.zig");
 const simd = @import("../../simd.zig");
 const std = @import("std");
 const types = @import("../../../lang/types.zig");
@@ -119,21 +120,21 @@ pub const SumDecimal = struct {
     pub const fold_expr = true;
     pub const State = struct { n: i64 = 0, s: i256 align(8) = 0 };
     pub fn add(s: *State, x: Decimal, cx: Ctx) !void {
-        try decimal.addAtScale(&s.s, x, cx.out.scale);
+        try decimal_ops.addAtScale(&s.s, x, cx.out.scale);
         s.n += 1;
     }
     pub fn remove(s: *State, x: Decimal, cx: Ctx) !void {
-        const u = (decimal.rescaleTo(x, cx.out.scale) orelse return decimal.decimalOverflow()).unscaled;
-        s.s = std.math.sub(i256, s.s, u) catch return decimal.decimalOverflow();
+        const u = (decimal.rescaleTo(x, cx.out.scale) orelse return decimal_ops.decimalOverflow()).unscaled;
+        s.s = std.math.sub(i256, s.s, u) catch return decimal_ops.decimalOverflow();
         s.n -= 1;
     }
     pub fn merge(d: *State, s: *const State, _: Ctx) !void {
-        d.s = std.math.add(i256, d.s, s.s) catch return decimal.decimalOverflow();
+        d.s = std.math.add(i256, d.s, s.s) catch return decimal_ops.decimalOverflow();
         d.n += s.n;
     }
     pub fn finish(s: *const State, cx: Ctx) !Value {
         if (s.n == 0) return .null;
-        return .{ .decimal = decimal.wideSumDecimal(s.s, cx.out.scale) orelse return decimal.decimalOverflow() };
+        return .{ .decimal = decimal.wideSumDecimal(s.s, cx.out.scale) orelse return decimal_ops.decimalOverflow() };
     }
 };
 

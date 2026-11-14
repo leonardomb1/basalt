@@ -14,18 +14,19 @@
 //! slices so Ctrl+C is honoured within one slice. The defaults are objstore's.
 
 const std = @import("std");
-const driver = @import("driver.zig");
+const driver = @import("../exec/driver.zig");
+const netconn = @import("conn.zig");
 
 pub const max_attempts = 5;
 pub const budget_ms: u64 = 30_000;
 pub const slice_ms: u64 = 100;
 
-pub const retriable = driver.transientStatus;
+pub const retriable = netconn.transientStatus;
 
 /// A request that died on the wire: the socket set every connector shares, plus a
 /// server that closed the connection instead of answering.
 pub fn transient(e: anyerror) bool {
-    return driver.transientNet(e) or e == error.HttpConnectionClosing;
+    return netconn.transientNet(e) or e == error.HttpConnectionClosing;
 }
 
 /// `Retry-After` in delta-seconds; the HTTP-date form is left to the backoff.

@@ -18,11 +18,12 @@
 //! is why no registration is needed.
 
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
-const driver = @import("../../connect/driver.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
+const driver = @import("../../exec/driver.zig");
+const netconn = @import("../../net/conn.zig");
 const http_client = @import("../../net/http_client.zig");
 const xmlescape = @import("../../format/xml/escape.zig");
-const civil = @import("../../exec/civil.zig");
+const civil = @import("../../base/civil.zig");
 const uuid = @import("../../format/uuid.zig");
 const http_fake = @import("../../testing/http_fake.zig");
 
@@ -41,7 +42,7 @@ pub fn passwordToken(
     resource: []const u8,
     dl: Deadline,
 ) ![]const u8 {
-    driver.clearNote();
+    netconn.clearNote();
     const realm = getUserRealm(gpa, username, dl) catch |e| switch (e) {
         error.ConnectionTimedOut, error.Aborted => return e,
         else => Realm{ .federated = false, .sts_url = "" },
@@ -130,14 +131,14 @@ fn wsTrustAssertion(gpa: std.mem.Allocator, username: []const u8, password: []co
         .body = envelope,
     }, dl) catch |e| {
         const out = requestFailed(e);
-        driver.explainf(out, "ADFS WS-Trust request failed ({s}): {s}", .{ @errorName(e), sts_url });
+        netconn.explainf(out, "ADFS WS-Trust request failed ({s}): {s}", .{ @errorName(e), sts_url });
         return out;
     };
     defer gpa.free(res.body);
     const body = res.body;
     const assertion = extractElement(body, "Assertion") orelse {
         const reason = extractElement(body, "Text") orelse extractElement(body, "faultstring") orelse "";
-        driver.explainf(error.AadTokenFailed, "ADFS WS-Trust http {d}; fault: {s}", .{ res.code, reason });
+        netconn.explainf(error.AadTokenFailed, "ADFS WS-Trust http {d}; fault: {s}", .{ res.code, reason });
         return error.AadTokenFailed;
     };
     return gpa.dupe(u8, assertion);
@@ -192,7 +193,7 @@ pub fn ropcToken(
     resource: []const u8,
     dl: Deadline,
 ) ![]const u8 {
-    driver.clearNote();
+    netconn.clearNote();
     var body = std.array_list.Managed(u8).init(gpa);
     defer body.deinit();
     try body.appendSlice("grant_type=password");
@@ -216,13 +217,13 @@ fn postForToken(gpa: std.mem.Allocator, url: []const u8, body: []const u8, dl: D
         .body = body,
     }, dl) catch |e| {
         const out = requestFailed(e);
-        driver.explainf(out, "token request failed ({s})", .{@errorName(e)});
+        netconn.explainf(out, "token request failed ({s})", .{@errorName(e)});
         return out;
     };
     defer gpa.free(res.body);
     const resp = res.body;
     if (res.code != 200) {
-        driver.explainf(error.AadTokenFailed, "token http {d}: {s}", .{ res.code, resp[0..@min(resp.len, 600)] });
+        netconn.explainf(error.AadTokenFailed, "token http {d}: {s}", .{ res.code, resp[0..@min(resp.len, 600)] });
         return error.AadTokenFailed;
     }
     const root = std.json.parseFromSliceLeaky(std.json.Value, gpa, resp, .{}) catch return error.AadTokenFailed;
@@ -306,7 +307,7 @@ test "a black-holed token endpoint fails the connect with ConnectionTimedOut, no
     try std.testing.expectError(error.ConnectionTimedOut, postForToken(std.heap.page_allocator, url, "grant_type=password", .{ .timeout_ms = 400, .retries = 0 }));
     const waited = std.time.milliTimestamp() - started;
     try std.testing.expect(waited >= 350 and waited < 5_000);
-    try std.testing.expect(std.mem.indexOf(u8, driver.noteFor(error.ConnectionTimedOut), "ConnectionTimedOut") != null);
+    try std.testing.expect(std.mem.indexOf(u8, netconn.noteFor(error.ConnectionTimedOut), "ConnectionTimedOut") != null);
 }
 
 test "extractElement pulls a namespaced assertion" {

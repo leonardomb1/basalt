@@ -31,9 +31,8 @@ const max_query_depth = Parser.max_query_depth;
 const qualHasPrefix = @import("../sql_parser.zig").qualHasPrefix;
 const sidesOf = @import("rewrite.zig").sidesOf;
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
-const decimal = @import("../../exec/decimal.zig");
-const textconv = @import("../../exec/textconv.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
+const decimal = @import("../../base/decimal.zig");
 const stripPrefix = @import("../sql_parser.zig").stripPrefix;
 const stripQual = @import("../sql_parser.zig").stripQual;
 
@@ -938,7 +937,7 @@ fn limitCount(self: *Parser, what: []const u8, n: *u64, expr: *?*ast.Expr) Error
     const base = if (neg) e.unary.e else e;
     if (base.* == .float_lit) {
         const f = if (neg) -base.float_lit else base.float_lit;
-        const r = textconv.floatToInt(f, .half_even);
+        const r = decimal.floatToInt(f, .half_even);
         if (if (r) |x| x < 0 else f < 0) return self.fail(vpos, "{s} must not be negative, got {d}", .{ what, f });
         n.* = @intCast(r orelse return self.fail(vpos, "{s} {d} is out of range", .{ what, f }));
         return;
@@ -953,7 +952,7 @@ fn limitCount(self: *Parser, what: []const u8, n: *u64, expr: *?*ast.Expr) Error
             shown = -shown;
         }
         if (r < 0) return self.fail(vpos, "{s} must not be negative, got {d}", .{ what, shown });
-        n.* = @intCast(textconv.floatToInt(@abs(r), .exact) orelse return self.fail(vpos, "{s} {d} is out of range", .{ what, shown }));
+        n.* = @intCast(decimal.floatToInt(@abs(r), .exact) orelse return self.fail(vpos, "{s} {d} is out of range", .{ what, shown }));
         return;
     }
     if (e.* == .int_lit) {

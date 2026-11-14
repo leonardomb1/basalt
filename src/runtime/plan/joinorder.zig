@@ -53,7 +53,7 @@ const planErr = @import("../env.zig").planErr;
 const profile = @import("../../exec/profile.zig");
 const schemaPtr = @import("../env.zig").schemaPtr;
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 
 pub const flip_ratio = 4;

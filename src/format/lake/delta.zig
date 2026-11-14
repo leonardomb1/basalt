@@ -29,7 +29,7 @@
 
 const std = @import("std");
 const pagecache = @import("../../exec/pagecache.zig");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Layout = @import("../parquet/fit.zig").Layout;
 const Mapping = @import("../parquet/fit.zig").Mapping;
@@ -40,9 +40,9 @@ const nested_json = @import("../../exec/nested.zig");
 const dtypes = @import("delta_types.zig");
 const dvs = @import("delta_dv.zig");
 const eval = @import("../../exec/eval.zig");
-const folder = @import("../../connect/folder.zig");
+const folder = @import("../../store/folder.zig");
 const table = @import("table.zig");
-const trace = @import("../../connect/trace.zig");
+const trace = @import("../../base/iotrace.zig");
 const types = @import("../../lang/types.zig");
 const uuid = @import("../uuid.zig");
 const vcol = @import("variant_col.zig");
@@ -127,7 +127,7 @@ fn commitIct(arena: std.mem.Allocator, url: []const u8) ?i64 {
 pub fn msText(arena: std.mem.Allocator, ms: i64) ![]const u8 {
     const days = @divFloor(ms, 86_400_000);
     const rem: u64 = @intCast(ms - days * 86_400_000);
-    const c = @import("../../exec/civil.zig").civilFromDays(days);
+    const c = @import("../../base/civil.zig").civilFromDays(days);
     return msgfmt.allocPrint(arena, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}.{d:0>3} UTC", .{ @as(u64, @intCast(@max(c.y, 0))), c.m, c.d, rem / 3_600_000, rem / 60_000 % 60, rem / 1000 % 60, rem % 1000 });
 }
 

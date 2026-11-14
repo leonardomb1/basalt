@@ -6,7 +6,8 @@ const DbConfig = @import("../env.zig").DbConfig;
 const Env = @import("../env.zig").Env;
 const aad = @import("../../db/sqlserver/aad.zig");
 const ast = @import("../../lang/ast.zig");
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
+const netconn = @import("../../net/conn.zig");
 const env_mod = @import("../env.zig");
 const eval = @import("../../exec/eval.zig");
 const RunCfg = @import("register.zig").RunCfg;
@@ -18,17 +19,17 @@ const schema = @import("options_schema.zig");
 const sql = @import("../../db/sql.zig");
 const ssrp = @import("../../db/sqlserver/ssrp.zig");
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const tds = @import("../../db/sqlserver/tds.zig");
 pub const SqlKind = @import("../connect.zig").SqlKind;
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 
-/// A connect failure's error name, with the words the connector's `driver.LoginNote`
+/// A connect failure's error name, with the words the connector's `netconn.LoginNote`
 /// keeps for that error: the server's or identity provider's when they refused the
 /// login, the host and phase when the login timed out.
 pub fn connectWhy(arena: std.mem.Allocator, e: anyerror) ![]const u8 {
-    const said = driver.noteFor(e);
-    if (said.len > 0) return driver.connectorNoteAlloc(arena, "", e, said);
+    const said = netconn.noteFor(e);
+    if (said.len > 0) return netconn.connectorNoteAlloc(arena, "", e, said);
     if (eval.takeFailure(e)) |why| return arena.dupe(u8, why);
     return @errorName(e);
 }
@@ -166,7 +167,7 @@ test "connect_timeout and query_timeout are read as seconds into the connection'
         .{ .key = "query_timeout", .value = &qt, .pos = pos },
     } };
     const cfg = try resolveDbConfig(env, conn, 5432);
-    try std.testing.expectEqual(driver.Timeouts{ .connect_s = 5, .query_s = 3600 }, cfg.timeouts());
+    try std.testing.expectEqual(netconn.Timeouts{ .connect_s = 5, .query_s = 3600 }, cfg.timeouts());
     const plain = try resolveDbConfig(env, .{ .name = "pg", .connector = "postgres", .pos = pos, .config = &.{.{ .key = "host", .value = &host, .pos = pos }} }, 5432);
-    try std.testing.expectEqual(driver.Timeouts{ .connect_s = 60, .query_s = 0 }, plain.timeouts());
+    try std.testing.expectEqual(netconn.Timeouts{ .connect_s = 60, .query_s = 0 }, plain.timeouts());
 }

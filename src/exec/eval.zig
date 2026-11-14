@@ -67,7 +67,7 @@ const std = @import("std");
 const pagecache = @import("pagecache.zig");
 const ast = @import("../lang/ast.zig");
 const types = @import("../lang/types.zig");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 pub const Value = @import("value.zig").Value;
 pub const Batch = @import("batch.zig").Batch;
 
@@ -380,7 +380,7 @@ pub fn litAs(arena: std.mem.Allocator, text: []const u8, ty: Type) error{OutOfMe
         .int => return .{ .int_lit = parseIntStrict(s) orelse return null },
         .float => return .{ .float_lit = parseFloatStrict(s) orelse return null },
         .decimal => {
-            const d = decimal.asDecimalValue(.{ .string = s }) orelse return null;
+            const d = decimal_ops.asDecimalValue(.{ .string = s }) orelse return null;
             const inner = try ast.mk(arena, .{ .str_lit = try formatDecimal(arena, d.unscaled, d.scale) });
             return .{ .cast = .{ .e = inner, .ty = Type.decimal(38, d.scale) } };
         },
@@ -442,9 +442,10 @@ pub const evalColumn = @import("eval/vec.zig").evalColumn;
 pub const decFold = @import("eval/vec.zig").decFold;
 pub const constEval = @import("eval/vec.zig").constEval;
 pub const evalRow = @import("eval/row.zig").evalRow;
-const decimal = @import("decimal.zig");
+const decimal = @import("../base/decimal.zig");
+const decimal_ops = @import("decimal_ops.zig");
 const textconv = @import("textconv.zig");
-const decimalArithType = decimal.decimalArithType;
+const decimalArithType = decimal_ops.decimalArithType;
 pub const jsonPath = @import("eval/row.zig").jsonPath;
 pub const jsonToValue = @import("eval/row.zig").jsonToValue;
 pub const bindLambda = @import("eval/row.zig").bindLambda;
@@ -474,7 +475,7 @@ pub const parseIsoTimestamp = @import("eval/time.zig").parseIsoTimestamp;
 pub const parseDateText = @import("eval/time.zig").parseDateText;
 pub const parseTimestampText = @import("eval/time.zig").parseTimestampText;
 pub const civilFromDays = @import("eval/time.zig").civilFromDays;
-const formatDecimal = decimal.formatDecimal;
+const formatDecimal = decimal_ops.formatDecimal;
 const fieldIndex = @import("eval/support.zig").fieldIndex;
 pub const structPath = @import("eval/support.zig").structPath;
 const pathType = @import("eval/support.zig").pathType;

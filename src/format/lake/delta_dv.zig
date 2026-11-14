@@ -13,7 +13,7 @@
 //! its file-wide index whichever row groups a read prunes (`read.zig`).
 
 const std = @import("std");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const Bytes = @import("../bytes.zig").Bytes;
 const Deletes = @import("../parquet/fit.zig").Deletes;
 const roaring = @import("roaring.zig");

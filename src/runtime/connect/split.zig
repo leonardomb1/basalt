@@ -23,11 +23,11 @@
 //! @[splits] overrides. Each probe consumes the connection `Prober` opens for it.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
-const sql = @import("../db/sql.zig");
-const civil = @import("../exec/civil.zig");
-const uuid = @import("../format/uuid.zig");
-const Value = @import("../exec/value.zig").Value;
+const msgfmt = @import("../../base/msgfmt.zig");
+const sql = @import("../../db/sql.zig");
+const civil = @import("../../base/civil.zig");
+const uuid = @import("../../format/uuid.zig");
+const Value = @import("../../exec/value.zig").Value;
 
 const Conn = sql.Conn;
 const Dialect = sql.Dialect;
@@ -706,7 +706,7 @@ const FakeConn = struct {
         self.conn_closes += 1;
     }
 
-    fn schema(_: *anyopaque) @import("../lang/types.zig").Schema {
+    fn schema(_: *anyopaque) @import("../../lang/types.zig").Schema {
         return .{ .fields = &.{} };
     }
 
@@ -715,12 +715,12 @@ const FakeConn = struct {
         self.cursor_closes += 1;
     }
 
-    fn nextBatch(p: *anyopaque, arena: std.mem.Allocator) anyerror!?@import("../exec/batch.zig").Batch {
+    fn nextBatch(p: *anyopaque, arena: std.mem.Allocator) anyerror!?@import("../../exec/batch.zig").Batch {
         const self: *FakeConn = @ptrCast(@alignCast(p));
         if (self.no_batch or self.served) return null;
         self.served = true;
-        const types = @import("../lang/types.zig");
-        const column = @import("../exec/column.zig");
+        const types = @import("../../lang/types.zig");
+        const column = @import("../../exec/column.zig");
         const ncols: usize = if (self.rows.len == 0) 3 else self.rows[0].len;
         const fields = try arena.alloc(types.Schema.Field, ncols);
         const cols = try arena.alloc(column.Column, ncols);

@@ -13,7 +13,7 @@ const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const max_expr_depth = Parser.max_expr_depth;
 const max_paren_depth = Parser.max_paren_depth;
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 
 /// One call argument: an expression, or a lambda `x -> body` / `(acc, x) -> body`,
 /// which only the JSON array functions accept.
@@ -370,7 +370,10 @@ noinline fn numberLiteral(self: *Parser) Error!*ast.Expr {
     return self.mk(.{ .dec_lit = d });
 }
 
-pub const decimalLiteral = @import("../../exec/decimal.zig").literal;
+fn decimalLiteral(text: []const u8) ?ast.Expr.DecLit {
+    const d = @import("../../base/decimal.zig").literal(text) orelse return null;
+    return .{ .unscaled = d.unscaled, .scale = d.scale };
+}
 
 /// An aggregate refuses arguments past its maximum: extras were once dropped, so
 /// `SUM(x, id)` answered `SUM(x)`.

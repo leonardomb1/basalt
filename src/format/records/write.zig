@@ -13,7 +13,7 @@
 const std = @import("std");
 const Batch = @import("../../exec/batch.zig").Batch;
 const csv = @import("../csv.zig");
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const eval = @import("../../exec/eval.zig");
 const Output = @import("../output.zig").Output;
 
@@ -159,7 +159,7 @@ pub const Writer = struct {
 const testing = std.testing;
 const column = @import("../../exec/column.zig");
 const types = @import("../../lang/types.zig");
-const Guard = @import("../../connect/guard.zig").Guard;
+const Guard = @import("../../exec/guard.zig").Guard;
 
 fn textBatch(a: std.mem.Allocator, kind: types.TypeKind, vals: []const ?[]const u8) !Batch {
     var b = column.Builder.init(a, types.Type.init(kind).asNullable());

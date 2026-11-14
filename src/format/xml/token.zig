@@ -9,7 +9,7 @@
 //! Tag attributes and text are returned raw; entities are decoded with `decode`.
 
 const std = @import("std");
-const hex = @import("../hex.zig");
+const hex = @import("../../base/hex.zig");
 
 pub const Error = error{ BadXml, XmlTokenTooLong, OutOfMemory, ReadFailed };
 

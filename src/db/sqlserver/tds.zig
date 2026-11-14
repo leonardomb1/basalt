@@ -44,7 +44,7 @@
 //! COLMETADATA then ROW tokens of UTF-16 cells, verified against the DONE count.
 
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const column = @import("../../exec/column.zig");
 const celltext = @import("../../exec/celltext.zig");
@@ -52,14 +52,15 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const Value = @import("../../exec/value.zig").Value;
 const Decimal = @import("../../exec/value.zig").Decimal;
 const cell = @import("../../exec/cell.zig");
-const decimal = @import("../../exec/decimal.zig");
-const civil = @import("../../exec/civil.zig");
-const charset = @import("../../format/charset.zig");
-const hex = @import("../../format/hex.zig");
+const decimal = @import("../../base/decimal.zig");
+const civil = @import("../../base/civil.zig");
+const charset = @import("../../exec/charset.zig");
+const hex = @import("../../base/hex.zig");
 const uuid = @import("../../format/uuid.zig");
-const utf16 = @import("../../format/utf16.zig");
+const utf16 = @import("../../base/utf16.zig");
 const eval = @import("../../exec/eval.zig");
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
+const netconn = @import("../../net/conn.zig");
 const sql = @import("../sql.zig");
 const wire = @import("../wire.zig");
 const ntlm = @import("../../net/auth/ntlm.zig");
@@ -86,38 +87,38 @@ pub const Conn = struct {
     pkt_payload: usize = BULK_PKT_PAYLOAD,
     last_done_count: ?u64 = null,
 
-    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
-        driver.clearNote();
+    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: netconn.Timeouts) !*Conn {
+        netconn.clearNote();
         return open(gpa, host, port, to, sqlLogin, .{ user, password, database, host, tls_mode });
     }
 
     /// Azure AD access token (Dataverse / Azure SQL): PRELOGIN advertises
     /// FEDAUTHREQUIRED and LOGIN7 carries the token in a FEDAUTH feature extension. The
     /// caller fetches the token (see aad.ropcToken).
-    pub fn connectAad(gpa: std.mem.Allocator, host: []const u8, port: u16, token: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
-        driver.clearNote();
+    pub fn connectAad(gpa: std.mem.Allocator, host: []const u8, port: u16, token: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: netconn.Timeouts) !*Conn {
+        netconn.clearNote();
         if (tls_mode == .off) return error.EncryptionRequired;
         return open(gpa, host, port, to, aadLogin, .{ token, database, host, tls_mode });
     }
 
     /// NTLMv2 with an explicit `DOMAIN\user` password, not OS single sign-on.
-    pub fn connectNtlm(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: ntlm.Credential, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
-        driver.clearNote();
+    pub fn connectNtlm(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: ntlm.Credential, database: []const u8, tls_mode: sql.TlsMode, to: netconn.Timeouts) !*Conn {
+        netconn.clearNote();
         if (tls_mode == .off) return error.EncryptionRequired;
         return open(gpa, host, port, to, ntlmLogin, .{ cred, database, host, tls_mode });
     }
 
     /// A ticket for `spn` (`MSSQLSvc/<host>:<port>`) asked of the KDC with the password,
     /// its AP-REQ in SPNEGO in the LOGIN7 SSPI field, the server's AP-REP checked.
-    pub fn connectKerberos(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: krb5.Credential, spn: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
-        driver.clearNote();
+    pub fn connectKerberos(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: krb5.Credential, spn: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: netconn.Timeouts) !*Conn {
+        netconn.clearNote();
         if (tls_mode == .off) return error.EncryptionRequired;
         return open(gpa, host, port, to, kerberosLogin, .{ cred, spn, database, host, tls_mode });
     }
 
     /// Dials `host:port` and runs `login_fn(self, args...)` as the login phase:
     /// PRELOGIN, TLS, LOGIN7 and the session's SET options, under the login deadline.
-    fn open(gpa: std.mem.Allocator, host: []const u8, port: u16, to: driver.Timeouts, comptime login_fn: anytype, args: anytype) !*Conn {
+    fn open(gpa: std.mem.Allocator, host: []const u8, port: u16, to: netconn.Timeouts, comptime login_fn: anytype, args: anytype) !*Conn {
         const self = try wire.Conn.dial(Conn, gpa, host, port, to);
         errdefer self.close();
         @call(.auto, login_fn, .{self} ++ args) catch |e| return self.wire.loginFailed(e, host, port);
@@ -397,13 +398,13 @@ pub const Conn = struct {
 
     fn krbFailed(self: *Conn, e: anyerror) Error {
         if (e == error.OutOfMemory) return error.OutOfMemory;
-        const why = driver.lastNote();
+        const why = netconn.lastNote();
         return self.loginRefused("kerberos: {s}: {s}", .{ @errorName(e), if (why.len > 0) why else "no further detail" });
     }
 
-    /// The server's words for a refused login, kept as this thread's `driver.LoginNote`.
+    /// The server's words for a refused login, kept as this thread's `netconn.LoginNote`.
     fn noteRefusal(self: *const Conn, e: anyerror) void {
-        if (e == error.LoginFailed) driver.explain(e, self.wire.last_error);
+        if (e == error.LoginFailed) netconn.explain(e, self.wire.last_error);
     }
 
     fn loginRefused(self: *Conn, comptime fmt: []const u8, args: anytype) Error {

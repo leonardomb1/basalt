@@ -1,8 +1,8 @@
 //! Values as text: how dates, times, timestamps and decimals print.
 
 const Value = @import("../value.zig").Value;
-const civil = @import("../civil.zig");
-const formatDecimal = @import("../decimal.zig").formatDecimal;
+const civil = @import("../../base/civil.zig");
+const formatDecimal = @import("../decimal_ops.zig").formatDecimal;
 const std = @import("std");
 const evalLit = @import("testing_util.zig").evalLit;
 

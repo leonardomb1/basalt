@@ -7,11 +7,11 @@ const Value = @import("../../exec/value.zig").Value;
 const ast = @import("../../lang/ast.zig");
 const catalogQuery = @import("../plan/estimate.zig").catalogQuery;
 const pushdown = @import("../pushdown.zig");
-const split = @import("../../connect/split.zig");
+const split = @import("split.zig");
 const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 
 /// Per-column text and collation facts that decide which text comparisons may

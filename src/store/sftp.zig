@@ -20,16 +20,17 @@
 //! read once per lane. Sessions are pooled per server and user for the life of
 //! the process, each opened file its own handle on a session the opener has to
 //! itself until it closes the file. `CREATE CONNECTION … TYPE sftp` registers a
-//! `Conn` so a path's host part can name it. The thread's `driver.LoginNote` keeps
+//! `Conn` so a path's host part can name it. The thread's `netconn.LoginNote` keeps
 //! why the last attempt to reach a server failed, in the session's own words (an
 //! unknown host key's fingerprint) when it got that far.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const remotefs = @import("remotefs.zig");
 const scheme = @import("scheme.zig");
 const ssh = @import("../net/ssh.zig");
-const driver = @import("../connect/driver.zig");
+const driver = @import("../exec/driver.zig");
+const netconn = @import("../net/conn.zig");
 
 pub const Error = error{
     SftpProtocol,
@@ -92,7 +93,7 @@ pub const Conn = struct {
     key_passphrase: ?[]const u8 = null,
     known_hosts: ?[]const u8 = null,
     host_key: ?[]const u8 = null,
-    connect_timeout: u32 = driver.default_connect_timeout_s,
+    connect_timeout: u32 = netconn.default_connect_timeout_s,
     query_timeout: u32 = 0,
 };
 
@@ -532,18 +533,18 @@ const Proto = struct {
     }
 
     pub fn clearNotes() void {
-        driver.clearNote();
+        netconn.clearNote();
     }
 
     /// A failed connect leaves no session to ask, so without the server's words the
     /// note names the error and the login it tried.
     pub fn connect(cfg: ssh.Config) !*Client {
         return Client.open(std.heap.page_allocator, cfg) catch |e| {
-            const said = driver.lastNote();
+            const said = netconn.lastNote();
             if (said.len > 0)
-                driver.explain(e, said)
+                netconn.explain(e, said)
             else
-                driver.explainf(e, "{s} connecting to {s}:{d} as {s}", .{ @errorName(e), cfg.host, cfg.port, cfg.user });
+                netconn.explainf(e, "{s} connecting to {s}:{d} as {s}", .{ @errorName(e), cfg.host, cfg.port, cfg.user });
             return e;
         };
     }
@@ -575,7 +576,7 @@ const Proto = struct {
 
     /// `e`, its reason kept on the thread before anything else is asked of the session.
     fn noted(c: *Client, e: anyerror) anyerror {
-        driver.explain(e, c.lastError());
+        netconn.explain(e, c.lastError());
         return e;
     }
 
@@ -719,5 +720,5 @@ test "a server that accepts and never answers fails the SSH login within connect
     Proto.clearNotes();
     try std.testing.expectError(error.ConnectionTimedOut, Proto.connect(.{ .host = "127.0.0.1", .port = port, .user = "u", .timeouts = .{ .connect_s = 1 } }));
     var buf: [128]u8 = undefined;
-    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}: handshake did not answer within 1 s", .{port}), driver.noteFor(error.ConnectionTimedOut));
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}: handshake did not answer within 1 s", .{port}), netconn.noteFor(error.ConnectionTimedOut));
 }

@@ -13,12 +13,12 @@
 //! dark and light terminals alike.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const types = @import("../lang/types.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const celltext = @import("../exec/celltext.zig");
 const textconv = @import("../exec/textconv.zig");
-const driver = @import("driver.zig");
+const driver = @import("../exec/driver.zig");
 
 pub const Grid = struct {
     names: []const []const u8,

@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const jsontext = @import("jsontext.zig");
-const hex = @import("../format/hex.zig");
+const hex = @import("../base/hex.zig");
 
 pub const Error = error{ InvalidJson, OutOfMemory };
 

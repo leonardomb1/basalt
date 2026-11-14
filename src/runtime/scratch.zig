@@ -11,7 +11,7 @@ const DirSpace = @import("../exec/space.zig").DirSpace;
 const Space = @import("../exec/space.zig").Space;
 const std = @import("std");
 const pagecache = @import("../exec/pagecache.zig");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 
 pub const Scratch = struct {
     gpa: std.mem.Allocator,

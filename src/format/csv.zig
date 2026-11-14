@@ -45,15 +45,15 @@
 //! `.part` is removed. Committing on close is what makes the object appear.
 
 const std = @import("std");
-const filemap = @import("../exec/filemap.zig");
-const msgfmt = @import("msgfmt.zig");
+const filemap = @import("../base/filemap.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
 const celltext = @import("../exec/celltext.zig");
 const Batch = @import("../exec/batch.zig").Batch;
 const Value = @import("../exec/value.zig").Value;
 const eval = @import("../exec/eval.zig");
-const driver = @import("../connect/driver.zig");
+const driver = @import("../exec/driver.zig");
 const http_fake = @import("../testing/http_fake.zig");
 const Output = @import("output.zig").Output;
 const texttype = @import("texttype.zig");
@@ -61,13 +61,13 @@ const stream = @import("stream.zig");
 const Stream = stream.Stream;
 const json = @import("json/read.zig");
 const records = @import("records/read.zig");
-const release = stream.release;
+const release = filemap.dropPages;
 const Gunzip = stream.Gunzip;
 const explainf = stream.explainf;
 const codecBuffer = stream.codecBuffer;
-const folder = @import("../connect/folder.zig");
+const folder = @import("../store/folder.zig");
 const deflate = @import("compress/deflate.zig");
-const charset = @import("charset.zig");
+const charset = @import("../exec/charset.zig");
 
 const BATCH_ROWS = 1024;
 const LINE_BUF = stream.LINE_BUF;

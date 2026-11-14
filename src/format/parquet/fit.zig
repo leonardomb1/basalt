@@ -18,7 +18,7 @@
 //! table deletes (`Deletes`), which its reader skips.
 
 const std = @import("std");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Bound = @import("stats.zig").Bound;
 const Bytes = @import("../bytes.zig").Bytes;
@@ -84,7 +84,7 @@ pub const Layout = struct {
     pub fn view(self: *const Layout, arena: std.mem.Allocator, want: ?[]const []const u8) !*const View {
         var idx = std.array_list.Managed(usize).init(arena);
         for (self.schema.fields, 0..) |f, i| {
-            const keep = if (want) |w| @import("../../connect/driver.zig").wantsColumn(w, f.name) else true;
+            const keep = if (want) |w| @import("../../exec/driver.zig").wantsColumn(w, f.name) else true;
             if (keep) try idx.append(i);
         }
         if (idx.items.len == 0) {

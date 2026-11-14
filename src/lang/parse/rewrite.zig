@@ -13,7 +13,7 @@ const print = @import("../print.zig");
 const outName = @import("../sql_parser.zig").outName;
 const qualHasPrefix = @import("../sql_parser.zig").qualHasPrefix;
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const stripPrefix = @import("../sql_parser.zig").stripPrefix;
 const stripQual = @import("../sql_parser.zig").stripQual;
 

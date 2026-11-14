@@ -22,7 +22,7 @@
 //! `"two words"` is one phrase; all in any case, a NULL holding nothing.
 
 const std = @import("std");
-const table = @import("../../connect/table.zig");
+const table = @import("../../format/table.zig");
 const types = @import("../../lang/types.zig");
 const line = @import("line.zig");
 const search = @import("../../exec/search.zig");

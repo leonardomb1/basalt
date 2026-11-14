@@ -61,7 +61,7 @@
 //! before `retry_statuses` is consulted. A login request runs like a page, under
 //! its deadline and retries.
 //!
-//! Resilience: transient failures (`driver.transientStatus`: 408, 429 and every 5xx
+//! Resilience: transient failures (`netconn.transientStatus`: 408, 429 and every 5xx
 //! but 501, 505 and 511; connection resets) retry in place
 //! `retries` times through `objstore.retry`, backing off from `retry_base_ms` with
 //! jitter, stretched to a `Retry-After` of up to a minute, so one blip deep in a long
@@ -97,12 +97,13 @@
 
 const std = @import("std");
 const HttpClient = @import("http_std.zig");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const objstore = @import("../store/objstore.zig");
 const types = @import("../lang/types.zig");
 const ast = @import("../lang/ast.zig");
 const Batch = @import("../exec/batch.zig").Batch;
-const driver = @import("../connect/driver.zig");
+const driver = @import("../exec/driver.zig");
+const netconn = @import("conn.zig");
 const fjson = @import("../format/json/read.zig");
 const jt = @import("../exec/json.zig");
 const textconv = @import("../exec/textconv.zig");
@@ -110,9 +111,9 @@ const eval = @import("../exec/eval.zig");
 const ChainCapture = @import("tls_client.zig").ChainCapture;
 const trust = @import("trust.zig");
 const init = @import("tls_client.zig").init;
-const obs = @import("../runtime/obs.zig");
-const trace = @import("../connect/trace.zig");
-const percent = @import("percent.zig");
+const obs = @import("../exec/obs.zig");
+const trace = @import("../base/iotrace.zig");
+const percent = @import("../base/percent.zig");
 const scheme = @import("../store/scheme.zig");
 const http_fake = @import("../testing/http_fake.zig");
 
@@ -152,7 +153,7 @@ pub fn repairOnce(client: *HttpClient, done: *bool, url: []const u8) bool {
 /// Captures the chain a server presents over an unverified handshake. SNI and the
 /// hostname are still sent and checked; only the CA path is not verified.
 fn harvestChain(gpa: std.mem.Allocator, host: []const u8, port: u16, cap: *ChainCapture) !void {
-    const stream = try driver.dial(gpa, host, port, .{ .tune = false });
+    const stream = try netconn.dial(gpa, host, port, .{ .tune = false });
     defer stream.close();
     var in_buf: [std.crypto.tls.max_ciphertext_record_len]u8 = undefined;
     var out_buf: [std.crypto.tls.max_ciphertext_record_len]u8 = undefined;
@@ -332,7 +333,7 @@ pub const AuthState = struct {
 
 /// `url` as logs and messages show it: without a `user:pass@` and with each query
 /// value replaced by `...`, as either may hold a credential.
-pub const redactUrl = scheme.shown;
+pub const redactUrl = @import("../base/url.zig").shown;
 
 /// Whether a server-sent value can go into a header or request line as is: a CR,
 /// LF or NUL in it would end the line and start one the server chose.
@@ -410,7 +411,7 @@ pub const Mode = enum { none, page, offset, cursor };
 /// `timeout_ms`, `retries` and `retry_base_ms`; a SQL Server AAD token call takes
 /// the defaults.
 pub const Deadline = struct {
-    timeout_ms: i64 = driver.request_timeout_ms,
+    timeout_ms: i64 = netconn.request_timeout_ms,
     retries: i64 = 2,
     retry_base_ms: i64 = 500,
 };
@@ -455,7 +456,7 @@ pub const Reply = struct { code: u16, body: []u8 };
 
 /// A request outside any read, such as an identity provider's realm or token call,
 /// sent exactly as a page is: on a slot's worker under `dl`'s deadline and
-/// `driver.transientStatus` retries, so a black-holed endpoint is ConnectionTimedOut.
+/// `netconn.transientStatus` retries, so a black-holed endpoint is ConnectionTimedOut.
 /// The slot owns its client, so an abandoned worker frees both; the body is `gpa`'s.
 pub fn request(gpa: std.mem.Allocator, req: Request, dl: Deadline) !Reply {
     if (driver.aborting()) return error.Aborted;
@@ -1248,7 +1249,7 @@ pub const HttpSource = struct {
         }
     }
 
-    /// One request of a slot. A `driver.transientStatus` code or a listed status other
+    /// One request of a slot. A `netconn.transientStatus` code or a listed status other
     /// than 401 is worth another attempt; every status is kept for the consumer, a
     /// transport error is not. An abandoned slot stops retrying, as nobody waits for it.
     fn attempt(slot: *Slot) !objstore.Verdict {
@@ -1516,7 +1517,7 @@ fn withParam(arena: std.mem.Allocator, base: []const u8, key: []const u8, val: [
     return buf.toOwnedSlice();
 }
 
-/// Maps a non-200 status to a named error, distinct per fix: a `driver.transientStatus`
+/// Maps a non-200 status to a named error, distinct per fix: a `netconn.transientStatus`
 /// code is worth a control-plane retry (exit 75), 401 is an expired token, 400 a
 /// rejected request.
 pub fn statusError(code: u16) anyerror {

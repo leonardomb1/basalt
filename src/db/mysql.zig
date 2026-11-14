@@ -24,7 +24,7 @@
 //! and StarRocks' and Doris' columns, which no session zone changes, are unaffected.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const sql = @import("sql.zig");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
@@ -32,7 +32,8 @@ const cell = @import("../exec/cell.zig");
 const Value = @import("../exec/value.zig").Value;
 const Batch = @import("../exec/batch.zig").Batch;
 const wire = @import("wire.zig");
-const driver = @import("../connect/driver.zig");
+const driver = @import("../exec/driver.zig");
+const netconn = @import("../net/conn.zig");
 const typemap = @import("typemap.zig");
 
 /// utf8mb4_general_ci, so the session reads and writes four-byte UTF-8; utf8mb3
@@ -65,12 +66,12 @@ pub const Conn = struct {
     no_backslash: bool = false,
 
     /// The login phase runs from the dial through the session's time zone.
-    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
-        driver.clearNote();
+    pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: netconn.Timeouts) !*Conn {
+        netconn.clearNote();
         const self = try wire.Conn.dial(Conn, gpa, host, port, to);
         errdefer self.close();
         self.login(host, user, password, database, tls_mode) catch |e| {
-            if (e == error.MysqlAuthFailed) driver.explain(e, self.wire.last_error);
+            if (e == error.MysqlAuthFailed) netconn.explain(e, self.wire.last_error);
             return self.wire.loginFailed(e, host, port);
         };
         self.wire.sessionUp();

@@ -23,13 +23,13 @@
 //! cell, as strict OOXML writes it, stays text.
 
 const std = @import("std");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const textconv = @import("../../exec/textconv.zig");
 const types = @import("../../lang/types.zig");
 const Value = @import("../../exec/value.zig").Value;
 const column = @import("../../exec/column.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const zipsrc = @import("../compress/zip.zig");
 const xml = @import("../xml/token.zig");
 const serial = @import("serial.zig");

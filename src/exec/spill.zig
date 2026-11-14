@@ -20,18 +20,18 @@
 //! read back must not be written in place.
 
 const std = @import("std");
-const filemap = @import("filemap.zig");
+const filemap = @import("../base/filemap.zig");
 const types = @import("../lang/types.zig");
 const value = @import("value.zig");
 const column = @import("column.zig");
 const celltext = @import("celltext.zig");
-const civil = @import("civil.zig");
+const civil = @import("../base/civil.zig");
 const space_mod = @import("space.zig");
 
 const Space = space_mod.Space;
 const Batch = @import("batch.zig").Batch;
-const Cursor = @import("../format/cursor.zig").Reader(@import("builtin").cpu.arch.endian(), error.CorruptSpill);
-const release = @import("../format/stream.zig").release;
+const Cursor = @import("../base/cursor.zig").Reader(@import("builtin").cpu.arch.endian(), error.CorruptSpill);
+const release = @import("../base/filemap.zig").dropPages;
 const Column = column.Column;
 const Bitmap = column.Bitmap;
 const Tag = column.Tag;

@@ -53,7 +53,7 @@
 
 const std = @import("std");
 const pagecache = @import("../../exec/pagecache.zig");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const textconv = @import("../../exec/textconv.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const codecs = @import("../compress/codecs.zig");
@@ -64,15 +64,16 @@ const ckpt = @import("delta_checkpoint.zig");
 const dtypes = @import("delta_types.zig");
 const merge = @import("delta_merge.zig");
 const dvs = @import("delta_dv.zig");
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const eval = @import("../../exec/eval.zig");
-const decimal = @import("../../exec/decimal.zig");
-const folder = @import("../../connect/folder.zig");
+const decimal = @import("../../base/decimal.zig");
+const decimal_ops = @import("../../exec/decimal_ops.zig");
+const folder = @import("../../store/folder.zig");
 const jsontext = @import("../../exec/jsontext.zig");
 const objstore = @import("../../store/objstore.zig");
 const pqwrite = @import("../parquet/write.zig");
 const fit = @import("../parquet/fit.zig");
-const percent = @import("../../net/percent.zig");
+const percent = @import("../../base/percent.zig");
 const ast = @import("../../lang/ast.zig");
 const azure = @import("../../store/azure.zig");
 const s3 = @import("../../store/s3.zig");
@@ -1156,7 +1157,7 @@ pub const Sink = struct {
             key.clearRetainingCapacity();
             for (p.parts, vals) |k, *v| {
                 v.* = dtypes.partitionText(arena, p.cols[k].phys, p.cols[k].ty.scale, b.columns[p.cols[k].src].getValue(r)) catch |e| {
-                    if (e == error.DecimalDropsDigits) return decimal.dropsDigitsFailure(p.cols[k].name, p.cols[k].ty);
+                    if (e == error.DecimalDropsDigits) return decimal_ops.dropsDigitsFailure(p.cols[k].name, p.cols[k].ty);
                     return e;
                 };
                 if (v.*) |t| {

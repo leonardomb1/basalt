@@ -20,11 +20,11 @@ const std = @import("std");
 const types = @import("../lang/types.zig");
 const column = @import("column.zig");
 const Decimal = @import("value.zig").Decimal;
-const decimal = @import("decimal.zig");
+const decimal = @import("../base/decimal.zig");
 const textconv = @import("textconv.zig");
 const cast = @import("eval/cast.zig");
-const civil = @import("civil.zig");
-const hex = @import("../format/hex.zig");
+const civil = @import("../base/civil.zig");
+const hex = @import("../base/hex.zig");
 
 pub const Error = error{ TextTypeMismatch, UnparseableNumber, OutOfMemory };
 

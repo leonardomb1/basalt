@@ -25,11 +25,11 @@ const resolveAt = @import("../plan.zig").resolveAt;
 const op = @import("../../exec/op.zig");
 const openTailSink = @import("agg.zig").openTailSink;
 const parallel = @import("../parallel.zig");
-const SinkGuard = @import("../../connect/guard.zig").SinkGuard;
+const SinkGuard = @import("../../exec/guard.zig").SinkGuard;
 const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
 const pagecache = @import("../../exec/pagecache.zig");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const writeTail = @import("agg.zig").writeTail;
 

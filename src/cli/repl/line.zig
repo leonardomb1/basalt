@@ -41,8 +41,8 @@ const charLen = @import("line/layout.zig").charLen;
 pub const layoutRows = @import("line/layout.zig").layoutRows;
 pub const rowOf = @import("line/layout.zig").rowOf;
 const colsBetween = @import("line/layout.zig").colsBetween;
-pub const TermSize = @import("../../connect/table.zig").TermSize;
-pub const termSize = @import("../../connect/table.zig").termSize;
+pub const TermSize = @import("../../format/table.zig").TermSize;
+pub const termSize = @import("../../format/table.zig").termSize;
 pub const Buffer = @import("line/buffer.zig").Buffer;
 
 pub const Editor = struct {

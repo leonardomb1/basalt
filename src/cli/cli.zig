@@ -43,14 +43,14 @@
 //! fetches) and `repl/wizard.zig` (`\connect`).
 
 const std = @import("std");
-const table = @import("../connect/table.zig");
+const table = @import("../format/table.zig");
 const ast = @import("../lang/ast.zig");
 const aggregates = @import("../lang/aggregates.zig");
 const stats = @import("../lang/parse/stats.zig");
 const runtime = @import("../runtime/run.zig");
 const complete = @import("repl/complete.zig");
 const hilite = @import("repl/hilite.zig");
-const table_builtins = @import("../connect/table_builtins.zig");
+const table_builtins = @import("../runtime/connect/table_builtins.zig");
 const kernel = @import("kernel.zig");
 const eval = @import("../exec/eval.zig");
 
@@ -340,12 +340,12 @@ test "Tab's built-in functions are exactly the engine's: every scalar, aggregate
 test "Tab offers every table builtin, as a keyword or a function" {
     for (table_builtins.table) |b| {
         const offered = for (hilite.keywords) |k| {
-            if (std.ascii.eqlIgnoreCase(k, b.name)) break true;
+            if (std.ascii.eqlIgnoreCase(k, b.sig.name)) break true;
         } else for (complete.builtin_functions) |f| {
-            if (std.ascii.eqlIgnoreCase(f.name, b.name)) break true;
+            if (std.ascii.eqlIgnoreCase(f.name, b.sig.name)) break true;
         } else false;
         if (!offered) {
-            std.debug.print("table builtin `{s}` is not offered by Tab\n", .{b.name});
+            std.debug.print("table builtin `{s}` is not offered by Tab\n", .{b.sig.name});
             return error.TestUnexpectedResult;
         }
     }

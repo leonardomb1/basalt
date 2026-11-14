@@ -5,7 +5,7 @@
 const ast = @import("../../lang/ast.zig");
 const parser = @import("../../lang/sql_parser.zig");
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 
 /// The `}` closing a `${` opened before `start`: brace-balanced and quote-aware
 /// (`'...'` and `"..."`, both escaped by doubling).

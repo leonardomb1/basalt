@@ -28,7 +28,7 @@
 //! per outer row, which one join cannot.
 
 const std = @import("std");
-const msgfmt = @import("../../format/msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const ast = @import("../ast.zig");
 const sp = @import("../sql_parser.zig");
 const Parser = sp.Parser;

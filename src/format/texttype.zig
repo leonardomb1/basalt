@@ -156,3 +156,71 @@ test "a column of signed or long years sniffs as DATE, one of zero-led codes sta
         try std.testing.expectEqual(c[1], col.resolve(true).kind);
     }
 }
+
+/// The kind one cell reads as, for checking `types.widenSample` against `Column`.
+fn textCellKind(raw: []const u8, quoted: bool) ?types.TypeKind {
+    const eval = @import("../exec/eval.zig");
+    if (quoted) return .string;
+    if (raw.len == 0) return null;
+    if (eval.parseIsoDate(raw) != null) return .date;
+    if (cell.codeLooking(raw)) return .string;
+    if (eval.parseIntStrict(raw) != null) return .int;
+    if (eval.parseFloatStrict(raw) != null) return .float;
+    return .string;
+}
+
+test "widenSample over per-cell kinds reproduces texttype's Column.resolve" {
+    const Cell = struct { []const u8, bool };
+    const columns = [_][]const Cell{
+        &.{},
+        &.{.{ "", false }},
+        &.{ .{ "", false }, .{ "", false } },
+        &.{.{ "", true }},
+        &.{ .{ "1", false }, .{ "2", false } },
+        &.{ .{ "1", false }, .{ "2.5", false } },
+        &.{ .{ "1.5", false }, .{ "", false }, .{ "7", false } },
+        &.{.{ "1", true }},
+        &.{ .{ "1", false }, .{ "1", true } },
+        &.{.{ "007", false }},
+        &.{ .{ "1", false }, .{ "007", false } },
+        &.{.{ "+1", false }},
+        &.{.{ "-01", false }},
+        &.{.{ "0.5", false }},
+        &.{.{ "0", false }},
+        &.{.{ "1e400", false }},
+        &.{.{ "1e5", false }},
+        &.{.{ "nan", false }},
+        &.{ .{ "nan", false }, .{ "1", false } },
+        &.{.{ "inf", false }},
+        &.{.{ "-", false }},
+        &.{.{ "2020-01-01", false }},
+        &.{ .{ "2020-01-01", false }, .{ "2021-12-31", false } },
+        &.{ .{ "2020-01-01", false }, .{ "1", false } },
+        &.{ .{ "1", false }, .{ "2020-01-01", false } },
+        &.{ .{ "2020-01-01", false }, .{ "1.5", false } },
+        &.{.{ "0001-01-01", false }},
+        &.{ .{ "0001-01-01", false }, .{ "2020-02-29", false } },
+        &.{.{ "2020-02-30", false }},
+        &.{ .{ "2020-01-01", true }, .{ "2020-01-02", false } },
+        &.{.{ "abc", false }},
+        &.{ .{ "abc", false }, .{ "1", false } },
+        &.{.{ " 1", false }},
+        &.{.{ "1 ", false }},
+        &.{.{ "true", false }},
+        &.{.{ "12:00:00", false }},
+        &.{.{ "2020-01-01 10:00:00", false }},
+    };
+    for (columns) |cells| for ([_]bool{ true, false }) |whole| {
+        var c: Column = .{};
+        var s: types.Sample = .none;
+        for (cells) |x| {
+            c.note(x[0], x[1]);
+            if (textCellKind(x[0], x[1])) |k| s = types.widenSample(s, k);
+        }
+        const today = c.resolve(whole);
+        const home = if (s.kind()) |k| types.Type.init(k).asNullable() else types.Type.nullColumn(whole);
+        try std.testing.expectEqual(today.kind, home.kind);
+        try std.testing.expectEqual(today.nullable, home.nullable);
+        try std.testing.expectEqual(today.unknown, home.unknown);
+    };
+}

@@ -5,7 +5,7 @@ const Error = @import("read.zig").Error;
 const parquet = @import("footer.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
-const civil = @import("../../exec/civil.zig");
+const civil = @import("../../base/civil.zig");
 const eval = @import("../../exec/eval.zig");
 
 pub const conv_utf8 = 0;

@@ -10,7 +10,8 @@
 //! encoder writes a NULL as spaces, as fixed-width files spell one (binary encoders
 //! leave it NULL), refuses a value too wide for its field, and never rounds: a
 //! decimal with more places than its field has nonzero digits there is refused.
-//! `read_bytes` and `file_size` read a file by range wherever it is (`bytes.zig`).
+//! `read_bytes` and `file_size` read a file by range wherever it is, through the
+//! opener the run installs (`driver.RangedFile`, `format/bytes.zig`).
 
 const std = @import("std");
 const ast = @import("../../lang/ast.zig");
@@ -21,16 +22,16 @@ const TypeCtx = @import("../eval.zig").TypeCtx;
 const TypeError = @import("../eval.zig").TypeError;
 const Cx = @import("scalar.zig").Cx;
 const failWith = @import("support.zig").failWith;
-const civil = @import("../civil.zig");
-const charset = @import("../../format/charset.zig");
-const hex = @import("../../format/hex.zig");
-const bytes = @import("../../format/bytes.zig");
+const civil = @import("../../base/civil.zig");
+const charset = @import("../charset.zig");
+const hex = @import("../../base/hex.zig");
+const driver = @import("../driver.zig");
 const vecmod = @import("vec.zig");
 const column = @import("../column.zig");
 const Batch = @import("../batch.zig").Batch;
 const Bitmap = @import("vec.zig").Bitmap;
 
-const decimal = @import("../decimal.zig");
+const decimal = @import("../../base/decimal.zig");
 const max_digits = decimal.max_digits;
 
 fn fieldOf(comptime name: []const u8, rec: []const u8, pos: i64, len: i64) EvalError![]const u8 {
@@ -681,14 +682,14 @@ pub fn FmtBinFloat(comptime T: type, comptime endian: std.builtin.Endian) type {
 }
 
 /// A file opened for `read_bytes` or `file_size`, or the error naming it.
-fn openFile(comptime name: []const u8, arena: std.mem.Allocator, path: []const u8) EvalError!bytes.Bytes {
-    return bytes.Bytes.open(arena, path) catch |e| switch (e) {
+fn openFile(comptime name: []const u8, arena: std.mem.Allocator, path: []const u8) EvalError!driver.RangedFile {
+    return driver.openRanged(arena, path) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
         else => failWith(error.CastFailed, "`" ++ name ++ "`: cannot open `{s}` ({s})", .{ path, @errorName(e) }),
     };
 }
 
-fn rangeOf(arena: std.mem.Allocator, src: bytes.Bytes, path: []const u8, off: i64, len: i64) EvalError![]const u8 {
+fn rangeOf(arena: std.mem.Allocator, src: driver.RangedFile, path: []const u8, off: i64, len: i64) EvalError![]const u8 {
     if (off < 0 or len < 0) return failWith(error.CastFailed, "`read_bytes`: offset {d} and length {d} cannot be negative", .{ off, len });
     return src.range(arena, @intCast(off), @intCast(len)) catch |e| switch (e) {
         error.OutOfMemory => error.OutOfMemory,
@@ -1029,6 +1030,7 @@ test "record encoders: separators, padding, NULL as spaces, and every refusal by
 }
 
 test "read_bytes and file_size: ranges of a file, NULL offsets per row, and the errors naming the file" {
+    driver.installRangedOpener(@import("../../format/bytes.zig").openRanged);
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();

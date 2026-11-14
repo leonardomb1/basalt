@@ -74,7 +74,7 @@ pub fn Guard(comptime T: type) type {
 pub const SinkGuard = Guard(driver.Sink);
 
 const testing = std.testing;
-const Batch = @import("../exec/batch.zig").Batch;
+const Batch = @import("batch.zig").Batch;
 
 const Probe = struct {
     closes: usize = 0,

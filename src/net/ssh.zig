@@ -22,13 +22,14 @@
 //! data arriving while a send waits on the window is held for the next `recv`, its
 //! window granted back only then, so a server can make us hold at most one window;
 //! data past the window, or a packet longer than `max_packet`, is refused. The failure
-//! text (`why`, and the `driver.LoginNote` copy that outlives a failed `connect`) holds
+//! text (`why`, and the `netconn.LoginNote` copy that outlives a failed `connect`) holds
 //! the server's disconnect message or a fingerprint, never a secret.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const builtin = @import("builtin");
-const driver = @import("../connect/driver.zig");
+const driver = @import("../exec/driver.zig");
+const netconn = @import("conn.zig");
 const crypto = std.crypto;
 const Sha256 = crypto.hash.sha2.Sha256;
 const Sha512 = crypto.hash.sha2.Sha512;
@@ -71,7 +72,7 @@ pub const Config = struct {
     key_passphrase: ?[]const u8 = null,
     known_hosts: ?[]const u8 = null,
     host_key: ?[]const u8 = null,
-    timeouts: driver.Timeouts = .{},
+    timeouts: netconn.Timeouts = .{},
 };
 
 const client_version = "SSH-2.0-basalt";
@@ -150,7 +151,7 @@ pub const Buf = struct {
     }
 };
 
-pub const Cursor = @import("../format/cursor.zig").Reader(.big, error.SshProtocol);
+pub const Cursor = @import("../base/cursor.zig").Reader(.big, error.SshProtocol);
 
 fn listHas(list: []const u8, name: []const u8) bool {
     var it = std.mem.splitScalar(u8, list, ',');
@@ -349,7 +350,7 @@ pub const Session = struct {
         var owned = cfg;
         const text = try ownConfig(gpa, &owned);
         errdefer gpa.free(text);
-        const stream = try driver.dial(gpa, cfg.host, cfg.port, cfg.timeouts.dialOpts());
+        const stream = try netconn.dial(gpa, cfg.host, cfg.port, cfg.timeouts.dialOpts());
         self.* = .{
             .gpa = gpa,
             .stream = stream,
@@ -375,7 +376,7 @@ pub const Session = struct {
     /// `e`, or `ConnectionTimedOut` naming the host and `phase` when the login
     /// deadline fired: from the dial through `sessionUp`.
     pub fn loginFailed(self: *Session, e: anytype, phase: []const u8) (@TypeOf(e) || error{ConnectionTimedOut}) {
-        return driver.loginFailed(e, driver.ioTimedOut(&self.sr, &self.sw), self.cfg.host, self.cfg.port, phase, self.cfg.timeouts.connect_s);
+        return netconn.loginFailed(e, netconn.ioTimedOut(&self.sr, &self.sw), self.cfg.host, self.cfg.port, phase, self.cfg.timeouts.connect_s);
     }
 
     /// The caller's session setup is done: the login deadline gives way to the query one.
@@ -429,7 +430,7 @@ pub const Session = struct {
     fn fail(self: *Session, e: Error, comptime fmt: []const u8, args: anytype) Error {
         self.why.clearRetainingCapacity();
         self.why.writer().print(fmt, args) catch {};
-        driver.explain(e, self.why.items);
+        netconn.explain(e, self.why.items);
         return e;
     }
 

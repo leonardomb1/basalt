@@ -14,7 +14,7 @@ const std = @import("std");
 const suggestFor = @import("repl/catalog.zig").suggestFor;
 const unknownOption = @import("args.zig").unknownOption;
 const jsontext = @import("../exec/jsontext.zig");
-const utf16 = @import("../format/utf16.zig");
+const utf16 = @import("../base/utf16.zig");
 
 /// What Tab would offer at byte `--pos`, as JSON. Connections are asked for their
 /// tables and columns only under `--connect`, as that is a round trip to each.

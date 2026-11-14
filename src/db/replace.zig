@@ -16,7 +16,7 @@
 //! always deletes.
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const msgfmt = @import("../base/msgfmt.zig");
 const sql = @import("sql.zig");
 const types = @import("../lang/types.zig");
 

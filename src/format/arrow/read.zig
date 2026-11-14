@@ -44,18 +44,18 @@
 //! several, and which one a query meant is not something to guess.
 
 const std = @import("std");
-const filemap = @import("../../exec/filemap.zig");
+const filemap = @import("../../base/filemap.zig");
 const pagecache = @import("../../exec/pagecache.zig");
-const msgfmt = @import("../msgfmt.zig");
+const msgfmt = @import("../../base/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const column = @import("../../exec/column.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const Value = @import("../../exec/value.zig").Value;
 const eval = @import("../../exec/eval.zig");
-const driver = @import("../../connect/driver.zig");
+const driver = @import("../../exec/driver.zig");
 const codec = @import("../compress/codecs.zig");
 const flatbuf = @import("flatbuf.zig");
-const civil = @import("../../exec/civil.zig");
+const civil = @import("../../base/civil.zig");
 const jsontext = @import("../../exec/jsontext.zig");
 
 pub const Error = error{

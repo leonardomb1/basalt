@@ -3,9 +3,9 @@
 
 const Error = @import("read.zig").Error;
 const std = @import("std");
-const civil = @import("../../exec/civil.zig");
+const civil = @import("../../base/civil.zig");
 const testing = std.testing;
-const varint = @import("../varint.zig");
+const varint = @import("../../base/varint.zig");
 
 pub const BitReader = struct {
     buf: []const u8,

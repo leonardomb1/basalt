@@ -234,7 +234,7 @@ fn putInt(arena: std.mem.Allocator, out: *std.ArrayList(u8), comptime T: type, x
     try out.appendSlice(arena, &b);
 }
 
-const Cursor = @import("../cursor.zig").Reader(.little, error.DeletionVectorCorrupt);
+const Cursor = @import("../../base/cursor.zig").Reader(.little, error.DeletionVectorCorrupt);
 
 /// The bitmap `bytes` (the portable format, its magic already taken off) holds,
 /// checked whole and indexed by container into `arena`; `bytes` must outlive it.

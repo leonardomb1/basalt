@@ -24,7 +24,7 @@
 //! replay with what it read as its children, a Parquet footer.
 
 const std = @import("std");
-const trace = @import("../connect/trace.zig");
+const trace = @import("../base/iotrace.zig");
 const ast = @import("../lang/ast.zig");
 const op = @import("op.zig");
 const print = @import("../lang/print.zig");
