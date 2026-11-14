@@ -1639,8 +1639,7 @@ pub fn takeCol(arena: std.mem.Allocator, c: column.Column, idx: []const usize, n
 
 pub fn nullColumn(arena: std.mem.Allocator, ty: types.Type, n: usize) !column.Column {
     var b = try column.Builder.initCapacity(arena, ty.asNullable(), n);
-    var i: usize = 0;
-    while (i < n) : (i += 1) try b.append(.null);
+    try b.appendRepeated(.null, n);
     return b.finish();
 }
 
