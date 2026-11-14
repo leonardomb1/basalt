@@ -748,9 +748,9 @@ pub fn pathFail(arena: std.mem.Allocator, path: []const u8, e: anyerror) ![]cons
 /// is, both shown as `layer: Error: words`.
 pub const ConnectorNote = struct { layer: []const u8, why: []const u8 };
 
-/// The note for `e`: from the connector `path` names when there is a path, else from
-/// the one the error's name belongs to (a lane reports without its path); null when
-/// that connector kept no words.
+/// The thread's `driver.LoginNote` for `e`, laid at the connector `path` names when
+/// there is a path, else at the one the error's name belongs to (a lane reports
+/// without its path); null for any other connector or when no words were kept.
 pub fn connectorNote(e: anyerror, path: ?[]const u8) ?ConnectorNote {
     const Which = enum { sftp, smb, ftp, none };
     const which: Which = if (path) |p|
@@ -761,12 +761,8 @@ pub fn connectorNote(e: anyerror, path: ?[]const u8) ?ConnectorNote {
         if (std.mem.startsWith(u8, name, "Smb")) break :blk .smb;
         break :blk .none;
     };
-    const why = switch (which) {
-        .sftp => sftp.lastError(),
-        .smb => smb.lastError(),
-        .ftp => ftp.lastError(),
-        .none => return null,
-    };
+    if (which == .none) return null;
+    const why = driver.lastNote();
     if (why.len == 0) return null;
     return .{ .layer = @tagName(which), .why = why };
 }

@@ -473,7 +473,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         switch (info.kind) {
             inline else => |k| {
                 const c = SqlDriver(k).connect(env.gpa, cfg) catch |e|
-                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
+                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, e) }));
                 const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
                     defer c.close();
                     return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} read failed ({s}): {s}", .{ conn.connector, @errorName(e), c.wire.last_error }));

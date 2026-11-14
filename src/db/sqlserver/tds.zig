@@ -76,13 +76,6 @@ const BULK_PKT_PAYLOAD = 4088;
 
 pub const Error = error{ TdsProtocol, LoginFailed, QueryFailed, EncryptionRequired, TdsTlsRefused, UnsupportedTdsType } || std.mem.Allocator.Error || std.net.Stream.WriteError || std.net.Stream.ReadError;
 
-threadlocal var rejected: driver.ThreadNote(512) = .{};
-
-/// The server's own words for the last login it rejected on this thread, or "".
-pub fn lastError() []const u8 {
-    return rejected.get();
-}
-
 pub const Conn = struct {
     wire: wire.Conn,
     txn_desc: [8]u8 = @splat(0),
@@ -94,7 +87,7 @@ pub const Conn = struct {
     last_done_count: ?u64 = null,
 
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
-        rejected.clear();
+        driver.clearNote();
         return open(gpa, host, port, to, sqlLogin, .{ user, password, database, host, tls_mode });
     }
 
@@ -102,14 +95,14 @@ pub const Conn = struct {
     /// FEDAUTHREQUIRED and LOGIN7 carries the token in a FEDAUTH feature extension. The
     /// caller fetches the token (see aad.ropcToken).
     pub fn connectAad(gpa: std.mem.Allocator, host: []const u8, port: u16, token: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
-        rejected.clear();
+        driver.clearNote();
         if (tls_mode == .off) return error.EncryptionRequired;
         return open(gpa, host, port, to, aadLogin, .{ token, database, host, tls_mode });
     }
 
     /// NTLMv2 with an explicit `DOMAIN\user` password, not OS single sign-on.
     pub fn connectNtlm(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: ntlm.Credential, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
-        rejected.clear();
+        driver.clearNote();
         if (tls_mode == .off) return error.EncryptionRequired;
         return open(gpa, host, port, to, ntlmLogin, .{ cred, database, host, tls_mode });
     }
@@ -117,7 +110,7 @@ pub const Conn = struct {
     /// A ticket for `spn` (`MSSQLSvc/<host>:<port>`) asked of the KDC with the password,
     /// its AP-REQ in SPNEGO in the LOGIN7 SSPI field, the server's AP-REP checked.
     pub fn connectKerberos(gpa: std.mem.Allocator, host: []const u8, port: u16, cred: krb5.Credential, spn: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: driver.Timeouts) !*Conn {
-        rejected.clear();
+        driver.clearNote();
         if (tls_mode == .off) return error.EncryptionRequired;
         return open(gpa, host, port, to, kerberosLogin, .{ cred, spn, database, host, tls_mode });
     }
@@ -136,7 +129,7 @@ pub const Conn = struct {
         try self.prelogin(tls_mode != .off);
         if (tls_mode != .off) try self.startTls(host, tls_mode);
         self.login(user, password, database, host) catch |e| {
-            rejected.set(self.wire.last_error);
+            self.noteRefusal(e);
             return e;
         };
         try self.afterLogin();
@@ -150,7 +143,7 @@ pub const Conn = struct {
         try self.writePacket(PKT_LOGIN7, payload);
         try self.readMessage();
         self.parseLoginResponse() catch |e| {
-            rejected.set(self.wire.last_error);
+            self.noteRefusal(e);
             return e;
         };
         try self.afterLogin();
@@ -167,7 +160,7 @@ pub const Conn = struct {
         try self.prelogin(true);
         try self.startTls(host, tls_mode);
         self.loginKerberos(cred, spn, database, host) catch |e| {
-            rejected.set(self.wire.last_error);
+            self.noteRefusal(e);
             return e;
         };
         try self.afterLogin();
@@ -371,7 +364,7 @@ pub const Conn = struct {
         try self.writePacket(PKT_SSPI, auth);
         try self.readMessage();
         self.parseLoginResponse() catch |e| {
-            rejected.set(self.wire.last_error);
+            self.noteRefusal(e);
             return e;
         };
     }
@@ -404,8 +397,13 @@ pub const Conn = struct {
 
     fn krbFailed(self: *Conn, e: anyerror) Error {
         if (e == error.OutOfMemory) return error.OutOfMemory;
-        const why = krb5.lastError();
+        const why = driver.lastNote();
         return self.loginRefused("kerberos: {s}: {s}", .{ @errorName(e), if (why.len > 0) why else "no further detail" });
+    }
+
+    /// The server's words for a refused login, kept as this thread's `driver.LoginNote`.
+    fn noteRefusal(self: *const Conn, e: anyerror) void {
+        if (e == error.LoginFailed) driver.explain(e, self.wire.last_error);
     }
 
     fn loginRefused(self: *Conn, comptime fmt: []const u8, args: anytype) Error {

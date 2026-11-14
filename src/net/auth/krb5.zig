@@ -15,14 +15,13 @@
 //! resolves to its domain controllers). The realm is kept upper-cased, as AD
 //! writes it. Tickets are kept in-process per principal and service until they
 //! expire, so a parallel read's lanes do not each go back to the KDC.
-//! `lastError` says why the last call on this thread failed, never with a secret.
+//! A failure's words go to the thread's `driver.LoginNote`, never with a secret.
 //! The live test against a real domain never tries a wrong password: each one
 //! counts toward the account's lockout.
 
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
 const driver = @import("../../connect/driver.zig");
-const ThreadNote = driver.ThreadNote;
 const civil = @import("../../exec/civil.zig");
 
 pub const Error = error{
@@ -59,14 +58,8 @@ pub fn credential(user_in: []const u8, password: []const u8, realm_in: []const u
     return .{ .user = user, .password = password, .realm = std.ascii.upperString(buf[0..realm.len], realm), .kdc = kdc };
 }
 
-threadlocal var why: ThreadNote(512) = .{};
-
-pub fn lastError() []const u8 {
-    return why.get();
-}
-
 fn fail(e: Error, comptime fmt: []const u8, args: anytype) Error {
-    why.print(fmt, args);
+    driver.explainf(e, fmt, args);
     return e;
 }
 
@@ -847,7 +840,7 @@ fn remember(key: []const u8, t: Ticket) void {
 }
 
 pub fn serviceTicket(gpa: std.mem.Allocator, cred: Credential, spn: []const u8) !Ticket {
-    why.clear();
+    driver.clearNote();
     var kb: [512]u8 = undefined;
     const skey = cacheKey(&kb, cred, spn);
     if (cached(skey)) |t| return t;
@@ -1128,7 +1121,7 @@ test "krb5: a live login and service ticket (BASALT_KRB_REALM, _USER, _PASS, _SP
     };
     const spn = std.posix.getenv("BASALT_KRB_SPN") orelse return error.SkipZigTest;
     const tgt = asExchange(gpa, cred) catch |e| {
-        std.debug.print("AS exchange: {s}: {s}\n", .{ @errorName(e), lastError() });
+        std.debug.print("AS exchange: {s}: {s}\n", .{ @errorName(e), driver.lastNote() });
         return e;
     };
     defer {
@@ -1136,7 +1129,7 @@ test "krb5: a live login and service ticket (BASALT_KRB_REALM, _USER, _PASS, _SP
         gpa.free(tgt.realm);
     }
     const st = tgsExchange(gpa, cred, &tgt, spn) catch |e| {
-        std.debug.print("TGS exchange: {s}: {s}\n", .{ @errorName(e), lastError() });
+        std.debug.print("TGS exchange: {s}: {s}\n", .{ @errorName(e), driver.lastNote() });
         return e;
     };
     defer {

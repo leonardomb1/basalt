@@ -16,12 +16,12 @@
 //! control connection's host, since a server behind NAT advertises a private one.
 //! The data connection is opened before RETR and drained before the final reply
 //! is read, which some servers need to send it. A 4xx reply is transient, a 5xx
-//! permanent (550 is a missing file); both carry the server's text in `lastError`.
+//! permanent (550 is a missing file); both carry the server's text in the thread's
+//! `driver.LoginNote`.
 
 const std = @import("std");
 const msgfmt = @import("../format/msgfmt.zig");
 const driver = @import("../connect/driver.zig");
-const ThreadNote = driver.ThreadNote;
 const remotefs = @import("remotefs.zig");
 const scheme = @import("scheme.zig");
 const percentDecode = @import("../net/percent.zig").decode;
@@ -84,21 +84,19 @@ pub fn parseUrl(arena: std.mem.Allocator, url: []const u8) !Url {
     };
 }
 
-threadlocal var last_err: ThreadNote(256) = .{};
-
-/// The last server reply that failed a request on this thread, as `550 text`.
-pub fn lastError() []const u8 {
-    return last_err.get();
-}
-
 /// A refusal by its code: 4xx is worth retrying, 530 is the login, 550 a missing
-/// file or folder.
+/// file or folder. The reply, as `550 text`, is the thread's `driver.LoginNote`.
 fn refusal(code: u16, text: []const u8) anyerror {
-    last_err.print("{d} {s}", .{ code, text });
-    if (code >= 400 and code < 500) return error.FtpServerBusy;
-    if (code == 530) return error.FtpLoginFailed;
-    if (code == 550) return error.FileNotFound;
-    return error.FtpRefused;
+    const e: anyerror = if (code >= 400 and code < 500)
+        error.FtpServerBusy
+    else if (code == 530)
+        error.FtpLoginFailed
+    else if (code == 550)
+        error.FileNotFound
+    else
+        error.FtpRefused;
+    driver.explainf(e, "{d} {s}", .{ code, text });
+    return e;
 }
 
 const Reply = struct { code: u16, text: []const u8 };
@@ -237,7 +235,7 @@ pub const Session = struct {
             while (it.next()) |l| if (mlsdEntry(l)) |en| try out.append(en);
             return out.items;
         }
-        last_err.clear();
+        driver.clearNote();
         const data = try self.transfer("NLST", path);
         const body = try drain(arena, data);
         try self.finish();
@@ -334,7 +332,7 @@ pub fn localize(arena: std.mem.Allocator, url: []const u8) anyerror![]const u8 {
 
 fn fetch(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
     const gpa = std.heap.page_allocator;
-    last_err.clear();
+    driver.clearNote();
     const u = try parseUrl(arena, url);
     if (local.dir == null) {
         const base = std.process.getEnvVarOwned(arena, "TMPDIR") catch try arena.dupe(u8, "/tmp");
@@ -389,7 +387,7 @@ const Lister = struct {
 };
 
 fn note(e: anyerror, text: []const u8) anyerror {
-    last_err.set(text);
+    driver.explain(e, text);
     return e;
 }
 
@@ -686,7 +684,7 @@ test "PASV's advertised host is ignored, a folder is walked by NLST and CWD with
     try std.testing.expectEqualStrings("x\n9\n", try readLocal(a, p));
     try expectFolder(a, try localize(a, srv.url(&ub, "/d/")));
     try std.testing.expectError(error.FileNotFound, localize(a, srv.url(&ub, "/nope.csv")));
-    try std.testing.expectEqualStrings("550 No such file or directory", lastError());
+    try std.testing.expectEqualStrings("550 No such file or directory", driver.noteFor(error.FileNotFound));
 }
 
 test "the downloads stay until the last of two overlapping runs ends" {

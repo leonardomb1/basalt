@@ -214,7 +214,7 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
     const cfg = try resolveDbConfig(env, conn, info.port);
 
     const setup_conn = connectSql(env.gpa, kind, cfg) catch |e|
-        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} sink connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} sink connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, e) }));
     const setup = sql.Sink.open(env.gpa, setup_conn, dialect, w.target, schema, if (w.mode == .overwrite) .append else w.mode, null) catch |e| {
         defer setup_conn.close();
         const why = try driver.connectorNoteAlloc(env.arena, "", e, setup_conn.lastError());

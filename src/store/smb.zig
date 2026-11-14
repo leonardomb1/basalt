@@ -34,7 +34,6 @@
 const std = @import("std");
 const msgfmt = @import("../format/msgfmt.zig");
 const driver = @import("../connect/driver.zig");
-const ThreadNote = driver.ThreadNote;
 const remotefs = @import("remotefs.zig");
 const scheme = @import("scheme.zig");
 const utf16 = @import("../format/utf16.zig");
@@ -73,14 +72,8 @@ pub const Config = struct {
 
 pub const Auth = enum { ntlm, kerberos };
 
-threadlocal var why_note: ThreadNote(512) = .{};
-
-pub fn lastError() []const u8 {
-    return why_note.get();
-}
-
 fn fail(e: Error, comptime fmt: []const u8, args: anytype) Error {
-    why_note.print(fmt, args);
+    driver.explainf(e, fmt, args);
     return e;
 }
 
@@ -241,9 +234,7 @@ pub const Session = struct {
 
     /// `e`, or `ConnectionTimedOut` naming the host and `phase` when the login deadline fired.
     fn loginFailed(self: *Session, e: anytype, phase: []const u8) (@TypeOf(e) || error{ConnectionTimedOut}) {
-        const out = driver.loginFailed(e, driver.ioTimedOut(&self.sr, &self.sw), self.cfg.host, self.cfg.port, phase, self.cfg.timeouts.connect_s);
-        if (out == error.ConnectionTimedOut) why_note.set(driver.loginNote());
-        return out;
+        return driver.loginFailed(e, driver.ioTimedOut(&self.sr, &self.sw), self.cfg.host, self.cfg.port, phase, self.cfg.timeouts.connect_s);
     }
 
     fn release(self: *Session) void {
@@ -1076,7 +1067,7 @@ const Proto = struct {
     }
 
     pub fn clearNotes() void {
-        why_note.clear();
+        driver.clearNote();
     }
 
     pub fn connect(cfg: Config) !*Session {
@@ -1099,7 +1090,7 @@ const Proto = struct {
     }
 
     pub fn why(_: *Session) []const u8 {
-        return lastError();
+        return driver.lastNote();
     }
 
     pub fn openRead(s: *Session, t: Target) !Handle {
@@ -1239,7 +1230,7 @@ pub fn ccmDecrypt(msg: []u8, ct: []const u8, tag: [16]u8, aad: []const u8, nonce
 }
 
 fn krbFailed(e: anyerror) Error {
-    const why = krb5.lastError();
+    const why = driver.lastNote();
     return switch (e) {
         error.OutOfMemory => error.SmbFailure,
         else => fail(error.SmbLogonFailure, "kerberos: {s}: {s}", .{ @errorName(e), if (why.len > 0) why else "no further detail" }),
@@ -1459,7 +1450,7 @@ test "smb: a live login, share, listing and read (BASALT_SMB_TEST_PORT)" {
         const s = try Session.connect(gpa, .{ .host = "127.0.0.1", .port = try std.fmt.parseInt(u16, port_s, 10), .user = "basalt", .password = "it", .max_dialect = dialect_210 });
         defer s.close();
         try std.testing.expectError(error.SmbAccessDenied, s.tree("secure"));
-        try std.testing.expect(std.mem.indexOf(u8, lastError(), "requires encryption") != null);
+        try std.testing.expect(std.mem.indexOf(u8, driver.lastNote(), "requires encryption") != null);
     }
     try std.testing.expectError(error.SmbLogonFailure, Session.connect(gpa, .{ .host = "127.0.0.1", .port = try std.fmt.parseInt(u16, port_s, 10), .user = "basalt", .password = "wrong" }));
 }
@@ -1501,7 +1492,7 @@ test "a server that accepts and never answers fails the SMB login within connect
     const cfg = Config{ .host = "127.0.0.1", .port = port, .user = "u", .password = "p", .timeouts = .{ .connect_s = 1 } };
     try std.testing.expectError(error.ConnectionTimedOut, Session.connect(std.testing.allocator, cfg));
     var buf: [128]u8 = undefined;
-    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}: negotiate did not answer within 1 s", .{port}), lastError());
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}: negotiate did not answer within 1 s", .{port}), driver.noteFor(error.ConnectionTimedOut));
 }
 
 test "smb: a response claiming to be NEGOTIATE does not skip the signature check on a signed session" {

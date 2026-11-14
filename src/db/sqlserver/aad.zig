@@ -19,19 +19,12 @@
 
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
-const ThreadNote = @import("../../connect/driver.zig").ThreadNote;
+const driver = @import("../../connect/driver.zig");
 const http_client = @import("../../net/http_client.zig");
 const xmlescape = @import("../../format/xml/escape.zig");
 const civil = @import("../../exec/civil.zig");
 const uuid = @import("../../format/uuid.zig");
 const http_fake = @import("../../testing/http_fake.zig");
-
-threadlocal var why: ThreadNote(700) = .{};
-
-/// Why the last token request on this thread failed, in the identity provider's words, or "".
-pub fn lastError() []const u8 {
-    return why.get();
-}
 
 pub const ado_client_id = "2fd908ad-0664-4344-b9be-cd3e8b574c38";
 pub const sql_resource = "https://database.windows.net";
@@ -48,7 +41,7 @@ pub fn passwordToken(
     resource: []const u8,
     dl: Deadline,
 ) ![]const u8 {
-    why.clear();
+    driver.clearNote();
     const realm = getUserRealm(gpa, username, dl) catch |e| switch (e) {
         error.ConnectionTimedOut, error.Aborted => return e,
         else => Realm{ .federated = false, .sts_url = "" },
@@ -136,14 +129,15 @@ fn wsTrustAssertion(gpa: std.mem.Allocator, username: []const u8, password: []co
         .content_type = "application/soap+xml; charset=utf-8",
         .body = envelope,
     }, dl) catch |e| {
-        why.print("ADFS WS-Trust request failed ({s}): {s}", .{ @errorName(e), sts_url });
-        return requestFailed(e);
+        const out = requestFailed(e);
+        driver.explainf(out, "ADFS WS-Trust request failed ({s}): {s}", .{ @errorName(e), sts_url });
+        return out;
     };
     defer gpa.free(res.body);
     const body = res.body;
     const assertion = extractElement(body, "Assertion") orelse {
         const reason = extractElement(body, "Text") orelse extractElement(body, "faultstring") orelse "";
-        why.print("ADFS WS-Trust http {d}; fault: {s}", .{ res.code, reason });
+        driver.explainf(error.AadTokenFailed, "ADFS WS-Trust http {d}; fault: {s}", .{ res.code, reason });
         return error.AadTokenFailed;
     };
     return gpa.dupe(u8, assertion);
@@ -198,7 +192,7 @@ pub fn ropcToken(
     resource: []const u8,
     dl: Deadline,
 ) ![]const u8 {
-    why.clear();
+    driver.clearNote();
     var body = std.array_list.Managed(u8).init(gpa);
     defer body.deinit();
     try body.appendSlice("grant_type=password");
@@ -221,13 +215,14 @@ fn postForToken(gpa: std.mem.Allocator, url: []const u8, body: []const u8, dl: D
         .content_type = "application/x-www-form-urlencoded",
         .body = body,
     }, dl) catch |e| {
-        why.print("token request failed ({s})", .{@errorName(e)});
-        return requestFailed(e);
+        const out = requestFailed(e);
+        driver.explainf(out, "token request failed ({s})", .{@errorName(e)});
+        return out;
     };
     defer gpa.free(res.body);
     const resp = res.body;
     if (res.code != 200) {
-        why.print("token http {d}: {s}", .{ res.code, resp[0..@min(resp.len, 600)] });
+        driver.explainf(error.AadTokenFailed, "token http {d}: {s}", .{ res.code, resp[0..@min(resp.len, 600)] });
         return error.AadTokenFailed;
     }
     const root = std.json.parseFromSliceLeaky(std.json.Value, gpa, resp, .{}) catch return error.AadTokenFailed;
@@ -311,7 +306,7 @@ test "a black-holed token endpoint fails the connect with ConnectionTimedOut, no
     try std.testing.expectError(error.ConnectionTimedOut, postForToken(std.heap.page_allocator, url, "grant_type=password", .{ .timeout_ms = 400, .retries = 0 }));
     const waited = std.time.milliTimestamp() - started;
     try std.testing.expect(waited >= 350 and waited < 5_000);
-    try std.testing.expect(std.mem.indexOf(u8, lastError(), "ConnectionTimedOut") != null);
+    try std.testing.expect(std.mem.indexOf(u8, driver.noteFor(error.ConnectionTimedOut), "ConnectionTimedOut") != null);
 }
 
 test "extractElement pulls a namespaced assertion" {

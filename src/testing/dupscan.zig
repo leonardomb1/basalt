@@ -428,6 +428,7 @@ pub const plan = [_]Rule{
     } },
     .{ .home = "print", .pattern = print_pattern, .exact = true, .allow = &.{"lang/print.zig"} },
     .{ .home = "objstore.Upload", .pattern = upload_pattern, .exact = true, .allow = &.{"store/objstore.zig"} },
+    .{ .home = "driver.LoginNote", .pattern = login_note_pattern, .exact = true, .allow = &.{"connect/driver.zig"} },
 };
 
 pub const civil_pattern = "719_?468|146_?097|719_?16[23]|25_?56[789]|24_?107|2_?440_?588|86_400_000_000|std\\.time\\.epoch\\.";
@@ -500,6 +501,9 @@ pub const print_pattern = "\\.shl => \"<<\"|\\.@\"and\" => \"|\\.not => \"\\(?(n
 /// A provider gathering its own parts: buffering, sizing and the part list belong
 /// to `objstore.Upload`, which a provider feeds through `Upload.VTable`.
 pub const upload_pattern = "\\.part_len([^a-zA-Z0-9_]|$)";
+/// A connector's own thread-local failure note: every connector explains its
+/// failures through the one `driver.LoginNote`.
+pub const login_note_pattern = "threadlocal var \\w+: [^=]*(ThreadNote\\(|LoginNote )";
 
 fn startsOf(pattern: []const u8, text: []const u8, span: Span) ![]usize {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -729,7 +733,7 @@ test "dupscan plan patterns: what each one catches and what it lets through" {
     try expectStarts(guard_pattern, "errdefer w.abort();\n    if (a) { b(); }\n    try w.close();", .file, &.{0});
 }
 
-test "dupscan queue, sql, guard, delta_types, unsigned, widen, clamp and print patterns" {
+test "dupscan queue, sql, guard, delta_types, unsigned, widen, clamp, print and login note patterns" {
     try expectNeedles(queue_pattern, &.{"next.fetchAdd("});
     try expectNeedles(delta_types_pattern, &.{ "\"timestamp_ntz\"", "\"decimal(\"" });
     try expectNeedles(unsigned_pattern, &.{"decimal(20,"});
@@ -774,6 +778,11 @@ test "dupscan queue, sql, guard, delta_types, unsigned, widen, clamp and print p
         .{ print_pattern, ".shl => \"'<<'\",", false },
         .{ print_pattern, ".ne => \"<>\",", false },
         .{ print_pattern, ".@\"and\" => if (s) \"AND\" else \"and\",", false },
+        .{ login_note_pattern, "threadlocal var rejected: driver.ThreadNote(512) = .{};", true },
+        .{ login_note_pattern, "threadlocal var why: ThreadNote(700) = .{};", true },
+        .{ login_note_pattern, "threadlocal var login_note: LoginNote = .{};", true },
+        .{ login_note_pattern, "peer: driver.ThreadNote(288) = .{},", false },
+        .{ login_note_pattern, "threadlocal var regex_cache: RegexCache = .{};", false },
     };
     for (cases) |c| {
         const got = try startsOf(c[0], c[1], .line);

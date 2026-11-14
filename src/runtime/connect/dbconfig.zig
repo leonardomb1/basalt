@@ -20,19 +20,15 @@ const ssrp = @import("../../db/sqlserver/ssrp.zig");
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
 const tds = @import("../../db/sqlserver/tds.zig");
-const mysql = @import("../../db/mysql.zig");
 pub const SqlKind = @import("../connect.zig").SqlKind;
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 
-/// A connect failure's error name, with the server's or identity provider's own words
-/// when they refused the login, or the host and phase when the login timed out.
-pub fn connectWhy(arena: std.mem.Allocator, connector: []const u8, e: anyerror) ![]const u8 {
-    if (e == error.ConnectionTimedOut and driver.loginNote().len > 0)
-        return driver.connectorNoteAlloc(arena, "", e, driver.loginNote());
-    if (e == error.LoginFailed and std.mem.eql(u8, connector, "sqlserver"))
-        return driver.connectorNoteAlloc(arena, "", e, tds.lastError());
-    if (e == error.AadTokenFailed) return driver.connectorNoteAlloc(arena, "", e, aad.lastError());
-    if (e == error.MysqlAuthFailed) return driver.connectorNoteAlloc(arena, "", e, mysql.lastError());
+/// A connect failure's error name, with the words the connector's `driver.LoginNote`
+/// keeps for that error: the server's or identity provider's when they refused the
+/// login, the host and phase when the login timed out.
+pub fn connectWhy(arena: std.mem.Allocator, e: anyerror) ![]const u8 {
+    const said = driver.noteFor(e);
+    if (said.len > 0) return driver.connectorNoteAlloc(arena, "", e, said);
     if (eval.takeFailure(e)) |why| return arena.dupe(u8, why);
     return @errorName(e);
 }
@@ -151,7 +147,7 @@ test "a server that accepts and never answers fails each database login within c
             return error.TestUnexpectedResult;
         } else |e| e;
         try std.testing.expectEqual(error.ConnectionTimedOut, e);
-        try std.testing.expectEqualStrings(want, try connectWhy(a, @tagName(kind), e));
+        try std.testing.expectEqualStrings(want, try connectWhy(a, e));
         try std.testing.expect(env_mod.isTransient(e));
     }
 }

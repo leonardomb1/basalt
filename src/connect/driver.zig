@@ -95,8 +95,8 @@ test "stop flag: a source reports end of stream once its statement's flag is set
     try std.testing.expect((try other.next(std.testing.allocator)) != null);
 }
 
-/// A connector's own words for its last failure on this thread, held in `n` bytes
-/// and cut to fit. Each connector keeps one as a `threadlocal var`.
+/// Words held in `n` bytes and cut to fit; `set` takes text that may lie in the
+/// note itself.
 pub fn ThreadNote(comptime n: usize) type {
     return struct {
         buf: [n]u8 = undefined,
@@ -112,7 +112,7 @@ pub fn ThreadNote(comptime n: usize) type {
 
         pub fn set(self: *@This(), text: []const u8) void {
             self.len = @min(text.len, n);
-            @memcpy(self.buf[0..self.len], text[0..self.len]);
+            std.mem.copyForwards(u8, self.buf[0..self.len], text[0..self.len]);
         }
 
         pub fn print(self: *@This(), comptime fmt: []const u8, args: anytype) void {
@@ -170,9 +170,9 @@ pub const Dial = struct {
 /// that outlasts `io_timeout_s` fails as `loginTimedOut` in phase `connect`: the
 /// send timeout is set before `connect`, which Linux honours (EINPROGRESS); macOS
 /// ignores it there and gives up after its own SYN retries, about 75 s. Clears this
-/// thread's `loginNote`.
+/// thread's `LoginNote`.
 pub fn dial(gpa: std.mem.Allocator, host: []const u8, port: u16, opts: Dial) !std.net.Stream {
-    login_note.clear();
+    clearNote();
     const list = try std.net.getAddressList(gpa, host, port);
     defer list.deinit();
     if (list.addrs.len == 0) return error.UnknownHostName;
@@ -233,17 +233,51 @@ pub fn ioTimedOut(sr: *const std.net.Stream.Reader, sw: *const std.net.Stream.Wr
     return false;
 }
 
-threadlocal var login_note: ThreadNote(256) = .{};
+/// Why the last connector call on this thread failed, in the server's or basalt's
+/// words, and the error those words explain. Every connector shares the one note,
+/// thread-local as lanes connect in parallel: the next failure overwrites it, a
+/// `dial` clears it, and a reader copies it before asking anything else.
+pub const LoginNote = struct {
+    err: ?anyerror = null,
+    text: ThreadNote(700) = .{},
+};
 
-/// What this thread's last login timeout said, or empty.
-pub fn loginNote() []const u8 {
-    return login_note.get();
+threadlocal var login_note: LoginNote = .{};
+
+/// Keeps `text` as this thread's words for `e`; `text` may be the note's own.
+pub fn explain(e: anyerror, text: []const u8) void {
+    login_note.err = e;
+    login_note.text.set(text);
+}
+
+/// `explain` with the words formatted, `args` free to quote the note itself.
+pub fn explainf(e: anyerror, comptime fmt: []const u8, args: anytype) void {
+    @branchHint(.cold);
+    var words: ThreadNote(700) = .{};
+    words.print(fmt, args);
+    explain(e, words.get());
+}
+
+/// This thread's note, whatever error it explains, or "": for a reader whose error
+/// may have been renamed on its way up.
+pub fn lastNote() []const u8 {
+    return login_note.text.get();
+}
+
+/// This thread's note when it explains `e`, else "".
+pub fn noteFor(e: anyerror) []const u8 {
+    const err = login_note.err orelse return "";
+    return if (err == e) login_note.text.get() else "";
+}
+
+pub fn clearNote() void {
+    login_note = .{};
 }
 
 /// `ConnectionTimedOut` for a connection to `host:port` whose `phase` (`login`, `TLS
-/// handshake`, …) went `s` seconds without an answer; `loginNote` keeps the words.
+/// handshake`, …) went `s` seconds without an answer; the `LoginNote` keeps the words.
 pub fn loginTimedOut(host: []const u8, port: u16, phase: []const u8, s: u32) error{ConnectionTimedOut} {
-    login_note.print("{s}:{d}: {s} did not answer within {d} s", .{ host, port, phase, s });
+    explainf(error.ConnectionTimedOut, "{s}:{d}: {s} did not answer within {d} s", .{ host, port, phase, s });
     return error.ConnectionTimedOut;
 }
 
@@ -668,12 +702,12 @@ test "a TCP connect the server never completes fails within io_timeout_s, naming
     } else return error.TestUnexpectedResult;
     try testing.expectEqual(error.ConnectionTimedOut, e);
     var want: [64]u8 = undefined;
-    try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "127.0.0.1:{d}: connect did not answer within 1 s", .{port}), loginNote());
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&want, "127.0.0.1:{d}: connect did not answer within 1 s", .{port}), noteFor(error.ConnectionTimedOut));
 }
 
 test "a login timeout names host, port and phase; it and the dead-peer errors are transient, run and connector alike" {
     try testing.expectEqual(error.ConnectionTimedOut, loginTimedOut("db.internal", 5432, "login", 60));
-    try testing.expectEqualStrings("db.internal:5432: login did not answer within 60 s", loginNote());
+    try testing.expectEqualStrings("db.internal:5432: login did not answer within 60 s", noteFor(error.ConnectionTimedOut));
     const env = @import("../runtime/env.zig");
     for ([_]anyerror{ error.ConnectionTimedOut, error.ConnectionResetByPeer, error.BrokenPipe, error.ConnectionIoFailed, error.SmbDisconnected, error.SshConnectionLost }) |e| {
         try testing.expect(transientNet(e));

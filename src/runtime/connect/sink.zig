@@ -318,7 +318,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         switch (info.kind) {
             inline else => |k| {
                 const c = SqlDriver(k).connect(env.gpa, cfg) catch |e|
-                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, conn.connector, e) }));
+                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, e) }));
                 var target = w.target;
                 var mode = w.mode;
                 var plan: ?*ReplacePlan = null;

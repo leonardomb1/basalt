@@ -20,13 +20,12 @@
 //! read once per lane. Sessions are pooled per server and user for the life of
 //! the process, each opened file its own handle on a session the opener has to
 //! itself until it closes the file. `CREATE CONNECTION … TYPE sftp` registers a
-//! `Conn` so a path's host part can name it. `last_error` (thread-local) keeps
+//! `Conn` so a path's host part can name it. The thread's `driver.LoginNote` keeps
 //! why the last attempt to reach a server failed, in the session's own words (an
 //! unknown host key's fingerprint) when it got that far.
 
 const std = @import("std");
 const msgfmt = @import("../format/msgfmt.zig");
-const ThreadNote = @import("../connect/driver.zig").ThreadNote;
 const remotefs = @import("remotefs.zig");
 const scheme = @import("scheme.zig");
 const ssh = @import("../net/ssh.zig");
@@ -462,12 +461,6 @@ fn readAttrs(c: *ssh.Cursor) !Attrs {
     return a;
 }
 
-threadlocal var last_error: ThreadNote(512) = .{};
-
-pub fn lastError() []const u8 {
-    return last_error.get();
-}
-
 const Fs = remotefs.RemoteFs(Proto);
 pub const File = Fs.File;
 /// Fetches 1 MiB at a time (32 reads in flight): fetching only the reader's 64 KiB
@@ -539,13 +532,18 @@ const Proto = struct {
     }
 
     pub fn clearNotes() void {
-        ssh.clearFailure();
-        last_error.clear();
+        driver.clearNote();
     }
 
+    /// A failed connect leaves no session to ask, so without the server's words the
+    /// note names the error and the login it tried.
     pub fn connect(cfg: ssh.Config) !*Client {
         return Client.open(std.heap.page_allocator, cfg) catch |e| {
-            last_error.set(sshWhy(e, cfg));
+            const said = driver.lastNote();
+            if (said.len > 0)
+                driver.explain(e, said)
+            else
+                driver.explainf(e, "{s} connecting to {s}:{d} as {s}", .{ @errorName(e), cfg.host, cfg.port, cfg.user });
             return e;
         };
     }
@@ -577,7 +575,7 @@ const Proto = struct {
 
     /// `e`, its reason kept on the thread before anything else is asked of the session.
     fn noted(c: *Client, e: anyerror) anyerror {
-        last_error.set(c.lastError());
+        driver.explain(e, c.lastError());
         return e;
     }
 
@@ -629,16 +627,6 @@ const Proto = struct {
         return c.listDir(arena, dir) catch |e| return noted(c, e);
     }
 };
-
-threadlocal var why_buf: [600]u8 = undefined;
-
-/// An SSH failure in words. A failed connect leaves no session to ask, so the error
-/// and the server name it.
-fn sshWhy(e: anyerror, cfg: ssh.Config) []const u8 {
-    const said = ssh.lastFailure();
-    if (said.len > 0) return said;
-    return std.fmt.bufPrint(&why_buf, "{s} connecting to {s}:{d} as {s}", .{ @errorName(e), cfg.host, cfg.port, cfg.user }) catch @errorName(e);
-}
 
 test "sftp URLs: user, port, home-relative, registered names" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -731,5 +719,5 @@ test "a server that accepts and never answers fails the SSH login within connect
     Proto.clearNotes();
     try std.testing.expectError(error.ConnectionTimedOut, Proto.connect(.{ .host = "127.0.0.1", .port = port, .user = "u", .timeouts = .{ .connect_s = 1 } }));
     var buf: [128]u8 = undefined;
-    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}: handshake did not answer within 1 s", .{port}), lastError());
+    try std.testing.expectEqualStrings(try std.fmt.bufPrint(&buf, "127.0.0.1:{d}: handshake did not answer within 1 s", .{port}), driver.noteFor(error.ConnectionTimedOut));
 }
