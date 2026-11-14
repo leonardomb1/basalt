@@ -745,13 +745,7 @@ fn gatherBatch(arena: std.mem.Allocator, b: Batch, keep: []const bool, kept: usi
 
 pub fn sliceBatch(arena: std.mem.Allocator, b: Batch, start: usize, take: usize) anyerror!Batch {
     const outcols = try arena.alloc(column.Column, b.columns.len);
-    if (start % 8 == 0) {
-        for (b.columns, outcols) |c, *o| o.* = try column.slice(arena, c, start, take);
-    } else {
-        const idx = try arena.alloc(usize, take);
-        for (idx, start..) |*x, r| x.* = r;
-        for (b.columns, outcols) |c, *o| o.* = try column.permute(arena, c, idx);
-    }
+    for (b.columns, outcols) |c, *o| o.* = try column.slice(arena, c, start, take);
     return Batch{ .schema = b.schema, .columns = outcols, .len = take };
 }
 

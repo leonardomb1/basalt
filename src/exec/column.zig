@@ -633,14 +633,19 @@ pub fn takeAcross(a: std.mem.Allocator, srcs_raw: []const Column, refs: anytype)
     return Column.derived(srcs[0].ty, refs.len, bm, data);
 }
 
-/// Rows `start..start + n` of `c` as a view on its buffers, nothing copied: `start` is
-/// a multiple of 8 so the validity stays byte-aligned, byte offsets keep indexing the
-/// same values buffer, and a dictionary keeps its entries over a run of its codes.
+/// Rows `start..start + n` of `c` as a view on its buffers: byte offsets keep indexing
+/// the same values buffer and a dictionary keeps its entries over a run of its codes.
+/// The validity is a view too when `start` is a multiple of 8, and otherwise copied
+/// shifted to row 0, as a view would read another row's bit.
 pub fn slice(arena: std.mem.Allocator, c: Column, start: usize, n: usize) error{OutOfMemory}!Column {
-    std.debug.assert(start % 8 == 0 and start + n <= c.len);
+    std.debug.assert(start + n <= c.len);
     var out = c;
     out.len = n;
-    out.validity = .{ .bits = c.validity.bits[start / 8 ..][0 .. (n + 7) / 8], .len = n };
+    out.validity = if (start % 8 == 0) .{ .bits = c.validity.bits[start / 8 ..][0 .. (n + 7) / 8], .len = n } else blk: {
+        var v = try Bitmap.initFull(arena, n);
+        for (0..n) |i| if (!c.validity.get(start + i)) v.setValid(i, false);
+        break :blk v;
+    };
     out.data = switch (c.data) {
         .bytes => |b| .{ .bytes = .{ .offsets = b.offsets[start..][0 .. n + 1], .values = b.values } },
         .nested => |nd| .{ .nested = try sliceNested(arena, nd, start, n) },
@@ -2150,21 +2155,24 @@ test "a slice views its rows: nulls, strings past a nonzero first offset, and di
     }
 }
 
-test "a slice of fixed-width rows views the same values" {
+test "a slice of fixed-width rows views the same values, from an aligned start or any other" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     var b = Builder.init(a, types.Type.init(.int).asNullable());
     for (0..30) |i| try b.append(if (i % 5 == 2) .null else .{ .int = @intCast(i) });
     const c = try b.finish();
-    const s = try slice(a, c, 8, 22);
-    try std.testing.expectEqual(@as(usize, 22), s.data.i64.len);
-    for (0..s.len) |r| {
-        try std.testing.expectEqual(c.validity.get(8 + r), s.validity.get(r));
-        if (s.validity.get(r)) try std.testing.expectEqual(@as(i64, @intCast(8 + r)), s.data.i64[r]);
+    for ([_]usize{ 8, 3, 29 }) |at| {
+        const s = try slice(a, c, at, 30 - at);
+        try std.testing.expectEqual(30 - at, s.data.i64.len);
+        for (0..s.len) |r| {
+            try std.testing.expectEqual(c.validity.get(at + r), s.validity.get(r));
+            if (s.validity.get(r)) try std.testing.expectEqual(@as(i64, @intCast(at + r)), s.data.i64[r]);
+        }
+        try std.testing.expect(s.len < 3 or !s.validity.allSet(s.len));
     }
-    try std.testing.expect(!s.validity.allSet(s.len));
     try std.testing.expect((try slice(a, c, 24, 2)).validity.allSet(2));
+    try std.testing.expect((try slice(a, c, 23, 2)).validity.allSet(2));
 }
 
 test "permute of a few rows of a long column checks only those rows' validity" {
