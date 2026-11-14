@@ -155,6 +155,19 @@ pub fn intRem(a: i64, b: i64) error{DivByZero}!i64 {
     return @rem(a, b);
 }
 
+/// `a op b` over ints, checked: overflow is IntOverflow and a zero divisor
+/// DivByZero, the one integer arithmetic the row and vector evaluators share.
+pub inline fn intOp(comptime op: ast.BinOp, a: i64, b: i64) error{ DivByZero, IntOverflow }!i64 {
+    return switch (op) {
+        .add => std.math.add(i64, a, b) catch error.IntOverflow,
+        .sub => std.math.sub(i64, a, b) catch error.IntOverflow,
+        .mul => std.math.mul(i64, a, b) catch error.IntOverflow,
+        .div => intDiv(a, b),
+        .mod => intRem(a, b),
+        else => @compileError("intOp takes + - * / %"),
+    };
+}
+
 /// Text is no operand: the checker refuses it, and where a value's type is only
 /// known at run time (a JSON element in a lambda) it fails rather than reading as 0.
 /// A zero divisor is an error for every kind, a float's too, as in PostgreSQL.
@@ -164,11 +177,7 @@ pub fn arith(op: ast.BinOp, l: Value, r: Value) EvalError!Value {
         const a = l.int;
         const b = r.int;
         return switch (op) {
-            .add => .{ .int = std.math.add(i64, a, b) catch return error.IntOverflow },
-            .sub => .{ .int = std.math.sub(i64, a, b) catch return error.IntOverflow },
-            .mul => .{ .int = std.math.mul(i64, a, b) catch return error.IntOverflow },
-            .div => .{ .int = try intDiv(a, b) },
-            .mod => .{ .int = try intRem(a, b) },
+            inline .add, .sub, .mul, .div, .mod => |o| .{ .int = try intOp(o, a, b) },
             else => unreachable,
         };
     }

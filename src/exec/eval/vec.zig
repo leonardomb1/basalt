@@ -22,8 +22,7 @@ const forgetFailure = @import("support.zig").forgetFailure;
 const rescaleTo = @import("../decimal.zig").rescaleTo;
 const addAtScale = @import("../decimal.zig").addAtScale;
 const cmpBound = @import("../decimal.zig").cmpBound;
-const intDiv = @import("row.zig").intDiv;
-const intRem = @import("row.zig").intRem;
+const intOp = @import("row.zig").intOp;
 const lookupBuiltin = @import("functions.zig").lookupBuiltin;
 const max_digits = @import("../decimal.zig").max_digits;
 const floatord = @import("../floatord.zig");
@@ -500,11 +499,11 @@ fn OpOut(comptime T: type, comptime op: ast.BinOp) type {
 /// Div/mod raise on a zero divisor and int add/sub/mul on overflow.
 inline fn applyOp(comptime T: type, comptime op: ast.BinOp, a: T, d: T) VecError!OpOut(T, op) {
     return switch (op) {
-        .add => if (T == i64) (std.math.add(i64, a, d) catch return error.IntOverflow) else a + d,
-        .sub => if (T == i64) (std.math.sub(i64, a, d) catch return error.IntOverflow) else a - d,
-        .mul => if (T == i64) (std.math.mul(i64, a, d) catch return error.IntOverflow) else a * d,
-        .div => if (T == i64) intDiv(a, d) else if (d == 0) error.DivByZero else a / d,
-        .mod => if (T == i64) intRem(a, d) else if (d == 0) error.DivByZero else @rem(a, d),
+        .add => if (T == i64) intOp(op, a, d) else a + d,
+        .sub => if (T == i64) intOp(op, a, d) else a - d,
+        .mul => if (T == i64) intOp(op, a, d) else a * d,
+        .div => if (T == i64) intOp(op, a, d) else if (d == 0) error.DivByZero else a / d,
+        .mod => if (T == i64) intOp(op, a, d) else if (d == 0) error.DivByZero else @rem(a, d),
         .eq, .ne, .lt, .le, .gt, .ge => cmpLane(T, op, a, d),
         else => unreachable,
     };
