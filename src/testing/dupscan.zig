@@ -427,6 +427,7 @@ pub const plan = [_]Rule{
         "runtime/connect/sql_read.zig",
     } },
     .{ .home = "print", .pattern = print_pattern, .exact = true, .allow = &.{"lang/print.zig"} },
+    .{ .home = "objstore.Upload", .pattern = upload_pattern, .exact = true, .allow = &.{"store/objstore.zig"} },
 };
 
 pub const civil_pattern = "719_?468|146_?097|719_?16[23]|25_?56[789]|24_?107|2_?440_?588|86_400_000_000|std\\.time\\.epoch\\.";
@@ -496,6 +497,9 @@ pub const minmax_pattern = "\\.(min|max|lo|hi)(\\[\\w+\\])? = try \\w+\\.own\\("
 /// A private operator-text table or expression printer; `print.Printer` under a
 /// `Mode` is the one walker.
 pub const print_pattern = "\\.shl => \"<<\"|\\.@\"and\" => \"|\\.not => \"\\(?(not|NOT) \"";
+/// A provider gathering its own parts: buffering, sizing and the part list belong
+/// to `objstore.Upload`, which a provider feeds through `Upload.VTable`.
+pub const upload_pattern = "\\.part_len([^a-zA-Z0-9_]|$)";
 
 fn startsOf(pattern: []const u8, text: []const u8, span: Span) ![]usize {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -705,6 +709,10 @@ test "dupscan plan patterns: what each one catches and what it lets through" {
         .{ sql_span_pattern, "if (c == '-' and i + 1 < text.len and text[i + 1] == '-') {", true },
         .{ sql_span_pattern, "if (std.mem.indexOf(u8, s, \"$$\") != null) return null;", false },
         .{ sql_span_pattern, "i = if (sql_lexer.spanAt(s, i)) |sp| sp.end else i + 1;", false },
+        .{ upload_pattern, "if (self.up.part_len > 0) {", true },
+        .{ upload_pattern, "self.part_len += n;", true },
+        .{ upload_pattern, "const n = self.part_length;", false },
+        .{ upload_pattern, "try w.up.ship(bytes);", false },
     };
     for (cases) |c| {
         const got = try startsOf(c[0], c[1], .line);

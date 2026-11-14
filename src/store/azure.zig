@@ -255,20 +255,19 @@ pub fn statusToError(code: u16, body: []const u8) Error {
 
 pub const block_size = 8 * 1024 * 1024;
 
+/// Azure's half of an `objstore.Upload`: Put Block and Put Block List, plus the
+/// container creation on a first ContainerNotFound. It has no single PUT, so an
+/// object of any size, an empty one included, is committed as a block list, and
+/// no discard, as Azure garbage-collects uncommitted blocks.
 pub const BlockBlobWriter = struct {
-    interface: std.Io.Writer,
-    arena: std.mem.Allocator,
     up: objstore.Upload,
     blob: Blob,
     key: []const u8,
-    block_ids: std.array_list.Managed([]const u8),
     content_type: []const u8,
-    last_error: []const u8 = "",
-    last_status: ?Error = null,
     rand: std.Random.DefaultPrng,
     sleep: objstore.Sleep = std.Thread.sleep,
 
-    const vtable = std.Io.Writer.VTable{ .drain = objstore.drain(BlockBlobWriter) };
+    const parts = objstore.Upload.partsOf(BlockBlobWriter);
 
     pub fn init(
         arena: std.mem.Allocator,
@@ -278,25 +277,13 @@ pub const BlockBlobWriter = struct {
     ) !*BlockBlobWriter {
         const self = try arena.create(BlockBlobWriter);
         self.* = .{
-            .interface = .{ .vtable = &vtable, .buffer = try arena.alloc(u8, 64 * 1024) },
-            .arena = arena,
-            .up = try objstore.Upload.init(arena, client, block_size),
+            .up = try objstore.Upload.init(arena, client, block_size, parts),
             .blob = blob,
             .key = try keyFromEnv(arena),
-            .block_ids = std.array_list.Managed([]const u8).init(arena),
             .content_type = content_type,
             .rand = objstore.jitterPrng(),
         };
         return self;
-    }
-
-    pub fn put(self: *BlockBlobWriter, bytes: []const u8) std.Io.Writer.Error!usize {
-        self.up.stage(bytes, self, stageBlock) catch return error.WriteFailed;
-        return bytes.len;
-    }
-
-    pub fn abort(self: *BlockBlobWriter) void {
-        self.up.release();
     }
 
     /// Block IDs must all be the same length and base64-encoded; the commit list
@@ -305,15 +292,15 @@ pub const BlockBlobWriter = struct {
         var raw: [16]u8 = undefined;
         _ = try std.fmt.bufPrint(&raw, "blk{d:0>13}", .{n});
         const enc = std.base64.standard.Encoder;
-        const out = try self.arena.alloc(u8, enc.calcSize(raw.len));
+        const out = try self.up.arena.alloc(u8, enc.calcSize(raw.len));
         _ = enc.encode(out, &raw);
         return out;
     }
 
     /// Put Block. A missing container is created once and the block retried, so a
     /// fresh destination needs no setup step. Query params sign sorted: blockid, comp.
-    fn stageBlock(self: *BlockBlobWriter, bytes: []const u8) !void {
-        const id = try self.blockId(self.block_ids.items.len);
+    pub fn putPart(self: *BlockBlobWriter, bytes: []const u8) ![]const u8 {
+        const id = try self.blockId(self.up.ids.items.len);
         const a = self.up.fresh();
         const id_enc = try percent.encodeAlloc(a, id, "");
         const url = try msgfmt.allocPrint(a, "{s}?comp=block&blockid={s}", .{ self.blob.url, id_enc });
@@ -326,7 +313,7 @@ pub const BlockBlobWriter = struct {
             },
         };
         try self.sendCreating(url, sign, bytes);
-        try self.block_ids.append(id);
+        return id;
     }
 
     /// `send`, creating a missing container once and sending again, so a fresh
@@ -341,21 +328,14 @@ pub const BlockBlobWriter = struct {
         };
     }
 
-    /// Commits the staged blocks in order. Until this returns, the blob does not exist.
-    /// A replay after a lost answer is harmless: `Latest` resolves an id against the
-    /// committed list once the uncommitted one is gone, so the same list commits again.
-    pub fn finish(self: *BlockBlobWriter) !void {
-        defer self.up.release();
-        try self.interface.flush();
-        if (self.up.part_len > 0) {
-            try self.stageBlock(self.up.pending());
-            self.up.part_len = 0;
-        }
-
+    /// Put Block List over the blocks put, in order. A replay after a lost answer
+    /// is harmless: `Latest` resolves an id against the committed list once the
+    /// uncommitted one is gone, so the same list commits again.
+    pub fn commit(self: *BlockBlobWriter) !void {
         const a = self.up.fresh();
         var body = std.array_list.Managed(u8).init(a);
         try body.appendSlice("<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>");
-        for (self.block_ids.items) |id| {
+        for (self.up.ids.items) |id| {
             try body.appendSlice("<Latest>");
             try body.appendSlice(id);
             try body.appendSlice("</Latest>");
@@ -403,7 +383,7 @@ pub const BlockBlobWriter = struct {
                         return w.failed(r);
                     },
                 }
-                w.last_status = null;
+                w.up.last_status = null;
                 return .done;
             }
         }.attempt);
@@ -414,7 +394,7 @@ pub const BlockBlobWriter = struct {
     const Send = struct { w: *BlockBlobWriter, url: []const u8, sign: Sign, body: []const u8 };
 
     /// PUT with retry, signed afresh per attempt. `last_status` is cleared on success,
-    /// since `stageBlock` retries a missing container and that first attempt's stale
+    /// since `putPart` retries a missing container and that first attempt's stale
     /// error must not be re-raised.
     fn send(self: *BlockBlobWriter, url: []const u8, sign: Sign, body: []const u8) !void {
         try objstore.retry(self.policy(), Send{ .w = self, .url = url, .sign = sign, .body = body }, struct {
@@ -429,7 +409,7 @@ pub const BlockBlobWriter = struct {
                 });
                 const r = try objstore.exchange(w.up.alloc(), w.up.client, .{ .method = .PUT, .url = c.url, .headers = hdrs, .payload = c.body });
                 if (r.code == 201 or r.code == 200) {
-                    w.last_status = null;
+                    w.up.last_status = null;
                     return .done;
                 }
                 return w.failed(r);
@@ -458,9 +438,7 @@ pub const BlockBlobWriter = struct {
     }
 
     fn fail(self: *BlockBlobWriter, code: u16, body: []const u8) Error {
-        self.last_error = self.up.keepError(code, body);
-        self.last_status = statusToError(code, body);
-        return self.last_status.?;
+        return self.up.fail(Error, statusToError(code, body), code, body);
     }
 
     fn failed(self: *BlockBlobWriter, r: objstore.Response) objstore.Verdict {
@@ -475,12 +453,9 @@ test "block ids are the same width at every block number" {
     var client: HttpClient = undefined;
     const blob = try parseUrl(a, "az://acct/c/f.csv", null);
     var w = BlockBlobWriter{
-        .interface = .{ .vtable = undefined, .buffer = &.{} },
-        .arena = a,
-        .up = .{ .client = &client },
+        .up = .{ .arena = a, .vtable = BlockBlobWriter.parts, .client = &client },
         .blob = blob,
         .key = "",
-        .block_ids = std.array_list.Managed([]const u8).init(a),
         .content_type = "text/csv",
         .rand = std.Random.DefaultPrng.init(0),
     };
@@ -513,39 +488,35 @@ test "Put Block is re-put after a reset and waits out Retry-After; Put Block Lis
     });
     defer srv.stop();
     var w = BlockBlobWriter{
-        .interface = .{ .vtable = &BlockBlobWriter.vtable, .buffer = &.{} },
-        .arena = a,
-        .up = .{ .client = &client },
+        .up = .{ .arena = a, .vtable = BlockBlobWriter.parts, .client = &client },
         .blob = try parseUrl(a, "az://devstoreaccount1/c/f.csv", try srv.url(a, "")),
         .key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
-        .block_ids = std.array_list.Managed([]const u8).init(a),
         .content_type = "text/csv",
         .rand = std.Random.DefaultPrng.init(0),
         .sleep = testSleep,
     };
     test_slept_ms = 0;
-    try w.stageBlock("hello");
-    try std.testing.expectEqual(@as(usize, 1), w.block_ids.items.len);
+    try w.up.ship("hello");
+    try std.testing.expectEqual(@as(usize, 1), w.up.ids.items.len);
     try std.testing.expect(test_slept_ms >= 2000);
     try std.testing.expectEqualStrings(srv.line(0), srv.line(2));
-    try w.finish();
+    try w.up.finish();
     try std.testing.expectEqual(@as(usize, 5), srv.requests());
     try std.testing.expect(std.mem.indexOf(u8, srv.line(4), "comp=blocklist") != null);
     try std.testing.expectEqualStrings(srv.line(3), srv.line(4));
 }
 
 fn testStagingWriter(a: std.mem.Allocator, client: *HttpClient, srv: *http_fake.FakeServer, buf: []u8, block: []u8) !BlockBlobWriter {
-    return .{
-        .interface = .{ .vtable = &BlockBlobWriter.vtable, .buffer = buf },
-        .arena = a,
-        .up = .{ .client = client, .part = block },
+    var w = BlockBlobWriter{
+        .up = .{ .arena = a, .vtable = BlockBlobWriter.parts, .client = client, .part = block },
         .blob = try parseUrl(a, "az://devstoreaccount1/c/f.csv", try srv.url(a, "")),
         .key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
-        .block_ids = std.array_list.Managed([]const u8).init(a),
         .content_type = "text/csv",
         .rand = std.Random.DefaultPrng.init(0),
         .sleep = testSleep,
     };
+    w.up.interface.buffer = buf;
+    return w;
 }
 
 test "writes gather into whole blocks however they are chunked" {
@@ -561,10 +532,10 @@ test "writes gather into whole blocks however they are chunked" {
     var buf: [8]u8 = undefined;
     var block: [16]u8 = undefined;
     var w = try testStagingWriter(a, &client, &srv, &buf, &block);
-    for (0..7) |_| try w.interface.writeAll("abcdefg");
-    try w.interface.writeAll("h");
-    try w.finish();
-    try std.testing.expectEqual(@as(usize, 4), w.block_ids.items.len);
+    for (0..7) |_| try w.up.interface.writeAll("abcdefg");
+    try w.up.interface.writeAll("h");
+    try w.up.finish();
+    try std.testing.expectEqual(@as(usize, 4), w.up.ids.items.len);
     try std.testing.expectEqual(@as(usize, 5), srv.requests());
     try std.testing.expect(std.mem.indexOf(u8, srv.line(4), "comp=blocklist") != null);
 }
@@ -582,12 +553,12 @@ test "a long upload's memory does not grow with each block's request" {
     var buf: [8]u8 = undefined;
     var block: [16]u8 = undefined;
     var w = try testStagingWriter(a, &client, &srv, &buf, &block);
-    defer w.abort();
-    try w.block_ids.ensureTotalCapacity(64);
-    for (0..8) |_| try w.interface.writeAll("0123456789abcdef");
+    defer w.up.abort();
+    try w.up.ids.ensureTotalCapacity(a, 64);
+    for (0..8) |_| try w.up.interface.writeAll("0123456789abcdef");
     const early = ar.queryCapacity();
-    for (0..32) |_| try w.interface.writeAll("0123456789abcdef");
-    try std.testing.expectEqual(@as(usize, 40), w.block_ids.items.len);
+    for (0..32) |_| try w.up.interface.writeAll("0123456789abcdef");
+    try std.testing.expectEqual(@as(usize, 40), w.up.ids.items.len);
     try std.testing.expect(ar.queryCapacity() - early <= 32 * 64);
 }
 
@@ -609,12 +580,9 @@ test "putIfAbsent: 201 creates, 409 and 412 find one there, a missing container 
     });
     defer srv.stop();
     var w = BlockBlobWriter{
-        .interface = .{ .vtable = &BlockBlobWriter.vtable, .buffer = &.{} },
-        .arena = a,
-        .up = .{ .client = &client },
+        .up = .{ .arena = a, .vtable = BlockBlobWriter.parts, .client = &client },
         .blob = try parseUrl(a, "az://devstoreaccount1/c/_delta_log/0.json", try srv.url(a, "")),
         .key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==",
-        .block_ids = std.array_list.Managed([]const u8).init(a),
         .content_type = "application/json",
         .rand = std.Random.DefaultPrng.init(0),
         .sleep = testSleep,
@@ -873,23 +841,21 @@ fn vtStatusToError(code: u16, body: []const u8) anyerror {
 }
 
 fn vtOpenWriter(ptr: *const anyopaque, arena: std.mem.Allocator, client: ?*HttpClient, content_type: []const u8) anyerror!objstore.Writer {
-    return objstore.writer(try BlockBlobWriter.init(arena, client, objstore.cast(Blob, ptr).*, content_type));
+    const w = try BlockBlobWriter.init(arena, client, objstore.cast(Blob, ptr).*, content_type);
+    return objstore.writer(&w.up);
 }
 
 fn vtPutIfAbsent(ptr: *const anyopaque, arena: std.mem.Allocator, client: *HttpClient, bytes: []const u8, content_type: []const u8, why: *[]const u8) anyerror!bool {
     var w = BlockBlobWriter{
-        .interface = .{ .vtable = &BlockBlobWriter.vtable, .buffer = &.{} },
-        .arena = arena,
-        .up = .{ .client = client },
+        .up = .{ .arena = arena, .vtable = BlockBlobWriter.parts, .client = client },
         .blob = objstore.cast(Blob, ptr).*,
         .key = try keyFromEnv(arena),
-        .block_ids = std.array_list.Managed([]const u8).init(arena),
         .content_type = content_type,
         .rand = objstore.jitterPrng(),
     };
     defer w.up.release();
     return w.putIfAbsent(bytes) catch |e| {
-        why.* = arena.dupe(u8, w.last_error) catch "";
+        why.* = arena.dupe(u8, w.up.last_error) catch "";
         return e;
     };
 }

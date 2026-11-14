@@ -4,9 +4,9 @@
 //!
 //! Shared pieces: the XML tag scraping both REST APIs need, the error-body parser
 //! (`<Code>`/`<Message>`, shown as `Code: Message (HTTP nnn)` instead of a bare
-//! status), the retry policy (re-exported from connect/retry.zig), the
-//! `std.Io.Writer` drain adapter for a streaming
-//! upload, and the paginated listing loop. Signing stays per provider: Shared Key
+//! status), the retry policy (re-exported from connect/retry.zig), the streaming
+//! `Upload` (part buffering, the part list, single PUT or commit, abort) behind
+//! which a provider supplies only its requests, and the paginated listing loop. Signing stays per provider: Shared Key
 //! and SigV4 have nothing in common past "put a header on the request", and query
 //! parameter names and encoding stay with each provider's page function because
 //! they are signed and the services canonicalise a query string differently.
@@ -35,7 +35,7 @@
 //! writing that const and appending it to `providers`. An object `Writer` left
 //! without `finish` publishes nothing, since staged blocks and uncompleted uploads
 //! are invisible to readers; its `abort` frees its client and request memory, an
-//! S3 one also aborts its multipart upload, and an SFTP one removes its visible
+//! S3 one also discards its multipart upload, and an SFTP one removes its visible
 //! `.part` file. A read of a prefix
 //! that lists nothing raises the provider's `empty_prefix` error, as it is almost
 //! always a typo.
@@ -242,32 +242,107 @@ fn exchangeOnce(arena: std.mem.Allocator, client: *HttpClient, call: Call, locat
     return out;
 }
 
-/// What an upload writer holds beside its open-time arena, which keeps only what
-/// lasts the whole upload (block ids, part ETags): the part being gathered, the
-/// HTTP client (owned when the writer made it), and the arena of the request in
-/// flight, emptied before the next part, so memory stays flat however large the
-/// object grows.
+/// A streaming object upload, the one write path of every provider: written bytes
+/// gather into one part-sized buffer, each full one is put as a part (S3 UploadPart,
+/// Azure Put Block) and its id kept, and `finish` commits the ordered ids (Complete
+/// Multipart Upload, Put Block List). An object that never filled a part is one
+/// single PUT when the provider has one; a provider without commits the parts it
+/// has, none for an empty object. `start` runs before the first part, and a
+/// started upload that fails in `finish` or is aborted is `discard`ed, best effort,
+/// its own failure dropped so `last_status` and `last_error` keep the cause.
+///
+/// The open-time arena keeps only what lasts the whole upload (part ids); the HTTP
+/// client is owned when the upload made it; the request arena is emptied before
+/// each request, so memory stays flat however large the object grows.
+/// `std.Io.Writer` only knows `WriteFailed`, so a provider records the typed error
+/// and the store's message here for `Writer.specific` to put back.
 pub const Upload = struct {
+    interface: std.Io.Writer = .{ .vtable = &io_vtable, .buffer = &.{} },
+    arena: std.mem.Allocator,
+    vtable: *const VTable,
     client: *HttpClient,
     owns_client: bool = false,
     req: std.heap.ArenaAllocator = .init(std.heap.page_allocator),
     part: []u8 = &.{},
     part_len: usize = 0,
+    ids: std.ArrayListUnmanaged([]const u8) = .empty,
+    total: u64 = 0,
+    started: bool = false,
+    last_error: []const u8 = "",
+    last_status: ?anyerror = null,
     err_buf: [256]u8 = undefined,
     released: bool = false,
 
-    /// Over `client`, or over a client of its own when null, freed by `release`.
-    pub fn init(arena: std.mem.Allocator, client: ?*HttpClient, part_size: usize) !Upload {
-        const part = try arena.alloc(u8, part_size);
-        if (client) |c| return .{ .client = c, .part = part };
-        const c = try arena.create(HttpClient);
-        c.* = http_client.initClient(std.heap.smp_allocator);
-        return .{ .client = c, .owns_client = true, .part = part };
+    const io_vtable = std.Io.Writer.VTable{ .drain = drain(Upload) };
+
+    /// What differs per provider. `put_part` puts part `ids.items.len` (0-based) and
+    /// returns its id, held in the open-time arena.
+    pub const VTable = struct {
+        start: ?*const fn (*Upload) anyerror!void = null,
+        put_part: *const fn (*Upload, []const u8) anyerror![]const u8,
+        commit: *const fn (*Upload) anyerror!void,
+        discard: ?*const fn (*Upload) anyerror!void = null,
+        single_put: ?*const fn (*Upload, []const u8) anyerror!void = null,
+    };
+
+    /// The vtable over `T`'s methods, `T` holding this upload as its field `up`:
+    /// `putPart` and `commit` always, `start`, `discard` and `singlePut` when declared.
+    pub fn partsOf(comptime T: type) *const VTable {
+        const A = struct {
+            fn of(up: *Upload) *T {
+                return @fieldParentPtr("up", up);
+            }
+            fn start(up: *Upload) anyerror!void {
+                return of(up).start();
+            }
+            fn putPart(up: *Upload, bytes: []const u8) anyerror![]const u8 {
+                return of(up).putPart(bytes);
+            }
+            fn commit(up: *Upload) anyerror!void {
+                return of(up).commit();
+            }
+            fn discard(up: *Upload) anyerror!void {
+                return of(up).discard();
+            }
+            fn singlePut(up: *Upload, bytes: []const u8) anyerror!void {
+                return of(up).singlePut(bytes);
+            }
+            const vt = VTable{
+                .start = if (@hasDecl(T, "start")) start else null,
+                .put_part = putPart,
+                .commit = commit,
+                .discard = if (@hasDecl(T, "discard")) discard else null,
+                .single_put = if (@hasDecl(T, "singlePut")) singlePut else null,
+            };
+        };
+        return &A.vt;
     }
 
-    /// Copies `bytes` in, handing each full part to `ship(w, part)`, so every part
-    /// but the last is exactly the buffer's size however the writer machinery chunks.
-    pub fn stage(self: *Upload, bytes: []const u8, w: anytype, comptime ship: anytype) !void {
+    /// `part_size` parts over `client`, or over a client of its own when null, freed
+    /// by `release`.
+    pub fn init(arena: std.mem.Allocator, client: ?*HttpClient, part_size: usize, vtable: *const VTable) !Upload {
+        var up = Upload{ .arena = arena, .vtable = vtable, .client = undefined };
+        up.interface.buffer = try arena.alloc(u8, 64 * 1024);
+        up.part = try arena.alloc(u8, part_size);
+        if (client) |c| {
+            up.client = c;
+            return up;
+        }
+        const c = try arena.create(HttpClient);
+        c.* = http_client.initClient(std.heap.smp_allocator);
+        up.client = c;
+        up.owns_client = true;
+        return up;
+    }
+
+    pub fn put(self: *Upload, bytes: []const u8) std.Io.Writer.Error!usize {
+        self.stage(bytes) catch return error.WriteFailed;
+        return bytes.len;
+    }
+
+    /// Copies `bytes` in, shipping each full part, so every part but the last is
+    /// exactly the buffer's size however the writer machinery chunks.
+    fn stage(self: *Upload, bytes: []const u8) !void {
         var rest = bytes;
         while (rest.len > 0) {
             const n = @min(self.part.len - self.part_len, rest.len);
@@ -275,10 +350,50 @@ pub const Upload = struct {
             self.part_len += n;
             rest = rest[n..];
             if (self.part_len == self.part.len) {
-                try ship(w, self.part);
+                try self.ship(self.part);
                 self.part_len = 0;
             }
         }
+    }
+
+    /// Puts `bytes` as the next part, starting the upload first if it is not.
+    pub fn ship(self: *Upload, bytes: []const u8) !void {
+        if (!self.started) {
+            if (self.vtable.start) |f| try f(self);
+            self.started = true;
+        }
+        const id = try self.vtable.put_part(self, bytes);
+        try self.ids.append(self.arena, id);
+        self.total += bytes.len;
+    }
+
+    /// Publishes the object: the single PUT when no part was put and the provider
+    /// has one, else the last part and the commit. Until this returns the object
+    /// does not exist.
+    pub fn finish(self: *Upload) !void {
+        defer self.release();
+        errdefer self.discardStarted();
+        try self.interface.flush();
+        if (!self.started) if (self.vtable.single_put) |f| return f(self, self.pending());
+        if (self.part_len > 0) {
+            try self.ship(self.pending());
+            self.part_len = 0;
+        }
+        try self.vtable.commit(self);
+    }
+
+    /// Discards a started upload, then frees the client and request memory.
+    pub fn abort(self: *Upload) void {
+        self.discardStarted();
+        self.release();
+    }
+
+    /// Best effort and before `release`: the discard's failure is dropped without
+    /// touching `last_error` or `last_status`, which hold the cause of the abort.
+    fn discardStarted(self: *Upload) void {
+        if (!self.started or self.released) return;
+        const f = self.vtable.discard orelse return;
+        f(self) catch {};
     }
 
     /// The part gathered so far.
@@ -303,6 +418,14 @@ pub const Upload = struct {
         const n = @min(msg.len, self.err_buf.len);
         @memcpy(self.err_buf[0..n], msg[0..n]);
         return self.err_buf[0..n];
+    }
+
+    /// Records `err` as the upload's failure, with the store's message for `code`
+    /// and `body`, and returns it.
+    pub fn fail(self: *Upload, comptime E: type, err: E, code: u16, body: []const u8) E {
+        self.last_error = self.keepError(code, body);
+        self.last_status = err;
+        return err;
     }
 
     /// Once only: `abort` may follow a `finish` that failed.
