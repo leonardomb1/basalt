@@ -115,11 +115,14 @@ pub const Rows = struct {
     builders: []column.Builder,
     fast: []Fast,
     vals: []?[]const u8,
+    /// Whether each picked value is a plain string (`jt.objectMembers`), which a
+    /// STRING column takes as it stands.
+    plain: []bool,
     len: usize = 0,
 
     /// A column's shortcut, chosen once from its type: a plain number or a literal
     /// appended as `read` would append it, without the `Value` and cast between.
-    const Fast = enum { none, int, float, bool };
+    const Fast = enum { none, int, float, bool, str };
 
     /// `known`, the whole input's columns when `schema` projects them, else null.
     pub fn init(arena: std.mem.Allocator, schema: types.Schema, known: ?types.Schema, capacity: usize) Error!Rows {
@@ -128,6 +131,7 @@ pub const Rows = struct {
             .builders = try arena.alloc(column.Builder, schema.fields.len),
             .fast = try arena.alloc(Fast, schema.fields.len),
             .vals = try arena.alloc(?[]const u8, schema.fields.len),
+            .plain = try arena.alloc(bool, schema.fields.len),
         };
         for (r.builders, r.fast, schema.fields, 0..) |*b, *fa, f, i| {
             b.* = try column.Builder.initCapacity(arena, f.ty, @max(capacity, 1));
@@ -135,6 +139,7 @@ pub const Rows = struct {
                 .int => .int,
                 .float => .float,
                 .bool => .bool,
+                .string => .str,
                 else => .none,
             };
             try r.index.put(arena, f.name, i);
@@ -149,6 +154,7 @@ pub const Rows = struct {
     /// refused only once the whole row is known to be JSON, as a validated row's was.
     pub fn add(self: *Rows, arena: std.mem.Allocator, row: []const u8) Error!void {
         @memset(self.vals, null);
+        @memset(self.plain, false);
         if (row[0] == '{') {
             var pick = Pick{ .rows = self, .arena = arena };
             jt.objectMembers(row, &pick) catch |e| switch (e) {
@@ -166,6 +172,7 @@ pub const Rows = struct {
     /// row out and handing it to `add`. Nothing is appended unless it was read whole.
     pub fn addPrefix(self: *Rows, arena: std.mem.Allocator, t: []const u8) Error!?usize {
         @memset(self.vals, null);
+        @memset(self.plain, false);
         var pick = Pick{ .rows = self, .arena = arena };
         const end = jt.objectPrefix(t, &pick) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
@@ -181,7 +188,7 @@ pub const Rows = struct {
         try jt.validate(arena, row);
         var pick = Pick{ .rows = self, .arena = arena };
         var m = jt.Members.root(row);
-        while (m.next()) |mem| try pick.member(mem.key, false, mem.value);
+        while (m.next()) |mem| try pick.member(mem.key, false, mem.value, false);
         if (pick.stray) |key| return strayKey(key);
         return self.append(arena);
     }
@@ -194,17 +201,28 @@ pub const Rows = struct {
         at: usize = 0,
         stray: ?[]const u8 = null,
 
-        pub fn member(p: *Pick, raw_key: []const u8, plain: bool, value: []const u8) jt.Error!void {
+        pub inline fn member(p: *Pick, raw_key: []const u8, plain: bool, value: []const u8, plain_value: bool) jt.Error!void {
             const key = if (plain) raw_key else try jt.decodeString(p.arena, raw_key);
             const fields = p.rows.schema.fields;
-            const ci = if (p.at < fields.len and std.mem.eql(u8, fields[p.at].name, key)) p.at else p.rows.index.get(key) orelse {
+            const ci = if (p.at < fields.len and sameName(fields[p.at].name, key)) p.at else p.rows.index.get(key) orelse {
                 if (!p.rows.known.contains(key) and p.stray == null) p.stray = key;
                 return;
             };
             p.rows.vals[ci] = value;
+            p.rows.plain[ci] = plain_value;
             p.at = ci + 1;
         }
     };
+
+    /// `std.mem.eql` for a key against a column's name, a name of 8 bytes or more
+    /// compared as its first and last 8, which cover it.
+    inline fn sameName(name: []const u8, key: []const u8) bool {
+        if (name.len != key.len) return false;
+        if (name.len < 8) return std.mem.eql(u8, name, key);
+        const head = std.mem.readInt(u64, name[0..8], .little) == std.mem.readInt(u64, key[0..8], .little);
+        const tail = std.mem.readInt(u64, name[name.len - 8 ..][0..8], .little) == std.mem.readInt(u64, key[key.len - 8 ..][0..8], .little);
+        return head and tail and (name.len <= 16 or std.mem.eql(u8, name[8 .. name.len - 8], key[8 .. key.len - 8]));
+    }
 
     fn strayKey(key: []const u8) Error {
         return pastSample("the key `{s}` is not among the keys of the rows sampled to type the columns, so its values would be dropped", .{clip(key)});
@@ -213,8 +231,8 @@ pub const Rows = struct {
     /// The picked values appended to their columns.
     fn append(self: *Rows, arena: std.mem.Allocator) Error!void {
         const fields = self.schema.fields;
-        for (self.builders, self.vals, fields, self.fast) |*b, raw, f, fa| {
-            if (raw) |t| if (try appendFast(b, fa, t)) continue;
+        for (self.builders, self.vals, fields, self.fast, self.plain) |*b, raw, f, fa, plain| {
+            if (raw) |t| if (try appendFast(b, fa, t, plain)) continue;
             b.append(try read(arena, raw, f)) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.CastFailed => error.InvalidJson,
@@ -224,21 +242,26 @@ pub const Rows = struct {
     }
 
     /// Appends `raw` by its column's shortcut when it is the plain case the shortcut
-    /// reads exactly as `read` would; false leaves it to `read`.
-    fn appendFast(b: *column.Builder, fa: Fast, raw: []const u8) Error!bool {
+    /// reads exactly as `read` would; false leaves it to `read`. A fixed-width cell
+    /// assumes its room: `init` sized every column for the rows a `Rows` ever holds.
+    fn appendFast(b: *column.Builder, fa: Fast, raw: []const u8, plain: bool) Error!bool {
         switch (fa) {
             .none => return false,
-            .int => b.appendInt(cell.intFast(raw) orelse return false) catch return error.OutOfMemory,
+            .str => {
+                if (!plain) return false;
+                b.appendStr(raw[1 .. raw.len - 1]) catch return error.OutOfMemory;
+            },
+            .int => b.appendAsAssumeCapacity(.i64, cell.intFast(raw) orelse return false),
             .float => {
                 const x = cell.floatFast(raw) orelse return false;
                 if (x == 0) return false;
-                b.appendFloat(x) catch return error.OutOfMemory;
+                b.appendAsAssumeCapacity(.f64, x);
             },
-            .bool => b.appendAs(.b, switch (raw[0]) {
+            .bool => b.appendAsAssumeCapacity(.b, switch (raw[0]) {
                 't' => true,
                 'f' => false,
                 else => return false,
-            }) catch return error.OutOfMemory,
+            }),
         }
         return true;
     }
@@ -936,8 +959,8 @@ test "the column shortcuts append exactly what the general path does, whenever t
                 .float => .float,
                 else => .bool,
             }).asNullable();
-            var fast = column.Builder.init(a, ty);
-            if (!try Rows.appendFast(&fast, fa, raw)) continue;
+            var fast = try column.Builder.initCapacity(a, ty, 1);
+            if (!try Rows.appendFast(&fast, fa, raw, false)) continue;
             taken += 1;
             var slow = column.Builder.init(a, ty);
             try slow.append(try Rows.read(a, raw, .{ .name = "c", .ty = ty }));
@@ -952,6 +975,15 @@ test "the column shortcuts append exactly what the general path does, whenever t
                 return error.TestUnexpectedResult;
             }
         }
+    }
+    for ([_][]const u8{ "\"\"", "\"x\"", "\"1996-03-13\"", "\"DELIVER IN PERSON\"", "\"a b:c,{d}[e]\"" }) |raw| {
+        const ty = types.Type.init(.string).asNullable();
+        var fast = column.Builder.init(a, ty);
+        try std.testing.expect(try Rows.appendFast(&fast, .str, raw, true));
+        try std.testing.expect(!try Rows.appendFast(&fast, .str, raw, false));
+        var slow = column.Builder.init(a, ty);
+        try slow.append(try Rows.read(a, raw, .{ .name = "c", .ty = ty }));
+        try std.testing.expectEqualStrings((try slow.finish()).getValue(0).string, (try fast.finish()).getValue(0).string);
     }
     try testing.expect(taken > 10_000);
 }

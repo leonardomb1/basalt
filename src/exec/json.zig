@@ -215,9 +215,10 @@ const Validator = struct {
 pub const ReadError = error{ InvalidJson, OutOfMemory, Fallback };
 
 /// Object `t` validated and read in one pass, each member handed in order to
-/// `sink.member(key, plain, value)`: `key` the text between its quotes, `plain` when
-/// it holds neither an escape nor a byte past ASCII (so it reads as it stands),
-/// `value` the value's raw text. It accepts and refuses what `validate` does: a
+/// `sink.member(key, plain_key, value, plain_value)`: `key` the text between its
+/// quotes, `plain_key` when it holds neither an escape nor a byte past ASCII (so it
+/// reads as it stands), `value` the value's raw text, `plain_value` when it is a
+/// string as plain. It accepts and refuses what `validate` does: a
 /// plain string is found a vector at a time, and anything else, an escape, a byte
 /// past ASCII, a number, a literal or a nested value, goes through `Validator`'s own
 /// steps. `error.Fallback` leaves a document nested past `max_depth` to the caller,
@@ -273,10 +274,16 @@ fn readMembers(v: *Validator, sink: anytype, whole: bool) MembersError!void {
         v.i += 1;
         v.ws();
         const vs = v.i;
+        var plain_value = false;
         if (v.i < t.len and t[v.i] == '"') {
-            if (plainStringEnd(t, v.i + 1)) |k| v.i = k + 1 else _ = try v.string();
+            if (plainStringEnd(t, v.i + 1)) |k| {
+                v.i = k + 1;
+                plain_value = true;
+            } else _ = try v.string();
+        } else if (v.i < t.len and (isDigit(t[v.i]) or t[v.i] == '-')) {
+            try v.number();
         } else try v.value();
-        try sink.member(key, plain, t[vs..v.i]);
+        try sink.member(key, plain, t[vs..v.i], plain_value);
         v.ws();
         if (v.i >= t.len) return error.Invalid;
         switch (t[v.i]) {
@@ -896,8 +903,9 @@ const TestPick = struct {
     got: std.ArrayListUnmanaged(Members.Member) = .empty,
     a: std.mem.Allocator,
 
-    pub fn member(p: *TestPick, key: []const u8, plain: bool, value: []const u8) Error!void {
+    pub fn member(p: *TestPick, key: []const u8, plain: bool, value: []const u8, plain_value: bool) Error!void {
         if (plain) for (key) |c| if (c == '\\' or c >= 0x80) return error.InvalidJson;
+        if (plain_value) for (value[1 .. value.len - 1]) |c| if (c == '\\' or c >= 0x80) return error.InvalidJson;
         try p.got.append(p.a, .{ .key = key, .value = value });
     }
 };
