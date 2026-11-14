@@ -323,8 +323,7 @@ pub fn writeJsonValue(arena: std.mem.Allocator, v: Value, w: *std.Io.Writer) Eva
 }
 
 pub fn bindLambda(arena: std.mem.Allocator, body: *const ast.Expr, name: []const u8, v: Value) error{OutOfMemory}!*ast.Expr {
-    const lit = try arena.create(ast.Expr);
-    lit.* = try literalOf(arena, v);
+    const lit = try ast.mk(arena, try literalOf(arena, v));
     return bindLambdaTo(arena, body, name, lit);
 }
 
@@ -379,8 +378,7 @@ pub fn bindParams(arena: std.mem.Allocator, l: ast.Expr.Lambda, slots: []const *
 pub fn lambdaSlots(arena: std.mem.Allocator, vals: []const ast.Expr) error{OutOfMemory}![]*ast.Expr {
     const slots = try arena.alloc(*ast.Expr, vals.len);
     for (slots, vals) |*sl, v| {
-        sl.* = try arena.create(ast.Expr);
-        sl.*.* = v;
+        sl.* = try ast.mk(arena, v);
     }
     return slots;
 }
@@ -392,8 +390,7 @@ pub fn accNode(arena: std.mem.Allocator, acc: Value, ty: Type) error{OutOfMemory
         .null, .bool, .int, .float, .string => return literalOf(arena, acc),
         else => {
             if (ty.unknown) return literalOf(arena, acc);
-            const text = try arena.create(ast.Expr);
-            text.* = .{ .str_lit = try valueToString(arena, acc) };
+            const text = try ast.mk(arena, .{ .str_lit = try valueToString(arena, acc) });
             return .{ .cast = .{ .e = text, .ty = ty } };
         },
     }

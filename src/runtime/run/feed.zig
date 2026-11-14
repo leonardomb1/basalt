@@ -108,8 +108,7 @@ fn targetHints(a: std.mem.Allocator, w: ast.Write, pos: ast.Pos) ![]const ast.Hi
 }
 
 fn expr(a: std.mem.Allocator, e: ast.Expr) !*ast.Expr {
-    const out = try a.create(ast.Expr);
-    out.* = e;
+    const out = try ast.mk(a, e);
     return out;
 }
 

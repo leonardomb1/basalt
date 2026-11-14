@@ -181,7 +181,8 @@ pub const MatchArm = struct {
     is_default: bool,
 };
 
-fn mkExpr(arena: std.mem.Allocator, e: Expr) !*Expr {
+/// `e` in a node of its own in `arena`, the one way an expression is allocated.
+pub fn mk(arena: std.mem.Allocator, e: Expr) error{OutOfMemory}!*Expr {
     const p = try arena.create(Expr);
     p.* = e;
     return p;
@@ -193,18 +194,18 @@ fn mkExpr(arena: std.mem.Allocator, e: Expr) !*Expr {
 pub fn rebuildExpr(arena: std.mem.Allocator, e: *const Expr, ctx: anytype, comptime recur: anytype) !*Expr {
     return switch (e.*) {
         .null_lit, .bool_lit, .int_lit, .float_lit, .dec_lit, .str_lit, .field, .lambda_var => @constCast(e),
-        .lambda => |l| try mkExpr(arena, .{ .lambda = .{ .params = l.params, .body = try recur(ctx, l.body) } }),
-        .unary => |u| try mkExpr(arena, .{ .unary = .{ .op = u.op, .e = try recur(ctx, u.e) } }),
-        .binary => |b| try mkExpr(arena, .{ .binary = .{ .op = b.op, .l = try recur(ctx, b.l), .r = try recur(ctx, b.r) } }),
-        .cond => |c| try mkExpr(arena, .{ .cond = .{ .cond = try recur(ctx, c.cond), .then = try recur(ctx, c.then), .els = try recur(ctx, c.els) } }),
-        .cast => |c| try mkExpr(arena, .{ .cast = .{ .e = try recur(ctx, c.e), .ty = c.ty, .safe = c.safe } }),
-        .index => |x| try mkExpr(arena, .{ .index = .{ .e = try recur(ctx, x.e), .key = try recur(ctx, x.key) } }),
-        .is_null => |n| try mkExpr(arena, .{ .is_null = .{ .e = try recur(ctx, n.e), .negated = n.negated, .kind = n.kind } }),
-        .let_in => |l| try mkExpr(arena, .{ .let_in = .{ .name = l.name, .value = try recur(ctx, l.value), .body = try recur(ctx, l.body) } }),
+        .lambda => |l| try mk(arena, .{ .lambda = .{ .params = l.params, .body = try recur(ctx, l.body) } }),
+        .unary => |u| try mk(arena, .{ .unary = .{ .op = u.op, .e = try recur(ctx, u.e) } }),
+        .binary => |b| try mk(arena, .{ .binary = .{ .op = b.op, .l = try recur(ctx, b.l), .r = try recur(ctx, b.r) } }),
+        .cond => |c| try mk(arena, .{ .cond = .{ .cond = try recur(ctx, c.cond), .then = try recur(ctx, c.then), .els = try recur(ctx, c.els) } }),
+        .cast => |c| try mk(arena, .{ .cast = .{ .e = try recur(ctx, c.e), .ty = c.ty, .safe = c.safe } }),
+        .index => |x| try mk(arena, .{ .index = .{ .e = try recur(ctx, x.e), .key = try recur(ctx, x.key) } }),
+        .is_null => |n| try mk(arena, .{ .is_null = .{ .e = try recur(ctx, n.e), .negated = n.negated, .kind = n.kind } }),
+        .let_in => |l| try mk(arena, .{ .let_in = .{ .name = l.name, .value = try recur(ctx, l.value), .body = try recur(ctx, l.body) } }),
         .call => |c| blk: {
             const args = try arena.alloc(*Expr, c.args.len);
             for (c.args, args) |a, *out| out.* = try recur(ctx, a);
-            break :blk try mkExpr(arena, .{ .call = .{ .name = c.name, .args = args, .distinct = c.distinct, .span = c.span, .now_us = c.now_us, .acc = c.acc } });
+            break :blk try mk(arena, .{ .call = .{ .name = c.name, .args = args, .distinct = c.distinct, .span = c.span, .now_us = c.now_us, .acc = c.acc } });
         },
         .match => |m| blk: {
             const subject = if (m.subject) |s| try recur(ctx, s) else null;
@@ -219,7 +220,7 @@ pub fn rebuildExpr(arena: std.mem.Allocator, e: *const Expr, ctx: anytype, compt
                     .is_default = arm.is_default,
                 };
             }
-            break :blk try mkExpr(arena, .{ .match = .{ .subject = subject, .arms = arms } });
+            break :blk try mk(arena, .{ .match = .{ .subject = subject, .arms = arms } });
         },
     };
 }
@@ -887,9 +888,9 @@ test "rebuildExpr identity copies every field — no silent drop" {
             return rebuildExpr(arena, e, arena, r);
         }
     };
-    const x = try mkExpr(a, .{ .field = .{ .parts = &[_][]const u8{"x"} } });
-    const empty = try mkExpr(a, .{ .is_null = .{ .e = x, .negated = true, .kind = .is_empty } });
-    const casted = try mkExpr(a, .{ .cast = .{ .e = empty, .ty = types.Type.init(.int), .safe = true } });
+    const x = try mk(a, .{ .field = .{ .parts = &[_][]const u8{"x"} } });
+    const empty = try mk(a, .{ .is_null = .{ .e = x, .negated = true, .kind = .is_empty } });
+    const casted = try mk(a, .{ .cast = .{ .e = empty, .ty = types.Type.init(.int), .safe = true } });
 
     const out = try Id.r(a, casted);
     try std.testing.expect(out.* == .cast);
@@ -899,7 +900,7 @@ test "rebuildExpr identity copies every field — no silent drop" {
     try std.testing.expectEqual(Expr.NullTest.is_empty, out.cast.e.is_null.kind);
     try std.testing.expect(out.cast.e.is_null.negated);
 
-    const bound = try mkExpr(a, .{ .let_in = .{ .name = "v", .value = casted, .body = x } });
+    const bound = try mk(a, .{ .let_in = .{ .name = "v", .value = casted, .body = x } });
     const out2 = try Id.r(a, bound);
     try std.testing.expect(out2.* == .let_in);
     try std.testing.expectEqualStrings("v", out2.let_in.name);
@@ -909,7 +910,7 @@ test "rebuildExpr identity copies every field — no silent drop" {
     args[0] = x;
     args[1] = empty;
     const span: Span = .{ .start = .{ .line = 3, .col = 5 }, .end = .{ .line = 3, .col = 17 } };
-    const call = try mkExpr(a, .{ .call = .{ .name = "concat", .args = args, .distinct = true, .span = span } });
+    const call = try mk(a, .{ .call = .{ .name = "concat", .args = args, .distinct = true, .span = span } });
     const out3 = try Id.r(a, call);
     try std.testing.expect(out3.* == .call);
     try std.testing.expectEqualStrings("concat", out3.call.name);
@@ -918,8 +919,8 @@ test "rebuildExpr identity copies every field — no silent drop" {
     try std.testing.expect(out3.call.distinct);
     try std.testing.expectEqual(span, out3.call.span.?);
 
-    const one = try mkExpr(a, .{ .int_lit = 1 });
-    const two = try mkExpr(a, .{ .int_lit = 2 });
+    const one = try mk(a, .{ .int_lit = 1 });
+    const two = try mk(a, .{ .int_lit = 2 });
     const pats = try a.alloc(*Expr, 2);
     pats[0] = one;
     pats[1] = two;
@@ -927,7 +928,7 @@ test "rebuildExpr identity copies every field — no silent drop" {
     arms[0] = .{ .pats = pats, .guard = null, .value = x, .is_default = false };
     arms[1] = .{ .pats = &.{}, .guard = empty, .value = one, .is_default = false };
     arms[2] = .{ .pats = &.{}, .guard = null, .value = two, .is_default = true };
-    const m = try mkExpr(a, .{ .match = .{ .subject = x, .arms = arms } });
+    const m = try mk(a, .{ .match = .{ .subject = x, .arms = arms } });
     const out4 = try Id.r(a, m);
     try std.testing.expect(out4.* == .match);
     try std.testing.expect(out4.match.subject.?.* == .field);
@@ -946,20 +947,20 @@ test "rebuildExpr identity copies every field — no silent drop" {
     try std.testing.expectEqual(@as(usize, 0), out4.match.arms[2].pats.len);
     try std.testing.expectEqual(@as(i64, 2), out4.match.arms[2].value.int_lit);
 
-    const bin = try mkExpr(a, .{ .binary = .{ .op = .ge, .l = x, .r = two } });
+    const bin = try mk(a, .{ .binary = .{ .op = .ge, .l = x, .r = two } });
     const out5 = try Id.r(a, bin);
     try std.testing.expect(out5.* == .binary);
     try std.testing.expectEqual(BinOp.ge, out5.binary.op);
     try std.testing.expect(out5.binary.l.* == .field);
     try std.testing.expectEqual(@as(i64, 2), out5.binary.r.int_lit);
 
-    const un = try mkExpr(a, .{ .unary = .{ .op = .bit_not, .e = one } });
+    const un = try mk(a, .{ .unary = .{ .op = .bit_not, .e = one } });
     const out6 = try Id.r(a, un);
     try std.testing.expect(out6.* == .unary);
     try std.testing.expectEqual(UnOp.bit_not, out6.unary.op);
     try std.testing.expectEqual(@as(i64, 1), out6.unary.e.int_lit);
 
-    const lam = try mkExpr(a, .{ .lambda = .{ .params = &[_][]const u8{ "acc", "t" }, .body = bin } });
+    const lam = try mk(a, .{ .lambda = .{ .params = &[_][]const u8{ "acc", "t" }, .body = bin } });
     const out7 = try Id.r(a, lam);
     try std.testing.expect(out7.* == .lambda);
     try std.testing.expectEqual(@as(usize, 2), out7.lambda.params.len);

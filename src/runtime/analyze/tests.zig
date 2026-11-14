@@ -622,8 +622,7 @@ test "a $param or LET in a filter reaches the pushdown as its value, never as a 
     try std.testing.expectEqualStrings("(([b] >= 1) AND ([k] < 5))", plan.outputs[0].source.pushdown);
 
     var params = ParamMap.init(a);
-    const five = try a.create(ast.Expr);
-    five.* = .{ .int_lit = 5 };
+    const five = try ast.mk(a, .{ .int_lit = 5 });
     try params.put("n", five);
     const stages = prog.stmts[prog.stmts.len - 1].explain.pipeline.stages;
     const bound = try substFilterParams(a, stages, &params);

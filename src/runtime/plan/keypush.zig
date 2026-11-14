@@ -159,8 +159,7 @@ pub fn parquetSide(env: *Env, stages: []const ast.Stage) !bool {
 pub fn traceKey(arena: std.mem.Allocator, stages: []const ast.Stage, name: []const u8) !?*ast.Expr {
     const parts = try arena.alloc([]const u8, 1);
     parts[0] = name;
-    var cur = try arena.create(ast.Expr);
-    cur.* = .{ .field = .{ .parts = parts } };
+    var cur = try ast.mk(arena, .{ .field = .{ .parts = parts } });
     var i = stages.len;
     while (i > 0) {
         i -= 1;
@@ -206,8 +205,7 @@ fn source(arena: std.mem.Allocator, items: []const ast.SelectItem, name: []const
 fn fieldOf(arena: std.mem.Allocator, name: []const u8) !*ast.Expr {
     const parts = try arena.alloc([]const u8, 1);
     parts[0] = name;
-    const e = try arena.create(ast.Expr);
-    e.* = .{ .field = .{ .parts = parts } };
+    const e = try ast.mk(arena, .{ .field = .{ .parts = parts } });
     return e;
 }
 
@@ -333,15 +331,12 @@ fn literal(arena: std.mem.Allocator, dialect: Dialect, v: Value, ranged: bool) !
         .decimal => try eval.valueToString(arena, v),
         .float => |f| if (ranged and std.math.isFinite(f)) try msgfmt.allocPrint(arena, "{e}", .{f}) else null,
         .string => |s| if (ranged) null else blk: {
-            const e = try arena.create(ast.Expr);
-            e.* = .{ .str_lit = s };
+            const e = try ast.mk(arena, .{ .str_lit = s });
             break :blk try translate.translatePred(arena, e, dialect, opts);
         },
         .date, .timestamp => blk: {
-            const text = try arena.create(ast.Expr);
-            text.* = .{ .str_lit = try eval.valueToString(arena, v) };
-            const e = try arena.create(ast.Expr);
-            e.* = .{ .cast = .{ .e = text, .ty = types.Type.init(if (v == .date) .date else .timestamp) } };
+            const text = try ast.mk(arena, .{ .str_lit = try eval.valueToString(arena, v) });
+            const e = try ast.mk(arena, .{ .cast = .{ .e = text, .ty = types.Type.init(if (v == .date) .date else .timestamp) } });
             break :blk try translate.translatePred(arena, e, dialect, opts);
         },
         else => null,
@@ -452,10 +447,8 @@ test "traceKey: through filters, selects, renames and computed keys to the read'
     try testing.expect((try traceKey(a, bst, "nope")) == null);
 
     const pos = ast.Pos{ .line = 1, .col = 1 };
-    const cc = try a.create(ast.Expr);
-    cc.* = .{ .field = .{ .parts = &.{"cc"} } };
-    const trimmed = try a.create(ast.Expr);
-    trimmed.* = .{ .call = .{ .name = "trim", .args = &.{cc} } };
+    const cc = try ast.mk(a, .{ .field = .{ .parts = &.{"cc"} } });
+    const trimmed = try ast.mk(a, .{ .call = .{ .name = "trim", .args = &.{cc} } });
     const with_key = [_]ast.Stage{
         bst[0],                                                                                                                     bst[1],
         .{ .node = .{ .select = &.{ .star, .{ .computed = .{ .name = "__jk1", .expr = trimmed } } } }, .hints = &.{}, .pos = pos },
@@ -477,10 +470,8 @@ test "render: IN lists per dialect, a range past the cap, nothing for what canno
         .{ .name = "code", .ty = types.Type.init(.string) },
         .{ .name = "n", .ty = types.Type.init(.int) },
     } };
-    const code = try a.create(ast.Expr);
-    code.* = .{ .field = .{ .parts = &.{"code"} } };
-    const n = try a.create(ast.Expr);
-    n.* = .{ .field = .{ .parts = &.{"n"} } };
+    const code = try ast.mk(a, .{ .field = .{ .parts = &.{"code"} } });
+    const n = try ast.mk(a, .{ .field = .{ .parts = &.{"n"} } });
 
     const strs = [_]Value{ .{ .string = "A1" }, .{ .string = "it's" } };
     const ints = [_]Value{ .{ .int = 3 }, .{ .int = 9 } };

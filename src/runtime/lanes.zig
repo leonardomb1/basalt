@@ -237,8 +237,7 @@ test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
     const a = ar.allocator();
 
     const p = ast.Pos{ .line = 0, .col = 0 };
-    const pred = try a.create(ast.Expr);
-    pred.* = .{ .bool_lit = true };
+    const pred = try ast.mk(a, .{ .bool_lit = true });
     const items = try a.alloc(ast.SelectItem, 1);
     items[0] = .star;
 
@@ -269,8 +268,7 @@ test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
     const no_agg = [_]ast.Stage{ rd, flt, wrt };
     try std.testing.expect(classifyWholeAgg(&no_agg) == null);
 
-    const arg = try a.create(ast.Expr);
-    arg.* = .{ .field = .{ .parts = &.{"c"} } };
+    const arg = try ast.mk(a, .{ .field = .{ .parts = &.{"c"} } });
     const med = try a.alloc(ast.AggItem, 1);
     med[0] = .{ .name = "m", .func = .median, .arg = arg };
     const med_agg = ast.Stage{ .node = .{ .aggregate = .{ .aggs = med, .by = by } }, .hints = &.{}, .pos = p };

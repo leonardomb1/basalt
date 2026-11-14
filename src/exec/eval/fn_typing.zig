@@ -367,8 +367,7 @@ pub const typing = struct {
         var acc = try self.typeOf(c.args[1]);
         var pass: usize = 0;
         while (pass < 3) : (pass += 1) {
-            const null_node = try self.arena.create(ast.Expr);
-            null_node.* = .null_lit;
+            const null_node = try ast.mk(self.arena, .null_lit);
             const acc_node: ast.Expr = if (acc.unknown) .null_lit else .{ .cast = .{ .e = null_node, .ty = acc } };
             const body = try bindParams(self.arena, l, try lambdaSlots(self.arena, &.{ acc_node, .null_lit, .{ .int_lit = 0 } }));
             const bt = try self.typeOf(body);

@@ -407,8 +407,7 @@ test "planAgg: projects only referenced columns and pushes the filter" {
     const schema = types.Schema{ .fields = &.{
         .{ .name = "a", .ty = I }, .{ .name = "b", .ty = S }, .{ .name = "c", .ty = I }, .{ .name = "d", .ty = I },
     } };
-    const lit5 = try a.create(ast.Expr);
-    lit5.* = .{ .int_lit = 5 };
+    const lit5 = try ast.mk(a, .{ .int_lit = 5 });
     const filt = ast.Stage{ .node = .{ .filter = try bin(a, .ge, try fld(a, "a"), lit5) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
     const by = try a.alloc(ast.QualName, 1);
     by[0] = .{ .parts = &.{"b"} };
@@ -452,8 +451,7 @@ test "planMap: a downstream filter through the reconcile keeps its column live" 
     recon[1] = try fieldItem(a, "b");
     recon[2] = try fieldItem(a, "c");
     recon[3] = try fieldItem(a, "d");
-    const litc = try a.create(ast.Expr);
-    litc.* = .{ .int_lit = 1 };
+    const litc = try ast.mk(a, .{ .int_lit = 1 });
     const fc = ast.Stage{ .node = .{ .filter = try bin(a, .gt, try fld(a, "c"), litc) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
     const down = try a.alloc(ast.SelectItem, 1);
     down[0] = try fieldItem(a, "b");
@@ -469,8 +467,7 @@ test "planMap: a leading filter is pushed as a predicate" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const lit0 = try a.create(ast.Expr);
-    lit0.* = .{ .int_lit = 0 };
+    const lit0 = try ast.mk(a, .{ .int_lit = 0 });
     const filt = ast.Stage{ .node = .{ .filter = try bin(a, .gt, try fld(a, "a"), lit0) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
     const down = try a.alloc(ast.SelectItem, 1);
     down[0] = try fieldItem(a, "a");
@@ -513,8 +510,7 @@ test "planAgg: an untranslatable filter is not pushed but its columns stay proje
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const nowc = try a.create(ast.Expr);
-    nowc.* = .{ .call = .{ .name = "now", .args = &.{} } };
+    const nowc = try ast.mk(a, .{ .call = .{ .name = "now", .args = &.{} } });
     const filt = ast.Stage{ .node = .{ .filter = try bin(a, .gt, try fld(a, "b"), nowc) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
     const by = try a.alloc(ast.QualName, 1);
     by[0] = .{ .parts = &.{"a"} };
@@ -545,8 +541,7 @@ test "planAgg: a select in the prefix disables projection (filter still pushed)"
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const lit5 = try a.create(ast.Expr);
-    lit5.* = .{ .int_lit = 5 };
+    const lit5 = try ast.mk(a, .{ .int_lit = 5 });
     const filt = ast.Stage{ .node = .{ .filter = try bin(a, .ge, try fld(a, "a"), lit5) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
     const items = try a.alloc(ast.SelectItem, 1);
     items[0] = .star;
@@ -778,8 +773,7 @@ test "planWholeAggWhy: a refusal names the gate that refused" {
     } };
     var why: []const u8 = "";
 
-    const nowc = try a.create(ast.Expr);
-    nowc.* = .{ .call = .{ .name = "now", .args = &.{} } };
+    const nowc = try ast.mk(a, .{ .call = .{ .name = "now", .args = &.{} } });
     const bad = ast.Stage{ .node = .{ .filter = try bin(a, .gt, try fld(a, "t"), nowc) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
     const ag = ast.Aggregate{ .aggs = aggs, .by = try byList(a, &.{"b"}) };
     try testing.expect((try planWholeAggWhy(a, .mysql, base_t, wholeSchema(), &.{bad}, ag, plan_schema, null, &why)) == null);
@@ -800,8 +794,7 @@ test "planWholeAgg: an untranslatable filter falls back instead of pushing a sup
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const nowc = try a.create(ast.Expr);
-    nowc.* = .{ .call = .{ .name = "now", .args = &.{} } };
+    const nowc = try ast.mk(a, .{ .call = .{ .name = "now", .args = &.{} } });
     const bad = ast.Stage{ .node = .{ .filter = try bin(a, .gt, try fld(a, "t"), nowc) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
     const ok = try geFilter(a, "a", 5);
 
@@ -872,8 +865,7 @@ test "planWholeAgg: a non-bare aggregate argument falls back" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const two = try a.create(ast.Expr);
-    two.* = .{ .int_lit = 2 };
+    const two = try ast.mk(a, .{ .int_lit = 2 });
     const aggs = try a.alloc(ast.AggItem, 1);
     aggs[0] = .{ .name = "s", .func = .sum, .arg = try bin(a, .add, try fld(a, "c"), two) };
     const plan_schema = types.Schema{ .fields = &.{.{ .name = "s", .ty = types.Type.init(.int).withNull(true) }} };

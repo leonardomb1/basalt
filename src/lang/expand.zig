@@ -309,9 +309,7 @@ fn parseJsonArg(arena: std.mem.Allocator, name: []const u8, text: []const u8, ms
 }
 
 fn mk(cx: *Ctx, e: ast.Expr) Error!*ast.Expr {
-    const p = try cx.arena.create(ast.Expr);
-    p.* = e;
-    return p;
+    return ast.mk(cx.arena, e);
 }
 
 fn mkNull(cx: *Ctx) Error!*ast.Expr {
@@ -493,8 +491,7 @@ pub fn bindArg(arena: std.mem.Allocator, fd: ast.FnDecl, i: usize, a: **ast.Expr
     if (!isTemporalText(ty, a.*)) return null;
     if (!temporalTextOk(arena, ty, a.*.str_lit))
         return try msgfmt.allocPrint(arena, "`{s}`: argument {d} (`{s}`) expects {s}, got `{s}`", .{ fd.name, i + 1, p.name, typeWord(want), a.*.str_lit });
-    const cast = try arena.create(ast.Expr);
-    cast.* = .{ .cast = .{ .e = a.*, .ty = ty } };
+    const cast = try ast.mk(arena, .{ .cast = .{ .e = a.*, .ty = ty } });
     a.* = cast;
     return null;
 }

@@ -103,15 +103,13 @@ fn folded(arena: std.mem.Allocator, e: *const ast.Expr) error{OutOfMemory}!*cons
                 if (r.* == .bool_lit) return if (r.bool_lit == keep) l else r;
             }
             if (l == b.l and r == b.r) return e;
-            const n = try arena.create(ast.Expr);
-            n.* = .{ .binary = .{ .op = b.op, .l = @constCast(l), .r = @constCast(r) } };
+            const n = try ast.mk(arena, .{ .binary = .{ .op = b.op, .l = @constCast(l), .r = @constCast(r) } });
             return n;
         },
         .unary => |u| {
             const x = try folded(arena, u.e);
             if (x == u.e) return e;
-            const n = try arena.create(ast.Expr);
-            n.* = .{ .unary = .{ .op = u.op, .e = @constCast(x) } };
+            const n = try ast.mk(arena, .{ .unary = .{ .op = u.op, .e = @constCast(x) } });
             return n;
         },
         .call => |c| {
@@ -124,8 +122,7 @@ fn folded(arena: std.mem.Allocator, e: *const ast.Expr) error{OutOfMemory}!*cons
             if (same) return e;
             var nc = c;
             nc.args = args;
-            const n = try arena.create(ast.Expr);
-            n.* = .{ .call = nc };
+            const n = try ast.mk(arena, .{ .call = nc });
             return n;
         },
         .cast => |c| {
@@ -133,8 +130,7 @@ fn folded(arena: std.mem.Allocator, e: *const ast.Expr) error{OutOfMemory}!*cons
             if (x == c.e) return e;
             var nc = c;
             nc.e = @constCast(x);
-            const n = try arena.create(ast.Expr);
-            n.* = .{ .cast = nc };
+            const n = try ast.mk(arena, .{ .cast = nc });
             return n;
         },
         else => return e,
@@ -864,8 +860,7 @@ test "translateExpr: equality with a string literal escapes quotes" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const lit = try a.create(ast.Expr);
-    lit.* = .{ .str_lit = "O'Brien" };
+    const lit = try ast.mk(a, .{ .str_lit = "O'Brien" });
     const e = try bin(a, .eq, try fld(a, "b"), lit);
     const sql = (try translateExpr(a, e, .mysql, testSchema(), true)).?;
     try testing.expectEqualStrings("(`b` = 'O''Brien')", sql);
@@ -876,13 +871,11 @@ test "translateExpr: loose date text against a column of unknown type stays in t
     defer ar.deinit();
     const a = ar.allocator();
     for ([_][]const u8{ "2024-01-05T05:00:00+05:00", "2024-1-5", "2024-01-05 05:00Z", "2024-01-05 05:00:00.1234567" }) |s| {
-        const lit = try a.create(ast.Expr);
-        lit.* = .{ .str_lit = s };
+        const lit = try ast.mk(a, .{ .str_lit = s });
         const e = try bin(a, .eq, try fld(a, "ts"), lit);
         try testing.expect((try translateExpr(a, e, .postgres, .{ .fields = &.{} }, false)) == null);
     }
-    const iso = try a.create(ast.Expr);
-    iso.* = .{ .str_lit = "2024-01-05 05:00:00" };
+    const iso = try ast.mk(a, .{ .str_lit = "2024-01-05 05:00:00" });
     const e = try bin(a, .eq, try fld(a, "ts"), iso);
     try testing.expectEqualStrings("(\"ts\" = '2024-01-05 05:00:00')", (try translateExpr(a, e, .postgres, .{ .fields = &.{} }, false)).?);
 }
@@ -900,23 +893,19 @@ test "translateExpr: a date or timestamp outside years 1..9999 stays in the engi
         .{ "ts", "-0001-01-01 00:00:00" }, .{ "ts", "12345-01-01 00:00" }, .{ "x", "-0001-01-01" },
         .{ "x", "11000-01-01 00:00:00" },  .{ "x", "0000-12-31" },
     }) |c| {
-        const lit = try a.create(ast.Expr);
-        lit.* = .{ .str_lit = c[1] };
+        const lit = try ast.mk(a, .{ .str_lit = c[1] });
         inline for (.{ .postgres, .mysql }) |dialect| {
             try testing.expect((try translateExpr(a, try bin(a, .eq, try fld(a, c[0]), lit), dialect, schema, false)) == null);
         }
     }
     for ([_]types.TypeKind{ .date, .timestamp }) |k| {
-        const far = try a.create(ast.Expr);
-        far.* = .{ .str_lit = "-0001-01-01" };
-        const cast = try a.create(ast.Expr);
-        cast.* = .{ .cast = .{ .e = far, .ty = types.Type.init(k) } };
+        const far = try ast.mk(a, .{ .str_lit = "-0001-01-01" });
+        const cast = try ast.mk(a, .{ .cast = .{ .e = far, .ty = types.Type.init(k) } });
         try testing.expect((try translateExpr(a, try bin(a, .eq, try fld(a, "x"), cast), .mysql, schema, false)) == null);
         far.* = .{ .str_lit = "2024-01-01" };
         try testing.expect((try translateExpr(a, try bin(a, .eq, try fld(a, "x"), cast), .mysql, schema, false)) != null);
     }
-    const ok = try a.create(ast.Expr);
-    ok.* = .{ .str_lit = "0001-01-01" };
+    const ok = try ast.mk(a, .{ .str_lit = "0001-01-01" });
     try testing.expectEqualStrings("(\"d\" = '0001-01-01')", (try translateExpr(a, try bin(a, .eq, try fld(a, "d"), ok), .postgres, schema, false)).?);
 }
 
@@ -926,8 +915,7 @@ test "translateExpr: a fraction past the microsecond stays in the engine on ever
     const a = ar.allocator();
     const schema = types.Schema{ .fields = &.{.{ .name = "t", .ty = types.Type.init(.time) }} };
     for ([_][2][]const u8{ .{ "t", "12:00:00.1234567" }, .{ "x", "12:00:00.1234567" } }) |c| {
-        const lit = try a.create(ast.Expr);
-        lit.* = .{ .str_lit = c[1] };
+        const lit = try ast.mk(a, .{ .str_lit = c[1] });
         inline for (.{ .postgres, .mysql }) |dialect| {
             errdefer std.debug.print("{s} = '{s}'\n", .{ c[0], c[1] });
             try testing.expect((try translateExpr(a, try bin(a, .eq, try fld(a, c[0]), lit), dialect, schema, false)) == null);
@@ -938,16 +926,13 @@ test "translateExpr: a fraction past the microsecond stays in the engine on ever
         .{ .time, "23:59:59.9999999" },
         .{ .date, "2024-01-05 23:59:59.9999999" },
     }) |c| {
-        const s = try a.create(ast.Expr);
-        s.* = .{ .str_lit = c[1] };
-        const cast = try a.create(ast.Expr);
-        cast.* = .{ .cast = .{ .e = s, .ty = types.Type.init(c[0]) } };
+        const s = try ast.mk(a, .{ .str_lit = c[1] });
+        const cast = try ast.mk(a, .{ .cast = .{ .e = s, .ty = types.Type.init(c[0]) } });
         try testing.expect((try translateExpr(a, try bin(a, .eq, try fld(a, "x"), cast), .postgres, schema, false)) == null);
         s.* = .{ .str_lit = c[1][0 .. c[1].len - 1] };
         try testing.expect((try translateExpr(a, try bin(a, .eq, try fld(a, "x"), cast), .postgres, schema, false)) != null);
     }
-    const ok = try a.create(ast.Expr);
-    ok.* = .{ .str_lit = "12:00:00.123456" };
+    const ok = try ast.mk(a, .{ .str_lit = "12:00:00.123456" });
     try testing.expectEqualStrings("(\"t\" = '12:00:00.123456')", (try translateExpr(a, try bin(a, .eq, try fld(a, "t"), ok), .postgres, schema, false)).?);
     try testing.expectEqualStrings("(\"x\" = '12:00:00.123456')", (try translateExpr(a, try bin(a, .eq, try fld(a, "x"), ok), .postgres, schema, false)).?);
 }
@@ -956,11 +941,9 @@ test "translateExpr: concat stays NULL on a NULL argument in every dialect" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const z = try a.create(ast.Expr);
-    z.* = .{ .str_lit = "z" };
+    const z = try ast.mk(a, .{ .str_lit = "z" });
     const c = try callExpr(a, "concat", &.{ try fld(a, "b"), z });
-    const e = try a.create(ast.Expr);
-    e.* = .{ .is_null = .{ .e = c, .negated = false } };
+    const e = try ast.mk(a, .{ .is_null = .{ .e = c, .negated = false } });
     try testing.expectEqualStrings("(CASE WHEN \"b\" IS NULL OR 'z' IS NULL THEN NULL ELSE CONCAT(\"b\", 'z') END IS NULL)", (try translateExpr(a, e, .postgres, testSchema(), true)).?);
     try testing.expectEqualStrings("(CONCAT(`b`, 'z') IS NULL)", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
 }
@@ -969,10 +952,8 @@ test "translateExpr: AND of comparisons, per-dialect quoting" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const lit5 = try a.create(ast.Expr);
-    lit5.* = .{ .int_lit = 5 };
-    const lit9 = try a.create(ast.Expr);
-    lit9.* = .{ .int_lit = 9 };
+    const lit5 = try ast.mk(a, .{ .int_lit = 5 });
+    const lit9 = try ast.mk(a, .{ .int_lit = 9 });
     const e = try bin(a, .@"and", try bin(a, .ge, try fld(a, "a"), lit5), try bin(a, .lt, try fld(a, "c"), lit9));
     try testing.expectEqualStrings("((\"a\" >= 5) AND (\"c\" < 9))", (try translateExpr(a, e, .postgres, testSchema(), true)).?);
     try testing.expectEqualStrings("(([a] >= 5) AND ([c] < 9))", (try translateExpr(a, e, .sqlserver, testSchema(), true)).?);
@@ -990,8 +971,7 @@ test "translateExpr: a decimal literal is sent with every digit it was written w
         .{ .lit = .{ .unscaled = 12345678901234567890123456789012345678, .scale = 10 }, .want = "1234567890123456789012345678.9012345678" },
     };
     for (cases) |c| for ([_]Dialect{ .postgres, .mysql, .sqlserver, .starrocks }) |d| {
-        const lit = try a.create(ast.Expr);
-        lit.* = .{ .dec_lit = c.lit };
+        const lit = try ast.mk(a, .{ .dec_lit = c.lit });
         const got = (try translateExpr(a, try bin(a, .gt, try fld(a, "a"), lit), d, testSchema(), true)).?;
         try testing.expect(std.mem.endsWith(u8, got, try msgfmt.allocPrint(a, " > {s})", .{c.want})));
     };
@@ -1016,15 +996,12 @@ test "translateExpr: a quoted literal against a number or bool column is sent as
         .{ .col = "ok", .op = .ne, .lit = "f", .d = .sqlserver, .want = "([ok] <> 0)" },
     };
     for (cases) |c| {
-        const lit = try a.create(ast.Expr);
-        lit.* = .{ .str_lit = c.lit };
+        const lit = try ast.mk(a, .{ .str_lit = c.lit });
         const got = try translateExpr(a, try bin(a, c.op, try fld(a, c.col), lit), c.d, sch, true);
         if (c.want) |w| try testing.expectEqualStrings(w, got.?) else try testing.expect(got == null);
     }
-    const five = try a.create(ast.Expr);
-    five.* = .{ .str_lit = "5" };
-    const cast = try a.create(ast.Expr);
-    cast.* = .{ .cast = .{ .e = try intLit(a, 7), .ty = types.Type.decimal(10, 2) } };
+    const five = try ast.mk(a, .{ .str_lit = "5" });
+    const cast = try ast.mk(a, .{ .cast = .{ .e = try intLit(a, 7), .ty = types.Type.decimal(10, 2) } });
     const untyped = try bin(a, .lt, cast, five);
     try testing.expect((try translateExpr(a, untyped, .mysql, .{ .fields = &.{} }, false)) == null);
     try testing.expect(std.mem.endsWith(u8, (try translateExpr(a, untyped, .postgres, .{ .fields = &.{} }, false)).?, " < '5')"));
@@ -1034,8 +1011,7 @@ test "translateExpr: IS [NOT] DISTINCT FROM is native on postgres, `<=>` on the 
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const lit = try a.create(ast.Expr);
-    lit.* = .{ .int_lit = 5 };
+    const lit = try ast.mk(a, .{ .int_lit = 5 });
     const nd = try bin(a, .not_distinct, try fld(a, "a"), lit);
     const d = try bin(a, .distinct, try fld(a, "a"), lit);
     try testing.expectEqualStrings("(\"a\" IS NOT DISTINCT FROM 5)", (try translateExpr(a, nd, .postgres, testSchema(), true)).?);
@@ -1049,8 +1025,7 @@ test "translateExpr: is not null" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const e = try a.create(ast.Expr);
-    e.* = .{ .is_null = .{ .e = try fld(a, "a"), .negated = true } };
+    const e = try ast.mk(a, .{ .is_null = .{ .e = try fld(a, "a"), .negated = true } });
     try testing.expectEqualStrings("(`a` IS NOT NULL)", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
 }
 
@@ -1058,8 +1033,7 @@ test "translateExpr: a field the schema does not have is not pushed" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const lit = try a.create(ast.Expr);
-    lit.* = .{ .int_lit = 1 };
+    const lit = try ast.mk(a, .{ .int_lit = 1 });
     try testing.expect((try translateExpr(a, try bin(a, .eq, try fld(a, "zzz"), lit), .mysql, testSchema(), true)) == null);
 }
 
@@ -1067,8 +1041,7 @@ test "translateExpr: bitwise operators are never pushed down" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const four = try a.create(ast.Expr);
-    four.* = .{ .int_lit = 4 };
+    const four = try ast.mk(a, .{ .int_lit = 4 });
 
     const masked = try bin(a, .bit_and, try fld(a, "a"), four);
     const pred = try bin(a, .eq, masked, four);
@@ -1079,8 +1052,7 @@ test "translateExpr: bitwise operators are never pushed down" {
     for ([_]ast.BinOp{ .bit_or, .bit_xor, .shl, .shr }) |op| {
         try testing.expect((try translateExpr(a, try bin(a, op, try fld(a, "a"), four), .mysql, testSchema(), true)) == null);
     }
-    const notx = try a.create(ast.Expr);
-    notx.* = .{ .unary = .{ .op = .bit_not, .e = try fld(a, "a") } };
+    const notx = try ast.mk(a, .{ .unary = .{ .op = .bit_not, .e = try fld(a, "a") } });
     try testing.expect((try translateExpr(a, notx, .mysql, testSchema(), true)) == null);
 }
 
@@ -1088,13 +1060,10 @@ test "translateExpr: NOT over an OR with a bool literal" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const lit1 = try a.create(ast.Expr);
-    lit1.* = .{ .int_lit = 1 };
-    const f = try a.create(ast.Expr);
-    f.* = .{ .bool_lit = false };
+    const lit1 = try ast.mk(a, .{ .int_lit = 1 });
+    const f = try ast.mk(a, .{ .bool_lit = false });
     const or_e = try bin(a, .@"or", try bin(a, .gt, try fld(a, "a"), lit1), f);
-    const not_e = try a.create(ast.Expr);
-    not_e.* = .{ .unary = .{ .op = .not, .e = or_e } };
+    const not_e = try ast.mk(a, .{ .unary = .{ .op = .not, .e = or_e } });
     try testing.expectEqualStrings("(NOT ((`a` > 1)))", (try translateExpr(a, not_e, .mysql, testSchema(), true)).?);
 }
 
@@ -1278,16 +1247,13 @@ test "translateExpr: a safe (TRY_) cast is never pushed" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const from_text = try a.create(ast.Expr);
-    from_text.* = .{ .cast = .{ .e = try fld(a, "b"), .ty = types.Type.init(.int) } };
+    const from_text = try ast.mk(a, .{ .cast = .{ .e = try fld(a, "b"), .ty = types.Type.init(.int) } });
     try testing.expect((try translateExpr(a, from_text, .mysql, testSchema(), true)) == null);
 
-    const plain = try a.create(ast.Expr);
-    plain.* = .{ .cast = .{ .e = try fld(a, "a"), .ty = types.Type.init(.int) } };
+    const plain = try ast.mk(a, .{ .cast = .{ .e = try fld(a, "a"), .ty = types.Type.init(.int) } });
     try testing.expectEqualStrings("CAST(`a` AS SIGNED)", (try translateExpr(a, plain, .mysql, testSchema(), true)).?);
 
-    const safe = try a.create(ast.Expr);
-    safe.* = .{ .cast = .{ .e = try fld(a, "a"), .ty = types.Type.init(.int), .safe = true } };
+    const safe = try ast.mk(a, .{ .cast = .{ .e = try fld(a, "a"), .ty = types.Type.init(.int), .safe = true } });
     try testing.expect((try translateExpr(a, safe, .mysql, testSchema(), true)) == null);
     try testing.expect((try translateExpr(a, safe, .postgres, testSchema(), true)) == null);
     try testing.expect((try translateExpr(a, safe, .sqlserver, testSchema(), true)) == null);

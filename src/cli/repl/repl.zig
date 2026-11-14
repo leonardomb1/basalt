@@ -674,8 +674,7 @@ fn isDeclaration(st: ast.Stmt) bool {
 }
 
 fn mkExpr(a: std.mem.Allocator, e: ast.Expr) !*ast.Expr {
-    const p = try a.create(ast.Expr);
-    p.* = e;
+    const p = try ast.mk(a, e);
     return p;
 }
 

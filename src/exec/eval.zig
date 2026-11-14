@@ -381,8 +381,7 @@ pub fn litAs(arena: std.mem.Allocator, text: []const u8, ty: Type) error{OutOfMe
         .float => return .{ .float_lit = parseFloatStrict(s) orelse return null },
         .decimal => {
             const d = decimal.asDecimalValue(.{ .string = s }) orelse return null;
-            const inner = try arena.create(ast.Expr);
-            inner.* = .{ .str_lit = try formatDecimal(arena, d.unscaled, d.scale) };
+            const inner = try ast.mk(arena, .{ .str_lit = try formatDecimal(arena, d.unscaled, d.scale) });
             return .{ .cast = .{ .e = inner, .ty = Type.decimal(38, d.scale) } };
         },
         .bool => return .{ .bool_lit = textconv.boolText(.sql, s) orelse return null },

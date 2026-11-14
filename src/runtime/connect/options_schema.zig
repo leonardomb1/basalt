@@ -240,23 +240,17 @@ pub fn withEnv(arena: std.mem.Allocator, e: *const ast.Expr, mode: EnvMode, unse
 
 fn envRecur(cx: EnvCtx, e: *const ast.Expr) error{ OutOfMemory, EnvUnset }!*ast.Expr {
     if (envName(e)) |name| {
-        const out = try cx.arena.create(ast.Expr);
-        switch (cx.mode) {
-            .typed => {
-                const nul = try cx.arena.create(ast.Expr);
-                nul.* = .null_lit;
-                out.* = .{ .cast = .{ .e = nul, .ty = types.Type.init(.string).asNullable() } };
-            },
+        return switch (cx.mode) {
+            .typed => ast.mk(cx.arena, .{ .cast = .{ .e = try ast.mk(cx.arena, .null_lit), .ty = types.Type.init(.string).asNullable() } }),
             .read => {
                 const v = std.process.getEnvVarOwned(cx.arena, name) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
                     cx.unset.* = name;
                     return error.EnvUnset;
                 };
-                out.* = .{ .str_lit = v };
+                return ast.mk(cx.arena, .{ .str_lit = v });
             },
-        }
-        return out;
+        };
     }
     return ast.rebuildExpr(cx.arena, e, cx, envRecur);
 }

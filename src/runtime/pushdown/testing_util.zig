@@ -45,8 +45,7 @@ pub fn wholeSchema() types.Schema {
 pub const base_t = "SELECT * FROM t";
 
 pub fn qfld(arena: std.mem.Allocator, parts: []const []const u8) !*ast.Expr {
-    const e = try arena.create(ast.Expr);
-    e.* = .{ .field = try qual(arena, parts) };
+    const e = try ast.mk(arena, .{ .field = try qual(arena, parts) });
     return e;
 }
 
@@ -101,28 +100,24 @@ pub fn schema4() types.Schema {
 }
 
 pub fn intLit(arena: std.mem.Allocator, v: i64) !*ast.Expr {
-    const e = try arena.create(ast.Expr);
-    e.* = .{ .int_lit = v };
+    const e = try ast.mk(arena, .{ .int_lit = v });
     return e;
 }
 
 pub fn strLit(arena: std.mem.Allocator, s: []const u8) !*ast.Expr {
-    const e = try arena.create(ast.Expr);
-    e.* = .{ .str_lit = s };
+    const e = try ast.mk(arena, .{ .str_lit = s });
     return e;
 }
 
 pub fn callExpr(arena: std.mem.Allocator, name: []const u8, args: []const *ast.Expr) !*ast.Expr {
     const owned = try arena.alloc(*ast.Expr, args.len);
     @memcpy(owned, args);
-    const e = try arena.create(ast.Expr);
-    e.* = .{ .call = .{ .name = name, .args = owned } };
+    const e = try ast.mk(arena, .{ .call = .{ .name = name, .args = owned } });
     return e;
 }
 
 pub fn geFilter(arena: std.mem.Allocator, col: []const u8, v: i64) !ast.Stage {
-    const lit = try arena.create(ast.Expr);
-    lit.* = .{ .int_lit = v };
+    const lit = try ast.mk(arena, .{ .int_lit = v });
     return .{ .node = .{ .filter = try bin(arena, .ge, try fld(arena, col), lit) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
 }
 
@@ -146,8 +141,7 @@ pub fn expectWholeAggRefused(a: std.mem.Allocator, d: Dialect, ag: ast.Aggregate
 }
 
 pub fn eqFilter(arena: std.mem.Allocator, parts: []const []const u8, v: i64) !ast.Stage {
-    const lit = try arena.create(ast.Expr);
-    lit.* = .{ .int_lit = v };
+    const lit = try ast.mk(arena, .{ .int_lit = v });
     return .{ .node = .{ .filter = try bin(arena, .eq, try qfld(arena, parts), lit) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
 }
 

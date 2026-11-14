@@ -215,14 +215,12 @@ test "sumType equals the GROUP BY SUM's type (analyze/schema.zig aggResultType)"
     const a = ar.allocator();
     for (sum_args) |t| {
         const fields = [_]types.Schema.Field{.{ .name = "x", .ty = t }};
-        const e = try a.create(ast.Expr);
-        e.* = .{ .field = .{ .parts = &.{"x"} } };
+        const e = try ast.mk(a, .{ .field = .{ .parts = &.{"x"} } });
         var diag = Diag{};
         try expectSameType(try schema.aggResultType(a, .sum, e, .{ .fields = &fields }, &diag), sumType(t));
     }
     var diag = Diag{};
-    const n = try a.create(ast.Expr);
-    n.* = .null_lit;
+    const n = try ast.mk(a, .null_lit);
     try expectSameType(try schema.aggResultType(a, .sum, n, .{ .fields = &.{} }, &diag), sumType(types.Type.unknownNull()));
 }
 

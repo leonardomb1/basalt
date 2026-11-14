@@ -403,8 +403,7 @@ pub fn nameApart(arena: std.mem.Allocator, items: []ast.SelectItem) !void {
         var nm = try msgfmt.allocPrint(arena, "{s}_r", .{it.field.last()});
         var n: usize = 2;
         while (nameTaken(items, nm)) : (n += 1) nm = try msgfmt.allocPrint(arena, "{s}_r{d}", .{ it.field.last(), n });
-        const e = try arena.create(ast.Expr);
-        e.* = .{ .field = it.field };
+        const e = try ast.mk(arena, .{ .field = it.field });
         it.* = .{ .computed = .{ .name = nm, .expr = e } };
     }
 }
@@ -809,9 +808,7 @@ pub const Parser = struct {
     }
 
     pub fn mk(self: *Parser, e: ast.Expr) Error!*ast.Expr {
-        const p = try self.arena.create(ast.Expr);
-        p.* = e;
-        return p;
+        return ast.mk(self.arena, e);
     }
 
     pub fn isConn(self: *Parser, name: []const u8) bool {

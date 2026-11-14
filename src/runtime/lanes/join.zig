@@ -667,12 +667,9 @@ test "lane joins: right and full lanes mark one shared bitset, and one drain emi
     defer ar.deinit();
     const a = ar.allocator();
 
-    const rv = try a.create(ast.Expr);
-    rv.* = .{ .field = .{ .parts = &.{"rv"} } };
-    const x = try a.create(ast.Expr);
-    x.* = .{ .str_lit = "x" };
-    const not_x = try a.create(ast.Expr);
-    not_x.* = .{ .binary = .{ .op = .ne, .l = rv, .r = x } };
+    const rv = try ast.mk(a, .{ .field = .{ .parts = &.{"rv"} } });
+    const x = try ast.mk(a, .{ .str_lit = "x" });
+    const not_x = try ast.mk(a, .{ .binary = .{ .op = .ne, .l = rv, .r = x } });
 
     const build = try op_testing.kvBatch(a, &op_testing.join_right_schema, &.{ 1, 1, 2, 4, null }, &.{ "x", "y", "z", "w", "m" });
     const probes = [_][]const op.Batch{

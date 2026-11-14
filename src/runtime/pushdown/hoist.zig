@@ -278,11 +278,7 @@ fn swapKeysRecur(cx: KeySwap, e: *const ast.Expr) error{OutOfMemory}!*ast.Expr {
     return ast.rebuildExpr(cx.arena, e, cx, swapKeysRecur);
 }
 
-pub fn mkExpr(arena: std.mem.Allocator, e: ast.Expr) !*ast.Expr {
-    const p = try arena.create(ast.Expr);
-    p.* = e;
-    return p;
-}
+pub const mkExpr = ast.mk;
 
 /// A filter over the right side's join keys alone, restated over the left keys so
 /// it runs before an inner join: only references written with the right side's

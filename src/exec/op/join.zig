@@ -1786,12 +1786,9 @@ test "join: a residual over long key chains, past one pair buffer and the semi/a
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const rv = try a.create(ast.Expr);
-    rv.* = .{ .field = .{ .parts = &.{"rv"} } };
-    const x = try a.create(ast.Expr);
-    x.* = .{ .str_lit = "x" };
-    const residual = try a.create(ast.Expr);
-    residual.* = .{ .binary = .{ .op = .ne, .l = rv, .r = x } };
+    const rv = try ast.mk(a, .{ .field = .{ .parts = &.{"rv"} } });
+    const x = try ast.mk(a, .{ .str_lit = "x" });
+    const residual = try ast.mk(a, .{ .binary = .{ .op = .ne, .l = rv, .r = x } });
 
     var rk = std.array_list.Managed(?i64).init(a);
     var rvs = std.array_list.Managed(?[]const u8).init(a);
@@ -1865,12 +1862,9 @@ test "join: a key that multiplies rows comes out in bounded batches, in order, w
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const rv = try a.create(ast.Expr);
-    rv.* = .{ .field = .{ .parts = &.{"rv"} } };
-    const x = try a.create(ast.Expr);
-    x.* = .{ .str_lit = "x" };
-    const residual = try a.create(ast.Expr);
-    residual.* = .{ .binary = .{ .op = .ne, .l = rv, .r = x } };
+    const rv = try ast.mk(a, .{ .field = .{ .parts = &.{"rv"} } });
+    const x = try ast.mk(a, .{ .str_lit = "x" });
+    const residual = try ast.mk(a, .{ .binary = .{ .op = .ne, .l = rv, .r = x } });
     var rk = std.array_list.Managed(?i64).init(a);
     var rvs = std.array_list.Managed(?[]const u8).init(a);
     for (0..70_000) |_| {
@@ -1928,12 +1922,9 @@ test "join: a residual ON condition decides which key matches count, per join ki
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const rv = try a.create(ast.Expr);
-    rv.* = .{ .field = .{ .parts = &.{"rv"} } };
-    const x = try a.create(ast.Expr);
-    x.* = .{ .str_lit = "x" };
-    const residual = try a.create(ast.Expr);
-    residual.* = .{ .binary = .{ .op = .ne, .l = rv, .r = x } };
+    const rv = try ast.mk(a, .{ .field = .{ .parts = &.{"rv"} } });
+    const x = try ast.mk(a, .{ .str_lit = "x" });
+    const residual = try ast.mk(a, .{ .binary = .{ .op = .ne, .l = rv, .r = x } });
 
     const Case = struct { kind: ast.JoinKind, keys: []const ?i64, rvs: []const ?[]const u8 };
     const cases = [_]Case{
@@ -2339,12 +2330,9 @@ test "join spill: every kind, with and without a residual, gives the in-memory r
     const sd = try SpillDir.init(1 << 30);
     defer sd.deinit();
 
-    const rv = try a.create(ast.Expr);
-    rv.* = .{ .field = .{ .parts = &.{"rv"} } };
-    const x = try a.create(ast.Expr);
-    x.* = .{ .str_lit = "x" };
-    const residual = try a.create(ast.Expr);
-    residual.* = .{ .binary = .{ .op = .ne, .l = rv, .r = x } };
+    const rv = try ast.mk(a, .{ .field = .{ .parts = &.{"rv"} } });
+    const x = try ast.mk(a, .{ .str_lit = "x" });
+    const residual = try ast.mk(a, .{ .binary = .{ .op = .ne, .l = rv, .r = x } });
 
     const left = try genBatches(a, &join_left_schema, 300, 70, 1, 50, 17, "l");
     const right = try genBatches(a, &join_right_schema, 200, 45, 7, 60, 23, "r");
@@ -2571,12 +2559,9 @@ test "join spill: partitions past spill_at split again, two levels and more, for
     const sd = try SpillDir.init(1 << 30);
     defer sd.deinit();
 
-    const rv = try a.create(ast.Expr);
-    rv.* = .{ .field = .{ .parts = &.{"rv"} } };
-    const x = try a.create(ast.Expr);
-    x.* = .{ .str_lit = "x" };
-    const residual = try a.create(ast.Expr);
-    residual.* = .{ .binary = .{ .op = .ne, .l = rv, .r = x } };
+    const rv = try ast.mk(a, .{ .field = .{ .parts = &.{"rv"} } });
+    const x = try ast.mk(a, .{ .str_lit = "x" });
+    const residual = try ast.mk(a, .{ .binary = .{ .op = .ne, .l = rv, .r = x } });
 
     const left = try genBatches(a, &join_left_schema, 3000, 256, 7, 2500, 31, "l");
     const right = try genBatches(a, &join_right_schema, 4000, 300, 3, 1500, 41, "r");

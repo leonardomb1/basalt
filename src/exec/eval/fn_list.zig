@@ -123,8 +123,7 @@ fn isParam(l: ast.Expr.Lambda, name: []const u8) bool {
 fn bodyOf(arena: std.mem.Allocator, l: ast.Expr.Lambda) error{OutOfMemory}!*ast.Expr {
     const slots = try arena.alloc(*ast.Expr, l.params.len);
     for (slots, l.params) |*s, name| {
-        s.* = try arena.create(ast.Expr);
-        s.*.* = .{ .field = try ast.QualName.one(arena, name) };
+        s.* = try ast.mk(arena, .{ .field = try ast.QualName.one(arena, name) });
     }
     return row_eval.bindParams(arena, l, slots);
 }
@@ -249,16 +248,14 @@ fn reduce(arena: std.mem.Allocator, c: ast.Expr.Call, l: ast.Expr.Lambda, outer:
     var tc = TypeCtx{ .schema = outer.schema.*, .arena = arena };
     const acc_ty = (typing(&tc, c) catch return error.TypeMismatch).asNullable();
     var b = try column.Builder.initCapacity(arena, acc_ty, list.len);
-    const acc_slot = try arena.create(ast.Expr);
-    acc_slot.* = .null_lit;
+    const acc_slot = try ast.mk(arena, .null_lit);
     const slots = try arena.alloc(*ast.Expr, l.params.len);
     for (slots, l.params, 0..) |*s, name, i| {
         if (i == 0) {
             s.* = acc_slot;
             continue;
         }
-        s.* = try arena.create(ast.Expr);
-        s.*.* = .{ .field = try ast.QualName.one(arena, name) };
+        s.* = try ast.mk(arena, .{ .field = try ast.QualName.one(arena, name) });
     }
     const body = try row_eval.bindParams(arena, l, slots);
     for (0..list.len) |r| {

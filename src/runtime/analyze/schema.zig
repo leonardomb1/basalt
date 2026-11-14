@@ -624,8 +624,7 @@ pub fn orientKeys(arena: std.mem.Allocator, left: types.Schema, right: types.Sch
         if (d.b_left) fb.right = false;
         const as_written = fa.left and fb.right;
         const flipped = fb.left and fa.right;
-        const eq = try arena.create(ast.Expr);
-        eq.* = .{ .binary = .{ .op = .eq, .l = d.a, .r = d.b } };
+        const eq = try ast.mk(arena, .{ .binary = .{ .op = .eq, .l = d.a, .r = d.b } });
         if (fa.unknown orelse fb.unknown) |u|
             return failPos(diag, d.pos, "unknown column `{s}` in the ON of the join with `{s}` — neither side has it", .{ u, rname });
         if (as_written and flipped)
@@ -643,8 +642,7 @@ pub fn orientKeys(arena: std.mem.Allocator, left: types.Schema, right: types.Sch
             try rfilt.append(.{ .node = .{ .filter = eq }, .hints = &.{}, .pos = d.pos });
         } else if ((fa.left and fb.left) or (fa.right and fb.right)) {
             residual = if (residual) |r| blk: {
-                const both = try arena.create(ast.Expr);
-                both.* = .{ .binary = .{ .op = .@"and", .l = r, .r = eq } };
+                const both = try ast.mk(arena, .{ .binary = .{ .op = .@"and", .l = r, .r = eq } });
                 break :blk both;
             } else eq;
         } else return failPos(diag, d.pos, "each value of an `=` in the ON of the join with `{s}` must name one side's columns, not both", .{rname});
@@ -968,15 +966,13 @@ pub fn bindBodyVars(arena: std.mem.Allocator, stmts: []const ast.Stmt, map: *Par
 /// A literal of the right type (value irrelevant) to stand in for a param during
 /// type-flow when it has no declared default.
 pub fn typedZero(arena: std.mem.Allocator, ty: types.Type) Error!*const ast.Expr {
-    const e = try arena.create(ast.Expr);
-    e.* = switch (ty.kind) {
+    return ast.mk(arena, switch (ty.kind) {
         .int => .{ .int_lit = 0 },
         .float => .{ .float_lit = 0 },
         .string, .bytes => .{ .str_lit = "" },
         .bool => .{ .bool_lit = false },
         else => .null_lit,
-    };
-    return e;
+    });
 }
 
 const both_pinned: []const ast.KeyPin = &.{.{ .left = true, .right = true }};
@@ -1197,8 +1193,7 @@ test "analyze: a numeric aggregate of a string literal says to double-quote a co
     const a = ar.allocator();
     const f = [_]types.Schema.Field{.{ .name = "Kick-Off", .ty = types.Type.init(.int) }};
     var diag = Diag{};
-    const lit = try a.create(ast.Expr);
-    lit.* = .{ .str_lit = "Kick-Off" };
+    const lit = try ast.mk(a, .{ .str_lit = "Kick-Off" });
     try std.testing.expectError(error.AnalyzeFailed, aggResultType(a, .sum, lit, .{ .fields = &f }, &diag));
     try std.testing.expect(std.mem.indexOf(u8, diag.msg, "sum(\"Kick-Off\")") != null);
 }
@@ -1338,8 +1333,7 @@ test "SUM's type under GROUP BY and as a window equals the old switches, over ev
         }
         if (!aggregates.Arg.numeric.accepts(t)) continue;
         const fields = [_]types.Schema.Field{.{ .name = "x", .ty = t }};
-        const e = try a.create(ast.Expr);
-        e.* = .{ .field = .{ .parts = &.{"x"} } };
+        const e = try ast.mk(a, .{ .field = .{ .parts = &.{"x"} } });
         var diag = Diag{};
         const got = try aggResultType(a, .sum, e, .{ .fields = &fields }, &diag);
         try std.testing.expect(types.Type.eql(old.groupBy(t), got));

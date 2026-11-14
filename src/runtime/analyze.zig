@@ -233,11 +233,7 @@ pub fn bindLimits(arena: std.mem.Allocator, stages: []const ast.Stage, params: *
     return out orelse stages;
 }
 
-pub fn mk(arena: std.mem.Allocator, e: ast.Expr) Error!*const ast.Expr {
-    const p = try arena.create(ast.Expr);
-    p.* = e;
-    return p;
-}
+pub const mk = ast.mk;
 
 pub fn exprType(arena: std.mem.Allocator, in: types.Schema, e: *const ast.Expr, diag: *Diag) Error!types.Type {
     var ctx = eval.TypeCtx{ .schema = in, .arena = arena };
@@ -286,8 +282,7 @@ fn litFor(cx: CoerceCtx, text: []const u8, other: *const ast.Expr) Error!?*ast.E
     };
     if (t.unknown or !(t.kind.isNumeric() or t.kind == .bool)) return null;
     const lit = (try eval.litAs(cx.arena, text, t)) orelse return null;
-    const p = try cx.arena.create(ast.Expr);
-    p.* = lit;
+    const p = try ast.mk(cx.arena, lit);
     return p;
 }
 
@@ -1005,8 +1000,7 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
                 try params_map.put(l.name, env_mod.mkLit(arena, v) catch return error.OutOfMemory);
             } else try params_map.put(l.name, try substExpr(arena, le, &params_map));
         } else {
-            const ph = try arena.create(ast.Expr);
-            ph.* = .null_lit;
+            const ph = try ast.mk(arena, .null_lit);
             try params_map.put(l.name, ph);
         }
     };

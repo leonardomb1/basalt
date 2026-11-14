@@ -825,11 +825,7 @@ pub fn loopValue(arena: std.mem.Allocator, cell: []const u8, ty: ?types.Type) Va
     };
 }
 
-pub fn mk(arena: std.mem.Allocator, e: ast.Expr) anyerror!*ast.Expr {
-    const p = try arena.create(ast.Expr);
-    p.* = e;
-    return p;
-}
+pub const mk = ast.mk;
 
 /// The DSL has no date, time or decimal literal, so those become their text
 /// cast to their own type: a DATE param stays a DATE and a decimal keeps its digits.
