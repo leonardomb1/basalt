@@ -143,27 +143,77 @@ pub const Rows = struct {
         return r;
     }
 
-    /// Appends one validated row: each column's key, the last of its name, read as its
-    /// column's type, NULL when absent or unreadable. Rows mostly repeat one key order,
-    /// so each key is first tried as the column after the last one matched.
+    /// Appends one row, validated here: each column's key, the last of its name, read as
+    /// its column's type, NULL when absent or unreadable. An object is validated and its
+    /// members picked in one pass (`jt.objectMembers`); a key not among the columns is
+    /// refused only once the whole row is known to be JSON, as a validated row's was.
     pub fn add(self: *Rows, arena: std.mem.Allocator, row: []const u8) Error!void {
-        const vals = self.vals;
-        const fields = self.schema.fields;
-        @memset(vals, null);
+        @memset(self.vals, null);
         if (row[0] == '{') {
-            var m = jt.Members.root(row);
-            var at: usize = 0;
-            while (m.next()) |mem| {
-                const key = try jt.decodeString(arena, mem.key);
-                const ci = if (at < fields.len and std.mem.eql(u8, fields[at].name, key)) at else self.index.get(key) orelse {
-                    if (self.known.contains(key)) continue;
-                    return pastSample("the key `{s}` is not among the keys of the rows sampled to type the columns, so its values would be dropped", .{clip(key)});
-                };
-                vals[ci] = mem.value;
-                at = ci + 1;
-            }
+            var pick = Pick{ .rows = self, .arena = arena };
+            jt.objectMembers(row, &pick) catch |e| switch (e) {
+                error.Fallback => return self.addDeep(arena, row),
+                error.InvalidJson => return error.InvalidJson,
+                error.OutOfMemory => return error.OutOfMemory,
+            };
+            if (pick.stray) |key| return strayKey(key);
+        } else try jt.validate(arena, row);
+        return self.append(arena);
+    }
+
+    /// The object row at the start of `t` read in the one pass that finds its end: how
+    /// many bytes it took, or null when it is not read so, the caller then cutting the
+    /// row out and handing it to `add`. Nothing is appended unless it was read whole.
+    pub fn addPrefix(self: *Rows, arena: std.mem.Allocator, t: []const u8) Error!?usize {
+        @memset(self.vals, null);
+        var pick = Pick{ .rows = self, .arena = arena };
+        const end = jt.objectPrefix(t, &pick) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidJson, error.Fallback => return null,
+        };
+        if (pick.stray) |key| return strayKey(key);
+        try self.append(arena);
+        return end;
+    }
+
+    /// A row nested past what `jt.objectMembers` reads alone, validated whole first.
+    fn addDeep(self: *Rows, arena: std.mem.Allocator, row: []const u8) Error!void {
+        try jt.validate(arena, row);
+        var pick = Pick{ .rows = self, .arena = arena };
+        var m = jt.Members.root(row);
+        while (m.next()) |mem| try pick.member(mem.key, false, mem.value);
+        if (pick.stray) |key| return strayKey(key);
+        return self.append(arena);
+    }
+
+    /// Where each member of a row goes: rows mostly repeat one key order, so a key is
+    /// first tried as the column after the last one matched.
+    const Pick = struct {
+        rows: *Rows,
+        arena: std.mem.Allocator,
+        at: usize = 0,
+        stray: ?[]const u8 = null,
+
+        pub fn member(p: *Pick, raw_key: []const u8, plain: bool, value: []const u8) jt.Error!void {
+            const key = if (plain) raw_key else try jt.decodeString(p.arena, raw_key);
+            const fields = p.rows.schema.fields;
+            const ci = if (p.at < fields.len and std.mem.eql(u8, fields[p.at].name, key)) p.at else p.rows.index.get(key) orelse {
+                if (!p.rows.known.contains(key) and p.stray == null) p.stray = key;
+                return;
+            };
+            p.rows.vals[ci] = value;
+            p.at = ci + 1;
         }
-        for (self.builders, vals, fields, self.fast) |*b, raw, f, fa| {
+    };
+
+    fn strayKey(key: []const u8) Error {
+        return pastSample("the key `{s}` is not among the keys of the rows sampled to type the columns, so its values would be dropped", .{clip(key)});
+    }
+
+    /// The picked values appended to their columns.
+    fn append(self: *Rows, arena: std.mem.Allocator) Error!void {
+        const fields = self.schema.fields;
+        for (self.builders, self.vals, fields, self.fast) |*b, raw, f, fa| {
             if (raw) |t| if (try appendFast(b, fa, t)) continue;
             b.append(try read(arena, raw, f)) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
@@ -346,6 +396,23 @@ pub const Scan = struct {
         }
     }
 
+    /// The unread text from the next non-blank byte, for a reader that finds a row's
+    /// end itself and then takes it with `advance`; null at the end of what is held.
+    pub fn unread(self: *Scan) Error!?[]const u8 {
+        if (self.array) return null;
+        _ = (try self.peek()) orelse return null;
+        return self.buf.items[self.at..];
+    }
+
+    /// Takes the next `n` bytes as read, releasing the mapped pages behind them.
+    pub fn advance(self: *Scan, n: usize) void {
+        self.at += n;
+        if (self.mapped and self.at - self.released >= release_every) {
+            filemap.dropPages(self.buf.items[self.released..self.at]);
+            self.released = self.at;
+        }
+    }
+
     /// Whether the input is one top-level array, judged by its first byte.
     pub fn detect(self: *Scan) Error!bool {
         return (try self.peek()) == '[';
@@ -384,11 +451,7 @@ pub const Scan = struct {
         while (true) {
             const t = self.buf.items[self.at..];
             if (valueEnd(t, self.eof)) |end| {
-                self.at += end;
-                if (self.mapped and self.at - self.released >= release_every) {
-                    filemap.dropPages(self.buf.items[self.released..self.at]);
-                    self.released = self.at;
-                }
+                self.advance(end);
                 return t[0..end];
             }
             if (self.eof) return error.InvalidJson;
@@ -404,7 +467,7 @@ pub const Scan = struct {
             '{', '[' => {
                 var depth: usize = 0;
                 var j: usize = 0;
-                while (std.mem.indexOfAnyPos(u8, t, j, "\"{}[]")) |k| {
+                while (jt.findAny("\"{}[]", t, j)) |k| {
                     j = k;
                     switch (t[j]) {
                         '"' => {
@@ -430,7 +493,7 @@ pub const Scan = struct {
 
     fn stringEnd(t: []const u8, i: usize) ?usize {
         var j = i + 1;
-        while (std.mem.indexOfAnyPos(u8, t, j, "\"\\")) |k| {
+        while (jt.findAny("\"\\", t, j)) |k| {
             if (t[k] == '"') return k + 1;
             j = k + 2;
         }
@@ -485,7 +548,7 @@ pub const Reader = struct {
         var held = std.array_list.Managed([]const u8).init(arena);
         try held.appendSlice(self.held);
         while (held.items.len < opts.sample) {
-            const row = (try self.nextRow(arena)) orelse {
+            const row = (try self.nextRow(arena, true)) orelse {
                 infer.whole = opts.alone;
                 break;
             };
@@ -506,7 +569,14 @@ pub const Reader = struct {
                 self.held_at += 1;
                 continue;
             }
-            const row = (try self.nextRow(arena)) orelse {
+            if (self.elems == null and self.whole == null) if (try self.scan.unread()) |t| if (t[0] == '{') {
+                if (try rows.addPrefix(arena, t)) |n| {
+                    self.scan.advance(n);
+                    self.rows_seen += 1;
+                    continue;
+                }
+            };
+            const row = (try self.nextRow(arena, false)) orelse {
                 self.done = true;
                 break;
             };
@@ -516,12 +586,13 @@ pub const Reader = struct {
         return try rows.finish(arena, &self.schema);
     }
 
-    /// The next row's text after the held ones, validated.
-    fn nextRow(self: *Reader, arena: std.mem.Allocator) Error!?[]const u8 {
+    /// The next row's text after the held ones, validated when `check`; a row for a
+    /// batch is left to `Rows.add`, which validates it as it reads it.
+    fn nextRow(self: *Reader, arena: std.mem.Allocator, check: bool) Error!?[]const u8 {
         const row = if (self.elems) |*e| e.next() else if (self.whole != null) null else try self.scan.next();
         const r = row orelse return null;
         self.rows_seen += 1;
-        try jt.validate(arena, r);
+        if (check) try jt.validate(arena, r);
         return r;
     }
 

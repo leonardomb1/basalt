@@ -44,6 +44,10 @@ const Validator = struct {
 
     const E = error{ Invalid, Fallback };
 
+    fn members(v: *Validator, sink: anytype, whole: bool) MembersError!void {
+        return readMembers(v, sink, whole);
+    }
+
     fn run(v: *Validator) E!void {
         v.ws();
         try v.value();
@@ -208,6 +212,131 @@ const Validator = struct {
     }
 };
 
+pub const ReadError = error{ InvalidJson, OutOfMemory, Fallback };
+
+/// Object `t` validated and read in one pass, each member handed in order to
+/// `sink.member(key, plain, value)`: `key` the text between its quotes, `plain` when
+/// it holds neither an escape nor a byte past ASCII (so it reads as it stands),
+/// `value` the value's raw text. It accepts and refuses what `validate` does: a
+/// plain string is found a vector at a time, and anything else, an escape, a byte
+/// past ASCII, a number, a literal or a nested value, goes through `Validator`'s own
+/// steps. `error.Fallback` leaves a document nested past `max_depth` to the caller,
+/// for `validate` to decide.
+pub fn objectMembers(t: []const u8, sink: anytype) ReadError!void {
+    _ = try readObject(t, sink, true);
+}
+
+/// `objectMembers` over the object at the start of `t`, after any whitespace, with
+/// whatever follows it left alone: how far it reached, the object's last byte
+/// included. A row read straight from a scan's buffer this way is found and read in
+/// the one pass.
+pub fn objectPrefix(t: []const u8, sink: anytype) ReadError!usize {
+    return readObject(t, sink, false);
+}
+
+fn readObject(t: []const u8, sink: anytype, whole: bool) ReadError!usize {
+    var v = Validator{ .t = t };
+    v.members(sink, whole) catch |e| return switch (e) {
+        error.Invalid => error.InvalidJson,
+        error.Fallback => error.Fallback,
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidJson => error.InvalidJson,
+    };
+    return v.i;
+}
+
+const MembersError = Validator.E || Error;
+
+fn readMembers(v: *Validator, sink: anytype, whole: bool) MembersError!void {
+    const t = v.t;
+    v.ws();
+    if (v.i >= t.len or t[v.i] != '{') return error.Invalid;
+    v.i += 1;
+    v.depth = 1;
+    v.ws();
+    if (v.i < t.len and t[v.i] == '}') {
+        v.i += 1;
+    } else while (true) {
+        v.ws();
+        if (v.i >= t.len or t[v.i] != '"') return error.Invalid;
+        var key: []const u8 = undefined;
+        var plain = true;
+        if (plainStringEnd(t, v.i + 1)) |k| {
+            key = t[v.i + 1 .. k];
+            v.i = k + 1;
+        } else {
+            key = try v.string();
+            plain = false;
+        }
+        v.ws();
+        if (v.i >= t.len or t[v.i] != ':') return error.Invalid;
+        v.i += 1;
+        v.ws();
+        const vs = v.i;
+        if (v.i < t.len and t[v.i] == '"') {
+            if (plainStringEnd(t, v.i + 1)) |k| v.i = k + 1 else _ = try v.string();
+        } else try v.value();
+        try sink.member(key, plain, t[vs..v.i]);
+        v.ws();
+        if (v.i >= t.len) return error.Invalid;
+        switch (t[v.i]) {
+            ',' => v.i += 1,
+            '}' => {
+                v.i += 1;
+                break;
+            },
+            else => return error.Invalid,
+        }
+    }
+    if (!whole) return;
+    v.ws();
+    if (v.i != t.len) return error.Invalid;
+}
+
+/// The closing quote of the string whose content starts at `i`, when that content is
+/// plain: printable ASCII with no escape, the string `Validator.string` accepts as it
+/// stands. Null leaves the string to `Validator.string`.
+fn plainStringEnd(t: []const u8, i: usize) ?usize {
+    const n = 32;
+    const V = @Vector(n, u8);
+    var j = i;
+    while (j + n <= t.len) : (j += n) {
+        const c: V = t[j..][0..n].*;
+        const stop = maskOf(c == @as(V, @splat('"'))) | maskOf(c == @as(V, @splat('\\'))) |
+            maskOf(c < @as(V, @splat(0x20))) | maskOf(c >= @as(V, @splat(0x80)));
+        if (stop != 0) {
+            const k = j + @ctz(stop);
+            return if (t[k] == '"') k else null;
+        }
+    }
+    while (j < t.len) : (j += 1) switch (t[j]) {
+        '"' => return j,
+        '\\', 0...0x1F, 0x80...0xFF => return null,
+        else => {},
+    };
+    return null;
+}
+
+fn maskOf(b: @Vector(32, bool)) u32 {
+    return @bitCast(b);
+}
+
+/// The first byte at or after `from` in `t` that is one of `set`, a vector at a time:
+/// `std.mem.indexOfAnyPos` tests each byte against the set in turn.
+pub fn findAny(comptime set: []const u8, t: []const u8, from: usize) ?usize {
+    const n = 32;
+    const V = @Vector(n, u8);
+    var j = from;
+    while (j + n <= t.len) : (j += n) {
+        const c: V = t[j..][0..n].*;
+        var m: u32 = 0;
+        inline for (set) |b| m |= maskOf(c == @as(V, @splat(b)));
+        if (m != 0) return j + @ctz(m);
+    }
+    while (j < t.len) : (j += 1) inline for (set) |b| if (t[j] == b) return j;
+    return null;
+}
+
 fn isDigit(c: u8) bool {
     return c >= '0' and c <= '9';
 }
@@ -234,7 +363,7 @@ fn skipWs(t: []const u8, i_in: usize) usize {
 fn stringEnd(t: []const u8, i: usize) usize {
     var j = i + 1;
     while (true) {
-        j = std.mem.indexOfAnyPos(u8, t, j, "\"\\").?;
+        j = findAny("\"\\", t, j).?;
         if (t[j] == '"') return j + 1;
         j += 2;
     }
@@ -249,7 +378,7 @@ fn valueEnd(t: []const u8, i: usize) usize {
             var depth: usize = 0;
             var j = i;
             while (true) {
-                j = std.mem.indexOfAnyPos(u8, t, j, "\"{}[]").?;
+                j = findAny("\"{}[]", t, j).?;
                 switch (t[j]) {
                     '"' => {
                         j = stringEnd(t, j);
@@ -749,4 +878,71 @@ test "json: reads every generated document as std.json does, and every damaged o
         }
     }
     try testing.expect(checked > 8000);
+}
+
+fn genLongString(r: std.Random, w: *std.Io.Writer) !void {
+    try w.writeByte('"');
+    const n = r.uintLessThan(usize, 90);
+    const odd = if (r.boolean()) r.uintLessThan(usize, n + 1) else n + 1;
+    for (0..n + 1) |k| {
+        if (k == odd) {
+            try w.writeAll(([_][]const u8{ "\\n", "\\\"", "\xc3\xa9", "\\u00e9", "\x01", "\\" })[r.uintLessThan(usize, 6)]);
+        } else if (k < n) try w.writeByte("abcdefghijklmnopqrstuvwxyz0123456789 -_:,{}[]"[r.uintLessThan(usize, 45)]);
+    }
+    try w.writeByte('"');
+}
+
+const TestPick = struct {
+    got: std.ArrayListUnmanaged(Members.Member) = .empty,
+    a: std.mem.Allocator,
+
+    pub fn member(p: *TestPick, key: []const u8, plain: bool, value: []const u8) Error!void {
+        if (plain) for (key) |c| if (c == '\\' or c >= 0x80) return error.InvalidJson;
+        try p.got.append(p.a, .{ .key = key, .value = value });
+    }
+};
+
+test "json: objectMembers accepts and refuses what validate does, and hands back the members Members reads" {
+    var prng = std.Random.DefaultPrng.init(20261114);
+    const r = prng.random();
+    var agreed: usize = 0;
+    for (0..30000) |round| {
+        var ar = std.heap.ArenaAllocator.init(testing.allocator);
+        defer ar.deinit();
+        const a = ar.allocator();
+        var aw = std.Io.Writer.Allocating.init(a);
+        const w = &aw.writer;
+        try w.writeAll(([_][]const u8{ "{", " { " })[r.uintLessThan(usize, 2)]);
+        const n = r.uintLessThan(usize, 6);
+        for (0..n) |k| {
+            if (k > 0) try w.writeAll(([_][]const u8{ ",", " , " })[r.uintLessThan(usize, 2)]);
+            if (r.boolean()) try genLongString(r, w) else try genString(r, w);
+            try w.writeAll(([_][]const u8{ ":", " : " })[r.uintLessThan(usize, 2)]);
+            if (r.uintLessThan(u8, 3) == 0) try genLongString(r, w) else try genValue(r, w, 1);
+        }
+        try w.writeAll(([_][]const u8{ "}", "} ", "}\n" })[r.uintLessThan(usize, 3)]);
+        var doc: []u8 = try a.dupe(u8, aw.written());
+        if (round % 3 == 0) doc[r.uintLessThan(usize, doc.len)] = ([_]u8{ '"', '\\', ',', ']', '}', '1', ' ', 0x01, 0xff, 'e', ':' })[r.uintLessThan(usize, 11)];
+
+        const valid = if (validate(a, doc)) |_| true else |_| false;
+        var picked = TestPick{ .a = a };
+        const mine = if (objectMembers(doc, &picked)) |_| true else |e| switch (e) {
+            error.Fallback => valid,
+            else => false,
+        };
+        if (mine != valid) {
+            std.debug.print("objectMembers {} but validate {} on `{s}`\n", .{ mine, valid, doc });
+            return error.TestUnexpectedResult;
+        }
+        if (!valid) continue;
+        agreed += 1;
+        var it = Members.root(doc[skipWs(doc, 0)..]);
+        for (picked.got.items) |m| {
+            const want = it.next() orelse return error.TestUnexpectedResult;
+            try testing.expectEqualStrings(want.key, m.key);
+            try testing.expectEqualStrings(want.value, m.value);
+        }
+        try testing.expect(it.next() == null);
+    }
+    try testing.expect(agreed > 15000);
 }
