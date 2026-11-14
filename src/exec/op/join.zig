@@ -106,9 +106,7 @@ fn concatBatches(state: std.mem.Allocator, chunks: []const Batch, schema: *const
 /// What `JoinIndex` adds over `rows` keyed rows of `nk` keys: the table's slots, a
 /// record per key (hash, words, mask, first row) and a chain link per row.
 fn indexOverhead(rows: usize, nk: usize) usize {
-    var slots: usize = 16;
-    while (slots * 7 < (rows + 1) * 10) slots *= 2;
-    return slots * @sizeOf(u32) + rows * (3 * @sizeOf(u64) + nk * @sizeOf(i64) + @sizeOf(u32));
+    return keytable.GroupTable.capAtLeast(rows, 16) * @sizeOf(u32) + rows * (3 * @sizeOf(u64) + nk * @sizeOf(i64) + @sizeOf(u32));
 }
 
 pub const KeyClass = enum { i64s, bytes, boxed };
@@ -605,8 +603,7 @@ pub const JoinIndex = struct {
         fn fill(b: *Build, p: usize) !void {
             const ix = b.ix;
             const rows_ = b.order[b.starts[p]..b.starts[p + 1]];
-            var slots: usize = 16;
-            while (slots * 7 < (rows_.len + 1) * 10) slots *= 2;
+            const slots = keytable.GroupTable.capAtLeast(rows_.len, 16);
             const pt = &ix.parts[p];
             pt.* = .{};
             if (b.enc) |e| if (ix.keys.len == 1) return b.fillInts(pt, rows_, e.keys, slots);

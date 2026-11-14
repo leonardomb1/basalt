@@ -502,7 +502,13 @@ pub const GroupTable = struct {
 
     /// The smallest power of two, at least 256, holding `n` keys under the load limit.
     pub fn capFor(n: usize) usize {
-        var cap: usize = 256;
+        return capAtLeast(n, 256);
+    }
+
+    /// The smallest power of two, at least `floor`, holding `n` keys under the load
+    /// limit: a join's index, which never grows, sizes each partition by it.
+    pub fn capAtLeast(n: usize, floor: usize) usize {
+        var cap = floor;
         while ((n + 1) * 10 >= cap * 7) cap *= growth;
         return cap;
     }
