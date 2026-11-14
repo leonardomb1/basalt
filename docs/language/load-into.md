@@ -12,7 +12,7 @@ AS
 - File target by quoted path — the extension picks the writer:
   `LOAD INTO '/out/x.csv'`, `LOAD INTO '/out/x.parquet'`,
   `LOAD INTO '/out/x.arrow'` (Arrow IPC file; also `.feather`, `.ipc`, and
-  `.arrows` for the stream format, local paths only), or an object-store
+  `.arrows` for the stream format), or an object-store
   path `LOAD INTO 'az://account/container/bronze/x.parquet'` or
   `LOAD INTO 's3://bucket/bronze/x.parquet'`.
 - A StarRocks or Doris table loads by Stream Load. `USING` names how a load's
