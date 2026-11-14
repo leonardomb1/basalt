@@ -1143,7 +1143,7 @@ pub const Window = struct {
         if (chunks.len == 1) return start;
         const p = chunks[chunks.len - 2];
         for (self.part, arrs) |k, x| {
-            const last = try KeyArr.prepare(t, try column.slice(t, p.columns[k.idx], p.len - 1, 1), k);
+            const last = try KeyArr.prepare(t, try column.permute(t, p.columns[k.idx], &.{p.len - 1}), k);
             if (last.orderAcross(0, x, 0) != .eq) return at;
         }
         return start;
@@ -1947,4 +1947,32 @@ test "layout across chunks and threads marks the same partitions and peer groups
         if (l.pend[k] - 1 > k) try testing.expectEqual(l.pstart[k], l.pstart[l.pend[k] - 1]);
         if (l.gend[k] - 1 > k) try testing.expectEqual(l.gstart[k], l.gstart[l.gend[k] - 1]);
     }
+}
+
+test "window lastPartStart: a partition key whose nulls start in the previous chunk's last bits keeps the next chunk in its partition" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = try a.create(types.Schema);
+    schema.* = .{ .fields = &.{.{ .name = "p", .ty = types.Type.init(.int).asNullable() }} };
+    const h = try Held.create(testing.allocator);
+    defer h.destroy();
+    var first: [16]?i64 = @splat(null);
+    for (first[0..13]) |*x| x.* = 0;
+    const nulls: [8]?i64 = @splat(null);
+    for ([_][]const ?i64{ &first, &nulls }) |vals| {
+        const cols = try a.alloc(column.Column, 1);
+        cols[0] = try column.intColumn(a, vals);
+        try h.add(.{ .schema = schema, .columns = cols, .len = vals.len });
+    }
+    const w = Window{
+        .child = undefined,
+        .in_schema = schema,
+        .out_schema = schema,
+        .part = &[_]Sort.Key{.{ .idx = 0, .desc = false, .nulls_first = false }},
+        .ord = &.{},
+        .funcs = &.{},
+        .gpa = testing.allocator,
+    };
+    try testing.expectEqual(@as(usize, 13), try w.lastPartStart(a, h, 13));
 }
