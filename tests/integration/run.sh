@@ -10,8 +10,7 @@
 # Suite names: mysql postgres sqlserver starrocks doris sftp smb azure parquet s3 arrow
 # stdout kernel
 # (arrow needs `uv`: it reads the stream back with pyarrow; stdout needs nothing;
-# kernel needs python3; azure needs the `az` CLI and s3 python3, to put the Delta
-# table)
+# kernel needs python3; azure and s3 need python3, to put the Delta table)
 # Scripts are Basalt SQL (the BSL parser was removed in v0.2.0); connection
 # attrs are passed as `OPTIONS(...)` bodies.
 set -euo pipefail
@@ -1189,9 +1188,9 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM 'az://devstoreacc
     tail -3 "$out/empty.log"
   fi
 
-  # The Delta table, put by az with the names as they are on disk.
-  if lakebuild && az storage blob upload-batch --only-show-errors --overwrite -d basalt-it --destination-path lake -s "$out/lake" \
-       --connection-string "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=$AZURE_STORAGE_KEY;BlobEndpoint=$AZURE_BLOB_ENDPOINT/devstoreaccount1;" >/dev/null; then
+  # The Delta table, put by a Shared Key signer of the suite's own (not basalt's)
+  # with the names as they are on disk.
+  if lakebuild && python3 tests/integration/azure_put.py "$AZURE_BLOB_ENDPOINT" devstoreaccount1 "$AZURE_STORAGE_KEY" basalt-it lake "$out/lake"; then
     lakert azure "az://devstoreaccount1/basalt-it/lake/"
   else
     report "azure-lake (upload error)" bad
