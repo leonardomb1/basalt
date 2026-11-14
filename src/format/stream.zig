@@ -23,6 +23,7 @@ const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
 const zipsrc = @import("compress/zip.zig");
 const inflate = @import("compress/inflate.zig");
+const ReadAhead = @import("readahead.zig").ReadAhead;
 
 pub const LINE_BUF = 64 * 1024;
 
@@ -86,6 +87,8 @@ pub const Stream = struct {
     zstd_state: std.compress.zstd.Decompress = undefined,
     gunzip: inflate.Gunzip = undefined,
     codec_bufs: ?CodecBufs = null,
+    /// A local file's decoding run a thread ahead of its parser (`readahead.zig`).
+    ahead: ?*ReadAhead = null,
 
     const CodecBufs = struct { window: []u8, buf: []u8 };
 
@@ -134,6 +137,7 @@ pub const Stream = struct {
     /// The current one stays open until `path` has opened, so `close` after a failure
     /// still closes exactly one.
     pub fn reopen(self: *Stream, path: []const u8) !void {
+        self.stopAhead();
         const old = self.backend;
         try self.attach(path);
         closeBackend(old);
@@ -141,7 +145,12 @@ pub const Stream = struct {
     }
 
     pub fn close(self: *Stream) void {
+        self.stopAhead();
         closeBackend(self.backend);
+    }
+
+    fn stopAhead(self: *Stream) void {
+        if (self.ahead) |a| a.stop();
     }
 
     fn closeBackend(backend: Backend) void {
@@ -209,6 +218,16 @@ pub const Stream = struct {
                 self.zstd_state = .init(self.reader, cbuf, .{});
                 self.reader = &self.zstd_state.reader;
             },
+        }
+        if (self.codec != .none and self.backend == .file) {
+            if (self.ahead) |a| {
+                try a.restart(self.reader);
+            } else {
+                const a = try self.arena.create(ReadAhead);
+                try a.start(self.arena, self.reader);
+                self.ahead = a;
+            }
+            self.reader = &self.ahead.?.reader;
         }
     }
 
