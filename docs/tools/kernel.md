@@ -10,7 +10,9 @@ declares it (even one that only declares), whatever its type, as a JavaScript
 `let` holds its value from line to line: `LET t = now()` is one instant for
 every later script, and `LET n = (SELECT count(*) ...)` or a list from
 `array_agg` is not queried again, however its source changes. Declare it again
-to recompute it. The REPL keeps `LET`s the same way.
+to recompute it. The REPL keeps `LET`s the same way. A script whose declarations
+do not check with the session's still runs to report why, but none of them is
+kept, so it cannot fail the scripts after it.
 
 ## Requests
 

@@ -146,6 +146,7 @@ pub const Pending = @import("prepare.zig").Pending;
 pub const Prepared = @import("prepare.zig").Prepared;
 pub const PrepareError = @import("prepare.zig").PrepareError;
 pub const sessionText = @import("prepare.zig").sessionText;
+pub const declarationsStand = @import("prepare.zig").declarationsStand;
 pub const prepareEntry = @import("prepare.zig").prepareEntry;
 pub const LetFreezer = @import("prepare.zig").LetFreezer;
 pub const appendDisplaySinks = @import("repl/repl.zig").appendDisplaySinks;

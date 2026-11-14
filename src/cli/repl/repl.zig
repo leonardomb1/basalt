@@ -9,6 +9,7 @@ const declOf = @import("../entry.zig").declOf;
 const splitStatements = @import("../entry.zig").splitStatements;
 const Editor = @import("line.zig").Editor;
 const LetFreezer = @import("../prepare.zig").LetFreezer;
+const declarationsStand = @import("../prepare.zig").declarationsStand;
 const LineResult = @import("line.zig").Result;
 const analyze = @import("../../runtime/analyze.zig");
 const ast = @import("../../lang/ast.zig");
@@ -516,7 +517,7 @@ pub fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg
     const prog = entry.prog;
     const pending = entry.pending;
 
-    for (pending) |p| try sess.decls.put(p.id, p.text);
+    if (try declarationsStand(a, &sess.decls, pending)) for (pending) |p| try sess.decls.put(p.id, p.text);
 
     if (entry.executable == 0) {
         for (pending) |p| if (p.id.kind == .let) {

@@ -259,6 +259,10 @@ def main(binary):
     os.remove(lf)
     r = rows(data)
     report("a LET declared anew holds its new value; the others keep theirs", st["ok"] and r and r[0]["vs"] == [1, 2, 3, 4] and r[0]["cnt"] == 2, (data, st))
+    _, st = k.run("LET bad = cardinality($vs);")
+    data, st2 = k.run("SELECT $cnt AS cnt;")
+    report("a declaration that does not check is refused without poisoning the session",
+           not st["ok"] and st2["ok"] and rows(data) == [{"cnt": 2}], (st, data, st2))
 
     # UTF-16 offsets for a JavaScript editor: an emoji is two units, four bytes.
     k.send(op="complete", id="u16", script="SELECT '😀' AS x, dbl(1) AS y ORDER BY d", pos=40, utf16=True)

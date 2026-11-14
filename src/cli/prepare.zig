@@ -3,6 +3,7 @@
 
 const DeclId = @import("entry.zig").DeclId;
 const DeclStore = @import("entry.zig").DeclStore;
+const checkText = @import("cmd_check.zig").checkText;
 const Value = @import("../exec/value.zig").Value;
 const ast = @import("../lang/ast.zig");
 const declOf = @import("entry.zig").declOf;
@@ -92,6 +93,30 @@ pub fn prepareEntry(a: std.mem.Allocator, decls: *const DeclStore, block: []cons
         }
     }
     return .{ .text = text, .entry_at = entry_at, .prog = prog, .pending = pending.items, .executable = executable };
+}
+
+/// Whether the session's declarations, with an entry's own (`pending`) in place of
+/// those they declare anew, check without error by themselves. An entry whose
+/// declarations do not is still run, to report why, but leaves the session as it
+/// was, so a declaration that cannot stand never fails the entries after it.
+pub fn declarationsStand(a: std.mem.Allocator, decls: *const DeclStore, pending: []const Pending) !bool {
+    if (pending.len == 0) return true;
+    var buf = std.array_list.Managed(u8).init(a);
+    for (decls.items.items) |e| {
+        const shadowed = for (pending) |p| {
+            if (p.id.kind == e.kind and std.ascii.eqlIgnoreCase(p.id.name, e.name)) break true;
+        } else false;
+        if (shadowed) continue;
+        try buf.appendSlice(e.text);
+        try buf.appendSlice(";\n");
+    }
+    for (pending) |p| {
+        try buf.appendSlice(p.text);
+        try buf.appendSlice(";\n");
+    }
+    const issues = try checkText(a, buf.items, "<repl>", ".", .{ .declarations_only = true });
+    for (issues) |is| if (!is.warning) return false;
+    return true;
 }
 
 /// Collects the values an entry's LETs are given as it runs, copied out of the run,
