@@ -49,7 +49,6 @@ const driver = @import("../connect/driver.zig");
 const retry_mod = @import("../connect/retry.zig");
 const scheme = @import("scheme.zig");
 const http_client = @import("../net/http_client.zig");
-const percent = @import("../net/percent.zig");
 const FakeServer = @import("../testing/http_fake.zig").FakeServer;
 const http_fake = @import("../testing/http_fake.zig");
 const s3 = @import("s3.zig");
@@ -563,23 +562,6 @@ pub fn find(url: []const u8) ?*const Provider {
     const s = scheme.of(url);
     for (providers) |p| if (p.scheme == s) return p;
     return null;
-}
-
-pub const EncodeSlash = enum { keep_slash, encode_slash };
-
-/// URI encoding as both providers sign it (SigV4's, and Shared Key's encoded
-/// path): unreserved characters pass, the rest become uppercase %XX. A path keeps
-/// '/'; a query value encodes it too.
-pub fn uriEncode(arena: std.mem.Allocator, s: []const u8, slash: EncodeSlash) ![]const u8 {
-    var aw = std.Io.Writer.Allocating.init(arena);
-    switch (slash) {
-        inline else => |sl| std.Uri.Component.percentEncode(&aw.writer, s, struct {
-            fn keep(c: u8) bool {
-                return percent.isUnreserved(c) or (sl == .keep_slash and c == '/');
-            }
-        }.keep) catch return error.OutOfMemory,
-    }
-    return aw.toOwnedSlice();
 }
 
 pub fn isUrl(url: []const u8) bool {

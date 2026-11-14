@@ -868,13 +868,7 @@ fn escapePath(w: *std.Io.Writer, s: []const u8) !void {
 /// A relative path as the log's URI form: everything but unreserved characters,
 /// `/` and `=` percent-encoded.
 fn uriPath(arena: std.mem.Allocator, rel: []const u8) ![]const u8 {
-    var aw = std.Io.Writer.Allocating.init(arena);
-    try std.Uri.Component.percentEncode(&aw.writer, rel, struct {
-        fn keep(ch: u8) bool {
-            return percent.isUnreserved(ch) or ch == '/' or ch == '=';
-        }
-    }.keep);
-    return aw.written();
+    return percent.encodeAlloc(arena, rel, "/=");
 }
 
 fn statsJson(arena: std.mem.Allocator, p: *const Plan, sum: pqwrite.Writer.Summary) ![]const u8 {

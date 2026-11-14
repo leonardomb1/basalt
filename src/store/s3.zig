@@ -44,6 +44,7 @@ const std = @import("std");
 const HttpClient = @import("../net/http_std.zig");
 const msgfmt = @import("../format/msgfmt.zig");
 const objstore = @import("objstore.zig");
+const percent = @import("../net/percent.zig");
 const scheme = @import("scheme.zig");
 const http_fake = @import("../testing/http_fake.zig");
 const xml = @import("../format/xml/token.zig");
@@ -165,7 +166,7 @@ pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8
     if (bucket.len == 0 or key.len == 0) return Error.S3BadUrl;
 
     const region = regionFromEnv(arena);
-    const enc_key = try objstore.uriEncode(arena, key, .keep_slash);
+    const enc_key = try percent.encodeAlloc(arena, key, "/");
     const base = try bucketBase(arena, bucket, region, endpoint);
     const sep: []const u8 = if (std.mem.endsWith(u8, base.uri_path, "/")) "" else "/";
     return .{
@@ -410,9 +411,9 @@ const ListPage = struct {
     fn page(c: ListPage, token: []const u8) ![]const u8 {
         var q = std.array_list.Managed([]const u8).init(c.arena);
         if (token.len > 0)
-            try q.append(try msgfmt.allocPrint(c.arena, "continuation-token={s}", .{try objstore.uriEncode(c.arena, token, .encode_slash)}));
+            try q.append(try msgfmt.allocPrint(c.arena, "continuation-token={s}", .{try percent.encodeAlloc(c.arena, token, "")}));
         try q.append("list-type=2");
-        try q.append(try msgfmt.allocPrint(c.arena, "prefix={s}", .{try objstore.uriEncode(c.arena, c.prefix, .encode_slash)}));
+        try q.append(try msgfmt.allocPrint(c.arena, "prefix={s}", .{try percent.encodeAlloc(c.arena, c.prefix, "")}));
 
         var url = std.array_list.Managed(u8).init(c.arena);
         try url.appendSlice(c.base_url);
@@ -585,7 +586,7 @@ pub const MultipartWriter = struct {
                     const ids = try xml.elementTexts(w.up.alloc(), r.body, "UploadId");
                     if (ids.len == 0) return w.failed(r);
                     w.upload_id = try w.arena.dupe(u8, ids[0]);
-                    w.upload_id_enc = try objstore.uriEncode(w.arena, w.upload_id.?, .encode_slash);
+                    w.upload_id_enc = try percent.encodeAlloc(w.arena, w.upload_id.?, "");
                     return .done;
                 }
                 if (try w.createBucketIfMissing(r.code, r.body)) return .again;
@@ -874,7 +875,7 @@ test "sigv4: AWS example 2 — PUT object with payload hash and extra headers" {
     const a = ar.allocator();
     const ph = try payloadHash(a, "Welcome to Amazon S3.");
     try std.testing.expectEqualStrings("44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072", ph);
-    try std.testing.expectEqualStrings("test%24file.text", try objstore.uriEncode(a, "test$file.text", .keep_slash));
+    try std.testing.expectEqualStrings("test%24file.text", try percent.encodeAlloc(a, "test$file.text", "/"));
     const h = try authHeader(a, example_access, example_secret, .{
         .method = "PUT",
         .uri_path = "/test%24file.text",

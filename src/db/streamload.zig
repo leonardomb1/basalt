@@ -54,7 +54,7 @@ const obs = @import("../runtime/obs.zig");
 const op = @import("../exec/op.zig");
 const Space = @import("../exec/space.zig").Space;
 const deflate = @import("../format/compress/deflate.zig");
-const isUnreserved = @import("../net/percent.zig").isUnreserved;
+const percent = @import("../net/percent.zig");
 
 const TIMEOUT_S = 600;
 const MAX_AGE_NS = TIMEOUT_S / 2 * std.time.ns_per_s;
@@ -159,9 +159,9 @@ fn loadUrl(gpa: std.mem.Allocator, base: []const u8, db: []const u8, table: []co
     errdefer aw.deinit();
     const w = &aw.writer;
     try w.print("{s}/api/", .{base});
-    try std.Uri.Component.percentEncode(w, db, isUnreserved);
+    try percent.writeEncoded(w, db, "");
     try w.writeByte('/');
-    try std.Uri.Component.percentEncode(w, table, isUnreserved);
+    try percent.writeEncoded(w, table, "");
     try w.writeAll("/_stream_load");
     return aw.toOwnedSlice();
 }

@@ -41,6 +41,7 @@ const std = @import("std");
 const HttpClient = @import("../net/http_std.zig");
 const msgfmt = @import("../format/msgfmt.zig");
 const objstore = @import("objstore.zig");
+const percent = @import("../net/percent.zig");
 const scheme = @import("scheme.zig");
 const http_fake = @import("../testing/http_fake.zig");
 const civil = @import("../exec/civil.zig");
@@ -92,7 +93,7 @@ pub fn parseUrl(arena: std.mem.Allocator, url: []const u8, endpoint: ?[]const u8
     if (account.len == 0 or container.len == 0 or path.len == 0) return Error.AzureBadUrl;
 
     const base = try containerBase(arena, account, container, endpoint);
-    const enc = try objstore.uriEncode(arena, path, .keep_slash);
+    const enc = try percent.encodeAlloc(arena, path, "/");
     const url_path = try msgfmt.allocPrint(arena, "{s}/{s}", .{ base.path, enc });
     return .{
         .account = account,
@@ -314,7 +315,7 @@ pub const BlockBlobWriter = struct {
     fn stageBlock(self: *BlockBlobWriter, bytes: []const u8) !void {
         const id = try self.blockId(self.block_ids.items.len);
         const a = self.up.fresh();
-        const id_enc = try objstore.uriEncode(a, id, .encode_slash);
+        const id_enc = try percent.encodeAlloc(a, id, "");
         const url = try msgfmt.allocPrint(a, "{s}?comp=block&blockid={s}", .{ self.blob.url, id_enc });
 
         const sign = Sign{
@@ -641,9 +642,9 @@ test "query values escape the base64 characters that are not URL-safe" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    try std.testing.expectEqualStrings("%2B", try objstore.uriEncode(a, "+", .encode_slash));
-    try std.testing.expectEqualStrings("a%2Fb%3D%3D", try objstore.uriEncode(a, "a/b==", .encode_slash));
-    try std.testing.expectEqualStrings("YmxrMDA", try objstore.uriEncode(a, "YmxrMDA", .encode_slash));
+    try std.testing.expectEqualStrings("%2B", try percent.encodeAlloc(a, "+", ""));
+    try std.testing.expectEqualStrings("a%2Fb%3D%3D", try percent.encodeAlloc(a, "a/b==", ""));
+    try std.testing.expectEqualStrings("YmxrMDA", try percent.encodeAlloc(a, "YmxrMDA", ""));
 }
 
 test "parseUrl: host-style URL and signature for the real service" {
@@ -748,9 +749,9 @@ const ListPage = struct {
 
     fn page(c: ListPage, marker: []const u8) ![]const u8 {
         const url = if (marker.len == 0)
-            try msgfmt.allocPrint(c.arena, "{s}?restype=container&comp=list&prefix={s}", .{ c.base, try objstore.uriEncode(c.arena, c.prefix, .encode_slash) })
+            try msgfmt.allocPrint(c.arena, "{s}?restype=container&comp=list&prefix={s}", .{ c.base, try percent.encodeAlloc(c.arena, c.prefix, "") })
         else
-            try msgfmt.allocPrint(c.arena, "{s}?restype=container&comp=list&prefix={s}&marker={s}", .{ c.base, try objstore.uriEncode(c.arena, c.prefix, .encode_slash), try objstore.uriEncode(c.arena, marker, .encode_slash) });
+            try msgfmt.allocPrint(c.arena, "{s}?restype=container&comp=list&prefix={s}&marker={s}", .{ c.base, try percent.encodeAlloc(c.arena, c.prefix, ""), try percent.encodeAlloc(c.arena, marker, "") });
 
         var q = std.array_list.Managed([]const u8).init(c.arena);
         try q.append("comp:list");
