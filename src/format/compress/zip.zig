@@ -30,6 +30,8 @@ const sftp = @import("../../store/sftp.zig");
 const smb = @import("../../store/smb.zig");
 const scheme = @import("../../store/scheme.zig");
 const fits = @import("../bytes.zig").fits;
+const inflate = @import("inflate.zig");
+const Crc32 = @import("../../base/crc32.zig").Crc32;
 
 pub const Error = error{
     ZipMemberNotFound,
@@ -57,7 +59,7 @@ pub const Member = struct {
         smb,
     },
     limited: std.Io.Reader.Limited,
-    inflate: std.compress.flate.Decompress,
+    inflate: inflate.Inflate,
     checked: Checked,
 
     pub fn close(self: *Member) void {
@@ -241,8 +243,8 @@ pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8)
     switch (e.method) {
         .store => m.reader = &m.limited.interface,
         .deflate => {
-            const window = try arena.alloc(u8, std.compress.flate.max_window_len);
-            m.inflate = std.compress.flate.Decompress.init(&m.limited.interface, .raw, window);
+            const window = try arena.alloc(u8, inflate.buffer_len);
+            m.inflate = inflate.Inflate.init(&m.limited.interface, .raw, window);
             m.reader = &m.inflate.reader;
         },
         else => unreachable,
@@ -262,7 +264,7 @@ pub fn openMember(arena: std.mem.Allocator, path: []const u8, want: ?[]const u8)
 /// would read as wrong bytes.
 const Checked = struct {
     in: *std.Io.Reader,
-    crc: std.hash.Crc32 = .init(),
+    crc: Crc32 = .{},
     n: u64 = 0,
     want_crc: u32,
     want_len: u64,

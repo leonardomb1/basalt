@@ -31,6 +31,7 @@ const driver = @import("../../exec/driver.zig");
 const decode = @import("decode.zig");
 const schema_mod = @import("schema.zig");
 const std = @import("std");
+const inflate = @import("../compress/inflate.zig");
 const stream = @import("../stream.zig");
 const types = @import("../../lang/types.zig");
 const varint = @import("../../base/varint.zig");
@@ -243,7 +244,7 @@ pub const Reader = struct {
             .null => return raw,
             .deflate => {
                 var src: std.Io.Reader = .fixed(raw);
-                var d = std.compress.flate.Decompress.init(&src, .raw, try a.alloc(u8, std.compress.flate.max_window_len));
+                var d = inflate.Inflate.init(&src, .raw, try a.alloc(u8, inflate.buffer_len));
                 return self.pump(&d.reader, "deflate", cap);
             },
             .zstandard => {

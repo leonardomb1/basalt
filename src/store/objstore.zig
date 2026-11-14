@@ -224,16 +224,14 @@ fn exchangeOnce(arena: std.mem.Allocator, client: *HttpClient, call: Call, locat
         return out;
     }
     if (call.method == .HEAD) return out;
-    if (resp.head.content_encoding == .compress) return error.UnsupportedCompressionMethod;
     var aw = std.Io.Writer.Allocating.init(arena);
     var transfer_buf: [64]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const reader = resp.readerDecompressing(&transfer_buf, &decompress, http_client.decompress_direct);
+    const reader = try http_client.decodedBody(arena, &resp, &transfer_buf);
     var left: usize = call.max_body orelse std.math.maxInt(usize);
     while (true) {
         const n = reader.stream(&aw.writer, .limited(left +| 1)) catch |e| switch (e) {
             error.EndOfStream => break,
-            error.ReadFailed => return resp.bodyErr().?,
+            error.ReadFailed => return resp.bodyErr() orelse error.CorruptCompressedBody,
             error.WriteFailed => return error.OutOfMemory,
         };
         if (n > left) return error.HttpBodyTooLarge;

@@ -115,6 +115,7 @@ const obs = @import("../exec/obs.zig");
 const trace = @import("../base/iotrace.zig");
 const percent = @import("../base/percent.zig");
 const scheme = @import("../store/scheme.zig");
+const inflate = @import("../format/compress/inflate.zig");
 const http_fake = @import("../testing/http_fake.zig");
 
 /// The most one response body may decode to, a page or a login reply.
@@ -395,6 +396,36 @@ pub fn encodeSpaces(arena: std.mem.Allocator, url: []const u8) ![]const u8 {
 }
 
 pub const decompress_direct: []u8 = &.{};
+
+/// A response's body with its `Content-Encoding` undone by basalt's own decoders:
+/// gzip (concatenated members read as one), deflate (a zlib stream, as RFC 9110 has
+/// it) and zstd, each decoder and its window in `arena`. The body is read by its
+/// framing whatever the method (`framedReader`). A `ReadFailed` the transfer
+/// did not raise (`bodyErr` null) is the decoder's: the body is not what its
+/// encoding says.
+pub fn decodedBody(arena: std.mem.Allocator, resp: *HttpClient.Response, transfer_buf: []u8) !*std.Io.Reader {
+    const ce = resp.head.content_encoding;
+    if (ce == .compress) return error.UnsupportedCompressionMethod;
+    const raw = resp.framedReader(transfer_buf);
+    switch (ce) {
+        .identity, .compress => return raw,
+        .gzip => {
+            const g = try arena.create(inflate.Gunzip);
+            g.init(raw, try arena.alloc(u8, inflate.buffer_len), try arena.alloc(u8, 64 << 10));
+            return &g.interface;
+        },
+        .deflate => {
+            const d = try arena.create(inflate.Inflate);
+            d.* = .init(raw, .zlib, try arena.alloc(u8, inflate.buffer_len));
+            return &d.reader;
+        },
+        .zstd => {
+            const z = try arena.create(std.compress.zstd.Decompress);
+            z.* = .init(raw, try arena.alloc(u8, std.compress.zstd.default_window_len + std.compress.zstd.block_size_max), .{});
+            return &z.reader;
+        },
+    }
+}
 
 pub fn initClient(gpa: std.mem.Allocator) HttpClient {
     var client = HttpClient{ .allocator = gpa };

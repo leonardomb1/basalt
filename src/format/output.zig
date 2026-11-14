@@ -115,7 +115,7 @@ pub const Output = struct {
             return one[0];
         }
         var fr = f.reader(try arena.alloc(u8, stream.LINE_BUF));
-        var gz: stream.Gunzip = undefined;
+        var gz: @import("compress/inflate.zig").Gunzip = undefined;
         gz.init(&fr.interface, try arena.alloc(u8, stream.codecBuffer(.gzip)), try arena.alloc(u8, stream.LINE_BUF));
         var last: ?u8 = null;
         while (true) {

@@ -23,6 +23,7 @@
 const std = @import("std");
 const pagecache = @import("../../exec/pagecache.zig");
 const deflate = @import("deflate.zig");
+const inflate_mod = @import("inflate.zig");
 const varint = @import("../../base/varint.zig");
 
 pub const Codec = enum(i32) {
@@ -92,12 +93,13 @@ fn inflate(
     out: []u8,
     container: std.compress.flate.Container,
 ) Error!void {
-    const win = try arena.alloc(u8, std.compress.flate.max_window_len);
+    const win = try arena.alloc(u8, inflate_mod.buffer_len);
     defer arena.free(win);
-    var in: std.Io.Reader = .fixed(src);
-    var d = std.compress.flate.Decompress.init(&in, container, win);
-    d.reader.readSliceAll(out) catch return Error.CorruptCompressedData;
-    try expectExhausted(&d.reader);
+    inflate_mod.decompress(src, out, switch (container) {
+        .raw => .raw,
+        .gzip => .gzip,
+        .zlib => .zlib,
+    }, win) catch return Error.CorruptCompressedData;
 }
 
 fn zstdDecode(arena: std.mem.Allocator, src: []const u8, out: []u8) Error!void {

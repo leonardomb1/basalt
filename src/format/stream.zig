@@ -22,6 +22,7 @@ const scheme = @import("../store/scheme.zig");
 const sftp = @import("../store/sftp.zig");
 const smb = @import("../store/smb.zig");
 const zipsrc = @import("compress/zip.zig");
+const inflate = @import("compress/inflate.zig");
 
 pub const LINE_BUF = 64 * 1024;
 
@@ -70,43 +71,10 @@ pub fn isUrl(path: []const u8) bool {
 pub fn codecBuffer(codec: Codec) usize {
     return switch (codec) {
         .none => 0,
-        .gzip => std.compress.flate.max_window_len,
+        .gzip => inflate.buffer_len,
         .zstd => std.compress.zstd.default_window_len + std.compress.zstd.block_size_max,
     };
 }
-
-pub const Gunzip = struct {
-    src: *std.Io.Reader,
-    dec: std.compress.flate.Decompress,
-    window: []u8,
-    interface: std.Io.Reader,
-
-    pub fn init(self: *Gunzip, src: *std.Io.Reader, window: []u8, buf: []u8) void {
-        self.* = .{
-            .src = src,
-            .dec = .init(src, .gzip, window),
-            .window = window,
-            .interface = .{ .vtable = &.{ .stream = streamFn }, .buffer = buf, .seek = 0, .end = 0 },
-        };
-    }
-
-    fn streamFn(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
-        const self: *Gunzip = @fieldParentPtr("interface", r);
-        while (true) {
-            return self.dec.reader.stream(w, limit) catch |e| switch (e) {
-                error.EndOfStream => {
-                    _ = self.src.peekByte() catch |e2| return switch (e2) {
-                        error.EndOfStream => error.EndOfStream,
-                        error.ReadFailed => error.ReadFailed,
-                    };
-                    self.dec = .init(self.src, .gzip, self.window);
-                    continue;
-                },
-                else => |x| return x,
-            };
-        }
-    }
-};
 
 pub const Stream = struct {
     reader: *std.Io.Reader,
@@ -115,8 +83,8 @@ pub const Stream = struct {
     arena: std.mem.Allocator,
     backend: Backend,
     read_buf: [LINE_BUF]u8 = undefined,
-    codec_state: std.http.Decompress = undefined,
-    gunzip: Gunzip = undefined,
+    zstd_state: std.compress.zstd.Decompress = undefined,
+    gunzip: inflate.Gunzip = undefined,
     codec_bufs: ?CodecBufs = null,
 
     const CodecBufs = struct { window: []u8, buf: []u8 };
@@ -137,7 +105,6 @@ pub const Stream = struct {
         client: HttpClient,
         req: HttpClient.Request,
         response: HttpClient.Response,
-        decompress: std.http.Decompress = undefined,
         redirect_buf: [8 * 1024]u8 = undefined,
         transfer_buf: [LINE_BUF]u8 = undefined,
     };
@@ -239,7 +206,8 @@ pub const Stream = struct {
             },
             .zstd => {
                 const cbuf = try self.arena.alloc(u8, codecBuffer(.zstd));
-                self.reader = std.http.Decompress.init(&self.codec_state, self.reader, cbuf, .zstd);
+                self.zstd_state = .init(self.reader, cbuf, .{});
+                self.reader = &self.zstd_state.reader;
             },
         }
     }
@@ -264,15 +232,7 @@ pub const Stream = struct {
         var opening: HttpOpen = .{ .arena = arena, .hf = hf, .uri = uri, .extra = extra };
         try objstore.retry(.{ .rand = prng.random() }, &opening, HttpOpen.attempt);
         errdefer hf.req.deinit();
-        const ce = hf.response.head.content_encoding;
-        if (ce == .compress) return error.UnsupportedCompressionMethod;
-        const win = switch (ce) {
-            .zstd => codecBuffer(.zstd),
-            .gzip, .deflate => codecBuffer(.gzip),
-            .compress, .identity => 0,
-        };
-        const dbuf: []u8 = if (win > 0) try arena.alloc(u8, win) else &.{};
-        self.reader = hf.response.readerDecompressing(&hf.transfer_buf, &hf.decompress, dbuf);
+        self.reader = try http_client.decodedBody(arena, &hf.response, &hf.transfer_buf);
         return hf;
     }
 

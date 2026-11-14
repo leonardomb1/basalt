@@ -38,6 +38,7 @@
 //! unit-tested; the network paths need a live server.
 
 const std = @import("std");
+const http_client = @import("../net/http_client.zig");
 const HttpClient = @import("../net/http_std.zig");
 const msgfmt = @import("../base/msgfmt.zig");
 const explain = @import("../exec/eval/support.zig").explain;
@@ -801,9 +802,11 @@ pub const StreamLoadSink = struct {
         var body_aw = std.Io.Writer.Allocating.init(self.gpa);
         defer body_aw.deinit();
         var transfer: [64]u8 = undefined;
-        var decompress: std.http.Decompress = undefined;
-        _ = res.readerDecompressing(&transfer, &decompress, &.{}).streamRemaining(&body_aw.writer) catch |e| switch (e) {
-            error.ReadFailed => return res.bodyErr() orelse e,
+        var body_arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer body_arena.deinit();
+        const decoded = try http_client.decodedBody(body_arena.allocator(), &res, &transfer);
+        _ = decoded.streamRemaining(&body_aw.writer) catch |e| switch (e) {
+            error.ReadFailed => return res.bodyErr() orelse error.CorruptCompressedBody,
             else => return e,
         };
         const body = body_aw.writer.buffered();

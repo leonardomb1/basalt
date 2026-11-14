@@ -722,6 +722,17 @@ pub const Response = struct {
         return req.reader.bodyReader(transfer_buffer, head.transfer_encoding, head.content_length);
     }
 
+    /// The body as its framing (chunked, a length, or to the close) delivers it,
+    /// still in its `Content-Encoding`, whatever the method, as `readerDecompressing`
+    /// takes it: `reader` returns none for a PUT, whose answer can carry one.
+    ///
+    /// Asserts that this function is only called once.
+    pub fn framedReader(response: *Response, transfer_buffer: []u8) *Reader {
+        response.head.invalidateStrings();
+        const head = &response.head;
+        return response.request.reader.bodyReader(transfer_buffer, head.transfer_encoding, head.content_length);
+    }
+
     /// If compressed body has been negotiated this will return decompressed bytes.
     ///
     /// If the returned `Reader` returns `error.ReadFailed` the error is
