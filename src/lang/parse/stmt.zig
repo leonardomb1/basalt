@@ -7,10 +7,8 @@ const Error = @import("../sql_parser.zig").Error;
 const PendingSemiJoin = Parser.PendingSemiJoin;
 const Pos = @import("../sql_parser.zig").Pos;
 const ast = @import("../ast.zig");
-const binOpText = @import("../sql_parser.zig").binOpText;
 const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const print = @import("../print.zig");
-const quote = @import("../quote.zig");
 const std = @import("std");
 
 /// A script that opens with EXPLAIN explains the whole script offline, without
@@ -320,7 +318,7 @@ pub fn exprToTemplate(self: *Parser, e: *const ast.Expr) Error![]const u8 {
 }
 
 pub fn templatePart(self: *Parser, buf: *std.array_list.Managed(u8), e0: *const ast.Expr) Error!void {
-    const e = typedText(e0);
+    const e = print.typedText(e0);
     switch (e.*) {
         .str_lit => |s| return buf.appendSlice(s),
         .int_lit => |v| return buf.writer().print("{d}", .{v}),
@@ -336,65 +334,27 @@ pub fn templatePart(self: *Parser, buf: *std.array_list.Managed(u8), e0: *const 
     try buf.append('}');
 }
 
-/// A string literal a typed parameter took as a CAST (a table function's DATE
-/// argument), read back as the text it was written as.
-fn typedText(e: *const ast.Expr) *const ast.Expr {
-    return if (e.* == .cast and e.cast.e.* == .str_lit) e.cast.e else e;
-}
+/// `${ }` hole text: script keywords and operators, every binary and every unary's
+/// operand parenthesised, a typed string literal as its text, and no kind a hole
+/// cannot hold. A call drops its DISTINCT.
+const hole: print.Mode(void) = .{
+    .field = print.plainField,
+    .float = .scientific,
+    .dialect = .script,
+    .grouping = .script,
+    .refuses = &.{ .lambda_var, .match, .index, .cast, .is_null, .let_in, .lambda },
+    .typed_text = true,
+    .distinct = false,
+};
 
 /// Print an expression back as `${ }` hole text; `$name` already parsed to a bare
 /// field, so it prints as `name`.
 pub fn unparse(self: *Parser, buf: *std.array_list.Managed(u8), e: *const ast.Expr) Error!void {
-    switch (typedText(e).*) {
-        .null_lit => try buf.appendSlice("null"),
-        .bool_lit => |b| try buf.appendSlice(if (b) "true" else "false"),
-        .int_lit => |v| try buf.writer().print("{d}", .{v}),
-        .float_lit => |v| try buf.writer().print("{e}", .{v}),
-        .dec_lit => |v| try buf.writer().print("{f}", .{v}),
-        .str_lit => |s| try quote.strLit(buf, s),
-        .field => |q| {
-            var w = buf.writer().adaptToNewApi(&.{});
-            print.name(&w.new_interface, q) catch return error.OutOfMemory;
-        },
-        .call => |c| {
-            try buf.appendSlice(c.name);
-            try buf.append('(');
-            for (c.args, 0..) |arg, i| {
-                if (i > 0) try buf.appendSlice(", ");
-                try self.unparse(buf, arg);
-            }
-            try buf.append(')');
-        },
-        .binary => |b| {
-            try buf.append('(');
-            try self.unparse(buf, b.l);
-            try buf.append(' ');
-            try buf.appendSlice(binOpText(b.op));
-            try buf.append(' ');
-            try self.unparse(buf, b.r);
-            try buf.append(')');
-        },
-        .unary => |u| {
-            try buf.appendSlice(switch (u.op) {
-                .not => "not ",
-                .neg => "-",
-                .bit_not => "~",
-            });
-            try buf.append('(');
-            try self.unparse(buf, u.e);
-            try buf.append(')');
-        },
-        .cond => |c| {
-            try buf.appendSlice("if(");
-            try self.unparse(buf, c.cond);
-            try buf.appendSlice(", ");
-            try self.unparse(buf, c.then);
-            try buf.appendSlice(", ");
-            try self.unparse(buf, c.els);
-            try buf.append(')');
-        },
-        else => return self.fail(self.curPos(), "expression too complex to use as a dynamic identifier or predicate", .{}),
-    }
+    var w = buf.writer().adaptToNewApi(&.{});
+    print.Printer(void, hole).walk(.{ .ctx = {}, .w = &w.new_interface }, e) catch |err| switch (err) {
+        error.WriteFailed => return error.OutOfMemory,
+        error.Refused => return self.fail(self.curPos(), "expression too complex to use as a dynamic identifier or predicate", .{}),
+    };
 }
 
 test "unparse and print give text that parses back to the same expression: a negated negation, a quoted name, NOT over a sign" {

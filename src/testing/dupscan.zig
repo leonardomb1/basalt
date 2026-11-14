@@ -426,6 +426,7 @@ pub const plan = [_]Rule{
         "lang/sql_lexer.zig",
         "runtime/connect/sql_read.zig",
     } },
+    .{ .home = "print", .pattern = print_pattern, .exact = true, .allow = &.{"lang/print.zig"} },
 };
 
 pub const civil_pattern = "719_?468|146_?097|719_?16[23]|25_?56[789]|24_?107|2_?440_?588|86_400_000_000|std\\.time\\.epoch\\.";
@@ -492,6 +493,9 @@ pub const split_and_pattern = "\\.binary\\.op == \\.@\"and\"\\) \\{";
 pub const pushable_pattern = "\"(lower|upper|trim|substr|replace|concat|coalesce|left|right|repeat|reverse|like|starts_with|ends_with|contains|nullif|length|strlen)\", \"(lower|upper|trim|substr|replace|concat|coalesce|left|right|repeat|reverse|like|starts_with|ends_with|contains|nullif|length|strlen)\"|eql(IgnoreCase)?\\((u8, )?[^\"]*\"(lower|upper|trim|substr|replace|concat|coalesce|left|right|repeat|reverse|like|starts_with|ends_with|contains|nullif|length|strlen)\"\\)";
 pub const widen_pattern = "== \\.int and \\(\\S+ == \\.decimal or|== \\.decimal and \\S+ == \\.float";
 pub const minmax_pattern = "\\.(min|max|lo|hi)(\\[\\w+\\])? = try \\w+\\.own\\(";
+/// A private operator-text table or expression printer; `print.Printer` under a
+/// `Mode` is the one walker.
+pub const print_pattern = "\\.shl => \"<<\"|\\.@\"and\" => \"|\\.not => \"\\(?(not|NOT) \"";
 
 fn startsOf(pattern: []const u8, text: []const u8, span: Span) ![]usize {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -717,7 +721,7 @@ test "dupscan plan patterns: what each one catches and what it lets through" {
     try expectStarts(guard_pattern, "errdefer w.abort();\n    if (a) { b(); }\n    try w.close();", .file, &.{0});
 }
 
-test "dupscan queue, sql, guard, delta_types, unsigned, widen and clamp patterns" {
+test "dupscan queue, sql, guard, delta_types, unsigned, widen, clamp and print patterns" {
     try expectNeedles(queue_pattern, &.{"next.fetchAdd("});
     try expectNeedles(delta_types_pattern, &.{ "\"timestamp_ntz\"", "\"decimal(\"" });
     try expectNeedles(unsigned_pattern, &.{"decimal(20,"});
@@ -755,6 +759,13 @@ test "dupscan queue, sql, guard, delta_types, unsigned, widen and clamp patterns
         .{ clamp_pattern, "const us = d *| civil.us_per_day;", true },
         .{ clamp_pattern, "return civil.dayMicrosChecked(days) orelse error.CastFailed;", false },
         .{ clamp_pattern, "const us = d * civil.us_per_day;", false },
+        .{ print_pattern, ".shl => \"<<\",", true },
+        .{ print_pattern, ".@\"and\" => \"and\",", true },
+        .{ print_pattern, ".not => \"(not \",", true },
+        .{ print_pattern, ".not => \"NOT \",", true },
+        .{ print_pattern, ".shl => \"'<<'\",", false },
+        .{ print_pattern, ".ne => \"<>\",", false },
+        .{ print_pattern, ".@\"and\" => if (s) \"AND\" else \"and\",", false },
     };
     for (cases) |c| {
         const got = try startsOf(c[0], c[1], .line);

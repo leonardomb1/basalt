@@ -9,7 +9,7 @@ const Pos = @import("../sql_parser.zig").Pos;
 const aggregates = @import("../aggregates.zig");
 const ast = @import("../ast.zig");
 const quote = @import("../quote.zig");
-const binOpText = @import("../sql_parser.zig").binOpText;
+const print = @import("../print.zig");
 const outName = @import("../sql_parser.zig").outName;
 const qualHasPrefix = @import("../sql_parser.zig").qualHasPrefix;
 const std = @import("std");
@@ -47,113 +47,29 @@ pub fn parseQualNameTok(self: *Parser) Error!ast.QualName {
 /// known (`key_aliases`) a column renders as it resolves, so `a.g` and `g` of the
 /// FROM table `a` share a key.
 pub fn exprKey(self: *Parser, e: *const ast.Expr, buf: *std.array_list.Managed(u8)) Error!void {
-    switch (e.*) {
-        .field => |q0| {
-            const q = if (self.key_aliases) |al| stripQual(q0, al) else q0;
-            if (q.dollar) try buf.append('$');
-            for (q.parts, 0..) |part, i| {
-                if (i != 0) try buf.append('.');
-                if (i < q.safe.len and q.safe[i]) try buf.append('?');
-                if (plainName(part)) try buf.appendSlice(part) else try quote.ident(buf, part);
-            }
-        },
-        .int_lit => |v| try buf.print("{d}", .{v}),
-        .float_lit => |v| try buf.print("{e}", .{v}),
-        .dec_lit => |v| try buf.print("{f}", .{v}),
-        .str_lit => |v| try quote.strLit(buf, v),
-        .bool_lit => |v| try buf.appendSlice(if (v) "true" else "false"),
-        .null_lit => try buf.appendSlice("null"),
-        .call => |c| {
-            for (c.name) |ch| try buf.append(std.ascii.toLower(ch));
-            try buf.append('(');
-            if (c.distinct) try buf.appendSlice("distinct ");
-            if (c.args.len == 0) try buf.append('*');
-            for (c.args, 0..) |a, i| {
-                if (i != 0) try buf.append(',');
-                try self.exprKey(a, buf);
-            }
-            try buf.append(')');
-        },
-        .unary => |u| {
-            try buf.appendSlice(switch (u.op) {
-                .neg => "(-",
-                .not => "(not ",
-                .bit_not => "(~",
-            });
-            try self.exprKey(u.e, buf);
-            try buf.append(')');
-        },
-        .binary => |b| {
-            try buf.append('(');
-            try self.exprKey(b.l, buf);
-            try buf.print(" {s} ", .{binOpText(b.op)});
-            try self.exprKey(b.r, buf);
-            try buf.append(')');
-        },
-        .index => |x| {
-            try self.exprKey(x.e, buf);
-            try buf.append('[');
-            try self.exprKey(x.key, buf);
-            try buf.append(']');
-        },
-        .cast => |c| {
-            try buf.appendSlice("cast(");
-            try self.exprKey(c.e, buf);
-            try buf.print(" as {s}", .{try c.ty.name(self.arena)});
-            if (c.safe) try buf.append('?');
-            try buf.append(')');
-        },
-        .is_null => |n| {
-            try buf.append('(');
-            try self.exprKey(n.e, buf);
-            try buf.appendSlice(if (n.negated) " is not " else " is ");
-            try buf.appendSlice(@tagName(n.kind));
-            try buf.append(')');
-        },
-        .cond => |c| {
-            try buf.appendSlice("if(");
-            try self.exprKey(c.cond, buf);
-            try buf.append(',');
-            try self.exprKey(c.then, buf);
-            try buf.append(',');
-            try self.exprKey(c.els, buf);
-            try buf.append(')');
-        },
-        .match => |m| {
-            try buf.appendSlice("match(");
-            if (m.subject) |s| try self.exprKey(s, buf);
-            for (m.arms) |arm| {
-                try buf.appendSlice(if (arm.is_default) ";else" else ";when");
-                for (arm.pats) |p| {
-                    try buf.append(' ');
-                    try self.exprKey(p, buf);
-                }
-                if (arm.guard) |g| {
-                    try buf.appendSlice(" if ");
-                    try self.exprKey(g, buf);
-                }
-                try buf.appendSlice(" then ");
-                try self.exprKey(arm.value, buf);
-            }
-            try buf.append(')');
-        },
-        .let_in => |l| {
-            try buf.print("let({s}=", .{l.name});
-            try self.exprKey(l.value, buf);
-            try buf.appendSlice(" in ");
-            try self.exprKey(l.body, buf);
-            try buf.append(')');
-        },
-        .lambda => |l| {
-            try buf.append('(');
-            for (l.params, 0..) |pp, k| {
-                if (k > 0) try buf.append(',');
-                try buf.appendSlice(pp);
-            }
-            try buf.appendSlice(")->");
-            try self.exprKey(l.body, buf);
-        },
-        .lambda_var => |n| try buf.appendSlice(n),
+    var w = buf.writer().adaptToNewApi(&.{});
+    print.Printer(*const Parser, key_mode).walk(.{ .ctx = self, .w = &w.new_interface }, e) catch return error.OutOfMemory;
+}
+
+/// The key text: script keywords and operators, every operator parenthesised whole,
+/// the compact key layout, and columns through `keyField`.
+const key_mode: print.Mode(*const Parser) = .{
+    .field = keyField,
+    .float = .scientific,
+    .dialect = .script,
+    .grouping = .whole,
+    .layout = .key,
+};
+
+/// A column as it resolves against `key_aliases`, with its `$` and `?.` marks, each
+/// part bare only when lower-case.
+fn keyField(self: *const Parser, w: *std.Io.Writer, q0: ast.QualName) std.Io.Writer.Error!void {
+    const q = if (self.key_aliases) |al| stripQual(q0, al) else q0;
+    if (q.dollar) try w.writeByte('$');
+    for (q.parts, 0..) |part, i| {
+        if (i != 0) try w.writeByte('.');
+        if (i < q.safe.len and q.safe[i]) try w.writeByte('?');
+        if (plainName(part)) try w.writeAll(part) else try quote.ident(w, part);
     }
 }
 

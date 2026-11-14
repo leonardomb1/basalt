@@ -107,11 +107,17 @@ pub const Type = struct {
     /// scale, and a nested type's parts (`struct(city string, zip int)`,
     /// `list(int)`, `map(string, int)`). Nullability is not part of the name.
     pub fn name(self: Type, arena: std.mem.Allocator) ![]const u8 {
-        if (self.kind == .decimal) return msgfmt.allocPrint(arena, "decimal({d},{d})", .{ self.precision, self.scale });
-        if (!self.isNested()) return @tagName(self.kind);
+        if (self.kind != .decimal and !self.isNested()) return @tagName(self.kind);
         var out = std.Io.Writer.Allocating.init(arena);
-        self.writeName(&out.writer, .lower) catch return error.OutOfMemory;
+        self.writeShortName(&out.writer) catch return error.OutOfMemory;
         return out.written();
+    }
+
+    /// `name` written to `w`: a decimal as `decimal(p,s)`, any other type as
+    /// `writeName(.lower)` spells it.
+    pub fn writeShortName(self: Type, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (self.kind == .decimal) return w.print("decimal({d},{d})", .{ self.precision, self.scale });
+        return self.writeName(w, .lower);
     }
 
     /// The type as SQL spells it (`.upper`, which CAST parses back, a nested part

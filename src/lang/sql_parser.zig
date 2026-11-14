@@ -1002,31 +1002,6 @@ pub const Parser = struct {
     pub const parseSearch = @import("parse/expr.zig").parseSearch;
 };
 
-pub fn binOpText(op: ast.BinOp) []const u8 {
-    return switch (op) {
-        .add => "+",
-        .sub => "-",
-        .mul => "*",
-        .div => "/",
-        .mod => "%",
-        .eq => "==",
-        .ne => "!=",
-        .lt => "<",
-        .le => "<=",
-        .gt => ">",
-        .ge => ">=",
-        .@"and" => "and",
-        .@"or" => "or",
-        .bit_and => "&",
-        .bit_or => "|",
-        .bit_xor => "^",
-        .shl => "<<",
-        .shr => ">>",
-        .distinct => "IS DISTINCT FROM",
-        .not_distinct => "IS NOT DISTINCT FROM",
-    };
-}
-
 pub fn qualHasPrefix(q: ast.QualName, prefix: []const u8) bool {
     return q.parts.len > 1 and std.mem.eql(u8, q.parts[0], prefix);
 }

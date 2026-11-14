@@ -2,7 +2,7 @@
 //! identifiers, types, and the depth guard on long chains.
 
 const ast = @import("../../ast.zig");
-const binOpText = @import("../../sql_parser.zig").binOpText;
+const binOp = @import("../../print.zig").binOp;
 const Diagnostic = @import("../../sql_parser.zig").Diagnostic;
 const firstPipelineStages = @import("../testing_util.zig").firstPipelineStages;
 const parseExprStr = @import("../../sql_parser.zig").parseExprStr;
@@ -73,9 +73,9 @@ test "sql expr: bitwise precedence slots between comparisons and additive" {
     const cc = try parseExprStr(a, "a || b", &diag);
     try testing.expectEqualStrings("concat", cc.call.name);
 
-    try testing.expectEqualStrings("&", binOpText(.bit_and));
-    try testing.expectEqualStrings("<<", binOpText(.shl));
-    try testing.expectEqualStrings(">>", binOpText(.shr));
+    try testing.expectEqualStrings("&", binOp(.bit_and, .script));
+    try testing.expectEqualStrings("<<", binOp(.shl, .script));
+    try testing.expectEqualStrings(">>", binOp(.shr, .script));
 }
 
 test "sql: a lambda's parameter is its own node in the body, never a column" {
