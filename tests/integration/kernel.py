@@ -245,14 +245,20 @@ def main(binary):
     lf = os.path.join(tempfile.mkdtemp(), "let.csv")
     with open(lf, "w") as f:
         f.write("v\n1\n2\n")
-    k.run("LET born = now();\nLET cnt = (SELECT COUNT(*) FROM '%s');" % lf)
+    k.run("LET born = now();\nLET cnt = (SELECT COUNT(*) FROM '%s');\n"
+          "LET vs = (SELECT array_agg(CAST(v AS INT)) FROM '%s');\nLET raw = from_base64('AQI=');" % (lf, lf))
     time.sleep(1.1)
     with open(lf, "w") as f:
         f.write("v\n1\n2\n3\n4\n")
-    data, st = k.run("SELECT $cnt AS cnt, date_diff('second', CAST($born AS TIMESTAMP), now()) AS age;")
+    data, st = k.run("SELECT $cnt AS cnt, date_diff('second', CAST($born AS TIMESTAMP), now()) AS age, $vs AS vs, $raw AS raw;")
+    r = rows(data)
+    report("a LET holds the value its cell gave it, a list and bytes too", st["ok"] and r and r[0]["cnt"] == 2 and r[0]["age"] >= 1
+           and r[0]["vs"] == [1, 2] and r[0]["raw"] == "AQI=", (data, st))
+    k.run("LET vs = (SELECT array_agg(CAST(v AS INT)) FROM '%s');" % lf)
+    data, st = k.run("SELECT $vs AS vs, $cnt AS cnt;")
     os.remove(lf)
     r = rows(data)
-    report("a LET's value is decided once, in the cell that declares it", st["ok"] and r and r[0]["cnt"] == 2 and r[0]["age"] >= 1, (data, st))
+    report("a LET declared anew holds its new value; the others keep theirs", st["ok"] and r and r[0]["vs"] == [1, 2, 3, 4] and r[0]["cnt"] == 2, (data, st))
 
     # UTF-16 offsets for a JavaScript editor: an emoji is two units, four bytes.
     k.send(op="complete", id="u16", script="SELECT '😀' AS x, dbl(1) AS y ORDER BY d", pos=40, utf16=True)

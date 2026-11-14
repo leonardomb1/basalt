@@ -230,6 +230,36 @@ pub fn own(arena: std.mem.Allocator, r: @import("value.zig").NestedRef) error{Ou
     return .{ .node = node, .row = 0 };
 }
 
+/// `own`, its types copied too, so the value outlives the program that typed it, as a
+/// REPL or kernel session holds a LET's value across entries.
+pub fn ownDetached(arena: std.mem.Allocator, r: @import("value.zig").NestedRef) error{OutOfMemory}!@import("value.zig").NestedRef {
+    const o = try own(arena, r);
+    try retype(arena, @constCast(o.node));
+    return o;
+}
+
+/// `v` copied whole into `a`, a nested value's types included: what outlives the
+/// run and the program that made it.
+pub fn detach(a: std.mem.Allocator, v: @import("value.zig").Value) error{OutOfMemory}!@import("value.zig").Value {
+    return switch (v) {
+        .nested => |r| .{ .nested = try ownDetached(a, r) },
+        else => @import("op/aggregate/funcs.zig").dupeValue(a, v),
+    };
+}
+
+fn retype(a: std.mem.Allocator, n: *column.Nested) error{OutOfMemory}!void {
+    n.ty = try n.ty.dupe(a);
+    switch (n.body) {
+        .fields => |fs| for (@constCast(fs)) |*c| try retypeColumn(a, c),
+        .list => |*l| try retypeColumn(a, @constCast(&l.child)),
+    }
+}
+
+fn retypeColumn(a: std.mem.Allocator, c: *column.Column) error{OutOfMemory}!void {
+    c.ty = try c.ty.dupe(a);
+    if (c.data == .nested) try retype(a, @constCast(c.data.nested));
+}
+
 /// Every float under `n` made canonical in place; `n` must be storage of its own.
 pub fn canonFloats(n: *const column.Nested) void {
     const canonF64 = @import("keyhash.zig").canonF64;

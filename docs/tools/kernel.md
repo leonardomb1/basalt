@@ -5,11 +5,12 @@ keeps one for a person. Each script it runs sees every `CREATE CONNECTION`,
 `CREATE FUNCTION`, `PARAM` and `LET` an earlier script declared: they are kept as text and replayed ahead of the next script, so a
 script behaves exactly as it would in one file below them all, and re-declaring
 a name replaces it. A `WITH` belongs to its query and is not kept — two scripts
-may reuse a CTE name. A `LET` keeps the value it was given in the script that
-declares it (even one that only declares): `LET t = now()` is one instant for
-every later script, and `LET n = (SELECT count(*) ...)` is not queried again,
-however its source changes. Declare it again to recompute it. The REPL keeps
-`LET`s the same way.
+may reuse a CTE name. A `LET` holds the value it was given in the script that
+declares it (even one that only declares), whatever its type, as a JavaScript
+`let` holds its value from line to line: `LET t = now()` is one instant for
+every later script, and `LET n = (SELECT count(*) ...)` or a list from
+`array_agg` is not queried again, however its source changes. Declare it again
+to recompute it. The REPL keeps `LET`s the same way.
 
 ## Requests
 

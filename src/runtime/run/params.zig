@@ -2,11 +2,13 @@
 //! defaults, and LET values folded or queried once.
 
 const Diag = @import("../env.zig").Diag;
+const HeldLet = @import("../env.zig").HeldLet;
 const ParamArg = @import("../env.zig").ParamArg;
 const Value = @import("../../exec/value.zig").Value;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
 const errLabel = @import("../env.zig").errLabel;
+const heldValue = @import("../env.zig").heldValue;
 const eval = @import("../../exec/eval.zig");
 const options_schema = @import("../connect/options_schema.zig");
 const mkLit = @import("../env.zig").mkLit;
@@ -63,6 +65,7 @@ pub fn resolveParams(arena: std.mem.Allocator, program: ast.Program, cli: []cons
 pub fn resolveLets(
     arena: std.mem.Allocator,
     program: ast.Program,
+    held: []const HeldLet,
     params: *std.StringHashMap(Value),
     params_expr: *std.StringHashMap(*const ast.Expr),
     diag: *Diag,
@@ -78,6 +81,14 @@ pub fn resolveLets(
     for (program.stmts) |s| {
         if (s != .let_const) continue;
         const l = s.let_const;
+        if (l.expr == null) continue;
+        if (heldValue(held, l.name)) |v| {
+            try names.append(l.name);
+            try values.append(v);
+            try params.put(l.name, v);
+            try params_expr.put(l.name, try mkLit(arena, v));
+            continue;
+        }
         var unset: []const u8 = "";
         const le = options_schema.withEnv(arena, l.expr orelse continue, .read, &unset) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,

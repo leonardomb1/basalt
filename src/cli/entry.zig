@@ -6,6 +6,9 @@ const isClear = @import("repl/repl.zig").isClear;
 const isHelp = @import("repl/repl.zig").isHelp;
 const isQuit = @import("repl/repl.zig").isQuit;
 const parser = @import("../lang/sql_parser.zig");
+const HeldLet = @import("../runtime/env.zig").HeldLet;
+const Value = @import("../exec/value.zig").Value;
+const nested = @import("../exec/nested.zig");
 const std = @import("std");
 const Catalog = @import("repl/catalog.zig").Catalog;
 
@@ -165,18 +168,23 @@ pub fn declOf(stmt: []const u8) ?DeclId {
     return if (n.len == 0) null else .{ .kind = kind, .name = n };
 }
 
+/// The session's declarations as text, replayed ahead of each entry, and the value
+/// each LET was given when its entry ran, which it holds until declared anew.
 pub const DeclStore = struct {
     const Entry = struct { kind: DeclKind, name: []u8, text: []u8 };
+    const Held = struct { name: []u8, arena: *std.heap.ArenaAllocator, value: Value };
 
     gpa: std.mem.Allocator,
     items: std.array_list.Managed(Entry),
+    held: std.array_list.Managed(Held),
 
     pub fn init(gpa: std.mem.Allocator) DeclStore {
-        return .{ .gpa = gpa, .items = std.array_list.Managed(Entry).init(gpa) };
+        return .{ .gpa = gpa, .items = std.array_list.Managed(Entry).init(gpa), .held = std.array_list.Managed(Held).init(gpa) };
     }
     pub fn deinit(self: *DeclStore) void {
         self.clear();
         self.items.deinit();
+        self.held.deinit();
     }
     pub fn clear(self: *DeclStore) void {
         for (self.items.items) |e| {
@@ -184,8 +192,47 @@ pub const DeclStore = struct {
             self.gpa.free(e.text);
         }
         self.items.clearRetainingCapacity();
+        for (self.held.items) |h| self.freeHeld(h);
+        self.held.clearRetainingCapacity();
     }
+
+    /// Keeps `v` as LET `name`'s value, a copy of its own.
+    pub fn hold(self: *DeclStore, name: []const u8, v: Value) !void {
+        const arena = try self.gpa.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(self.gpa);
+        errdefer {
+            arena.deinit();
+            self.gpa.destroy(arena);
+        }
+        const h = Held{ .name = try arena.allocator().dupe(u8, name), .arena = arena, .value = try nested.detach(arena.allocator(), v) };
+        self.drop(name);
+        try self.held.append(h);
+    }
+
+    /// The values LETs hold, as an entry's run takes them.
+    pub fn heldLets(self: *const DeclStore, a: std.mem.Allocator) ![]const HeldLet {
+        const out = try a.alloc(HeldLet, self.held.items.len);
+        for (self.held.items, out) |h, *o| o.* = .{ .name = h.name, .value = h.value };
+        return out;
+    }
+
+    fn drop(self: *DeclStore, name: []const u8) void {
+        for (self.held.items, 0..) |h, i| if (std.ascii.eqlIgnoreCase(h.name, name)) {
+            self.freeHeld(h);
+            _ = self.held.orderedRemove(i);
+            return;
+        };
+    }
+
+    fn freeHeld(self: *DeclStore, h: Held) void {
+        h.arena.deinit();
+        self.gpa.destroy(h.arena);
+    }
+
+    /// A LET declared anew drops the value the old one held: it holds what it is given
+    /// when it runs.
     pub fn put(self: *DeclStore, id: DeclId, text: []const u8) !void {
+        if (id.kind == .let) self.drop(id.name);
         const dup_text = try self.gpa.dupe(u8, text);
         errdefer self.gpa.free(dup_text);
         for (self.items.items) |*e| {
@@ -254,4 +301,26 @@ test "declOf names session declarations" {
     try std.testing.expect(declOf("CREATE TABLE t") == null);
     try std.testing.expect(declOf("CREATE OR SOMETHING CONNECTION erp") == null);
     try std.testing.expect(declOf("") == null);
+}
+
+test "DeclStore holds a LET's value, of any kind, until the LET is declared anew or the session clears" {
+    var store = DeclStore.init(std.testing.allocator);
+    defer store.deinit();
+    try store.put(.{ .kind = .let, .name = "b" }, "LET b = from_base64('AQI=')");
+    var raw = [_]u8{ 1, 2 };
+    try store.hold("b", .{ .bytes = &raw });
+    raw[0] = 9;
+    var held = try store.heldLets(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2 }, held[0].value.bytes);
+    std.testing.allocator.free(held);
+    try store.hold("b", .{ .string = "again" });
+    held = try store.heldLets(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), held.len);
+    try std.testing.expectEqualStrings("again", held[0].value.string);
+    std.testing.allocator.free(held);
+    try store.put(.{ .kind = .let, .name = "B" }, "LET B = 2");
+    try std.testing.expectEqual(@as(usize, 0), store.held.items.len);
+    try store.hold("c", .{ .int = 1 });
+    store.clear();
+    try std.testing.expectEqual(@as(usize, 0), store.held.items.len);
 }

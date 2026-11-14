@@ -168,6 +168,7 @@ pub const RunOptions = struct {
     max_rows: ?u64 = null,
     progress_hook: ?obs.Progress.EventHook = null,
     on_let: ?LetHook = null,
+    held: []const HeldLet = &.{},
     declarations_only: bool = false,
     on_load: ?LoadHook = null,
     summary_out: ?*obs.Summary = null,
@@ -277,6 +278,17 @@ pub const LoadHook = struct {
     ctx: *anyopaque,
     f: *const fn (ctx: *anyopaque, done: LoadDone) void,
 };
+
+/// A LET's value as a session holds it: an entry's LET of that name takes it rather
+/// than evaluating its expression or query again, as a variable keeps what it was
+/// given until it is declared anew.
+pub const HeldLet = struct { name: []const u8, value: Value };
+
+/// The value `held` keeps for LET `name`, if any.
+pub fn heldValue(held: []const HeldLet, name: []const u8) ?Value {
+    for (held) |h| if (std.mem.eql(u8, h.name, name)) return h.value;
+    return null;
+}
 
 pub const LetHook = struct {
     ctx: *anyopaque,
@@ -420,6 +432,7 @@ pub const Env = struct {
     /// source it opens carries it, so the cap ends this statement's reads only.
     stop: ?*std.atomic.Value(bool) = null,
     on_let: ?LetHook = null,
+    held: []const HeldLet = &.{},
     space: ?Space = null,
     op_memory: usize = 2 << 30,
     stdin_free: bool = false,

@@ -56,6 +56,23 @@ pub const Type = struct {
         return .{ .kind = kind };
     }
 
+    /// `self` with its element and field types and names copied into `a`, so it
+    /// outlives the program that typed it.
+    pub fn dupe(self: Type, a: std.mem.Allocator) error{OutOfMemory}!Type {
+        var t = self;
+        if (self.elem) |e| {
+            const p = try a.create(Type);
+            p.* = try e.dupe(a);
+            t.elem = p;
+        }
+        if (self.fields) |fs| {
+            const out = try a.alloc(Field, fs.len);
+            for (fs, out) |f, *o| o.* = .{ .name = try a.dupe(u8, f.name), .ty = try f.ty.dupe(a) };
+            t.fields = out;
+        }
+        return t;
+    }
+
     pub fn unknownNull() Type {
         return .{ .kind = .bool, .nullable = true, .unknown = true };
     }

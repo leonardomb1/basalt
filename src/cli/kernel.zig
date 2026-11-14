@@ -67,9 +67,9 @@
 //! is handed back and the pump has drained. Loads are recorded under a lock
 //! because the workers of a parallel `FOR EACH` report them.
 //!
-//! A LET's value is decided by the script that declares it, not by whichever
-//! later script first runs, and replaces its expression in the session whether
-//! or not the rest of that script succeeds.
+//! A LET holds the value the script that declares it gave it, not one a later
+//! script computes again, and holds it whether or not the rest of that script
+//! succeeds.
 
 const std = @import("std");
 const pagecache = @import("../exec/pagecache.zig");
@@ -740,6 +740,7 @@ fn runScript(
                 .log = opts.log,
                 .declarations_only = true,
                 .on_let = freezer.hook(),
+                .held = try decls.heldLets(a),
             }, &rdiag) catch |e| {
                 if (e == error.OutOfMemory) return error.OutOfMemory;
                 var ei = ErrorInfo{
@@ -799,6 +800,7 @@ fn runScript(
             .progress_hook = .{ .ctx = &cap, .f = Capture.onProgress },
             .max_rows = req.max_rows orelse opts.max_rows,
             .on_let = freezer.hook(),
+            .held = try decls.heldLets(a),
             .on_load = .{ .ctx = &cap, .f = Capture.onLoad },
             .summary_out = &summary,
         }, &rdiag) catch |e| {

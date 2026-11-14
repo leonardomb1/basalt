@@ -7,7 +7,7 @@ A script is a sequence of `;`-terminated statements:
 @include 'lib/stats.sql' AS st;   -- a library: its functions as st.f(...)
 @include 'github.com/org/repo/sql/kit.sql@v1.2.0' AS kit;  -- remote, pinned in basalt.sum
 PARAM ...;                        -- CLI inputs
-LET name = <expr>;                -- sealed plan-time constant
+LET name = <expr>;                -- a variable, evaluated when it runs
 THROW 'msg' WHEN <condition>;     -- fail the plan on the script's own invariant
 CREATE CONNECTION ...;            -- named data endpoints
 CREATE FUNCTION f(a) AS <expr>;   -- scalar functions (inlined at plan time)

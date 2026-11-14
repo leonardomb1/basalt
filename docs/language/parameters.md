@@ -28,11 +28,13 @@ PARAM job    JSON;                       -- -p job='{"tables":[...]}', a documen
   command line. A kernel's `params` may carry names a script does not
   declare; those are ignored.
 
-**`LET name = <expr>;`** is PARAM's sealed sibling: a script-scoped constant
-folded once at plan time (in declaration order; it may reference `$params` and
-earlier `$lets`) and referenced as `$name`. It can never be bound externally —
-`-p name=...` is an error. A LET and a PARAM may not share a name. `LET
-run_ts = now();` gives one consistent timestamp across every pipeline of a run.
+**`LET name = <expr>;`** declares a variable, as JavaScript's `let` does: its
+expression is evaluated once, when the statement runs (in declaration order; it
+may reference `$params` and earlier `$lets`), and `$name` reads the value it then
+holds, never the expression again. A value from outside is a PARAM's to take: a
+LET cannot be bound externally, and `-p name=...` is an error. A LET and a PARAM
+may not share a name. `LET run_ts = now();` gives one consistent timestamp
+across every pipeline of a run.
 
 A LET may read an environment variable with `env('NAME')` (or `secret('NAME')`,
 the same, as in a connection's options), which keeps a password out of the

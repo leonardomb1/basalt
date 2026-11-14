@@ -159,7 +159,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var params_expr = std.StringHashMap(*const ast.Expr).init(arena);
     var pit = params.iterator();
     while (pit.next()) |kv| try params_expr.put(kv.key_ptr.*, try mkLit(arena, kv.value_ptr.*));
-    try resolveLets(arena, program, &params, &params_expr, diag);
+    try resolveLets(arena, program, opts.held, &params, &params_expr, diag);
     if (opts.on_let) |h| for (program.stmts) |s| {
         if (s == .let_const and s.let_const.expr != null)
             if (params.get(s.let_const.name)) |v| h.f(h.ctx, s.let_const.name, v);
@@ -217,7 +217,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var shared = std.heap.ThreadSafeAllocator{ .child_allocator = shared_arena.allocator() };
     var sources = std.array_list.Managed(driver.Source).init(arena);
     defer for (sources.items) |sc| sc.close();
-    var env = Env{ .arena = arena, .shared = shared.allocator(), .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .stdout_format = opts.stdout_format, .explain = opts.explain, .line_base = opts.line_base, .on_result = opts.on_result, .max_rows = opts.max_rows, .on_let = opts.on_let, .on_load = opts.on_load, .fns = &fns };
+    var env = Env{ .arena = arena, .shared = shared.allocator(), .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .stdout_format = opts.stdout_format, .explain = opts.explain, .line_base = opts.line_base, .on_result = opts.on_result, .max_rows = opts.max_rows, .on_let = opts.on_let, .held = opts.held, .on_load = opts.on_load, .fns = &fns };
 
     var cit = connections.valueIterator();
     while (cit.next()) |c| {
@@ -427,6 +427,11 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
 /// filter pushdown. One column required, zero rows is NULL, more than one an error.
 fn runScalarLet(env: *Env, l: ast.LetConst, of_explain: bool) !void {
     defer env.endStatement(false);
+    if (heldValue(env.held, l.name)) |v| {
+        try env.params.put(l.name, v);
+        try env.params_expr.put(l.name, try mkLit(env.arena, v));
+        return;
+    }
     const what = try analyze.queryLetLabel(env.arena, l.name);
     const step = try explainStep.openStep(env, env.explain or of_explain, what);
     defer explainStep.closeStep(env, step);
@@ -483,6 +488,7 @@ pub const defaultLanes = @import("parallel.zig").defaultLanes;
 pub const printPlanArrow = @import("run/explain.zig").printPlanArrow;
 const resolveParams = @import("run/params.zig").resolveParams;
 const resolveLets = @import("run/params.zig").resolveLets;
+const heldValue = @import("env.zig").heldValue;
 
 const describe_fields = [_]types.Schema.Field{
     .{ .name = "column", .ty = types.Type.init(.string) },

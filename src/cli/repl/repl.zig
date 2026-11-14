@@ -526,6 +526,7 @@ pub fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg
                 .log = .{ .summary = .none, .level = .err },
                 .declarations_only = true,
                 .on_let = freezer.hook(),
+                .held = try sess.decls.heldLets(a),
             }, &rdiag) catch |e| {
                 if (e == error.OutOfMemory) return e;
                 try msg.print("error: {s}\n", .{if (rdiag.msg.len > 0) rdiag.msg else @errorName(e)});
@@ -568,6 +569,7 @@ pub fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg
     defer freezer.commit(&sess.decls) catch {};
     _ = runtime.run(alloc, prepared, .{
         .on_let = freezer.hook(),
+        .held = try sess.decls.heldLets(a),
         .log = .{ .summary = .none, .level = .err },
         .stdout_format = sess.format,
         .explain = prog.explain == .analyze,
@@ -608,6 +610,7 @@ fn rerunWithSearch(gpa: std.mem.Allocator, sess: *Session, text: []const u8, acc
         return msg.writeAll("error: F searches a result made by a SELECT that ends its entry; run search(*, '…') in a query instead\n");
     var rdiag: runtime.Diag = .{};
     _ = runtime.run(gpa, try appendDisplaySinks(a, prog), .{
+        .held = try sess.decls.heldLets(a),
         .log = .{ .summary = .none, .level = .err },
         .stdout_format = .table,
         .progress = sess.tty and std.posix.isatty(std.fs.File.stderr().handle),

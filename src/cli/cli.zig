@@ -148,7 +148,6 @@ pub const PrepareError = @import("prepare.zig").PrepareError;
 pub const sessionText = @import("prepare.zig").sessionText;
 pub const prepareEntry = @import("prepare.zig").prepareEntry;
 pub const LetFreezer = @import("prepare.zig").LetFreezer;
-pub const letLiteral = @import("prepare.zig").letLiteral;
 pub const appendDisplaySinks = @import("repl/repl.zig").appendDisplaySinks;
 
 fn usage(w: anytype) !void {

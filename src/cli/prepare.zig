@@ -1,5 +1,5 @@
-//! An entry made runnable: the session's declarations as a prelude, LETs frozen to
-//! the values they had, shared by the REPL and the notebook kernel.
+//! An entry made runnable: the session's declarations as a prelude, each LET holding
+//! the value it was given when its entry ran, shared by the REPL and the kernel.
 
 const DeclId = @import("entry.zig").DeclId;
 const DeclStore = @import("entry.zig").DeclStore;
@@ -7,14 +7,12 @@ const Value = @import("../exec/value.zig").Value;
 const ast = @import("../lang/ast.zig");
 const declOf = @import("entry.zig").declOf;
 const entryStatements = @import("repl/repl.zig").entryStatements;
-const eval = @import("../exec/eval.zig");
 const include = @import("../lang/include.zig");
 const runtime = @import("../runtime/run.zig");
 const splitStatements = @import("entry.zig").splitStatements;
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
+const nested = @import("../exec/nested.zig");
 const parser = @import("../lang/sql_parser.zig");
-const quote = @import("../lang/quote.zig");
 
 pub const Pending = struct { id: DeclId, text: []const u8 };
 
@@ -96,14 +94,16 @@ pub fn prepareEntry(a: std.mem.Allocator, decls: *const DeclStore, block: []cons
     return .{ .text = text, .entry_at = entry_at, .prog = prog, .pending = pending.items, .executable = executable };
 }
 
+/// Collects the values an entry's LETs are given as it runs, copied out of the run,
+/// for the session to hold once the entry stands.
 pub const LetFreezer = struct {
     arena: std.mem.Allocator,
-    frozen: std.array_list.Managed(Frozen),
+    given: std.array_list.Managed(Given),
 
-    const Frozen = struct { name: []const u8, text: []const u8 };
+    const Given = struct { name: []const u8, value: Value };
 
     pub fn init(arena: std.mem.Allocator) LetFreezer {
-        return .{ .arena = arena, .frozen = std.array_list.Managed(Frozen).init(arena) };
+        return .{ .arena = arena, .given = std.array_list.Managed(Given).init(arena) };
     }
 
     pub fn hook(self: *LetFreezer) runtime.LetHook {
@@ -112,72 +112,20 @@ pub const LetFreezer = struct {
 
     fn onLet(ctx: *anyopaque, name: []const u8, v: Value) void {
         const self: *LetFreezer = @ptrCast(@alignCast(ctx));
-        const lit = letLiteral(self.arena, v) catch return orelse return;
-        const text = msgfmt.allocPrint(self.arena, "LET {s} = {s}", .{ name, lit }) catch return;
         const n = self.arena.dupe(u8, name) catch return;
-        self.frozen.append(.{ .name = n, .text = text }) catch {};
+        const kept = nested.detach(self.arena, v) catch return;
+        self.given.append(.{ .name = n, .value = kept }) catch {};
     }
 
     pub fn commit(self: *const LetFreezer, decls: *DeclStore) !void {
-        for (self.frozen.items) |f| {
+        for (self.given.items) |g| {
             for (decls.items.items) |e| {
-                if (e.kind == .let and std.ascii.eqlIgnoreCase(e.name, f.name)) break;
+                if (e.kind == .let and std.ascii.eqlIgnoreCase(e.name, g.name)) break;
             } else continue;
-            try decls.put(.{ .kind = .let, .name = f.name }, f.text);
+            try decls.hold(g.name, g.value);
         }
     }
 };
-
-/// A SQL expression that folds back to exactly `v`, or null when there is no literal
-/// form. A date, an exponent or the one overflowing int goes through a CAST of its text.
-pub fn letLiteral(arena: std.mem.Allocator, v: Value) !?[]const u8 {
-    return switch (v) {
-        .null => "NULL",
-        .bool => |b| if (b) "TRUE" else "FALSE",
-        .int => |x| if (x == std.math.minInt(i64))
-            "CAST('-9223372036854775808' AS BIGINT)"
-        else
-            try msgfmt.allocPrint(arena, "{d}", .{x}),
-        .float => |x| try msgfmt.allocPrint(arena, "CAST('{e}' AS DOUBLE)", .{x}),
-        .decimal => |d| try msgfmt.allocPrint(arena, "CAST('{s}' AS DECIMAL(38, {d}))", .{ try eval.valueToString(arena, v), d.scale }),
-        .string => |s| blk: {
-            var out = std.array_list.Managed(u8).init(arena);
-            try quote.strLit(&out, s);
-            break :blk out.items;
-        },
-        .date => try msgfmt.allocPrint(arena, "CAST('{s}' AS DATE)", .{try eval.valueToString(arena, v)}),
-        .time => try msgfmt.allocPrint(arena, "CAST('{s}' AS TIME)", .{try eval.valueToString(arena, v)}),
-        .timestamp => try msgfmt.allocPrint(arena, "CAST('{s}' AS TIMESTAMP)", .{try eval.valueToString(arena, v)}),
-        else => null,
-    };
-}
-
-test "letLiteral: every value folds back to itself" {
-    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const values = [_]Value{
-        .null,                                               .{ .bool = true },
-        .{ .int = std.math.minInt(i64) },                    .{ .int = std.math.maxInt(i64) },
-        .{ .int = -7 },                                      .{ .float = 0.1 },
-        .{ .float = -1.5e300 },                              .{ .float = 5e-324 },
-        .{ .decimal = .{ .unscaled = -12345, .scale = 3 } }, .{ .string = "it's\nfine" },
-        .{ .string = "" },                                   .{ .date = -1 },
-        .{ .time = 86_399_999_999 },                         .{ .timestamp = -500_000 },
-        .{ .timestamp = 1_767_268_800_123_456 },
-    };
-    for (values) |v| {
-        const lit = (try letLiteral(a, v)).?;
-        const src = try msgfmt.allocPrint(a, "LET x = {s};", .{lit});
-        var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
-        const prog = try parser.parseSource(a, src, &diag);
-        const back = try eval.constEval(a, prog.stmts[1].let_const.expr.?, &.{}, &.{});
-        errdefer std.debug.print("{s} -> {any}\n", .{ lit, back });
-        try std.testing.expectEqual(std.meta.activeTag(v), std.meta.activeTag(back));
-        if (v != .null) try std.testing.expectEqual(std.math.Order.eq, eval.compareValues(v, back).?);
-    }
-    try std.testing.expect((try letLiteral(a, .{ .bytes = "\x00" })) == null);
-}
 
 test "an entry's @include runs after the session has declarations, its lines keeping their numbers" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
