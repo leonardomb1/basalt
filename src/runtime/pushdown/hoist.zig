@@ -14,6 +14,7 @@
 
 const ast = @import("../../lang/ast.zig");
 const qual = @import("../pushdown.zig").qual;
+const pushable = @import("translate.zig").pushable;
 const std = @import("std");
 pub const Dialect = @import("../pushdown.zig").Dialect;
 const bin = @import("testing_util.zig").bin;
@@ -165,7 +166,6 @@ fn isRightName(name: []const u8, right: []const []const u8) bool {
 /// never crosses a join, where it would meet rows the join drops.
 pub fn mayRaise(e: *const ast.Expr) bool {
     const S = struct {
-        const total = [_][]const u8{ "upper", "lower", "length", "strlen", "starts_with", "ends_with", "contains", "like", "trim", "coalesce", "nullif" };
         fn hit(_: void, n: *const ast.Expr) ?bool {
             return switch (n.*) {
                 .cast => |c| if (!c.safe and ast.anyExpr(c.e, {}, field)) true else null,
@@ -174,8 +174,8 @@ pub fn mayRaise(e: *const ast.Expr) bool {
                     .eq, .ne, .lt, .le, .gt, .ge, .@"and", .@"or", .distinct, .not_distinct => null,
                     else => true,
                 },
-                .call => |c| for (total) |t| {
-                    if (std.ascii.eqlIgnoreCase(t, c.name)) break null;
+                .call => |c| for (pushable) |p| {
+                    if (p.total and std.ascii.eqlIgnoreCase(p.name, c.name)) break null;
                 } else true,
                 .lambda => true,
                 else => null,

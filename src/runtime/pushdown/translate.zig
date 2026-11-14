@@ -276,18 +276,6 @@ fn asciiPrintable(s: []const u8) bool {
     return true;
 }
 
-const text_fns = [_][]const u8{ "lower", "upper", "trim", "substr", "replace", "concat", "coalesce", "left", "right", "repeat", "reverse" };
-
-fn isTextFn(name: []const u8) bool {
-    for (text_fns) |n| if (std.mem.eql(u8, n, name)) return true;
-    return false;
-}
-
-fn isLikeFn(name: []const u8) bool {
-    return std.mem.eql(u8, name, "like") or std.mem.eql(u8, name, "starts_with") or
-        std.mem.eql(u8, name, "ends_with") or std.mem.eql(u8, name, "contains");
-}
-
 const Tx = struct {
     arena: std.mem.Allocator,
     dialect: Dialect,
@@ -332,8 +320,9 @@ const Tx = struct {
             },
             .cast => |c| if (c.ty.kind == .string) Kind{ .text = .{ .facts = null } } else .other,
             .call => |c| blk: {
-                if (!isTextFn(c.name)) break :blk .other;
-                if (std.mem.eql(u8, c.name, "coalesce") and !self.textArgs(c)) break :blk .other;
+                const p = lookupPushable(c.name) orelse break :blk .other;
+                if (p.text == .none) break :blk .other;
+                if (p.text == .args and !self.textArgs(c, p)) break :blk .other;
                 break :blk .{ .text = .{ .facts = self.textFnFacts(c), .fn_ = true } };
             },
             else => .unknown,
@@ -354,19 +343,16 @@ const Tx = struct {
                 .other => false,
             },
             .cast => |c| c.ty.kind == .string and provablyText(c.e, self.o.schema),
-            .call => |c| isTextFn(c.name) and self.textArgs(c),
+            .call => |c| if (lookupPushable(c.name)) |p| p.text != .none and self.textArgs(c, p) else false,
             else => false,
         };
     }
 
-    /// The arguments a text function reads as text, the first of `left`, `right`,
-    /// `repeat` and `substr` and every one of the others, are all text.
-    fn textArgs(self: Tx, c: ast.Expr.Call) bool {
-        const first_only = for ([_][]const u8{ "left", "right", "repeat", "substr" }) |n| {
-            if (std.mem.eql(u8, n, c.name)) break true;
-        } else false;
+    /// The arguments a text function reads as text, the first one or every one as
+    /// its `text` says, are all text.
+    fn textArgs(self: Tx, c: ast.Expr.Call, p: *const Pushable) bool {
         for (c.args, 0..) |a, i| {
-            if (first_only and i > 0) break;
+            if (p.text == .first and i > 0) break;
             if (!self.isText(a)) return false;
         }
         return true;
@@ -407,7 +393,7 @@ const Tx = struct {
                 return if (n.negated) try self.fmt("(NOT {s})", .{t}) else t;
             },
             .call => |c| {
-                if (isLikeFn(c.name)) return self.likePred(c, need);
+                if (lookupPushable(c.name)) |p| if (p.like != .none) return self.likePred(c, p.like, need);
                 return self.value(e);
             },
             .bool_lit => |b| return try self.arena.dupe(u8, if (b) "(1=1)" else "(1=0)"),
@@ -454,17 +440,19 @@ const Tx = struct {
         }
     }
 
-    /// `substr` descends only from position 1 (a UTF-8 SQL Server varchar counts bytes),
-    /// `replace` only under a byte-order collation (others replace case-insensitively).
+    /// A `from_one` call descends only from position 1 (a UTF-8 SQL Server varchar counts
+    /// bytes), a `byte_order` one only under a byte-order collation (others compare
+    /// case-insensitively).
     fn call(self: Tx, c: ast.Expr.Call) Err!?[]const u8 {
-        if (isLikeFn(c.name)) return self.likePred(c, .exact);
         const p = lookupPushable(c.name) orelse return null;
+        if (p.like != .none) return self.likePred(c, p.like, .exact);
+        if (!p.descends) return null;
         if (c.args.len < p.min_args or c.args.len > p.max_args) return null;
-        if (isTextFn(c.name) and !std.mem.eql(u8, c.name, "coalesce") and !self.textArgs(c)) return null;
-        if (std.mem.eql(u8, c.name, "substr")) {
+        if ((p.text == .every or p.text == .first) and !self.textArgs(c, p)) return null;
+        if (p.from_one) {
             if (c.args[1].* != .int_lit or c.args[1].int_lit != 1) return null;
         }
-        if (std.mem.eql(u8, c.name, "replace")) {
+        if (p.byte_order) {
             const f = self.textFnFacts(c) orelse {
                 self.want();
                 return null;
@@ -710,26 +698,24 @@ const Tx = struct {
 
     /// `like`/`starts_with`/`ends_with`/`contains` on a literal pattern. The source's `_`
     /// is a character, the engine's a byte; SQL Server reads `[` as a class, mysql `\` as an escape.
-    fn likePred(self: Tx, c: ast.Expr.Call, need: Need) Err!?[]const u8 {
+    fn likePred(self: Tx, c: ast.Expr.Call, like: Like, need: Need) Err!?[]const u8 {
         if (c.args.len != 2 or c.args[1].* != .str_lit) return null;
         const raw = c.args[1].str_lit;
         if (!self.dialect.textLitOk(raw)) return null;
         for (raw) |ch| {
             if (ch == '_' or ch == '\\') return null;
-            if (!std.mem.eql(u8, c.name, "like") and ch == '%') return null;
+            if (like != .raw and ch == '%') return null;
         }
         var body = std.array_list.Managed(u8).init(self.arena);
         for (raw) |ch| {
             if (ch == '%') try body.append(ch) else if (!try self.dialect.likeLiteral(&body, ch)) return null;
         }
-        const pat = if (std.mem.eql(u8, c.name, "starts_with"))
-            try self.fmt("{s}%", .{body.items})
-        else if (std.mem.eql(u8, c.name, "ends_with"))
-            try self.fmt("%{s}", .{body.items})
-        else if (std.mem.eql(u8, c.name, "contains"))
-            try self.fmt("%{s}%", .{body.items})
-        else
-            body.items;
+        const pat = switch (like) {
+            .prefix => try self.fmt("{s}%", .{body.items}),
+            .suffix => try self.fmt("%{s}", .{body.items}),
+            .infix => try self.fmt("%{s}%", .{body.items}),
+            .raw, .none => body.items,
+        };
         const k = self.kind(c.args[0]);
         if (k != .text and k != .unknown) return null;
         const known: ?ColFacts = if (k == .text) k.text.facts else null;
@@ -745,33 +731,52 @@ const Tx = struct {
     }
 };
 
+/// How a function reads text: `every` argument or the `first` only, its result
+/// then text; `args`, text only when every argument is, pushed either way.
+const Text = enum { none, every, first, args };
+
+/// The pattern a LIKE-family function matches: its literal as written (`raw`), or
+/// the literal as a prefix, suffix or infix.
+const Like = enum { none, raw, prefix, suffix, infix };
+
+/// One function the pushdown knows. `sql` is the portable spelling `render` uses;
+/// `descends` false keeps it engine-side; `text` and `like` say how it reads text;
+/// `from_one` pushes only a literal start of 1; `byte_order` needs the collation
+/// facts to show byte order; `total` means it never raises, so it may cross a join.
 const Pushable = struct {
     name: []const u8,
     sql: []const u8 = "",
-    min_args: usize,
-    max_args: usize,
-    render: *const fn (std.mem.Allocator, *const Pushable, ast.Expr.Call, []const []const u8, Dialect) error{OutOfMemory}!?[]const u8,
+    min_args: usize = 0,
+    max_args: usize = 0,
+    render: *const fn (std.mem.Allocator, *const Pushable, ast.Expr.Call, []const []const u8, Dialect) error{OutOfMemory}!?[]const u8 = render.none,
+    descends: bool = true,
+    text: Text = .none,
+    like: Like = .none,
+    from_one: bool = false,
+    byte_order: bool = false,
+    total: bool = false,
 };
 
 const variadic = std.math.maxInt(usize);
 
+/// The one home of the functions the pushdown translates and the hoist reasons about.
 pub const pushable = [_]Pushable{
-    .{ .name = "lower", .sql = "LOWER", .min_args = 1, .max_args = 1, .render = render.plain },
-    .{ .name = "upper", .sql = "UPPER", .min_args = 1, .max_args = 1, .render = render.plain },
-    .{ .name = "trim", .min_args = 1, .max_args = 1, .render = render.trim },
-    .{ .name = "substr", .sql = "SUBSTRING", .min_args = 3, .max_args = 3, .render = render.plain },
-    .{ .name = "replace", .sql = "REPLACE", .min_args = 3, .max_args = 3, .render = render.plain },
-    .{ .name = "concat", .sql = "CONCAT", .min_args = 2, .max_args = variadic, .render = render.concat },
-    .{ .name = "coalesce", .sql = "COALESCE", .min_args = 2, .max_args = variadic, .render = render.plain },
-    .{ .name = "like", .min_args = 2, .max_args = 2, .render = render.none },
-    .{ .name = "starts_with", .min_args = 2, .max_args = 2, .render = render.none },
-    .{ .name = "ends_with", .min_args = 2, .max_args = 2, .render = render.none },
-    .{ .name = "contains", .min_args = 2, .max_args = 2, .render = render.none },
+    .{ .name = "lower", .sql = "LOWER", .min_args = 1, .max_args = 1, .render = render.plain, .text = .every, .total = true },
+    .{ .name = "upper", .sql = "UPPER", .min_args = 1, .max_args = 1, .render = render.plain, .text = .every, .total = true },
+    .{ .name = "trim", .min_args = 1, .max_args = 1, .render = render.trim, .text = .every, .total = true },
+    .{ .name = "substr", .sql = "SUBSTRING", .min_args = 3, .max_args = 3, .render = render.plain, .text = .first, .from_one = true },
+    .{ .name = "replace", .sql = "REPLACE", .min_args = 3, .max_args = 3, .render = render.plain, .text = .every, .byte_order = true },
+    .{ .name = "concat", .sql = "CONCAT", .min_args = 2, .max_args = variadic, .render = render.concat, .text = .every },
+    .{ .name = "coalesce", .sql = "COALESCE", .min_args = 2, .max_args = variadic, .render = render.plain, .text = .args, .total = true },
+    .{ .name = "like", .min_args = 2, .max_args = 2, .like = .raw, .total = true },
+    .{ .name = "starts_with", .min_args = 2, .max_args = 2, .like = .prefix, .total = true },
+    .{ .name = "ends_with", .min_args = 2, .max_args = 2, .like = .suffix, .total = true },
+    .{ .name = "contains", .min_args = 2, .max_args = 2, .like = .infix, .total = true },
     .{ .name = "abs", .sql = "ABS", .min_args = 1, .max_args = 1, .render = render.plain },
     .{ .name = "floor", .sql = "FLOOR", .min_args = 1, .max_args = 1, .render = render.plain },
     .{ .name = "sqrt", .sql = "SQRT", .min_args = 1, .max_args = 1, .render = render.plain },
     .{ .name = "sign", .sql = "SIGN", .min_args = 1, .max_args = 1, .render = render.plain },
-    .{ .name = "reverse", .sql = "REVERSE", .min_args = 1, .max_args = 1, .render = render.plain },
+    .{ .name = "reverse", .sql = "REVERSE", .min_args = 1, .max_args = 1, .render = render.plain, .text = .every },
     .{ .name = "power", .sql = "POWER", .min_args = 2, .max_args = 2, .render = render.plain },
     .{ .name = "exp", .sql = "EXP", .min_args = 1, .max_args = 1, .render = render.plain },
     .{ .name = "sin", .sql = "SIN", .min_args = 1, .max_args = 1, .render = render.plain },
@@ -780,12 +785,14 @@ pub const pushable = [_]Pushable{
     .{ .name = "atan", .sql = "ATAN", .min_args = 1, .max_args = 1, .render = render.plain },
     .{ .name = "degrees", .sql = "DEGREES", .min_args = 1, .max_args = 1, .render = render.plain },
     .{ .name = "radians", .sql = "RADIANS", .min_args = 1, .max_args = 1, .render = render.plain },
-    .{ .name = "nullif", .sql = "NULLIF", .min_args = 2, .max_args = 2, .render = render.plain },
+    .{ .name = "nullif", .sql = "NULLIF", .min_args = 2, .max_args = 2, .render = render.plain, .total = true },
     .{ .name = "ceil", .min_args = 1, .max_args = 1, .render = render.ceil },
     .{ .name = "mod", .min_args = 2, .max_args = 2, .render = render.mod },
-    .{ .name = "left", .min_args = 2, .max_args = 2, .render = render.counted },
-    .{ .name = "right", .min_args = 2, .max_args = 2, .render = render.counted },
-    .{ .name = "repeat", .min_args = 2, .max_args = 2, .render = render.counted },
+    .{ .name = "left", .sql = "LEFT", .min_args = 2, .max_args = 2, .render = render.counted, .text = .first },
+    .{ .name = "right", .sql = "RIGHT", .min_args = 2, .max_args = 2, .render = render.counted, .text = .first },
+    .{ .name = "repeat", .min_args = 2, .max_args = 2, .render = render.counted, .text = .first },
+    .{ .name = "length", .descends = false, .total = true },
+    .{ .name = "strlen", .descends = false, .total = true },
 };
 
 fn lookupPushable(name: []const u8) ?*const Pushable {
@@ -844,14 +851,10 @@ const render = struct {
     }
 
     /// Only a literal count >= 0 is pushed: negative counts diverge across dialects.
+    /// No `sql` spelling means the dialect's repeat function.
     fn counted(arena: std.mem.Allocator, p: *const Pushable, c: ast.Expr.Call, args: []const []const u8, dialect: Dialect) error{OutOfMemory}!?[]const u8 {
         if (c.args[1].* != .int_lit or c.args[1].int_lit < 0) return null;
-        const f: []const u8 = if (std.mem.eql(u8, p.name, "left"))
-            "LEFT"
-        else if (std.mem.eql(u8, p.name, "right"))
-            "RIGHT"
-        else
-            dialect.repeatFn();
+        const f: []const u8 = if (p.sql.len > 0) p.sql else dialect.repeatFn();
         return try msgfmt.allocPrint(arena, "{s}({s}, {s})", .{ f, args[0], args[1] });
     }
 };

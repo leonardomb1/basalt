@@ -420,6 +420,7 @@ pub const plan = [_]Rule{
         "lang/ast.zig",
         "lang/parse/tablefn.zig",
     } },
+    .{ .home = "translate.pushable", .pattern = pushable_pattern, .under = "runtime/", .exact = true },
 };
 
 pub const civil_pattern = "719_?468|146_?097|719_?16[23]|25_?56[789]|24_?107|2_?440_?588|86_400_000_000|std\\.time\\.epoch\\.";
@@ -480,6 +481,9 @@ pub const round_to_pattern = "@abs\\(@rem\\(";
 pub const csv_quote_pattern = "\\[\\w+ \\+ 1\\] == '\"'";
 pub const projected_pattern = "\\.to, name\\)";
 pub const split_and_pattern = "\\.binary\\.op == \\.@\"and\"\\) \\{";
+/// A private list of pushdown function names, or a branch on one: the facts belong
+/// in a field of `translate.pushable`.
+pub const pushable_pattern = "\"(lower|upper|trim|substr|replace|concat|coalesce|left|right|repeat|reverse|like|starts_with|ends_with|contains|nullif|length|strlen)\", \"(lower|upper|trim|substr|replace|concat|coalesce|left|right|repeat|reverse|like|starts_with|ends_with|contains|nullif|length|strlen)\"|eql(IgnoreCase)?\\((u8, )?[^\"]*\"(lower|upper|trim|substr|replace|concat|coalesce|left|right|repeat|reverse|like|starts_with|ends_with|contains|nullif|length|strlen)\"\\)";
 pub const widen_pattern = "== \\.int and \\(\\S+ == \\.decimal or|== \\.decimal and \\S+ == \\.float";
 
 fn startsOf(pattern: []const u8, text: []const u8, span: Span) ![]usize {
