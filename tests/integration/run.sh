@@ -532,6 +532,23 @@ SELECT p, \$n AS x, (SELECT count(*) FROM db.public.it_sq WHERE p = 'a') AS hit 
   fi
 fi
 
+# A query read has no catalog, so a text function in its WHERE descends only once
+# a zero-row probe has typed the query's columns: over text it goes to the source,
+# over a date it stays in the engine, as the source's own conversion differs.
+if runs postgres; then
+  pgq() { docker compose -f tests/integration/compose.yaml exec -T postgres psql -U postgres -d it -t -A -F, "$@"; }
+  pgq -c "DROP TABLE IF EXISTS it_qtext; CREATE TABLE it_qtext (p text, d date); INSERT INTO it_qtext VALUES ('a', '2024-01-05'), ('b', '2025-02-01');" >/dev/null 2>&1
+  if $B run --log-level debug --format csv -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
+SELECT p FROM db.QUERY(\$\$SELECT p, d FROM it_qtext\$\$) WHERE upper(p) = 'A';
+SELECT p FROM db.QUERY(\$\$SELECT p, d FROM it_qtext\$\$) WHERE left(d, 4) = '2025';" >"$out/pg_qtext.txt" 2>&1 &&
+     grep -q 'WHERE (UPPER("p") = '"'"'A'"'"')' "$out/pg_qtext.txt" && ! grep -q 'LEFT("d"' "$out/pg_qtext.txt" &&
+     grep -qx 'a' "$out/pg_qtext.txt" && grep -qx 'b' "$out/pg_qtext.txt"; then
+    report postgres-query-text-pushdown ok
+  else
+    report postgres-query-text-pushdown bad; grep -i "sql read\|error" "$out/pg_qtext.txt" | head -5
+  fi
+fi
+
 # Decimal aggregates against the source's own answer. A bare postgres `numeric`
 # has no typmod, so the column is typed decimal(38,6) while each value arrives at
 # its own dscale — summing raw unscaled integers scaled the total by 10^4, and

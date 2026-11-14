@@ -375,6 +375,13 @@ pub fn serialWhereWith(arena: std.mem.Allocator, dialect: Dialect, stages: []con
     return leadingWhere(arena, dialect, stages[1..], .{ .facts = facts, .wants_facts = wants });
 }
 
+/// `serialWhereWith` with the read's columns typed by `schema`, which tells a text
+/// argument from another where no catalog facts do (a query read).
+pub fn serialWhereTyped(arena: std.mem.Allocator, dialect: Dialect, stages: []const ast.Stage, schema: types.Schema) !?[]const u8 {
+    if (stages.len < 2 or stages[0].node != .read) return null;
+    return leadingWhere(arena, dialect, stages[1..], .{ .schema = schema });
+}
+
 /// Every source column an expression references, by `parts[0]`; a lambda's
 /// parameter is not one, nor a `$param` or LET (a scalar subquery's included).
 pub fn collectFields(e: *const ast.Expr, set: *std.StringHashMap(void)) !void {

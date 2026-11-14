@@ -952,7 +952,8 @@ pub fn stampedBinding(env: *Env, name: []const u8) !?ast.Pipeline {
 }
 
 /// The implicit pushdown: the contiguous WHERE right after a SQL read, translated
-/// into that read's own query.
+/// into that read's own query. A query read has no catalog to tell its text columns,
+/// so a text function there costs one zero-row probe for the read's schema.
 pub fn descendLeadingWhere(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
     if (stages[0].node != .read) return stages;
     const arena = env.arena;
@@ -961,7 +962,17 @@ pub fn descendLeadingWhere(env: *Env, stages: []const ast.Stage) ![]const ast.St
     const d = (sqlConnInfo(conn) orelse return stages).dialect;
     if (!sql_read.pushableRead(d, rd)) return stages;
     const facts = try factsIfWanted(env, rd, d, stages[1..], .{ .fields = &.{} }, false, .superset);
-    const extra = (try pushdown.serialWhereWith(arena, d, stages, facts, null)) orelse return stages;
+    var wanted = false;
+    var found = try pushdown.serialWhereWith(arena, d, stages, facts, &wanted);
+    if (wanted and facts == null and rd.form != .table) {
+        var probe = rd;
+        probe.where = "1 = 0";
+        probe.cols = &.{};
+        if (sql_read.probedSchema(env, probe, stages[0].hints)) |schema| {
+            found = try pushdown.serialWhereTyped(arena, d, stages, schema);
+        } else |_| {}
+    }
+    const extra = found orelse return stages;
     const out = try arena.dupe(ast.Stage, stages);
     var nrd = rd;
     nrd.where = if (rd.where.len > 0)
