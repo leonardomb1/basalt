@@ -25,6 +25,7 @@ pub const op = @import("exec/op.zig");
 pub const profile = @import("exec/profile.zig");
 pub const simd = @import("exec/simd.zig");
 pub const floatord = @import("exec/floatord.zig");
+pub const minmax = @import("exec/minmax.zig");
 pub const pagecache = @import("exec/pagecache.zig");
 pub const driver = @import("connect/driver.zig");
 pub const retry = @import("connect/retry.zig");

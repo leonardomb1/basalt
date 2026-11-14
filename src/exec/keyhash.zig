@@ -182,34 +182,6 @@ pub fn valueEq(a: Value, b: Value) bool {
     };
 }
 
-/// The running MIN and MAX of the non-null values folded, in `compareValues` order,
-/// owned in the fold's allocator. A NaN is kept apart (`nan`, the first one seen), so
-/// `min`/`max` bound the other values; `lo`/`hi` are the total order's own answer,
-/// where a NaN sits above everything. A value that does not compare moves neither.
-pub const MinMax = struct {
-    min: ?Value = null,
-    max: ?Value = null,
-    nan: ?f64 = null,
-
-    pub fn fold(self: *MinMax, a: std.mem.Allocator, v: Value) !void {
-        if (v == .null) return;
-        if (v == .float and std.math.isNan(v.float)) {
-            if (self.nan == null) self.nan = v.float;
-            return;
-        }
-        if (self.min == null or (eval.compareValues(v, self.min.?) orelse .eq) == .lt) self.min = try v.own(a);
-        if (self.max == null or (eval.compareValues(v, self.max.?) orelse .eq) == .gt) self.max = try v.own(a);
-    }
-
-    pub fn lo(self: MinMax) ?Value {
-        return self.min orelse if (self.nan) |x| Value{ .float = x } else null;
-    }
-
-    pub fn hi(self: MinMax) ?Value {
-        return if (self.nan) |x| .{ .float = x } else self.max;
-    }
-};
-
 pub const MultiKeyCtx = struct {
     pub fn hash(_: MultiKeyCtx, key: []const Value) u64 {
         var h = std.hash.Wyhash.init(0);
@@ -415,51 +387,4 @@ test "hashCell: every scalar kind hashes as its boxed value and as the old join 
             try testing.expectEqual(Orig.pinnedJoinHash(&col, r), got);
         }
     }
-}
-
-fn sameBound(want: ?Value, got: ?Value) !void {
-    try testing.expectEqual(want == null, got == null);
-    const w = want orelse return;
-    const g = got.?;
-    try testing.expectEqual(std.meta.activeTag(w), std.meta.activeTag(g));
-    if (w == .float) return testing.expectEqual(@as(u64, @bitCast(w.float)), @as(u64, @bitCast(g.float)));
-    try testing.expect(valueEq(w, g));
-}
-
-test "MinMax: lo and hi are the old keyset fold's bounds, NaN payload included" {
-    const Orig = struct {
-        fn pinnedKeysetBounds(vals: []const Value) [2]?Value {
-            var lo: ?Value = null;
-            var hi: ?Value = null;
-            for (vals) |v| {
-                if (v == .null) continue;
-                if (lo == null or (eval.compareValues(v, lo.?) orelse .eq) == .lt) lo = v;
-                if (hi == null or (eval.compareValues(v, hi.?) orelse .eq) == .gt) hi = v;
-            }
-            return .{ lo, hi };
-        }
-    };
-    var ar = std.heap.ArenaAllocator.init(testing.allocator);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const nan = std.math.nan(f64);
-    const odd: f64 = @bitCast(@as(u64, 0xfff8000000000123));
-    const pool = [_]Value{ .null, .{ .float = nan }, .{ .float = odd }, .{ .float = -0.0 }, .{ .float = 0.0 }, .{ .float = 1.5 }, .{ .float = -std.math.inf(f64) }, .{ .float = std.math.inf(f64) } };
-    var prng = std.Random.DefaultPrng.init(7);
-    const rand = prng.random();
-    for (0..4000) |_| {
-        var buf: [6]Value = undefined;
-        const vals = buf[0..rand.uintAtMost(usize, buf.len)];
-        for (vals) |*v| v.* = pool[rand.uintLessThan(usize, pool.len)];
-        var mm = MinMax{};
-        for (vals) |v| try mm.fold(a, v);
-        const want = Orig.pinnedKeysetBounds(vals);
-        try sameBound(want[0], mm.lo());
-        try sameBound(want[1], mm.hi());
-    }
-    var t = MinMax{};
-    for ([_][]const u8{ "m", "b", "z", "b" }) |s| try t.fold(a, .{ .string = s });
-    try testing.expectEqualStrings("b", t.lo().?.string);
-    try testing.expectEqualStrings("z", t.hi().?.string);
-    try testing.expect(t.nan == null);
 }

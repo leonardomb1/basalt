@@ -7,6 +7,7 @@
 const Batch = @import("../batch.zig").Batch;
 const Value = @import("../value.zig").Value;
 const keyhash = @import("../keyhash.zig");
+const minmax = @import("../minmax.zig");
 const std = @import("std");
 
 /// One key column's values. `overflow` means `values` stopped at the cap and only
@@ -88,7 +89,7 @@ pub fn collect(arena: std.mem.Allocator, batches: []const Batch, cols: []const u
         var seen = std.HashMap(Value, void, keyhash.SingleKeyCtx, std.hash_map.default_max_load_percentage).init(arena);
         var vals = std.array_list.Managed(Value).init(arena);
         var overflow = false;
-        var bounds = keyhash.MinMax{};
+        var bounds = minmax.MinMax(minmax.ValueOrder, .apart){};
         var past = std.array_list.Managed(i64).init(arena);
         var ints = ranges;
         for (batches) |b| {

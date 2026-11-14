@@ -413,6 +413,7 @@ pub const plan = [_]Rule{
     .{ .home = "ast.fieldsOf", .pattern = fields_of_pattern, .exact = true, .allow = &.{"lang/ast.zig"} },
     .{ .home = "varint", .pattern = varint_pattern, .exact = true, .allow = &.{"format/varint.zig"} },
     .{ .home = "Value.own", .pattern = own_value_pattern, .exact = true, .allow = &.{"exec/value.zig"} },
+    .{ .home = "minmax", .pattern = minmax_pattern, .exact = true, .allow = &.{"exec/minmax.zig"} },
     .{ .home = "decimal.roundTo", .pattern = round_to_pattern, .exact = true, .allow = &.{"exec/decimal.zig"} },
     .{ .home = "csv.Quoting", .pattern = csv_quote_pattern, .under = "format/", .exact = true, .allow = &.{"format/csv.zig"} },
     .{ .home = "hoist.projectedFrom", .pattern = projected_pattern, .exact = true, .allow = &.{"runtime/pushdown/hoist.zig"} },
@@ -490,6 +491,7 @@ pub const split_and_pattern = "\\.binary\\.op == \\.@\"and\"\\) \\{";
 /// in a field of `translate.pushable`.
 pub const pushable_pattern = "\"(lower|upper|trim|substr|replace|concat|coalesce|left|right|repeat|reverse|like|starts_with|ends_with|contains|nullif|length|strlen)\", \"(lower|upper|trim|substr|replace|concat|coalesce|left|right|repeat|reverse|like|starts_with|ends_with|contains|nullif|length|strlen)\"|eql(IgnoreCase)?\\((u8, )?[^\"]*\"(lower|upper|trim|substr|replace|concat|coalesce|left|right|repeat|reverse|like|starts_with|ends_with|contains|nullif|length|strlen)\"\\)";
 pub const widen_pattern = "== \\.int and \\(\\S+ == \\.decimal or|== \\.decimal and \\S+ == \\.float";
+pub const minmax_pattern = "\\.(min|max|lo|hi)(\\[\\w+\\])? = try \\w+\\.own\\(";
 
 fn startsOf(pattern: []const u8, text: []const u8, span: Span) ![]usize {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -764,6 +766,26 @@ test "dupscan queue, sql, guard, delta_types, unsigned, widen and clamp patterns
     }
     try expectStarts(guard_pattern, "const w = try Writer.open(a, p, m, o);\n    errdefer w.abort();\n    for (bs) |b| try w.writeBatch(a, b);\n    try w.close();", .file, &.{43});
     try expectStarts(guard_pattern, "var g = Guard(*Writer).init(try Writer.open(a, p, m, o));\n    defer g.abort();\n    const w = g.get().?;\n    try g.close();", .file, &.{});
+}
+
+test "dupscan minmax pattern" {
+    try expectNeedles(minmax_pattern, &.{" = try "});
+    const cases = [_]struct { []const u8, []const u8, bool }{
+        .{ minmax_pattern, "if (self.min == null or less(v, self.min.?)) self.min = try v.own(a);", true },
+        .{ minmax_pattern, "if (c.max == null or more(mx, c.max.?)) c.max = try mx.own(out);", true },
+        .{ minmax_pattern, "if (self.hi[j] == .null or before(self.hi[j], v)) self.hi[j] = try v.own(a);", true },
+        .{ minmax_pattern, "try span.fold(a, v);", false },
+        .{ minmax_pattern, "const o = try v.own(arena);", false },
+        .{ minmax_pattern, ".min = try ownOpt(self.arena, cb.bounds.min),", false },
+    };
+    for (cases) |c| {
+        const got = try startsOf(c[0], c[1], .line);
+        defer std.testing.allocator.free(got);
+        std.testing.expectEqual(c[2], got.len != 0) catch |e| {
+            std.debug.print("pattern {s} on {s}\n", .{ c[0], c[1] });
+            return e;
+        };
+    }
 }
 
 test "dupscan mask blanks comments and tests but keeps strings and lines" {

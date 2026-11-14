@@ -80,6 +80,7 @@ const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const column = @import("../../exec/column.zig");
 const keyhash = @import("../../exec/keyhash.zig");
+const minmax = @import("../../exec/minmax.zig");
 const Decimal = @import("../../exec/value.zig").Decimal;
 const Value = @import("../../exec/value.zig").Value;
 
@@ -252,6 +253,9 @@ const PendingPage = struct {
     rows: usize,
 };
 
+/// A chunk's or a column's MIN and MAX statistics, in `compareValues` order.
+const Bounds = minmax.MinMax(minmax.ValueOrder, .poison);
+
 const ColBuf = struct {
     values: List(u8),
     pages: List(PendingPage),
@@ -264,9 +268,11 @@ const ColBuf = struct {
     bit_buf: u8 = 0,
     bit_n: u3 = 0,
     nulls: i64 = 0,
-    min: ?Value = null,
-    max: ?Value = null,
-    nan: bool = false,
+    /// The chunk's bounds. Decimals compare as numbers, not mantissas: per-value
+    /// scales once ranked `0.5` above `0.10`, wrote min > max, and readers pruned real
+    /// rows. A NaN drops them, as the format leaves NaN out of min/max and a reader
+    /// could then prune the rows `x > 5` matches.
+    bounds: Bounds = .{},
     dict: std.StringHashMap(u32),
     dict_order: List([]const u8),
     /// A fixed-width column's dictionary: its PLAIN bytes (at most 16) as an integer
@@ -330,9 +336,7 @@ const ColBuf = struct {
         self.bit_buf = 0;
         self.bit_n = 0;
         self.nulls = 0;
-        self.min = null;
-        self.max = null;
-        self.nan = false;
+        self.bounds = .{};
         self.dict.clearRetainingCapacity();
         self.dict_order.clearRetainingCapacity();
         self.fixed.clearRetainingCapacity();
@@ -470,22 +474,6 @@ const ColBuf = struct {
         self.fixed_raw.clearRetainingCapacity();
         self.dict_idx.clearRetainingCapacity();
         self.dict_bytes = 0;
-    }
-
-    /// Decimals compare as numbers, not mantissas: per-value scales once ranked `0.5`
-    /// above `0.10`, wrote min > max, and readers pruned real rows. A NaN drops the
-    /// chunk's bounds, as the format leaves NaN out of min/max and a reader could
-    /// then prune the rows `x > 5` matches.
-    fn observe(self: *ColBuf, arena: std.mem.Allocator, v: Value) !void {
-        if (self.nan) return;
-        if (v == .float and std.math.isNan(v.float)) {
-            self.nan = true;
-            self.min = null;
-            self.max = null;
-            return;
-        }
-        if (self.min == null or (eval.compareValues(v, self.min.?) orelse .eq) == .lt) self.min = try v.own(arena);
-        if (self.max == null or (eval.compareValues(v, self.max.?) orelse .eq) == .gt) self.max = try v.own(arena);
     }
 
     fn pushBit(self: *ColBuf, b: bool) !void {
@@ -757,8 +745,8 @@ pub const Writer = struct {
                 .uncompressed = uncompressed,
                 .compressed = compressed,
                 .nulls = cb.nulls,
-                .min = try ownOpt(self.arena, cb.min),
-                .max = try ownOpt(self.arena, cb.max),
+                .min = try ownOpt(self.arena, cb.bounds.min),
+                .max = try ownOpt(self.arena, cb.bounds.max),
             };
             group_bytes += uncompressed;
             cb.reset();
@@ -820,8 +808,8 @@ pub const Writer = struct {
             .uncompressed = uncompressed,
             .compressed = compressed,
             .nulls = cb.nulls,
-            .min = try ownOpt(self.arena, cb.min),
-            .max = try ownOpt(self.arena, cb.max),
+            .min = try ownOpt(self.arena, cb.bounds.min),
+            .max = try ownOpt(self.arena, cb.bounds.max),
             .dict = true,
         };
     }
@@ -878,6 +866,7 @@ pub const Writer = struct {
 
     /// Leaf `k`'s chunks folded into `c`: their nulls summed, their bounds widened.
     fn foldStats(self: *Writer, out: std.mem.Allocator, c: *ColumnStats, k: usize) !void {
+        var span = Bounds{ .min = c.min, .max = c.max };
         for (self.groups.items) |g| {
             const ch = g.chunks[k];
             c.nulls += ch.nulls;
@@ -890,9 +879,10 @@ pub const Writer = struct {
                 c.bounded = false;
                 continue;
             };
-            if (c.min == null or (eval.compareValues(mn, c.min.?) orelse .eq) == .lt) c.min = try mn.own(out);
-            if (c.max == null or (eval.compareValues(mx, c.max.?) orelse .eq) == .gt) c.max = try mx.own(out);
+            try span.widen(out, mn, mx);
         }
+        c.min = span.min;
+        c.max = span.max;
         if (!c.bounded) {
             c.min = null;
             c.max = null;
@@ -1449,7 +1439,7 @@ fn encodeValue(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, v: Value) !void {
         return;
     }
     try cb.pushDef(cb.present_def);
-    try cb.observe(sa, v);
+    try cb.bounds.fold(sa, v);
     switch (m.phys) {
         .boolean => try cb.pushBit(v == .bool and v.bool),
         .byte_array => try cb.putBytes(sa, switch (v) {
@@ -1578,10 +1568,10 @@ fn encodeFixedSlice(comptime T: type, cb: *ColBuf, sa: std.mem.Allocator, option
             if (x > mx) mx = x;
         }
     }
-    if (nan) try cb.observe(sa, .{ .float = std.math.nan(f64) });
+    if (nan) try cb.bounds.fold(sa, .{ .float = std.math.nan(f64) });
     if (any) {
-        try cb.observe(sa, typedValue(col.ty.kind, mn));
-        try cb.observe(sa, typedValue(col.ty.kind, mx));
+        try cb.bounds.fold(sa, typedValue(col.ty.kind, mn));
+        try cb.bounds.fold(sa, typedValue(col.ty.kind, mx));
     }
 }
 
@@ -1638,8 +1628,8 @@ fn encodeDecimalSlice(cb: *ColBuf, sa: std.mem.Allocator, m: Mapping, col: colum
         }
     }
     if (any) {
-        try cb.observe(sa, .{ .decimal = .{ .unscaled = mn, .scale = @intCast(scale) } });
-        try cb.observe(sa, .{ .decimal = .{ .unscaled = mx, .scale = @intCast(scale) } });
+        try cb.bounds.fold(sa, .{ .decimal = .{ .unscaled = mn, .scale = @intCast(scale) } });
+        try cb.bounds.fold(sa, .{ .decimal = .{ .unscaled = mx, .scale = @intCast(scale) } });
     }
 }
 
@@ -1662,8 +1652,8 @@ fn encodeBytesSlice(cb: *ColBuf, sa: std.mem.Allocator, optional: bool, col: col
         if (mx == null or std.mem.order(u8, s, mx.?) == .gt) mx = s;
     }
     const text = col.ty.kind == .string;
-    if (mn) |x| try cb.observe(sa, if (text) Value{ .string = x } else Value{ .bytes = x });
-    if (mx) |x| try cb.observe(sa, if (text) Value{ .string = x } else Value{ .bytes = x });
+    if (mn) |x| try cb.bounds.fold(sa, if (text) Value{ .string = x } else Value{ .bytes = x });
+    if (mx) |x| try cb.bounds.fold(sa, if (text) Value{ .string = x } else Value{ .bytes = x });
 }
 
 /// A fixed-width value PLAIN-encoded into `buf`: a boolean as one byte (the

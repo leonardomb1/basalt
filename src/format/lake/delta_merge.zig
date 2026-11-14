@@ -53,6 +53,7 @@ const roaring = @import("roaring.zig");
 const vcol = @import("variant_col.zig");
 const fmtnum = @import("../../exec/eval/format.zig");
 const join = @import("../../exec/op/join.zig");
+const minmax = @import("../../exec/minmax.zig");
 const msgfmt = @import("../msgfmt.zig");
 const op = @import("../../exec/op.zig");
 const pqstats = @import("../parquet/stats.zig");
@@ -87,19 +88,12 @@ pub const Bounds = struct {
     names: []const []const u8,
     tys: []const types.Type,
     part: []const bool,
-    lo: []Value,
-    hi: []Value,
+    spans: []Span,
     float32: []const bool = &.{},
 
     fn narrowed(self: *const Bounds, j: usize, v: Value) Value {
         if (v != .float or j >= self.float32.len or !self.float32[j]) return v;
         return .{ .float = @as(f32, @floatCast(v.float)) };
-    }
-
-    fn widen(self: *Bounds, a: std.mem.Allocator, j: usize, v: Value) !void {
-        if (v == .null) return;
-        if (self.lo[j] == .null or before(v, self.lo[j])) self.lo[j] = try v.own(a);
-        if (self.hi[j] == .null or before(self.hi[j], v)) self.hi[j] = try v.own(a);
     }
 
     /// Whether a file with these partition values and statistics may hold a key
@@ -108,8 +102,9 @@ pub const Bounds = struct {
     /// column's statistics, so a NaN key is never ruled out by them.
     pub fn mayHold(self: *const Bounds, arena: std.mem.Allocator, parts: ?std.json.Value, stats_text: ?[]const u8) !bool {
         const stats: ?std.json.ObjectMap = if (stats_text) |t| dtypes.parseStats(arena, t) else null;
-        for (self.names, self.tys, self.part, self.lo, self.hi, 0..) |name, ty, is_part, lo, hi, j| {
-            if (lo == .null) continue;
+        for (self.names, self.tys, self.part, self.spans, 0..) |name, ty, is_part, sp, j| {
+            const lo = sp.min orelse continue;
+            const hi = sp.max.?;
             if (is_part) {
                 const pv = parts orelse continue;
                 if (pv != .object) continue;
@@ -139,6 +134,21 @@ pub const Bounds = struct {
 fn before(a: Value, b: Value) bool {
     return (pqstats.cmp(a, b) orelse return false) == .lt;
 }
+
+/// `before` as the tracker's order: `pqstats.cmp` is not symmetric across kinds, so
+/// the MAX side asks `before(kept, v)`, never `cmp(v, kept)`.
+const KeyOrder = struct {
+    pub fn below(v: Value, kept: Value) bool {
+        return before(v, kept);
+    }
+
+    pub fn above(v: Value, kept: Value) bool {
+        return before(kept, v);
+    }
+};
+
+/// One key column's smallest and largest incoming value; a NaN sorts above all.
+pub const Span = minmax.MinMax(KeyOrder, .ordered);
 
 /// The files an UPSERT rewrote and the ones it read, for its commit.
 pub const Outcome = struct {
@@ -187,18 +197,16 @@ pub const Merge = struct {
         const names = try a.alloc([]const u8, nk);
         const tys = try a.alloc(types.Type, nk);
         const part = try a.alloc(bool, nk);
-        const lo = try a.alloc(Value, nk);
-        const hi = try a.alloc(Value, nk);
+        const spans = try a.alloc(Span, nk);
         const f32s = try a.alloc(bool, nk);
-        for (p.keys, names, tys, part, lo, hi, f32s) |k, *n, *t, *is_part, *l, *h, *f| {
+        for (p.keys, names, tys, part, spans, f32s) |k, *n, *t, *is_part, *sp, *f| {
             f.* = p.cols[k].phys.float32;
             n.* = p.cols[k].fileName();
             t.* = p.cols[k].ty;
             is_part.* = std.mem.indexOfScalar(usize, p.parts, k) != null;
-            l.* = .null;
-            h.* = .null;
+            sp.* = .{};
         }
-        self.bounds = .{ .names = names, .tys = tys, .part = part, .lo = lo, .hi = hi, .float32 = f32s };
+        self.bounds = .{ .names = names, .tys = tys, .part = part, .spans = spans, .float32 = f32s };
         if (p.snap) |st| self.dv = write.writesDeletionVectors(st);
         return self;
     }
@@ -245,7 +253,7 @@ pub const Merge = struct {
         const a = self.mem.allocator();
         for (p.keys, 0..) |k, j| {
             const c = cols[p.cols[k].src];
-            for (0..b.len) |r| try self.bounds.widen(a, j, c.getValue(r));
+            for (0..b.len) |r| try self.bounds.spans[j].fold(a, c.getValue(r));
         }
         const nb = Batch{ .schema = &self.schema, .columns = cols, .len = b.len };
         if (self.opts.space) |sp| {
@@ -839,14 +847,12 @@ test "bounds: partition values and statistics rule a file out only when provably
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    var lo = [_]Value{ .{ .int = 10 }, .{ .string = "eu" } };
-    var hi = [_]Value{ .{ .int = 20 }, .{ .string = "us" } };
+    var sp = [_]Span{ .{ .min = .{ .int = 10 }, .max = .{ .int = 20 } }, .{ .min = .{ .string = "eu" }, .max = .{ .string = "us" } } };
     const b = Bounds{
         .names = &.{ "id", "region" },
         .tys = &.{ types.Type.init(.int), types.Type.init(.string) },
         .part = &.{ false, true },
-        .lo = &lo,
-        .hi = &hi,
+        .spans = &sp,
     };
     const P = struct {
         fn parts(al: std.mem.Allocator, text: []const u8) !std.json.Value {
@@ -865,22 +871,19 @@ test "bounds: partition values and statistics rule a file out only when provably
     try testing.expect(!try b.mayHold(a, try P.parts(a, "{\"region\":null}"), null));
     try testing.expect(try b.mayHold(a, try P.parts(a, "{}"), null));
 
-    var tlo = [_]Value{.{ .timestamp = 1_000_500 }};
-    var thi = [_]Value{.{ .timestamp = 1_000_900 }};
-    var slo = [_]Value{.{ .string = "m" }};
-    var shi = [_]Value{.{ .string = "n" }};
-    const ts = Bounds{ .names = &.{"t"}, .tys = &.{types.Type.init(.timestamp)}, .part = &.{false}, .lo = &tlo, .hi = &thi };
+    var tsp = [_]Span{.{ .min = .{ .timestamp = 1_000_500 }, .max = .{ .timestamp = 1_000_900 } }};
+    var ssp = [_]Span{.{ .min = .{ .string = "m" }, .max = .{ .string = "n" } }};
+    const ts = Bounds{ .names = &.{"t"}, .tys = &.{types.Type.init(.timestamp)}, .part = &.{false}, .spans = &tsp };
     try testing.expect(try ts.mayHold(a, null, "{\"maxValues\":{\"t\":\"1970-01-01T00:00:01.000Z\"}}"));
     try testing.expect(!try ts.mayHold(a, null, "{\"maxValues\":{\"t\":\"1970-01-01T00:00:00.999Z\"}}"));
-    var flo = [_]Value{.{ .float = @as(f32, 0.1) }};
-    var fhi = [_]Value{.{ .float = @as(f32, 0.1) }};
-    const fl = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{false}, .lo = &flo, .hi = &fhi, .float32 = &.{true} };
+    var fsp = [_]Span{.{ .min = .{ .float = @as(f32, 0.1) }, .max = .{ .float = @as(f32, 0.1) } }};
+    const fl = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{false}, .spans = &fsp, .float32 = &.{true} };
     try testing.expect(try fl.mayHold(a, null, "{\"minValues\":{\"f\":0.1},\"maxValues\":{\"f\":0.1}}"));
-    const fp = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{true}, .lo = &flo, .hi = &fhi, .float32 = &.{true} };
+    const fp = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{true}, .spans = &fsp, .float32 = &.{true} };
     try testing.expect(try fp.mayHold(a, try P.parts(a, "{\"f\":\"0.1\"}"), null));
-    const fd = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{false}, .lo = &flo, .hi = &fhi };
+    const fd = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{false}, .spans = &fsp };
     try testing.expect(!try fd.mayHold(a, null, "{\"maxValues\":{\"f\":0.1}}"));
-    const str = Bounds{ .names = &.{"s"}, .tys = &.{types.Type.init(.string)}, .part = &.{false}, .lo = &slo, .hi = &shi };
+    const str = Bounds{ .names = &.{"s"}, .tys = &.{types.Type.init(.string)}, .part = &.{false}, .spans = &ssp };
     try testing.expect(!try str.mayHold(a, null, "{\"maxValues\":{\"s\":\"abc\"}}"));
     try testing.expect(try str.mayHold(a, null, "{\"maxValues\":{\"s\":\"" ++ "a" ** 32 ++ "\"}}"));
 }
@@ -891,18 +894,17 @@ test "bounds: a NaN key is never ruled out by statistics a writer may have left 
     const a = ar.allocator();
     const nan = std.math.nan(f64);
     const stats = "{\"numRecords\":2,\"minValues\":{\"f\":1.0},\"maxValues\":{\"f\":1.0},\"nullCount\":{\"f\":0}}";
-    var lo = [_]Value{.{ .float = nan }};
-    var hi = [_]Value{.{ .float = nan }};
-    const all_nan = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{false}, .lo = &lo, .hi = &hi };
+    var nan_sp = [_]Span{.{ .min = .{ .float = nan }, .max = .{ .float = nan } }};
+    const all_nan = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{false}, .spans = &nan_sp };
     try testing.expect(try all_nan.mayHold(a, null, stats));
-    var lo5 = [_]Value{.{ .float = 5 }};
-    const some_nan = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{false}, .lo = &lo5, .hi = &hi };
+    var some_sp = [_]Span{.{ .min = .{ .float = 5 }, .max = .{ .float = nan } }};
+    const some_nan = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{false}, .spans = &some_sp };
     try testing.expect(try some_nan.mayHold(a, null, stats));
     try testing.expect(!try some_nan.mayHold(a, null, "{\"numRecords\":2,\"nullCount\":{\"f\":2}}"));
-    var hi5 = [_]Value{.{ .float = 5 }};
-    const no_nan = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{false}, .lo = &lo5, .hi = &hi5 };
+    var five_sp = [_]Span{.{ .min = .{ .float = 5 }, .max = .{ .float = 5 } }};
+    const no_nan = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{false}, .spans = &five_sp };
     try testing.expect(!try no_nan.mayHold(a, null, stats));
-    const part = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{true}, .lo = &lo5, .hi = &hi };
+    const part = Bounds{ .names = &.{"f"}, .tys = &.{types.Type.init(.float)}, .part = &.{true}, .spans = &some_sp };
     try testing.expect(!try part.mayHold(a, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"f\":\"1.0\"}", .{}), null));
     try testing.expect(try part.mayHold(a, try std.json.parseFromSliceLeaky(std.json.Value, a, "{\"f\":\"NaN\"}", .{}), null));
 }
