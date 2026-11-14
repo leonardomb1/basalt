@@ -6,6 +6,7 @@ const Env = @import("../env.zig").Env;
 const RunOptions = @import("../env.zig").RunOptions;
 const SplitCtx = @import("../connect.zig").SplitCtx;
 const Stats = @import("../env.zig").Stats;
+const UnitPipeline = @import("../lanes/map.zig").UnitPipeline;
 const aborting = @import("../env.zig").aborting;
 const analyze = @import("../analyze.zig");
 const ast = @import("../../lang/ast.zig");
@@ -924,6 +925,23 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     const snk = try openSink(env, wr, res.schema);
     var guard = SinkGuard.init(snk);
     defer guard.abort();
+
+    if (snk.unitRows() > 0 and opts.lanes() > 1) {
+        var up: UnitPipeline = undefined;
+        try up.start(arena, gpa, snk, opts.lanes() - 1);
+        defer up.shutdown();
+        while (true) {
+            if (aborting()) return error.Aborted;
+            const b = (try res.op.next(batch_arena.allocator())) orelse break;
+            try up.submit(b);
+            stats.rows_out += b.len;
+            _ = batch_arena.reset(.retain_capacity);
+        }
+        try up.finish();
+        try guard.close();
+        if (env.profile) |p| _ = try p.absorb(res.op);
+        return;
+    }
 
     var ping_pong: [2]std.heap.ArenaAllocator = .{ std.heap.ArenaAllocator.init(gpa), std.heap.ArenaAllocator.init(gpa) };
     defer for (&ping_pong) |*a| a.deinit();

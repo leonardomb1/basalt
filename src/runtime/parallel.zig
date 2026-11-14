@@ -274,11 +274,11 @@ const LaneTally = struct {
 
 /// A failure's account (`eval.takeFailure`, else the connector's), thread-local to
 /// the thread that failed, copied so the thread reporting the error can give it.
-const ThreadNote = struct {
+pub const ThreadNote = struct {
     buf: [480]u8 = undefined,
     len: usize = 0,
 
-    fn capture(self: *ThreadNote, e: anyerror) void {
+    pub fn capture(self: *ThreadNote, e: anyerror) void {
         if (eval.takeFailure(e)) |why| {
             self.len = @min(why.len, self.buf.len);
             @memcpy(self.buf[0..self.len], why[0..self.len]);
@@ -287,7 +287,7 @@ const ThreadNote = struct {
         }
     }
 
-    fn explained(self: *const ThreadNote, e: anyerror) anyerror {
+    pub fn explained(self: *const ThreadNote, e: anyerror) anyerror {
         return if (self.len > 0) eval.explain(e, self.buf[0..self.len]) else e;
     }
 };

@@ -60,8 +60,11 @@ pub const OrderedOut = struct {
     const Part = union(enum) { bytes: []const u8, batch: Batch, encoded: driver.UnitEncoder };
     const Unit = struct { arena: std.heap.ArenaAllocator, parts: std.array_list.Managed(Part), next_free: ?*Unit = null };
 
-    pub fn init(arena: std.mem.Allocator, nunits: usize, window: usize, snk: driver.Sink) !OrderedOut {
-        const done = try arena.alloc(?*Unit, nunits);
+    /// `done` is a ring of `window` slots: a unit begins only within `window` of
+    /// `next` (`waitTurn`), so the units in flight never share a slot, and the count
+    /// of units need not be known, as it is not for a serial source.
+    pub fn init(arena: std.mem.Allocator, window: usize, snk: driver.Sink) !OrderedOut {
+        const done = try arena.alloc(?*Unit, window);
         @memset(done, null);
         return .{ .window = window, .done = done, .snk = snk };
     }
@@ -83,15 +86,16 @@ pub const OrderedOut = struct {
     /// unit from `next` on, outside `mtx`, so handing over never waits on the sink.
     pub fn deposit(self: *OrderedOut, i: usize, u: *Unit) !void {
         self.mtx.lock();
-        self.done[i] = u;
+        self.done[i % self.window] = u;
         if (self.writing) {
             self.mtx.unlock();
             return;
         }
         self.writing = true;
-        while (self.next < self.done.len) {
-            const head = self.done[self.next] orelse break;
-            self.done[self.next] = null;
+        while (true) {
+            const slot = &self.done[self.next % self.window];
+            const head = slot.* orelse break;
+            slot.* = null;
             self.next += 1;
             self.cv.broadcast();
             self.mtx.unlock();
@@ -196,6 +200,157 @@ pub const OrderedOut = struct {
             try f.unit.parts.append(.{ .encoded = e });
         }
         try self.deposit(i, f.unit);
+    }
+};
+
+/// A unit-encoding sink (Parquet) fed by one serial pipeline: a gzip CSV, stdin, a
+/// serial SQL read. Its batches are copied into a unit until it holds the sink's
+/// `unitRows`, and a pool of workers encodes the units on their own threads while
+/// the pipeline reads on, `OrderedOut` committing them in order; one writer thread
+/// encoding every row group had held a gzipped CSV's load to its pace. A unit
+/// begins only within the window (`workers + 2`), which bounds the rows held.
+pub const UnitPipeline = struct {
+    ordered: OrderedOut,
+    snk: driver.Sink,
+    gpa: std.mem.Allocator,
+    unit_rows: usize,
+    threads: []std.Thread = &.{},
+    mtx: std.Thread.Mutex = .{},
+    cv: std.Thread.Condition = .{},
+    queue: std.ArrayListUnmanaged(Job) = .empty,
+    stop: bool = false,
+    failed: std.atomic.Value(bool) = .init(false),
+    err: ?anyerror = null,
+    note: parallel.ThreadNote = .{},
+    cur: ?OrderedOut.Fill = null,
+    cur_i: usize = 0,
+    next_i: usize = 0,
+
+    const Job = struct { i: usize, unit: *OrderedOut.Unit };
+
+    /// The pipeline for `snk` on `workers` encoding threads, ready for `submit`.
+    pub fn start(self: *UnitPipeline, arena: std.mem.Allocator, gpa: std.mem.Allocator, snk: driver.Sink, workers: usize) !void {
+        self.* = .{ .ordered = try OrderedOut.init(arena, workers + 2, snk), .snk = snk, .gpa = gpa, .unit_rows = snk.unitRows() };
+        try self.queue.ensureTotalCapacity(arena, workers + 2);
+        const threads = try arena.alloc(std.Thread, workers);
+        var n: usize = 0;
+        errdefer self.joinFirst(threads[0..n]);
+        while (n < workers) : (n += 1) threads[n] = try std.Thread.spawn(.{}, workerFn, .{self});
+        self.threads = threads;
+    }
+
+    /// Copies `b` into the unit being filled, handing the unit to a worker once it
+    /// holds `unit_rows`; waits while the window is full.
+    pub fn submit(self: *UnitPipeline, b: Batch) !void {
+        if (b.len == 0) return;
+        if (self.failed.load(.seq_cst)) return self.failure();
+        if (self.cur == null) {
+            self.ordered.waitTurn(self.next_i, &self.failed);
+            if (self.failed.load(.seq_cst)) return self.failure();
+            const unit = try self.ordered.takeUnit();
+            self.cur = .{ .unit = unit, .enc = null };
+            self.cur_i = self.next_i;
+            self.next_i += 1;
+        }
+        const f = &self.cur.?;
+        try f.unit.parts.append(.{ .batch = try b.deepCopy(f.unit.arena.allocator()) });
+        f.rows += b.len;
+        if (f.rows >= self.unit_rows) try self.hand();
+    }
+
+    fn hand(self: *UnitPipeline) !void {
+        const f = self.cur orelse return;
+        self.cur = null;
+        self.mtx.lock();
+        defer self.mtx.unlock();
+        self.queue.appendAssumeCapacity(.{ .i = self.cur_i, .unit = f.unit });
+        self.cv.signal();
+    }
+
+    /// The last unit handed over, every unit encoded and committed, the workers gone.
+    pub fn finish(self: *UnitPipeline) !void {
+        if (!self.failed.load(.seq_cst)) try self.hand();
+        self.shutdown();
+        if (self.err != null) return self.failure();
+    }
+
+    /// Stops and joins the workers, whatever is still queued dropped; idempotent.
+    pub fn shutdown(self: *UnitPipeline) void {
+        if (self.cur) |f| {
+            OrderedOut.freeUnit(f.unit);
+            self.cur = null;
+        }
+        self.mtx.lock();
+        self.stop = true;
+        self.cv.broadcast();
+        self.mtx.unlock();
+        self.joinFirst(self.threads);
+        self.threads = &.{};
+        for (self.queue.items) |j| OrderedOut.freeUnit(j.unit);
+        self.queue.clearRetainingCapacity();
+        self.ordered.freeRest();
+    }
+
+    fn joinFirst(self: *UnitPipeline, threads: []std.Thread) void {
+        _ = self;
+        for (threads) |t| t.join();
+    }
+
+    fn failure(self: *UnitPipeline) anyerror {
+        const e = self.err orelse return error.Aborted;
+        return self.note.explained(e);
+    }
+
+    fn fail(self: *UnitPipeline, e: anyerror) void {
+        self.mtx.lock();
+        if (self.err == null) {
+            self.err = e;
+            self.note.capture(e);
+        }
+        self.mtx.unlock();
+        self.failed.store(true, .seq_cst);
+        self.ordered.wake();
+    }
+
+    fn workerFn(self: *UnitPipeline) void {
+        var scratch = std.heap.ArenaAllocator.init(self.gpa);
+        defer scratch.deinit();
+        while (true) {
+            self.mtx.lock();
+            while (self.queue.items.len == 0 and !self.stop) self.cv.wait(&self.mtx);
+            if (self.queue.items.len == 0) {
+                self.mtx.unlock();
+                return;
+            }
+            const job = self.queue.orderedRemove(0);
+            self.mtx.unlock();
+            if (self.failed.load(.seq_cst)) {
+                OrderedOut.freeUnit(job.unit);
+                continue;
+            }
+            self.encode(job, &scratch) catch |e| self.fail(e);
+        }
+    }
+
+    /// The unit's copied batches through an encoder of its own, sealed, then handed
+    /// to `OrderedOut` in place of the batches. The unit is this worker's to drop
+    /// until `hand`, which owns it from there, a failed seal or commit included.
+    fn encode(self: *UnitPipeline, job: Job, scratch: *std.heap.ArenaAllocator) !void {
+        const unit = job.unit;
+        const enc = (self.snk.openUnit(unit.arena.allocator()) orelse unreachable) catch |e| {
+            OrderedOut.freeUnit(unit);
+            return e;
+        };
+        const f = OrderedOut.Fill{ .unit = unit, .enc = enc };
+        {
+            errdefer f.drop();
+            for (unit.parts.items) |part| {
+                try enc.write(scratch.allocator(), part.batch);
+                _ = scratch.reset(.retain_capacity);
+            }
+            unit.parts.clearRetainingCapacity();
+        }
+        try self.ordered.hand(job.i, f);
     }
 };
 
@@ -363,7 +518,7 @@ fn mapDrive(env: *Env, m_in: *const Morsels, recs: []const analyze.Resolved, lan
     var g = MapSink{ .env = env, .sink_mode = sink_mode, .join = lane_join, .threads = nthreads };
     var ordered: OrderedOut = undefined;
     if (sink_mode == .shared and m.* != .sql) {
-        ordered = try OrderedOut.init(arena, m.count(), 2 * nthreads, sink_mode.shared);
+        ordered = try OrderedOut.init(arena, 2 * nthreads, sink_mode.shared);
         g.ordered = &ordered;
     }
     defer if (g.ordered) |o| o.freeRest();
@@ -487,4 +642,89 @@ test "join kinds allowed on the parallel probe path" {
     try std.testing.expect(mapJoinKindLaneSafe(.right));
     try std.testing.expect(mapJoinKindLaneSafe(.full));
     try std.testing.expect(mapJoinKindLaneSafe(.inner));
+}
+
+/// A unit-encoding sink whose encoders fail at `fail_at` of write, seal or commit,
+/// counting what it committed.
+const FailingUnits = struct {
+    fail_at: enum { none, write, seal, commit },
+    committed: std.atomic.Value(usize) = .init(0),
+
+    const Enc = struct { owner: *FailingUnits, rows: usize = 0 };
+
+    pub const unit_rows: usize = 4;
+
+    fn sink(self: *FailingUnits) driver.Sink {
+        return .{ .ptr = self, .vtable = &vt };
+    }
+
+    const vt = driver.Sink.VTable{
+        .writeBatch = struct {
+            fn f(_: *anyopaque, _: std.mem.Allocator, _: Batch) anyerror!void {}
+        }.f,
+        .close = struct {
+            fn f(_: *anyopaque) anyerror!void {}
+        }.f,
+        .abort = struct {
+            fn f(_: *anyopaque) void {}
+        }.f,
+        .openUnit = struct {
+            fn f(p: *anyopaque, a: std.mem.Allocator) anyerror!driver.UnitEncoder {
+                const e = try a.create(Enc);
+                e.* = .{ .owner = @ptrCast(@alignCast(p)) };
+                return .{ .ptr = e, .vtable = &enc_vt };
+            }
+        }.f,
+        .unit_rows = unit_rows,
+    };
+
+    const enc_vt = driver.UnitEncoder.VTable{
+        .write = struct {
+            fn f(p: *anyopaque, _: std.mem.Allocator, b: Batch) anyerror!void {
+                const e: *Enc = @ptrCast(@alignCast(p));
+                if (e.owner.fail_at == .write) return error.EncodeFailed;
+                e.rows += b.len;
+            }
+        }.f,
+        .seal = struct {
+            fn f(p: *anyopaque) anyerror!void {
+                const e: *Enc = @ptrCast(@alignCast(p));
+                if (e.owner.fail_at == .seal) return error.EncodeFailed;
+            }
+        }.f,
+        .commit = struct {
+            fn f(p: *anyopaque) anyerror!void {
+                const e: *Enc = @ptrCast(@alignCast(p));
+                if (e.owner.fail_at == .commit) return error.EncodeFailed;
+                _ = e.owner.committed.fetchAdd(e.rows, .monotonic);
+            }
+        }.f,
+        .discard = struct {
+            fn f(_: *anyopaque) void {}
+        }.f,
+    };
+};
+
+test "a serial pipeline's units encode on workers, every row committed, and an encoder failing at write, seal or commit is the run's error, each unit freed once" {
+    const tu = @import("../../exec/op/testing_util.zig");
+    for ([_]@TypeOf(@as(FailingUnits, undefined).fail_at){ .none, .write, .seal, .commit }) |at| {
+        var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer ar.deinit();
+        const a = ar.allocator();
+        var fu = FailingUnits{ .fail_at = at };
+        var up: UnitPipeline = undefined;
+        try up.start(a, std.testing.allocator, fu.sink(), 3);
+        defer up.shutdown();
+        const r = blk: {
+            for (0..40) |k| {
+                const b = try tu.intBatch(a, &tu.int_schema, &.{ @intCast(k), @intCast(k + 1), @intCast(k + 2) });
+                up.submit(b) catch |e| break :blk e;
+            }
+            break :blk up.finish();
+        };
+        if (at == .none) {
+            try r;
+            try std.testing.expectEqual(@as(usize, 120), fu.committed.load(.monotonic));
+        } else try std.testing.expectError(error.EncodeFailed, r);
+    }
 }

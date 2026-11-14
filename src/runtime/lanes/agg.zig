@@ -231,7 +231,7 @@ fn writeGroups(
         return writeTail(env, snk, batch, emitter.out_schema.*, tail, stats, .aggregate);
     }
 
-    var ord = try OrderedOut.init(env.arena, sets.len, 2 * threads, snk);
+    var ord = try OrderedOut.init(env.arena, 2 * threads, snk);
     defer ord.freeRest();
     var ctx = GroupWriteCtx{
         .emitter = emitter,
