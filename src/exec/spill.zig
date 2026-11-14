@@ -20,6 +20,7 @@
 //! read back must not be written in place.
 
 const std = @import("std");
+const filemap = @import("filemap.zig");
 const types = @import("../lang/types.zig");
 const value = @import("value.zig");
 const column = @import("column.zig");
@@ -288,7 +289,7 @@ pub const Writer = struct {
 };
 
 pub const Reader = struct {
-    map: []align(std.heap.page_size_min) const u8,
+    map: filemap.Map,
     schema: *const types.Schema,
     c: Cursor,
     /// Where the pages already handed back end: a run read once is not held resident
@@ -311,11 +312,9 @@ pub const Reader = struct {
     pub fn open(run: Run) !Reader {
         const file = try std.fs.cwd().openFile(run.path, .{});
         defer file.close();
-        const size = (try file.stat()).size;
-        if (size != run.bytes) return error.CorruptSpill;
-        if (size < ALIGN) return error.CorruptSpill;
-        const map = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
-        errdefer std.posix.munmap(map);
+        const map = try filemap.whole(file);
+        errdefer filemap.release(map);
+        if (map.len != run.bytes or map.len < ALIGN) return error.CorruptSpill;
         if (!std.mem.eql(u8, map[0..MAGIC.len], MAGIC)) return error.CorruptSpill;
         return .{ .map = map, .schema = run.schema, .c = .{ .p = map, .i = ALIGN } };
     }
@@ -471,7 +470,7 @@ pub const Reader = struct {
         self.spare.deinit(std.heap.smp_allocator);
         self.live = .empty;
         self.spare = .empty;
-        if (self.map.len > 0) std.posix.munmap(self.map);
+        filemap.release(self.map);
         self.map = self.map[0..0];
         self.c = .{ .p = self.map };
     }

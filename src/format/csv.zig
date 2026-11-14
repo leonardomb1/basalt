@@ -45,6 +45,7 @@
 //! `.part` is removed. Committing on close is what makes the object appear.
 
 const std = @import("std");
+const filemap = @import("../exec/filemap.zig");
 const msgfmt = @import("msgfmt.zig");
 const types = @import("../lang/types.zig");
 const column = @import("../exec/column.zig");
@@ -406,7 +407,7 @@ fn stripBom(line: []const u8) []const u8 {
 }
 
 pub const MappedCsv = struct {
-    data: []align(std.heap.page_size_min) const u8,
+    data: filemap.Map,
     body: []const u8,
     schema: types.Schema,
     file: std.fs.File,
@@ -446,10 +447,9 @@ pub const MappedCsv = struct {
         const self = try arena.create(MappedCsv);
         const file = try std.fs.cwd().openFile(path, .{});
         errdefer file.close();
-        const size = (try file.stat()).size;
-        if (size == 0) return error.NotMappable;
-        const data = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
-        errdefer std.posix.munmap(data);
+        const data = try filemap.whole(file);
+        errdefer filemap.release(data);
+        if (data.len == 0) return error.NotMappable;
         const first = std.mem.indexOfNone(u8, data, " \t\r\n") orelse return error.NotMappable;
         if (data[first] == '[' and opts.shape != .ndjson) return error.NotMappable;
         var sample = opts;
@@ -465,10 +465,9 @@ pub const MappedCsv = struct {
         if (std.mem.indexOf(u8, path, "://") != null or splitCodec(path).codec != .none or splitArchive(path) != null) return error.NotMappable;
         const file = try std.fs.cwd().openFile(path, .{});
         errdefer file.close();
-        const size = (try file.stat()).size;
-        if (size == 0) return error.NotMappable;
-        const data = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
-        errdefer std.posix.munmap(data);
+        const data = try filemap.whole(file);
+        errdefer filemap.release(data);
+        if (data.len == 0) return error.NotMappable;
         const recs = try arena.create(records.Mapped);
         recs.* = try records.Mapped.init(data, mode, try arena.dupe(u8, path));
         const self = try arena.create(MappedCsv);
@@ -497,10 +496,9 @@ pub const MappedCsv = struct {
         const self = try arena.create(MappedCsv);
         const file = try std.fs.cwd().openFile(path, .{});
         errdefer file.close();
-        const size = (try file.stat()).size;
-        if (size == 0) return error.EmptyCsv;
-        const data = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
-        errdefer std.posix.munmap(data);
+        const data = try filemap.whole(file);
+        errdefer filemap.release(data);
+        if (data.len == 0) return error.EmptyCsv;
 
         if (std.mem.indexOfScalar(u8, data, '\n') == null) return error.NotMappable;
         const head = scanRecord(data, 0, dialect.delim);
@@ -589,7 +587,7 @@ pub const MappedCsv = struct {
 
     pub fn close(self: *MappedCsv) void {
         if (self.recs) |r| r.deinit();
-        std.posix.munmap(self.data);
+        filemap.release(self.data);
         self.file.close();
     }
 };

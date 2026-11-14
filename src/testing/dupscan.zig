@@ -428,6 +428,7 @@ pub const plan = [_]Rule{
     } },
     .{ .home = "print", .pattern = print_pattern, .exact = true, .allow = &.{"lang/print.zig"} },
     .{ .home = "objstore.Upload", .pattern = upload_pattern, .exact = true, .allow = &.{"store/objstore.zig"} },
+    .{ .home = "filemap", .pattern = filemap_pattern, .exact = true, .allow = &.{"exec/filemap.zig"} },
     .{ .home = "driver.LoginNote", .pattern = login_note_pattern, .exact = true, .allow = &.{"connect/driver.zig"} },
     .{ .home = "formats_open", .pattern = format_arm_pattern, .exact = true },
     .{ .home = "output", .pattern = output_pattern, .under = "format/", .exact = true, .allow = &.{
@@ -507,6 +508,9 @@ pub const print_pattern = "\\.shl => \"<<\"|\\.@\"and\" => \"|\\.not => \"\\(?(n
 /// A provider gathering its own parts: buffering, sizing and the part list belong
 /// to `objstore.Upload`, which a provider feeds through `Upload.VTable`.
 pub const upload_pattern = "\\.part_len([^a-zA-Z0-9_]|$)";
+/// A file mapped read-only by hand: `filemap.whole` maps it and `filemap.release`
+/// unmaps it, an empty file included.
+pub const filemap_pattern = "posix\\.mmap\\([^\\n]*PROT\\.READ, ";
 /// A connector's own thread-local failure note: every connector explains its
 /// failures through the one `driver.LoginNote`.
 pub const login_note_pattern = "threadlocal var \\w+: [^=]*(ThreadNote\\(|LoginNote )";
@@ -728,6 +732,8 @@ test "dupscan plan patterns: what each one catches and what it lets through" {
         .{ upload_pattern, "if (self.up.part_len > 0) {", true },
         .{ upload_pattern, "self.part_len += n;", true },
         .{ upload_pattern, "const n = self.part_length;", false },
+        .{ filemap_pattern, "const data = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);", true },
+        .{ filemap_pattern, "const raw = std.posix.mmap(null, n, std.posix.PROT.READ | std.posix.PROT.WRITE, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch return null;", false },
         .{ upload_pattern, "try w.up.ship(bytes);", false },
     };
     for (cases) |c| {

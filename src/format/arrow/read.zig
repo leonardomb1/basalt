@@ -44,6 +44,7 @@
 //! several, and which one a query meant is not something to guess.
 
 const std = @import("std");
+const filemap = @import("../../exec/filemap.zig");
 const pagecache = @import("../../exec/pagecache.zig");
 const msgfmt = @import("../msgfmt.zig");
 const types = @import("../../lang/types.zig");
@@ -450,7 +451,7 @@ fn bytesOf(arena: std.mem.Allocator, b: Buf, c: ?Codec) Error![]const u8 {
 
 pub const Reader = struct {
     arena: std.mem.Allocator,
-    map: []align(std.heap.page_size_min) const u8,
+    map: filemap.Map,
     data: []const u8 = &.{},
     end: usize,
     pos: usize,
@@ -479,10 +480,9 @@ pub const Reader = struct {
         if (std.mem.indexOf(u8, path, "://") != null) return Error.UnsupportedArrow;
         const file = try std.fs.cwd().openFile(path, .{});
         defer file.close();
-        const size = (try file.stat()).size;
-        if (size < 8) return Error.NotArrow;
-        const map = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, file.handle, 0);
-        errdefer std.posix.munmap(map);
+        const map = try filemap.whole(file);
+        errdefer filemap.release(map);
+        if (map.len < 8) return Error.NotArrow;
         const self = try arena.create(Reader);
         self.* = .{
             .arena = arena,
@@ -762,7 +762,7 @@ pub const Reader = struct {
     pub fn close(self: *Reader) void {
         self.rb_arena.deinit();
         self.dicts.deinit();
-        if (self.map.len > 0) std.posix.munmap(self.map);
+        filemap.release(self.map);
     }
 
     pub fn source(self: *Reader) driver.Source {
