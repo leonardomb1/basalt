@@ -173,18 +173,6 @@ fn decimalOf(e: parquet.SchemaElement) Error!types.Type {
     return types.Type.decimal(@intCast(p), @intCast(s));
 }
 
-/// A byte-array decimal's big-endian two's-complement unscaled value, unchecked
-/// (`decimal.bigEndianWrapping`).
-pub const unscaledOf = @import("../../exec/decimal.zig").bigEndianWrapping;
-
-test "unscaledOf reads big-endian two's complement unchecked: past 16 bytes only the last 16 count" {
-    try testing.expectEqual(@as(i128, 0), unscaledOf(&.{}));
-    try testing.expectEqual(@as(i128, -255), unscaledOf(&.{ 0xFF, 0x01 }));
-    try testing.expectEqual(@as(i128, 0x0102), unscaledOf(&.{ 0x01, 0x02 }));
-    try testing.expectEqual(@as(i128, std.math.minInt(i128)), unscaledOf(&(.{ 0x7F, 0x80 } ++ .{0x00} ** 15)));
-    try testing.expectEqual(@as(i128, 5), unscaledOf(&(.{ 0x01, 0x00 } ++ .{0x00} ** 14 ++ .{0x05})));
-}
-
 test "physical plus converted type maps onto a basalt type" {
     const opt = parquet.Repetition.optional;
     try testing.expectEqual(types.TypeKind.int, (try basaltType(.{ .ty = .int32, .repetition = opt })).kind);

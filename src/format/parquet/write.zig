@@ -1853,9 +1853,7 @@ test "flba widths and big-endian two's complement match what readers expect" {
     var wide: [16]u8 = undefined;
     const x: i128 = 12_500_000_000_000_000_000;
     try decimalBytes(&wide, x);
-    var acc: i128 = if (wide[0] & 0x80 != 0) -1 else 0;
-    for (wide) |byte| acc = (acc << 8) | byte;
-    try testing.expectEqual(x, acc);
+    try testing.expectEqual(x, decimal.bigEndianDecimal(&wide).?);
 
     var one: [1]u8 = undefined;
     try testing.expectError(Error.UnsupportedParquetDecimal, decimalBytes(&one, 128));

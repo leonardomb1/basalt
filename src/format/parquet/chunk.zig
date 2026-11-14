@@ -27,9 +27,9 @@ const parquet = @import("footer.zig");
 const std = @import("std");
 const temporalTick = @import("logical.zig").temporalTick;
 const types = @import("../../lang/types.zig");
-const unscaledOf = @import("logical.zig").unscaledOf;
 const unsignedBits = @import("logical.zig").unsignedBits;
 const decimal = @import("../../exec/decimal.zig");
+const bigEndianDecimal = decimal.bigEndianDecimal;
 const eval = @import("../../exec/eval.zig");
 const Reader = @import("read.zig").Reader;
 const fx = @import("testing_util.zig").fx;
@@ -364,8 +364,9 @@ const Cast = struct {
         return .{ .unscaled = types.u64Unscaled(x), .scale = c.ty.scale };
     }
 
+    /// A byte-array decimal `pushBytes` has held to its precision already.
     fn bytesDecimal(c: Cast, s: []const u8) Decimal {
-        return .{ .unscaled = unscaledOf(s), .scale = c.ty.scale };
+        return .{ .unscaled = bigEndianDecimal(s) orelse unreachable, .scale = c.ty.scale };
     }
 };
 

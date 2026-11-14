@@ -408,6 +408,7 @@ pub const plan = [_]Rule{
     .{ .home = "clamp", .pattern = clamp_pattern, .exact = true },
     .{ .home = "http_std", .pattern = http_std_pattern, .exact = true },
     .{ .home = "percent", .pattern = percent_pattern, .exact = true, .allow = &.{ "net/percent.zig", "format/lake/delta_write.zig" } },
+    .{ .home = "decimal.bigEndianDecimal", .pattern = big_endian_pattern, .exact = true, .allow = &.{"exec/decimal.zig"} },
     .{ .home = "csv.Quoting", .pattern = csv_quote_pattern, .under = "format/", .exact = true, .allow = &.{"format/csv.zig"} },
     .{ .home = "hoist.projectedFrom", .pattern = projected_pattern, .exact = true, .allow = &.{"runtime/pushdown/hoist.zig"} },
     .{ .home = "ast.splitAnd", .pattern = split_and_pattern, .exact = true, .allow = &.{
@@ -465,6 +466,7 @@ pub const unsigned_pattern = "decimal\\(20, ?0\\)";
 pub const clamp_pattern = "dayMicros\\(|\\*\\| ?(civil\\.)?us_per_day";
 pub const http_std_pattern = "std\\.http\\.Client";
 pub const percent_pattern = "percentEncode\\(|%\\{X:0>2\\}";
+pub const big_endian_pattern = "acc = \\(acc << 8\\) \\|";
 pub const csv_quote_pattern = "\\[\\w+ \\+ 1\\] == '\"'";
 pub const projected_pattern = "\\.to, name\\)";
 pub const split_and_pattern = "\\.binary\\.op == \\.@\"and\"\\) \\{";

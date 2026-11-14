@@ -1129,15 +1129,6 @@ pub inline fn unscaledAt(out: []i128, vals: []const Decimal, valid: anytype, sca
     return true;
 }
 
-/// A big-endian two's complement integer as an unscaled decimal, with no width
-/// check: past 16 bytes only the last 16 count, as a Parquet byte-array decimal
-/// has always been read. `bigEndianDecimal` is the checked reading.
-pub fn bigEndianWrapping(b: []const u8) i128 {
-    var acc: i128 = if (b.len > 0 and b[0] & 0x80 != 0) -1 else 0;
-    for (b) |byte| acc = (acc << 8) | byte;
-    return acc;
-}
-
 const testing = std.testing;
 
 fn writeDecimalReference(w: anytype, unscaled: i128, scale: u8) !void {
