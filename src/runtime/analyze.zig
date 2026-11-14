@@ -341,6 +341,7 @@ const lake = @import("../format/lake/table.zig");
 pub const formatLabel = @import("analyze/targets.zig").formatLabel;
 pub const unwritableTarget = @import("analyze/targets.zig").unwritableTarget;
 pub const unreadableTarget = @import("analyze/targets.zig").unreadableTarget;
+pub const targetProblem = @import("analyze/targets.zig").targetProblem;
 pub const archiveProblem = @import("analyze/targets.zig").archiveProblem;
 const mayDivide = @import("analyze/targets.zig").mayDivide;
 const sourceVeto = @import("analyze/targets.zig").sourceVeto;
@@ -1922,7 +1923,7 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
     const to_file = std.mem.eql(u8, w.connector, "csv") and w.target.len > 0;
     if (to_file) {
         const fmt = try formatFromHints(hints, diag);
-        if (unwritableTarget(w.target, fmt) orelse unreadableTarget(w.target, fmt)) |why|
+        if (unwritableTarget(w.target, fmt) orelse targetProblem(w.target, fmt)) |why|
             return fail(diag, "cannot write `{s}`: {s}", .{ w.target, why });
     }
     _ = try dialectFromHints(hints, diag);

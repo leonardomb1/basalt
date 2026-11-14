@@ -43,10 +43,11 @@
 //! `total_compressed_size` (Arrow-based ones do) found the last page short.
 //!
 //! Output is strictly forward: every byte goes through `emit`, which tracks the
-//! running offset and never seeks, so the destination is any `*std.Io.Writer`, a
-//! local file or a staged object upload. Committing the upload happens only after
-//! the footer, so a reader never sees a Parquet object without one; an aborted
-//! run leaves either a footerless (unreadable) file or no object at all.
+//! running offset and never seeks, so the destination is any `Output`: a local
+//! file, a staged object upload, or memory for a lane's unit. Committing the upload
+//! happens only after the footer, so a reader never sees a Parquet object without
+//! one; an aborted run leaves either a footerless (unreadable) file or no object
+//! at all.
 //!
 //! Decimals take the physical type their precision calls for, as the spec
 //! prescribes: INT32 to 9 digits, INT64 to 18, FIXED_LEN_BYTE_ARRAY to the 38-digit
@@ -74,8 +75,7 @@ const codec = @import("../compress/codecs.zig");
 const eval = @import("../../exec/eval.zig");
 const decimal = @import("../../exec/decimal.zig");
 const driver = @import("../../connect/driver.zig");
-const objstore = @import("../../store/objstore.zig");
-const Part = @import("../../store/part.zig").Part;
+const Output = @import("../output.zig").Output;
 const types = @import("../../lang/types.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const column = @import("../../exec/column.zig");
@@ -517,8 +517,6 @@ const RowGroupMeta = struct {
     total_byte_size: i64,
 };
 
-const WRITE_BUF = 64 * 1024;
-
 const parquet_content_type = "application/vnd.apache.parquet";
 
 pub const Writer = struct {
@@ -530,9 +528,7 @@ pub const Writer = struct {
     own_mem: ?*std.heap.ArenaAllocator = null,
     pool: std.ArrayListUnmanaged(*std.heap.ArenaAllocator) = .empty,
     pool_mu: std.Thread.Mutex = .{},
-    backend: Backend,
-    write_buf: [WRITE_BUF]u8 = undefined,
-    fw: std.fs.File.Writer = undefined,
+    out: *Output,
     schema: types.Schema,
     maps: []Mapping,
     lays: []const Lay,
@@ -545,22 +541,7 @@ pub const Writer = struct {
     groups: List(RowGroupMeta),
     group_rows: usize = row_group_rows,
     group_bytes: usize = row_group_bytes,
-    part: Part = .{},
     field_ids: ?*const std.StringHashMapUnmanaged(i32) = null,
-
-    const Backend = union(enum) {
-        file: std.fs.File,
-        object: objstore.Writer,
-        memory: *std.Io.Writer.Allocating,
-    };
-
-    fn dest(self: *Writer) *std.Io.Writer {
-        return switch (self.backend) {
-            .file => &self.fw.interface,
-            .object => |o| o.io,
-            .memory => |m| &m.writer,
-        };
-    }
 
     pub const isPath = pqdecode.Reader.isPath;
 
@@ -600,7 +581,7 @@ pub const Writer = struct {
         self.* = .{
             .arena = arena,
             .scratch = std.heap.ArenaAllocator.init(pagecache.process),
-            .backend = undefined,
+            .out = undefined,
             .schema = schema,
             .maps = plan.maps,
             .lays = plan.lays,
@@ -610,29 +591,15 @@ pub const Writer = struct {
             .groups = List(RowGroupMeta).init(arena),
             .own_mem = mem,
         };
-        if (try objstore.openRemote(arena, path, parquet_content_type)) |o| {
-            self.backend = .{ .object = o };
-        } else {
-            self.backend = .{ .file = try self.part.create(path) };
-            self.fw = self.backend.file.writer(&self.write_buf);
-        }
-        errdefer self.dropBackend();
+        self.out = try Output.open(arena, path, parquet_content_type, .truncate);
+        errdefer self.out.abort();
         try self.emit(parquet.magic);
         return self;
     }
 
     fn emit(self: *Writer, bytes: []const u8) !void {
-        self.dest().writeAll(bytes) catch |e| return self.specific(e);
+        self.out.writer().writeAll(bytes) catch |e| return self.out.specific(e);
         self.offset += @intCast(bytes.len);
-    }
-
-    /// Recovers the error an object destination actually hit (see
-    /// `objstore.Writer.specific`); a file's error is already the real one.
-    fn specific(self: *Writer, e: anyerror) anyerror {
-        return switch (self.backend) {
-            .file, .memory => e,
-            .object => |o| o.specific(e),
-        };
     }
 
     /// Column at a time over spans of the batch: a span ends at `group_rows`, or
@@ -902,19 +869,7 @@ pub const Writer = struct {
         try self.emit(&len4);
         try self.emit(parquet.magic);
 
-        switch (self.backend) {
-            .file => |f| {
-                self.fw.interface.flush() catch |e| {
-                    f.close();
-                    self.part.discard();
-                    return e;
-                };
-                f.close();
-                try self.part.commit();
-            },
-            .object => |o| o.finish() catch |e| return self.specific(e),
-            .memory => {},
-        }
+        try self.out.finish();
         const sum = if (out) |a| try self.summarize(a) else null;
         self.freeOwn();
         return sum;
@@ -946,21 +901,8 @@ pub const Writer = struct {
 
     pub fn abort(self: *Writer) void {
         self.freeScratch();
-        self.dropBackend();
+        self.out.abort();
         self.freeOwn();
-    }
-
-    /// Closes the destination and discards what it holds: the `.part` file, or the
-    /// object upload.
-    fn dropBackend(self: *Writer) void {
-        switch (self.backend) {
-            .file => |f| {
-                f.close();
-                self.part.discard();
-            },
-            .object => |o| o.abort(),
-            .memory => {},
-        }
     }
 
     fn writeFileMetaData(self: *Writer, out: *List(u8)) !void {
@@ -1047,13 +989,12 @@ pub const Writer = struct {
         const col_mem = try self.takeColMem();
         errdefer self.giveColMem(col_mem);
         const cols = try newCols(arena, col_mem.allocator(), .{ .maps = self.maps, .lays = self.lays, .paths = self.paths });
-        const mem = try arena.create(std.Io.Writer.Allocating);
-        mem.* = std.Io.Writer.Allocating.init(arena);
+        const out = try Output.openMemory(arena);
         const e = try arena.create(Writer);
         e.* = .{
             .arena = arena,
             .scratch = std.heap.ArenaAllocator.init(pagecache.process),
-            .backend = .{ .memory = mem },
+            .out = out,
             .schema = self.schema,
             .maps = self.maps,
             .lays = self.lays,
@@ -1095,7 +1036,7 @@ pub const Writer = struct {
     fn appendEncoded(self: *Writer, enc: *Writer) !void {
         try self.flushRowGroup();
         const base = self.offset;
-        try self.emit(enc.backend.memory.written());
+        try self.emit(enc.out.written());
         for (enc.groups.items) |g| {
             const chunks = try self.arena.alloc(ChunkMeta, g.chunks.len);
             for (g.chunks, chunks) |c, *o| {

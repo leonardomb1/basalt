@@ -73,8 +73,11 @@ fn fileWriteMode(env: *Env, w: ast.Write) !driver.FileMode {
 pub fn guardFileFormat(env: *Env, path: []const u8, explicit: ?analyze.FileFormat, comptime verb: []const u8) !void {
     if (comptime std.mem.eql(u8, verb, "read")) if (explicit) |f| if (formats.readRefused(f)) |why|
         return planErr(env.diag, try msgfmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ path, why }));
-    const unwritable = if (comptime std.mem.eql(u8, verb, "write")) analyze.unwritableTarget(path, explicit) else null;
-    if (unwritable orelse analyze.unreadableTarget(path, explicit)) |why|
+    const problem = if (comptime std.mem.eql(u8, verb, "write"))
+        analyze.unwritableTarget(path, explicit) orelse analyze.targetProblem(path, explicit)
+    else
+        analyze.unreadableTarget(path, explicit);
+    if (problem) |why|
         return planErr(env.diag, try msgfmt.allocPrint(env.arena, "cannot " ++ verb ++ " `{s}`: {s}", .{ path, why }));
     if (comptime std.mem.eql(u8, verb, "read")) if (analyze.archiveProblem(env.arena, path, explicit, true)) |why|
         return planErr(env.diag, try msgfmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ path, why }));

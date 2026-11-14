@@ -414,7 +414,7 @@ pub fn stdinProblem(fmt: FileFormat) ?[]const u8 {
     return "STDIN is read as a stream, so it takes " ++ formats.stdin_labels ++ "; a file needing random access is read from a path";
 }
 
-/// Why `path` cannot be written beyond `unreadableTarget`; a CSV is gzipped for a
+/// Why `path` cannot be written beyond `targetProblem`; a CSV is gzipped for a
 /// `.gz` name, nothing else is.
 pub fn unwritableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
     if (explicit) |f| if (formats.of(f).write_refused) |why| return why;
@@ -432,7 +432,7 @@ pub fn unwritableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
 
 /// Why `path` cannot be read or written as a table, or null. A trailing `/` is a folder
 /// and an archive is `archiveProblem`'s to judge.
-pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
+pub fn targetProblem(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
     if (std.mem.endsWith(u8, path, "/")) return null;
     if (explicit == .delta) return "a Delta table is read from its root folder: end the path with `/`";
 
@@ -442,7 +442,16 @@ pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
         return "basalt handles " ++ formats.handled_list ++ "; name the format with `WITH (format = 'csv')` if the extension differs";
     const fmt = formats.of(tag);
     if (csv.splitCodec(path).codec != .none) if (fmt.compressed_read_refused) |why| return why;
-    if (std.mem.indexOf(u8, path, "://") != null) if (fmt.local_only) |why| return why;
+    return null;
+}
+
+/// Why `path` cannot be read as a table, or null: `targetProblem`, or a URL naming a
+/// format read only from a local file.
+pub fn unreadableTarget(path: []const u8, explicit: ?FileFormat) ?[]const u8 {
+    if (targetProblem(path, explicit)) |why| return why;
+    if (std.mem.endsWith(u8, path, "/") or csv.splitArchive(path) != null) return null;
+    const tag = explicit orelse formatOfPath(path) orelse return null;
+    if (std.mem.indexOf(u8, path, "://") != null) if (formats.of(tag).local_only) |why| return why;
     return null;
 }
 

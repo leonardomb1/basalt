@@ -1,8 +1,8 @@
 //! Opens any path a writer targets as one stream of bytes, the write side of
 //! `stream.zig`: a local file written whole through a `.part` (`store/part.zig`) or
-//! appended to in place, an object, SFTP or SMB upload committed on `finish`, or a
-//! file someone else owns (stdout). A `.gz` name gzips what is written. A format
-//! writer renders into `writer()` and never learns where its bytes go.
+//! appended to in place, an object, SFTP or SMB upload committed on `finish`, a
+//! file someone else owns (stdout), or memory. A `.gz` name gzips what is written.
+//! A format writer renders into `writer()` and never learns where its bytes go.
 //!
 //! On failure a local file keeps what was already flushed when appending, and is
 //! otherwise left as it was; an upload is never committed, so its staged blocks or
@@ -28,6 +28,7 @@ pub const Output = struct {
     const Backend = union(enum) {
         file: std.fs.File,
         object: objstore.Writer,
+        memory: *std.Io.Writer.Allocating,
     };
 
     /// `.append` opens a local file at its end (`end` is where it was), and is
@@ -59,6 +60,20 @@ pub const Output = struct {
         return self;
     }
 
+    /// Writes into memory, read back with `written`; nothing to commit or discard.
+    pub fn openMemory(arena: std.mem.Allocator) !*Output {
+        const m = try arena.create(std.Io.Writer.Allocating);
+        m.* = std.Io.Writer.Allocating.init(arena);
+        const self = try arena.create(Output);
+        self.* = .{ .backend = .{ .memory = m }, .owns_file = false };
+        return self;
+    }
+
+    /// What a memory output holds.
+    pub fn written(self: *Output) []u8 {
+        return self.backend.memory.written();
+    }
+
     /// Gzips everything written from here on, for a `.gz` name; zstd is refused.
     pub fn compress(self: *Output, path: []const u8) !void {
         switch (stream.splitCodec(path).codec) {
@@ -77,14 +92,15 @@ pub const Output = struct {
         return switch (self.backend) {
             .file => &self.fw.interface,
             .object => |o| o.io,
+            .memory => |m| &m.writer,
         };
     }
 
-    /// The local file being written, null for an upload.
+    /// The local file being written, null for an upload or memory.
     pub fn localFile(self: *Output) ?std.fs.File {
         return switch (self.backend) {
             .file => |f| f,
-            .object => null,
+            .object, .memory => null,
         };
     }
 
@@ -116,7 +132,7 @@ pub const Output = struct {
     /// a file's error is already the real one.
     pub fn specific(self: *Output, e: anyerror) anyerror {
         return switch (self.backend) {
-            .file => e,
+            .file, .memory => e,
             .object => |o| o.specific(e),
         };
     }
@@ -142,6 +158,7 @@ pub const Output = struct {
                 try self.part.commit();
             },
             .object => |o| o.finish() catch |e| return self.specific(e),
+            .memory => {},
         }
     }
 
@@ -153,6 +170,7 @@ pub const Output = struct {
         switch (self.backend) {
             .file => self.dropFile(),
             .object => |o| o.abort(),
+            .memory => {},
         }
     }
 

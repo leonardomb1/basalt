@@ -430,6 +430,11 @@ pub const plan = [_]Rule{
     .{ .home = "objstore.Upload", .pattern = upload_pattern, .exact = true, .allow = &.{"store/objstore.zig"} },
     .{ .home = "driver.LoginNote", .pattern = login_note_pattern, .exact = true, .allow = &.{"connect/driver.zig"} },
     .{ .home = "formats_open", .pattern = format_arm_pattern, .exact = true },
+    .{ .home = "output", .pattern = output_pattern, .under = "format/", .exact = true, .allow = &.{
+        "format/lake/delta_checkpoint.zig",
+        "format/lake/delta_write.zig",
+        "format/output.zig",
+    } },
 };
 
 pub const civil_pattern = "719_?468|146_?097|719_?16[23]|25_?56[789]|24_?107|2_?440_?588|86_400_000_000|std\\.time\\.epoch\\.";
@@ -508,6 +513,9 @@ pub const login_note_pattern = "threadlocal var \\w+: [^=]*(ThreadNote\\(|LoginN
 /// A switch arm naming a file format: what a format opens with is its entry in
 /// `runtime/connect/formats_open.zig`, looked up by tag.
 pub const format_arm_pattern = "\\.(xlsx|avro|records)( =>|, \\.\\w+.* =>)";
+/// A format writer choosing its own destination, a `.part` file or an upload:
+/// `format/output.zig`'s `Output` is the one backend.
+pub const output_pattern = "openRemote\\(|[pP]art\\.create\\(|Part\\{\\}";
 
 fn startsOf(pattern: []const u8, text: []const u8, span: Span) ![]usize {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -820,7 +828,7 @@ test "dupscan minmax pattern" {
     }
 }
 
-test "dupscan format registry patterns" {
+test "dupscan format registry and output patterns" {
     const cases = [_]struct { []const u8, []const u8, bool }{
         .{ format_arm_pattern, ".xlsx => |sheet| {", true },
         .{ format_arm_pattern, ".avro => return openAvro(env, rd.form.path, f.files),", true },
@@ -829,6 +837,11 @@ test "dupscan format registry patterns" {
         .{ format_arm_pattern, ".tag = .xlsx,", false },
         .{ format_arm_pattern, "if (want == .avro) return null;", false },
         .{ format_arm_pattern, "return .{ .records = try targets.recordsOptions(in.hints, in.diag) };", false },
+        .{ output_pattern, "if (try objstore.openRemote(arena, path, parquet_content_type)) |o| {", true },
+        .{ output_pattern, "self.backend = .{ .file = try self.part.create(path) };", true },
+        .{ output_pattern, "var part = Part{};", true },
+        .{ output_pattern, "self.out = try Output.open(arena, path, parquet_content_type, .truncate);", false },
+        .{ output_pattern, "part: Part = .{},", false },
     };
     for (cases) |c| {
         const got = try startsOf(c[0], c[1], .line);

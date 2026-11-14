@@ -175,8 +175,7 @@ const impls = struct {
 
         pub fn write(env: *Env, w: ast.Write, schema: types.Schema, mode: driver.FileMode) anyerror!driver.Sink {
             _ = mode;
-            const aw = arrowwrite.FileSink.open(env.gpa, w.target, schema) catch |e| switch (e) {
-                error.ArrowRemoteSink => return planErr(env.diag, try msgfmt.allocPrint(env.arena, "cannot write `{s}`: Arrow IPC is written to a local file", .{w.target})),
+            const aw = arrowwrite.FileSink.open(env.gpa, env.arena, w.target, schema) catch |e| switch (e) {
                 error.ArrowUnsupportedType => return planErr(env.diag, "Arrow IPC cannot carry a list, map or struct column"),
                 else => return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not open output Arrow IPC `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
             };

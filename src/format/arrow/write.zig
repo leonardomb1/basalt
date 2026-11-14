@@ -1,7 +1,8 @@
 //! Arrow IPC writer: the `--format arrow` stdout sink (stream format) and the
 //! `LOAD INTO 'x.arrow'` file sink (`.feather` and `.ipc` too; `.arrows` writes the
-//! stream format). The file is local only and replaced, never appended to; its
-//! footer repeats the schema and indexes every batch's block, for random access.
+//! stream format), through `Output` to a local file or an object, replaced and
+//! never appended to; its footer repeats the schema and indexes every batch's
+//! block, for random access.
 //!
 //! The columnar store is already Arrow's layout for most of what it holds:
 //! the validity bitmap is LSB-first with 1 = valid, strings and bytes are an
@@ -38,7 +39,7 @@ const column = @import("../../exec/column.zig");
 const Column = column.Column;
 const Batch = @import("../../exec/batch.zig").Batch;
 const driver = @import("../../connect/driver.zig");
-const Part = @import("../../store/part.zig").Part;
+const Output = @import("../output.zig").Output;
 const flatbuf = @import("flatbuf.zig");
 const decimal = @import("../../exec/decimal.zig");
 const littleEndian128 = @import("../../exec/decimal.zig").littleEndian128;
@@ -432,62 +433,54 @@ fn pushData(arena: std.mem.Allocator, body: *Body, col: *const Column, n: usize)
 
 pub const FileSink = struct {
     gpa: std.mem.Allocator,
-    file: std.fs.File,
-    buf: [1 << 16]u8 = undefined,
-    fw: std.fs.File.Writer = undefined,
+    out: *Output,
     sw: StreamWriter = undefined,
     blocks: std.array_list.Managed(i64),
     stream: bool,
-    part: Part,
 
-    pub fn open(gpa: std.mem.Allocator, path: []const u8, schema: types.Schema) !*FileSink {
-        if (std.mem.indexOf(u8, path, "://") != null) return error.ArrowRemoteSink;
+    /// The output lives on `arena`, which outlives the sink.
+    pub fn open(gpa: std.mem.Allocator, arena: std.mem.Allocator, path: []const u8, schema: types.Schema) !*FileSink {
         const stream = std.ascii.endsWithIgnoreCase(path, ".arrows");
+        const out = try Output.open(arena, path, if (stream) stream_content_type else file_content_type, .truncate);
+        errdefer out.abort();
         const self = try gpa.create(FileSink);
         errdefer gpa.destroy(self);
-        var part = Part{};
-        const file = try part.create(path);
-        errdefer {
-            file.close();
-            part.discard();
-        }
-        self.* = .{ .gpa = gpa, .file = file, .blocks = std.array_list.Managed(i64).init(gpa), .stream = stream, .part = part };
+        self.* = .{ .gpa = gpa, .out = out, .blocks = std.array_list.Managed(i64).init(gpa), .stream = stream };
         errdefer self.blocks.deinit();
-        self.fw = file.writer(&self.buf);
         var base: u64 = 0;
         if (!stream) {
-            try self.fw.interface.writeAll("ARROW1\x00\x00");
+            out.writer().writeAll("ARROW1\x00\x00") catch |e| return out.specific(e);
             base = 8;
         }
-        self.sw = try StreamWriter.initAt(gpa, &self.fw.interface, schema, &.{}, base, if (stream) null else &self.blocks);
+        self.sw = StreamWriter.initAt(gpa, out.writer(), schema, &.{}, base, if (stream) null else &self.blocks) catch |e| return out.specific(e);
         return self;
     }
 
     pub fn writeBatch(self: *FileSink, arena: std.mem.Allocator, batch: Batch) !void {
-        try self.sw.writeBatch(arena, batch);
+        self.sw.writeBatch(arena, batch) catch |e| return self.out.specific(e);
     }
 
     pub fn close(self: *FileSink) !void {
-        var part = self.part;
+        const out = self.out;
         const done = if (self.stream) self.sw.finish() else self.sw.finishFile();
         self.deinit();
         done catch |e| {
-            part.discard();
-            return e;
+            const err = out.specific(e);
+            out.abort();
+            return err;
         };
-        try part.commit();
+        try out.finish();
     }
 
     pub fn abort(self: *FileSink) void {
-        var part = self.part;
+        const out = self.out;
         self.deinit();
-        part.discard();
+        out.abort();
     }
 
     fn deinit(self: *FileSink) void {
         self.sw.deinit();
         self.blocks.deinit();
-        self.file.close();
         self.gpa.destroy(self);
     }
 
@@ -497,6 +490,9 @@ pub const FileSink = struct {
 
     const vtable = driver.sinkVTable(FileSink);
 };
+
+const file_content_type = "application/vnd.apache.arrow.file";
+const stream_content_type = "application/vnd.apache.arrow.stream";
 
 pub const ResultInfo = struct {
     statement: u32 = 0,
@@ -784,7 +780,7 @@ test "file sink: the IPC file and stream a sink writes read back through the rea
 
     inline for (.{ "t.arrow", "t.arrows" }) |name| {
         const path = try std.fs.path.join(a, &.{ dir, name });
-        const fs = try FileSink.open(std.testing.allocator, path, schema);
+        const fs = try FileSink.open(std.testing.allocator, a, path, schema);
         try fs.writeBatch(a, batch);
         try fs.writeBatch(a, batch);
         try fs.close();
@@ -913,7 +909,7 @@ test "file sink: lists, structs and maps go out as Arrow's own nested types and 
     var cols = [_]Column{ try column.slice(a, try rb.finish(), 0, 8), try mb.finish() };
     cols[0] = try column.slice(a, cols[0], 0, 4);
     cols[1] = try column.slice(a, cols[1], 0, 4);
-    const sink = try FileSink.open(std.testing.allocator, path, schema);
+    const sink = try FileSink.open(std.testing.allocator, a, path, schema);
     try sink.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 4 });
     try sink.close();
 
