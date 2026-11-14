@@ -14,7 +14,7 @@
 
 const ast = @import("../../lang/ast.zig");
 const qual = @import("../pushdown.zig").qual;
-const pushable = @import("translate.zig").pushable;
+const lookupPushable = @import("translate.zig").lookupPushable;
 const std = @import("std");
 pub const Dialect = @import("../pushdown.zig").Dialect;
 const bin = @import("testing_util.zig").bin;
@@ -174,9 +174,7 @@ pub fn mayRaise(e: *const ast.Expr) bool {
                     .eq, .ne, .lt, .le, .gt, .ge, .@"and", .@"or", .distinct, .not_distinct => null,
                     else => true,
                 },
-                .call => |c| for (pushable) |p| {
-                    if (p.total and std.ascii.eqlIgnoreCase(p.name, c.name)) break null;
-                } else true,
+                .call => |c| if (lookupPushable(c.name)) |p| (if (p.total) null else true) else true,
                 .lambda => true,
                 else => null,
             };
@@ -730,6 +728,22 @@ test "hoist: a conjunct that may fail on a row stays above the join, beside one 
     try std.testing.expect((try pushIntoJoinSides(a, &right)) == null);
     const lit = try bin(a, .gt, try fld(a, "d"), try mkExpr(a, .{ .cast = .{ .e = try mkExpr(a, .{ .str_lit = "2024-01-01" }), .ty = .{ .kind = .date } } }));
     try std.testing.expect(!mayRaise(lit));
+}
+
+test "hoist: a call crosses a join only when no value makes it fail" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const sqlp = @import("../../lang/sql_parser.zig");
+    var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    for ([_][]const u8{ "substr(s, 2, 3) = 'x'", "concat(s, 'a') = 'x'", "left(s, 2) = 'x'", "floor(f) > 1", "sqrt(f) > 1", "power(f, 2) > 1", "nullif(s, 'x') = 'y'" }) |src| {
+        errdefer std.debug.print("total: {s}\n", .{src});
+        try std.testing.expect(!mayRaise(try sqlp.parseExprStr(a, src, &diag)));
+    }
+    for ([_][]const u8{ "abs(n) > 1", "mod(n, m) = 0", "repeat(s, n) = 'x'", "s / n > 1" }) |src| {
+        errdefer std.debug.print("may raise: {s}\n", .{src});
+        try std.testing.expect(mayRaise(try sqlp.parseExprStr(a, src, &diag)));
+    }
 }
 
 test "hoist: a filter after a semi or anti join moves below it, whatever the right side's names" {
