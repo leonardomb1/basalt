@@ -29,6 +29,7 @@ const xlsx = @import("../../format/xlsx/read.zig");
 const xlsxwrite = @import("../../format/xlsx/write.zig");
 const zipsrc = @import("../../format/compress/zip.zig");
 const formats = @import("../../format/formats.zig");
+const formats_open = @import("../connect/formats_open.zig");
 const lake = @import("../../format/lake/table.zig");
 
 pub const FileFormat = formats.FileFormat;
@@ -313,24 +314,31 @@ pub fn partitionBy(arena: std.mem.Allocator, hints: []const ast.Hint, diag: *Dia
     return out.items;
 }
 
+/// What a file write parses whatever its format, so each format refuses the keys of
+/// the others; its format's `options` (`connect/formats_open.zig`) keeps its own.
+pub const WriteOptionsIn = struct {
+    arena: std.mem.Allocator,
+    hints: []const ast.Hint,
+    diag: *Diag,
+    codec: pqcodec.Codec,
+    shape: jsonwrite.Shape,
+    names: xmlwrite.Names,
+    sheet: []const u8,
+};
+
 pub fn writeOptions(arena: std.mem.Allocator, w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!WriteOptions {
-    const codec = try parquetCodecFromHints(w, hints, diag);
-    const shape = try jsonShapeFromHints(w, hints, diag);
-    const names = try xmlNamesFromHints(w, hints, diag);
-    const sheet = try xlsxSheetFromHints(hints, diag);
+    const in = WriteOptionsIn{
+        .arena = arena,
+        .hints = hints,
+        .diag = diag,
+        .codec = try parquetCodecFromHints(w, hints, diag),
+        .shape = try jsonShapeFromHints(w, hints, diag),
+        .names = try xmlNamesFromHints(w, hints, diag),
+        .sheet = try xlsxSheetFromHints(hints, diag),
+    };
     const file = std.mem.eql(u8, w.connector, "csv") and w.target.len > 0;
     const fmt: FileFormat = if (file) (try writeFormat(w, hints, diag)) orelse .csv else .csv;
-    return switch (fmt) {
-        .csv => .csv,
-        .parquet => .{ .parquet = codec },
-        .arrow => .arrow,
-        .xlsx => .{ .xlsx = sheet },
-        .json => .{ .json = shape },
-        .xml => .{ .xml = names },
-        .records => .{ .records = try recordsOptions(hints, diag) },
-        .delta => .{ .delta = .{ .codec = codec, .partition_by = try partitionBy(arena, hints, diag), .evolve = try evolveOf(hints, diag) } },
-        .avro => .{ .avro = try avroCodecFromHints(hints, diag) },
-    };
+    return formats_open.of(fmt).options(in);
 }
 
 /// A records sink's line ending and text encoding; parsed only for a records target,

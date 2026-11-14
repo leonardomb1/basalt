@@ -1,5 +1,6 @@
-//! Opening a source: local and remote files by format, folders, Arrow, Excel, SQL
-//! reads, generated rows and constant sources, with the columns a query reads.
+//! Opening a source: local and remote files by format (each through its
+//! `formats_open.zig` entry), folders, SQL reads, generated rows and constant
+//! sources, with the columns a query reads.
 
 const Batch = @import("../../exec/batch.zig").Batch;
 const Value = @import("../../exec/value.zig").Value;
@@ -7,12 +8,9 @@ const Env = @import("../env.zig").Env;
 const SqlDriver = @import("../connect.zig").SqlDriver;
 const analyze = @import("../analyze.zig");
 const options = @import("../analyze/options.zig");
-const arrowread = @import("../../format/arrow/read.zig");
-const avroread = @import("../../format/avro/read.zig");
 const ast = @import("../../lang/ast.zig");
 const azure = @import("../../store/azure.zig");
 const connectWhy = @import("dbconfig.zig").connectWhy;
-const csv = @import("../../format/csv.zig");
 const driver = @import("../../connect/driver.zig");
 const env_mod = @import("../env.zig");
 const eval = @import("../../exec/eval.zig");
@@ -40,10 +38,8 @@ const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
 const types = @import("../../lang/types.zig");
 const table_builtins = @import("../../connect/table_builtins.zig");
-const xlsx = @import("../../format/xlsx/read.zig");
-const jsonread = @import("../../format/json/read.zig");
-const xmlread = @import("../../format/xml/read.zig");
 const formats = @import("../../format/formats.zig");
+const formats_open = @import("formats_open.zig");
 const lake = @import("../../format/lake/table.zig");
 const stream = @import("../../format/stream.zig");
 const observe = @import("observe.zig");
@@ -121,7 +117,7 @@ fn openSourceOf(
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (try resolveFolder(env, rd.form.path, hints)) |fr| if (fr.kind == .parquet) {
             env.forgetFolder(rd.form.path);
-            const pf = try openParquetFolder(env, rd.form.path, fr, project);
+            const pf = try formats_open.openParquetFolder(env, rd.form.path, fr, project);
             pf.bounds = bounds;
             env.pipe.pq_readers += 1;
             env.pipe.pq_folder = pf;
@@ -131,10 +127,10 @@ fn openSourceOf(
     const is_pq = std.mem.eql(u8, rd.connector, "csv") and rd.form == .path and
         pqdecode.Reader.isPath(rd.form.path);
     if (is_pq) {
-        const pr = openParquetFile(env, rd.form.path, project) catch |e|
+        const pr = formats_open.openParquetFile(env, rd.form.path, project) catch |e|
             return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
         pr.bounds = bounds;
-        noteParquet(env, pr);
+        formats_open.noteParquet(env, pr);
         env.pipe.pq_readers += 1;
         env.pipe.pq_reader = pr;
         return pr.source();
@@ -143,19 +139,9 @@ fn openSourceOf(
         var fdiag = analyze.Diag{};
         const want = analyze.formatFromHints(hints, &fdiag) catch null;
         if (analyze.readFormat(rd.form.path, want) == .arrow and analyze.unreadableTarget(rd.form.path, want) == null)
-            return openArrow(env, rd.form.path, project);
+            return formats_open.openArrow(env, rd.form.path, project);
     }
     return openSourceCols(env, rd, hints, project);
-}
-
-/// A Parquet file's reader, over the bytes planning kept open for it when it
-/// opened this file and chose not to split it (`Env.pq_held`).
-fn openParquetFile(env: *Env, path: []const u8, project: ?[]const []const u8) !*pqdecode.Reader {
-    if (env.pipe.pq_held) |h| if (std.mem.eql(u8, h.path, path)) {
-        env.pipe.pq_held = null;
-        return pqdecode.Reader.openProjectedOn(env.arena, h.src, path, project);
-    };
-    return pqdecode.Reader.openProjected(env.arena, path, project);
 }
 
 /// A folder's format and files, or null when `path` is not a folder. Without
@@ -223,117 +209,6 @@ fn resolvePlain(env: *Env, path: []const u8, want: ?analyze.FileFormat, at: lake
 
 pub const FolderRead = env_mod.FolderRead;
 
-fn openParquetFolder(env: *Env, path: []const u8, fr: FolderRead, project: ?[][]const u8) !*pqdecode.Folder {
-    if (fr.table) |t| {
-        const pf = try pqdecode.Folder.openLayout(env.arena, t.layout, project);
-        pf.tally = env.scan;
-        return pf;
-    }
-    const files = fr.files;
-    const pf = pqdecode.Folder.open(env.arena, path, files, project) catch |e|
-        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read parquet `{s}` in folder `{s}` ({s})", .{ files[0], path, try pathFail(env.arena, files[0], e) }));
-    if (pf.firstReader()) |first| {
-        noteParquet(env, first);
-        pf.tally = first.tally;
-    }
-    return pf;
-}
-
-pub fn noteParquet(env: *Env, pr: *pqdecode.Reader) void {
-    const t = env.scan orelse return;
-    pr.tally = t;
-    driver.ScanTally.add(&t.columns_read, pr.leaves.len);
-    driver.ScanTally.add(&t.columns_total, pr.md.leafCount());
-}
-
-fn openArrow(env: *Env, path: []const u8, project: ?[][]const u8) !driver.Source {
-    const r = arrowread.Reader.openProjected(env.arena, path, project) catch |e| {
-        const why = switch (e) {
-            error.UnsupportedArrow => if (eval.takeFailure(e)) |w|
-                return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read {s}", .{w}))
-            else
-                "an Arrow type or feature basalt does not read",
-            error.NotArrow => "not an Arrow IPC file or stream",
-            error.CorruptArrow => "the file is truncated or corrupt",
-            else => try pathFail(env.arena, path, e),
-        };
-        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read Arrow IPC `{s}` ({s})", .{ path, why }));
-    };
-    if (env.scan) |t| {
-        driver.ScanTally.add(&t.columns_read, r.keep.len);
-        driver.ScanTally.add(&t.columns_total, r.fields.len);
-    }
-    return r.source();
-}
-
-fn openXlsx(env: *Env, path: []const u8, hints: []const ast.Hint) !driver.Source {
-    var odiag = analyze.Diag{};
-    const opts = analyze.xlsxOptions(hints, &odiag) catch |e| return aErr(env, &odiag, e);
-    const r = xlsx.Reader.open(env.arena, env.gpa, path, opts) catch |e| {
-        const why = switch (e) {
-            error.XlsxSheetNotFound => blk: {
-                const names = xlsx.sheetNames(env.arena, env.gpa, path) catch &.{};
-                const list = try std.mem.join(env.arena, ", ", names);
-                break :blk if (opts.sheet) |w|
-                    try msgfmt.allocPrint(env.arena, "no sheet `{s}` (sheets: {s})", .{ w, list })
-                else
-                    "the workbook has no worksheet";
-            },
-            error.NotXlsx, error.ZipNoEndRecord, error.ZipMemberNotFound => "not an Excel workbook (.xlsx)",
-            error.BadXml, error.XmlTokenTooLong => "the workbook's XML is malformed",
-            error.XlsxTooManyStrings => "its shared strings pass 512 MB",
-            else => try pathFail(env.arena, path, e),
-        };
-        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read Excel workbook `{s}` ({s})", .{ path, why }));
-    };
-    return r.source();
-}
-
-/// JSON or NDJSON files as one table, `path` naming them in messages.
-fn openJson(env: *Env, path: []const u8, files: []const []const u8, hints: []const ast.Hint) !driver.Source {
-    const f = jsonread.Files.open(env.arena, env.gpa, files, analyze.jsonOptions(hints)) catch |e| {
-        if (e == error.InvalidJson)
-            return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "`{s}` is not valid JSON or NDJSON in its first rows", .{path}));
-        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read JSON `{s}` ({s})", .{ path, try pathFail(env.arena, path, e) }));
-    };
-    return f.source();
-}
-
-/// Avro files as one table, `path` naming them in messages.
-fn openAvro(env: *Env, path: []const u8, files: []const []const u8) !driver.Source {
-    const f = avroread.Files.open(env.arena, env.gpa, files, .{}) catch |e| return avroOpenFailed(env, path, e);
-    return f.source();
-}
-
-fn avroOpenFailed(env: *Env, path: []const u8, e: anyerror) anyerror {
-    const why = switch (e) {
-        error.NotAvro => "not an Avro object container file",
-        error.CorruptAvro, error.UnsupportedAvro, error.BadAvroSchema => eval.takeFailure(e) orelse @errorName(e),
-        else => try pathFail(env.arena, path, e),
-    };
-    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read Avro `{s}` ({s})", .{ path, why }));
-}
-
-/// XML files as one table, `path` naming them in messages.
-fn openXml(env: *Env, path: []const u8, files: []const []const u8, hints: []const ast.Hint, text: []const []const u8) !driver.Source {
-    var odiag = analyze.Diag{};
-    const opts = analyze.xmlOptions(hints, text, &odiag) catch |e| return aErr(env, &odiag, e);
-    const f = xmlread.Files.open(env.arena, env.gpa, files, opts) catch |e| return xmlOpenFailed(env, path, e);
-    return f.source();
-}
-
-fn xmlOpenFailed(env: *Env, path: []const u8, e: anyerror) anyerror {
-    const told = eval.takeFailure(e);
-    if (told) |t| if (std.mem.startsWith(u8, t, path) and std.mem.startsWith(u8, t[path.len..], ": "))
-        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read XML `{s}`: {s}", .{ path, t[path.len + 2 ..] }));
-    const why = switch (e) {
-        error.BadXml, error.XmlTokenTooLong => told orelse "it is not well-formed XML in its first rows",
-        error.XmlUnsupportedEncoding, error.TextTypeMismatch => told orelse @errorName(e),
-        else => try pathFail(env.arena, path, e),
-    };
-    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read XML `{s}` ({s})", .{ path, why }));
-}
-
 /// The process's stdin, as CSV unless `format` names JSON or NDJSON. Refused when
 /// stdin is already spoken for: the script came from it, or a REPL or kernel reads it.
 fn openStdin(env: *Env, hints: []const ast.Hint, project: ?[][]const u8) !driver.Source {
@@ -343,31 +218,7 @@ fn openStdin(env: *Env, hints: []const ast.Hint, project: ?[][]const u8) !driver
     const want = analyze.formatFromHints(hints, &fdiag) catch |e| return aErr(env, &fdiag, e);
     if (want) |w| if (analyze.stdinProblem(w)) |why| return planErr(env.diag, why);
     const s = try stream.Stream.openStdin(env.arena);
-    if (want == .json) {
-        const f = jsonread.Files.on(env.arena, env.gpa, s, &.{}, analyze.jsonOptions(hints)) catch |e| {
-            if (e == error.InvalidJson) return planErrT(env.diag, e, "stdin is not valid JSON or NDJSON in its first rows");
-            return e;
-        };
-        return f.source();
-    }
-    if (want == .xml) {
-        var odiag = analyze.Diag{};
-        const opts = analyze.xmlOptions(hints, &.{}, &odiag) catch |e| return aErr(env, &odiag, e);
-        const f = xmlread.Files.on(env.arena, env.gpa, s, &.{}, opts) catch |e| return xmlOpenFailed(env, "stdin", e);
-        return f.source();
-    }
-    if (want == .avro) {
-        const f = avroread.Files.on(env.arena, env.gpa, s, &.{}, .{}) catch |e| return avroOpenFailed(env, "stdin", e);
-        return f.source();
-    }
-    var ddiag = analyze.Diag{};
-    const d = analyze.dialectFromHints(hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
-    const r = csv.CsvReader.openStream(env.arena, s, d) catch |e| {
-        if (e == error.EmptyCsv) return planErrT(env.diag, e, "stdin is empty: a CSV read needs at least a header line");
-        return e;
-    };
-    if (project) |p| try r.project(p);
-    return r.source();
+    return formats_open.of(want orelse .csv).stdin.?(env, s, hints, project);
 }
 
 /// A source opened for `rd`, a CSV converting only the columns `project` names. A union's
@@ -398,49 +249,16 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         try guardFileFormat(env, rd.form.path, want, "read");
         const fr = try resolveFolder(env, rd.form.path, hints);
         env.forgetFolder(rd.form.path);
-        if (fr) |f| switch (f.kind) {
-            .parquet => return (try openParquetFolder(env, rd.form.path, f, null)).source(),
-            .json => return openJson(env, rd.form.path, f.files, hints),
-            .xml => return openXml(env, rd.form.path, f.files, hints, rd.text_cols),
-            .avro => return openAvro(env, rd.form.path, f.files),
-            .csv => {},
-            .arrow, .xlsx, .records, .delta => unreachable,
-        };
-        switch (analyze.readFormat(rd.form.path, want)) {
-            .parquet => {
-                const pr = openParquetFile(env, rd.form.path, null) catch |e|
-                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read parquet `{s}` ({s})", .{ rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
-                noteParquet(env, pr);
-                return pr.source();
-            },
-            .arrow => return openArrow(env, rd.form.path, null),
-            .xlsx => return openXlsx(env, rd.form.path, hints),
-            .json => return openJson(env, rd.form.path, &.{rd.form.path}, hints),
-            .xml => return openXml(env, rd.form.path, &.{rd.form.path}, hints, rd.text_cols),
-            .avro => return openAvro(env, rd.form.path, &.{rd.form.path}),
-            .records, .delta => unreachable,
-            .csv => {},
-        }
-        var ddiag = analyze.Diag{};
-        var d = analyze.dialectFromHints(hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
-        d.text = rd.text_cols;
-        if (analyze.archiveProblem(env.arena, rd.form.path, want, true)) |why|
-            return planErr(env.diag, try msgfmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ rd.form.path, why }));
-        const opened = if (fr) |f| csv.CsvReader.openList(env.arena, f.files, d) else csv.CsvReader.open(env.arena, rd.form.path, d);
-        const reader = opened catch |e| {
-            if (e == azure.Error.AzureEmptyPrefix)
-                return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "no blobs under prefix `{s}`", .{rd.form.path}));
-            if (e == error.NoCsvInFolder)
-                return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "no .csv, .tsv or .txt file in folder `{s}`", .{rd.form.path}));
-            if (e == error.EmptyFolder)
-                return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "no files in folder `{s}`", .{rd.form.path}));
-            if (e == s3.Error.S3EmptyPrefix)
-                return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "no objects under prefix `{s}`", .{rd.form.path}));
-            const what: []const u8 = if (csv.splitArchive(rd.form.path) != null) "archive" else "input CSV";
-            return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not open {s} `{s}` ({s})", .{ what, rd.form.path, try pathFail(env.arena, rd.form.path, e) }));
-        };
-        if (project) |p| try reader.project(p);
-        return reader.source();
+        const kind = if (fr) |f| (if (f.kind == .csv) analyze.readFormat(rd.form.path, want) else f.kind) else analyze.readFormat(rd.form.path, want);
+        const open = formats_open.of(kind).read orelse unreachable;
+        return open(env, .{
+            .path = rd.form.path,
+            .folder = if (fr) |f| (if (f.kind == kind) f else null) else null,
+            .want = want,
+            .hints = hints,
+            .text = rd.text_cols,
+            .project = project,
+        });
     }
     const conn = env.connections.get(rd.connector) orelse
         return planErr(env.diag, try options.unknownConnectionMsg(env.arena, rd.connector, "read"));

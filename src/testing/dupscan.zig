@@ -429,6 +429,7 @@ pub const plan = [_]Rule{
     .{ .home = "print", .pattern = print_pattern, .exact = true, .allow = &.{"lang/print.zig"} },
     .{ .home = "objstore.Upload", .pattern = upload_pattern, .exact = true, .allow = &.{"store/objstore.zig"} },
     .{ .home = "driver.LoginNote", .pattern = login_note_pattern, .exact = true, .allow = &.{"connect/driver.zig"} },
+    .{ .home = "formats_open", .pattern = format_arm_pattern, .exact = true },
 };
 
 pub const civil_pattern = "719_?468|146_?097|719_?16[23]|25_?56[789]|24_?107|2_?440_?588|86_400_000_000|std\\.time\\.epoch\\.";
@@ -504,6 +505,9 @@ pub const upload_pattern = "\\.part_len([^a-zA-Z0-9_]|$)";
 /// A connector's own thread-local failure note: every connector explains its
 /// failures through the one `driver.LoginNote`.
 pub const login_note_pattern = "threadlocal var \\w+: [^=]*(ThreadNote\\(|LoginNote )";
+/// A switch arm naming a file format: what a format opens with is its entry in
+/// `runtime/connect/formats_open.zig`, looked up by tag.
+pub const format_arm_pattern = "\\.(xlsx|avro|records)( =>|, \\.\\w+.* =>)";
 
 fn startsOf(pattern: []const u8, text: []const u8, span: Span) ![]usize {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -805,6 +809,26 @@ test "dupscan minmax pattern" {
         .{ minmax_pattern, "try span.fold(a, v);", false },
         .{ minmax_pattern, "const o = try v.own(arena);", false },
         .{ minmax_pattern, ".min = try ownOpt(self.arena, cb.bounds.min),", false },
+    };
+    for (cases) |c| {
+        const got = try startsOf(c[0], c[1], .line);
+        defer std.testing.allocator.free(got);
+        std.testing.expectEqual(c[2], got.len != 0) catch |e| {
+            std.debug.print("pattern {s} on {s}\n", .{ c[0], c[1] });
+            return e;
+        };
+    }
+}
+
+test "dupscan format registry patterns" {
+    const cases = [_]struct { []const u8, []const u8, bool }{
+        .{ format_arm_pattern, ".xlsx => |sheet| {", true },
+        .{ format_arm_pattern, ".avro => return openAvro(env, rd.form.path, f.files),", true },
+        .{ format_arm_pattern, ".arrow, .xlsx, .records, .delta => unreachable,", true },
+        .{ format_arm_pattern, ".records, .delta => unreachable,", true },
+        .{ format_arm_pattern, ".tag = .xlsx,", false },
+        .{ format_arm_pattern, "if (want == .avro) return null;", false },
+        .{ format_arm_pattern, "return .{ .records = try targets.recordsOptions(in.hints, in.diag) };", false },
     };
     for (cases) |c| {
         const got = try startsOf(c[0], c[1], .line);
