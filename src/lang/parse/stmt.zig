@@ -336,7 +336,7 @@ pub fn templatePart(self: *Parser, buf: *std.array_list.Managed(u8), e0: *const 
 
 /// `${ }` hole text: script keywords and operators, every binary and every unary's
 /// operand parenthesised, a typed string literal as its text, and no kind a hole
-/// cannot hold. A call drops its DISTINCT.
+/// cannot hold.
 const hole: print.Mode(void) = .{
     .field = print.plainField,
     .float = .scientific,
@@ -344,7 +344,6 @@ const hole: print.Mode(void) = .{
     .grouping = .script,
     .refuses = &.{ .lambda_var, .match, .index, .cast, .is_null, .let_in, .lambda },
     .typed_text = true,
-    .distinct = false,
 };
 
 /// Print an expression back as `${ }` hole text; `$name` already parsed to a bare
@@ -362,7 +361,7 @@ test "unparse and print give text that parses back to the same expression: a neg
     defer ar.deinit();
     const a = ar.allocator();
     const sql = @import("../sql_parser.zig");
-    for ([_][]const u8{ "-(-x)", "\"my col\" + 1", "NOT (-x > 1)", "~(~t.\"a b\")", "- -1" }) |src| {
+    for ([_][]const u8{ "-(-x)", "\"my col\" + 1", "NOT (-x > 1)", "~(~t.\"a b\")", "- -1", "count(distinct x)", "-(a + b)" }) |src| {
         var diag: sql.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
         const e = try sql.parseExprStr(a, src, &diag);
         var p = Parser{ .arena = a, .toks = &.{}, .diag = &diag };
@@ -380,4 +379,9 @@ test "unparse and print give text that parses back to the same expression: a neg
         try print.expr(&again.writer, printed);
         try std.testing.expectEqualStrings(want.written(), again.written());
     }
+    var diag: sql.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    var p = Parser{ .arena = a, .toks = &.{}, .diag = &diag };
+    var buf = std.array_list.Managed(u8).init(a);
+    try p.unparse(&buf, try sql.parseExprStr(a, "-(a + b)", &diag));
+    try std.testing.expectEqualStrings("-(a + b)", buf.items);
 }

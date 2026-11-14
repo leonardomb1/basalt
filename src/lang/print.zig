@@ -26,14 +26,14 @@ pub const Dialect = enum { sql, script };
 pub const Grouping = enum { operands, script, whole };
 
 /// Node shapes: SQL text, or the compact key text (`f(*)`, lower-cased call names,
-/// `cast(x as int?)`, `(x is is_null)`, `match(...)`, `let(n=v in b)`, `(x)->b`,
+/// `cast(x as int?)`, `match(...)`, `let(n=v in b)`, `(x)->b`,
 /// arguments joined by a bare comma).
 pub const Layout = enum { sql, key };
 
 /// How a walk prints, one per caller: `field` renders a column from the caller's
 /// `Ctx`; `float` is `{d}` (`decimal`) or `{e}` (`scientific`); `refuses` lists the
 /// kinds the walk fails on with `error.Refused`; `typed_text` reads a CAST of a string
-/// literal back as that literal (`typedText`); `distinct` keeps a call's DISTINCT.
+/// literal back as that literal (`typedText`).
 pub fn Mode(comptime Ctx: type) type {
     return struct {
         field: fn (Ctx, W, ast.QualName) Error!void,
@@ -43,7 +43,6 @@ pub fn Mode(comptime Ctx: type) type {
         layout: Layout = .sql,
         refuses: []const Kind = &.{},
         typed_text: bool = false,
-        distinct: bool = true,
     };
 }
 
@@ -95,11 +94,11 @@ pub fn Printer(comptime Ctx: type, comptime mode: Mode(Ctx)) type {
                         .not => try self.kw("NOT "),
                         .bit_not => try w.writeByte('~'),
                     }
-                    if (mode.grouping == .script) {
+                    if (mode.grouping == .script and u.e.* != .binary) {
                         try w.writeByte('(');
                         try self.walk(u.e);
                         try w.writeByte(')');
-                    } else try self.operand(u.e);
+                    } else if (mode.grouping == .script) try self.walk(u.e) else try self.operand(u.e);
                 },
                 .binary => |b| {
                     try self.operand(b.l);
@@ -111,7 +110,7 @@ pub fn Printer(comptime Ctx: type, comptime mode: Mode(Ctx)) type {
                         for (c.name) |ch| try w.writeByte(std.ascii.toLower(ch));
                     } else try w.writeAll(c.name);
                     try w.writeByte('(');
-                    if (mode.distinct and c.distinct) try self.kw("DISTINCT ");
+                    if (c.distinct) try self.kw("DISTINCT ");
                     if (mode.layout == .key and c.args.len == 0) try w.writeByte('*');
                     try self.list(c.args);
                     try w.writeByte(')');
@@ -188,12 +187,9 @@ pub fn Printer(comptime Ctx: type, comptime mode: Mode(Ctx)) type {
                 .is_null => |n| {
                     try self.operand(n.e);
                     if (n.negated) try self.kw(" IS NOT ") else try self.kw(" IS ");
-                    switch (mode.layout) {
-                        .sql => switch (n.kind) {
-                            .is_null => try self.kw("NULL"),
-                            .is_empty => try self.kw("EMPTY"),
-                        },
-                        .key => try w.writeAll(@tagName(n.kind)),
+                    switch (n.kind) {
+                        .is_null => try self.kw("NULL"),
+                        .is_empty => try self.kw("EMPTY"),
                     }
                 },
                 .let_in => |l| {
