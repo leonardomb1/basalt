@@ -403,6 +403,19 @@ pub fn splitAnd(comptime P: type, e: P, out: *std.array_list.Managed(P)) std.mem
     try out.append(e);
 }
 
+/// Every column reference in `e`, `$param` and LET references included, in the order
+/// `anyExpr` meets them; a lambda's parameter is none.
+pub fn fieldsOf(e: *const Expr, out: *std.array_list.Managed(QualName)) error{OutOfMemory}!void {
+    const S = struct {
+        fn add(o: *std.array_list.Managed(QualName), n: *const Expr) ?bool {
+            if (n.* != .field) return null;
+            o.append(n.field) catch return true;
+            return false;
+        }
+    };
+    if (anyExpr(e, out, S.add)) return error.OutOfMemory;
+}
+
 /// Whether `pred` holds of `e` or of an expression inside it: `pred` answers true
 /// (found), false (not here, nor below) or null (look inside). With `rebuildExpr`,
 /// the one place that enumerates `Expr`'s children.

@@ -39,19 +39,6 @@ pub fn parseQualNameTok(self: *Parser) Error!ast.QualName {
     return .{ .parts = try parts.toOwnedSlice(), .span = self.spanFrom(start) };
 }
 
-/// Every column an expression reads, so a pre-aggregation projection keeps the
-/// aggregates' inputs.
-pub fn collectFields(_: *Parser, e: *const ast.Expr, out: *std.array_list.Managed(ast.QualName)) Error!void {
-    const S = struct {
-        fn add(o: *std.array_list.Managed(ast.QualName), n: *const ast.Expr) ?bool {
-            if (n.* != .field) return null;
-            o.append(n.field) catch return true;
-            return false;
-        }
-    };
-    if (ast.anyExpr(e, out, S.add)) return error.OutOfMemory;
-}
-
 /// Render an expression as the key GROUP BY, ORDER BY, HAVING and lifted aggregates
 /// bind by. It is exact where SQL is: columns keep their case, string literals their
 /// quotes and case, operators their grouping, so two different expressions never

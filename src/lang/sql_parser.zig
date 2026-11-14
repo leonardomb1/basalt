@@ -967,7 +967,6 @@ pub const Parser = struct {
     pub const joinKeyFail = @import("parse/rewrite.zig").joinKeyFail;
     pub const parseJoinKey = @import("parse/rewrite.zig").parseJoinKey;
     pub const parseQualNameTok = @import("parse/rewrite.zig").parseQualNameTok;
-    pub const collectFields = @import("parse/rewrite.zig").collectFields;
     pub const exprKey = @import("parse/rewrite.zig").exprKey;
     pub const bindName = @import("parse/rewrite.zig").bindName;
     pub const containsAgg = @import("parse/rewrite.zig").containsAgg;

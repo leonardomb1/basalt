@@ -230,7 +230,7 @@ fn refsOnlyProbe(
     j: ast.Join,
 ) !bool {
     var list = std.array_list.Managed(ast.QualName).init(arena);
-    try collectQuals(arena, e, &list);
+    try ast.fieldsOf(e, &list);
     names: for (list.items) |q| {
         if (q.dollar) continue;
         if (q.parts.len > 1) {
@@ -246,20 +246,6 @@ fn refsOnlyProbe(
         if (isRightName(q.last(), right)) return false;
     }
     return true;
-}
-
-const QualWalk = struct { arena: std.mem.Allocator, list: *std.array_list.Managed(ast.QualName) };
-
-fn collectQualsRecur(cx: QualWalk, e: *const ast.Expr) error{OutOfMemory}!*ast.Expr {
-    if (e.* == .field) {
-        try cx.list.append(e.field);
-        return @constCast(e);
-    }
-    return ast.rebuildExpr(cx.arena, e, cx, collectQualsRecur);
-}
-
-pub fn collectQuals(arena: std.mem.Allocator, e: *const ast.Expr, list: *std.array_list.Managed(ast.QualName)) !void {
-    _ = try collectQualsRecur(.{ .arena = arena, .list = list }, e);
 }
 
 /// Right-side key names to the left keys as written, qualifier and all: a left key
@@ -299,7 +285,7 @@ fn deriveProbePredicate(
 
     const side = if (j.alias.len > 0) j.alias else j.binding;
     var list = std.array_list.Managed(ast.QualName).init(arena);
-    try collectQuals(arena, e, &list);
+    try ast.fieldsOf(e, &list);
     if (list.items.len == 0) return null;
     for (list.items) |q| {
         if (q.parts.len != 2 or !std.mem.eql(u8, q.parts[0], side)) return null;
@@ -461,7 +447,7 @@ pub fn pushIntoJoinSides(arena: std.mem.Allocator, stages: []const ast.Stage) !?
 
 fn rightAliasOf(arena: std.mem.Allocator, e: *const ast.Expr) !?[]const u8 {
     var refs = std.array_list.Managed(ast.QualName).init(arena);
-    try collectQuals(arena, e, &refs);
+    try ast.fieldsOf(e, &refs);
     var alias: ?[]const u8 = null;
     for (refs.items) |q| {
         if (q.dollar) continue;
@@ -601,7 +587,7 @@ fn filterBelowSelect(arena: std.mem.Allocator, pred: *const ast.Expr, items: []c
         else => {},
     };
     var refs = std.array_list.Managed(ast.QualName).init(arena);
-    try collectQuals(arena, pred, &refs);
+    try ast.fieldsOf(pred, &refs);
     var map = std.StringHashMap(ast.QualName).init(arena);
     for (refs.items) |q| {
         if (q.dollar) continue;

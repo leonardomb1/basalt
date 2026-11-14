@@ -359,7 +359,6 @@ pub const ExplainedTopN = @import("pushdown/topn.zig").ExplainedTopN;
 pub const explainTopN = @import("pushdown/topn.zig").explainTopN;
 pub const planTopN = @import("pushdown/topn.zig").planTopN;
 pub const renderTopN = @import("pushdown/topn.zig").renderTopN;
-pub const collectQuals = @import("pushdown/hoist.zig").collectQuals;
 pub const hoistThroughJoins = @import("pushdown/hoist.zig").hoistThroughJoins;
 pub const hoistFilters = @import("pushdown/hoist.zig").hoistFilters;
 pub const pushIntoJoinSides = @import("pushdown/hoist.zig").pushIntoJoinSides;
@@ -379,15 +378,10 @@ pub fn serialWhereWith(arena: std.mem.Allocator, dialect: Dialect, stages: []con
 /// Every source column an expression references, by `parts[0]`; a lambda's
 /// parameter is not one, nor a `$param` or LET (a scalar subquery's included).
 pub fn collectFields(e: *const ast.Expr, set: *std.StringHashMap(void)) !void {
-    const S = struct {
-        fn add(m: *std.StringHashMap(void), n: *const ast.Expr) ?bool {
-            if (n.* != .field) return null;
-            if (n.field.dollar) return false;
-            m.put(n.field.parts[0], {}) catch return true;
-            return false;
-        }
-    };
-    if (ast.anyExpr(e, set, S.add)) return error.OutOfMemory;
+    var refs = std.array_list.Managed(ast.QualName).init(set.allocator);
+    defer refs.deinit();
+    try ast.fieldsOf(e, &refs);
+    for (refs.items) |q| if (!q.dollar) try set.put(q.parts[0], {});
 }
 
 pub fn qual(arena: std.mem.Allocator, parts: []const []const u8) !ast.QualName {

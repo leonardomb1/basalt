@@ -22,7 +22,6 @@ const op = @import("../../exec/op.zig");
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
 const substExpr = @import("../analyze.zig").substExpr;
-const collectQuals = @import("../pushdown/hoist.zig").collectQuals;
 const coerceLits = @import("../analyze.zig").coerceLits;
 const types = @import("../../lang/types.zig");
 const tfld = @import("testing_util.zig").tfld;
@@ -586,7 +585,7 @@ fn structHead(s: types.Schema, q: ast.QualName) bool {
 
 fn fitOf(arena: std.mem.Allocator, e: *const ast.Expr, left: types.Schema, right: types.Schema) !Fit {
     var quals = std.array_list.Managed(ast.QualName).init(arena);
-    try collectQuals(arena, e, &quals);
+    try ast.fieldsOf(e, &quals);
     var f = Fit{};
     for (quals.items) |q| {
         if (q.dollar) continue;

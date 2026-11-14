@@ -570,23 +570,23 @@ fn flipKeeps(env: *Env, pre: []const ast.Stage, rest: []const ast.Stage) !?[]con
     var later = std.array_list.Managed([]const u8).init(env.arena);
     var later_reads = std.array_list.Managed(?types.Schema).init(env.arena);
     walk: for (rest, 0..) |st, i| switch (st.node) {
-        .filter => |e| try pushdown.collectQuals(env.arena, e, &quals),
+        .filter => |e| try ast.fieldsOf(e, &quals),
         .join => |j| {
             try quals.appendSlice(j.left_keys);
             for (j.deferred) |d| {
-                try pushdown.collectQuals(env.arena, d.a, &quals);
-                try pushdown.collectQuals(env.arena, d.b, &quals);
+                try ast.fieldsOf(d.a, &quals);
+                try ast.fieldsOf(d.b, &quals);
                 try made.put(d.left_name, {});
                 try made.put(d.right_name, {});
             }
-            if (j.residual) |e| try pushdown.collectQuals(env.arena, e, &quals);
+            if (j.residual) |e| try ast.fieldsOf(e, &quals);
             try later.append(if (j.alias.len > 0) j.alias else j.binding);
             try later_reads.append(try sideSchema(env, j, rest[i + 1 ..]));
         },
         .select => |items| {
             for (items) |it| switch (it) {
                 .field => |q| try quals.append(q),
-                .computed => |c| try pushdown.collectQuals(env.arena, c.expr, &quals),
+                .computed => |c| try ast.fieldsOf(c.expr, &quals),
                 else => return null,
             };
             break :walk;
@@ -594,7 +594,7 @@ fn flipKeeps(env: *Env, pre: []const ast.Stage, rest: []const ast.Stage) !?[]con
         .aggregate => |ag| {
             if (ag.by_rest != null) return null;
             try quals.appendSlice(ag.by);
-            for (ag.aggs) |a| if (a.arg) |e| try pushdown.collectQuals(env.arena, e, &quals);
+            for (ag.aggs) |a| if (a.arg) |e| try ast.fieldsOf(e, &quals);
             break :walk;
         },
         else => return null,

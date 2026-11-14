@@ -280,19 +280,12 @@ const Needs = struct {
         if (ast.hasSearch(e)) self.whole_row = true;
         if (!self.joined) {
             var quals = std.array_list.Managed(ast.QualName).init(self.env.arena);
-            const S = struct {
-                fn add(o: *std.array_list.Managed(ast.QualName), n: *const ast.Expr) ?bool {
-                    if (n.* != .field) return null;
-                    o.append(n.field) catch return true;
-                    return false;
-                }
-            };
-            if (ast.anyExpr(e, &quals, S.add)) return error.OutOfMemory;
+            try ast.fieldsOf(e, &quals);
             for (quals.items) |q| if (!q.dollar) try self.path(q.parts);
             return;
         }
         var quals = std.array_list.Managed(ast.QualName).init(self.env.arena);
-        try pushdown.collectQuals(self.env.arena, e, &quals);
+        try ast.fieldsOf(e, &quals);
         for (quals.items) |q| try self.field(q);
     }
 };
@@ -445,7 +438,7 @@ pub fn codesOnlyColumns(arena: std.mem.Allocator, after: []const ast.Stage) ![]c
 fn exprNames(arena: std.mem.Allocator, e: *const ast.Expr, set: *std.StringHashMap(void)) !bool {
     if (ast.hasSearch(e)) return false;
     var quals = std.array_list.Managed(ast.QualName).init(arena);
-    try pushdown.collectQuals(arena, e, &quals);
+    try ast.fieldsOf(e, &quals);
     for (quals.items) |q| try qualNames(q, set);
     return true;
 }

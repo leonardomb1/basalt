@@ -28,7 +28,6 @@ const interpAll = @import("../script.zig").interpAll;
 const planErr = @import("../env.zig").planErr;
 const httpConn = @import("../connect/source.zig").httpConn;
 const queryParams = @import("../connect.zig").queryParams;
-const collectQuals = @import("../pushdown/hoist.zig").collectQuals;
 const nullColumn = @import("../../exec/op/join.zig").nullColumn;
 
 const default_concurrency = 4;
@@ -193,7 +192,7 @@ fn itemsOf(a: std.mem.Allocator, svc: *const Service, pages: []const Batch) !Bat
 /// `p` with an all-NULL column for each field `e` reads that the page has not.
 fn withMissing(a: std.mem.Allocator, p: Batch, e: *const ast.Expr) !Batch {
     var quals = std.array_list.Managed(ast.QualName).init(a);
-    try collectQuals(a, e, &quals);
+    try ast.fieldsOf(e, &quals);
     var fields = std.array_list.Managed(types.Schema.Field).init(a);
     var cols = std.array_list.Managed(column.Column).init(a);
     try fields.appendSlice(p.schema.fields);

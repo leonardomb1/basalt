@@ -156,7 +156,7 @@ pub fn parseLoadUsing(self: *Parser, write: *ast.Write, items: *?[]const ast.Sel
         const slot: *?*ast.Expr = if (std.mem.eql(u8, key, "sequence_by")) &seq else if (std.mem.eql(u8, key, "delete_when")) &del else if (std.mem.eql(u8, key, "position")) &at else return self.fail(kpos, "unknown `USING changes` argument `{s}` (it takes sequence_by, position and delete_when)", .{key});
         if (slot.* != null) return self.fail(kpos, "`USING changes` names `{s}` twice", .{key});
         slot.* = try self.parseExpr();
-        try self.collectFields(slot.*.?, &reads);
+        try ast.fieldsOf(slot.*.?, &reads);
         if (!self.eat(.comma)) break;
     }
     _ = try self.expect(.rparen);
@@ -877,7 +877,7 @@ fn carryAggInput(self: *Parser, stages: []ast.Stage, ai: usize, arg: *const ast.
     const pre = stages[ai - 1].node.select;
     for (pre) |it| if (it != .field and it != .computed) return;
     var needed = std.array_list.Managed(ast.QualName).init(self.arena);
-    try self.collectFields(arg, &needed);
+    try ast.fieldsOf(arg, &needed);
     var ext = std.array_list.Managed(ast.SelectItem).init(self.arena);
     try ext.appendSlice(pre);
     for (needed.items) |q| {
@@ -1872,7 +1872,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         if (needs_pre) {
             var needed = std.array_list.Managed(ast.QualName).init(self.arena);
             for (aggs.items) |a| {
-                if (a.arg) |arg| try self.collectFields(arg, &needed);
+                if (a.arg) |arg| try ast.fieldsOf(arg, &needed);
             }
             try needed.appendSlice(group);
             for (needed.items) |q0| {
@@ -2083,7 +2083,7 @@ fn parsePivot(self: *Parser, stages: *std.array_list.Managed(ast.Stage), aliases
     _ = try self.expect(.rparen);
     _ = try self.expect(.rparen);
     var fields = std.array_list.Managed(ast.QualName).init(self.arena);
-    for (asked.items) |a| for (a.call.args) |arg| try self.collectFields(arg, &fields);
+    for (asked.items) |a| for (a.call.args) |arg| try ast.fieldsOf(arg, &fields);
     var rest = std.array_list.Managed([]const u8).init(self.arena);
     try rest.append(col.last());
     for (fields.items) |q| if (!q.dollar and !ast.nameIn(rest.items, q.last())) try rest.append(q.last());
