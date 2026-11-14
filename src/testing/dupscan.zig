@@ -421,6 +421,10 @@ pub const plan = [_]Rule{
         "lang/parse/tablefn.zig",
     } },
     .{ .home = "translate.pushable", .pattern = pushable_pattern, .under = "runtime/", .exact = true },
+    .{ .home = "sql_lexer.spanAt", .pattern = sql_span_pattern, .exact = true, .allow = &.{
+        "lang/sql_lexer.zig",
+        "runtime/connect/sql_read.zig",
+    } },
 };
 
 pub const civil_pattern = "719_?468|146_?097|719_?16[23]|25_?56[789]|24_?107|2_?440_?588|86_400_000_000|std\\.time\\.epoch\\.";
@@ -480,6 +484,7 @@ pub const own_value_pattern = "\\.string => \\|\\w+\\| \\.\\{ \\.string = try \\
 pub const round_to_pattern = "@abs\\(@rem\\(";
 pub const csv_quote_pattern = "\\[\\w+ \\+ 1\\] == '\"'";
 pub const projected_pattern = "\\.to, name\\)";
+pub const sql_span_pattern = "indexOfPos\\(u8, \\w+, [^,]+, \"(\\*/|\\$\\$)\"\\)|== '-' and [^;]*== '-'";
 pub const split_and_pattern = "\\.binary\\.op == \\.@\"and\"\\) \\{";
 /// A private list of pushdown function names, or a branch on one: the facts belong
 /// in a field of `translate.pushable`.
@@ -689,6 +694,11 @@ test "dupscan plan patterns: what each one catches and what it lets through" {
         .{ queue_pattern, "const i = queue.next.fetchAdd(1, .monotonic);", true },
         .{ sql_pattern, "try w.writeAll(\"''\");", true },
         .{ sql_pattern, "try w.writeAll(\"'\");", false },
+        .{ sql_span_pattern, "const end = if (std.mem.indexOfPos(u8, text, i + 2, \"*/\")) |p| p + 2 else text.len;", true },
+        .{ sql_span_pattern, "const end = std.mem.indexOfPos(u8, s, i + 2, \"$$\");", true },
+        .{ sql_span_pattern, "if (c == '-' and i + 1 < text.len and text[i + 1] == '-') {", true },
+        .{ sql_span_pattern, "if (std.mem.indexOf(u8, s, \"$$\") != null) return null;", false },
+        .{ sql_span_pattern, "i = if (sql_lexer.spanAt(s, i)) |sp| sp.end else i + 1;", false },
     };
     for (cases) |c| {
         const got = try startsOf(c[0], c[1], .line);

@@ -9,6 +9,7 @@ const complete = @import("complete.zig");
 const parser = @import("../../lang/sql_parser.zig");
 const runtime = @import("../../runtime/run.zig");
 const sql = @import("../../db/sql.zig");
+const sql_lexer = @import("../../lang/sql_lexer.zig");
 const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
 const declareFrom = @import("../cmd_complete.zig").declareFrom;
@@ -202,15 +203,17 @@ pub fn suggest(ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, curs
 }
 
 /// The variables of every `FOR EACH ... AS (a, b:INT)` still open at `cursor`, read
-/// from the text, as a script being typed will not parse.
+/// from the text past the lexer's strings and comments, as a script being typed
+/// will not parse.
 fn loopVarsAt(text: []const u8, cursor: usize, out: *std.array_list.Managed([]const u8)) !void {
     const upto = text[0..@min(cursor, text.len)];
     var open: [16]usize = undefined;
     var n: usize = 0;
     var i: usize = 0;
     while (i < upto.len) : (i += 1) {
-        if (upto[i] == '\'') {
-            i = std.mem.indexOfScalarPos(u8, upto, i + 1, '\'') orelse return;
+        if (sql_lexer.spanAt(upto, i)) |sp| {
+            if (!sp.closed and sp.kind == .string) return;
+            i = sp.end - 1;
             continue;
         }
         if (i > 0 and (std.ascii.isAlphanumeric(upto[i - 1]) or upto[i - 1] == '_')) continue;
@@ -225,8 +228,12 @@ fn loopVarsAt(text: []const u8, cursor: usize, out: *std.array_list.Managed([]co
         var depth: usize = 0;
         var k = start;
         while (k < upto.len) : (k += 1) {
+            if (sql_lexer.spanAt(upto, k)) |sp| {
+                if (!sp.closed) break;
+                k = sp.end - 1;
+                continue;
+            }
             switch (upto[k]) {
-                '\'' => k = std.mem.indexOfScalarPos(u8, upto, k + 1, '\'') orelse break,
                 '(' => depth += 1,
                 ')' => depth -|= 1,
                 else => if (depth == 0 and wordsAt(upto, k, "as", "(") and !(std.ascii.isAlphanumeric(upto[k - 1]) or upto[k - 1] == '_')) {
@@ -303,10 +310,14 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
         if (wanted) try tables.append(.{ .conn = c, .tables = if (isHttp(cx, c)) &.{} else connTables(cx, c) });
     }
     var q: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, text, q, '\'')) |open| {
-        const close = std.mem.indexOfScalarPos(u8, text, open + 1, '\'') orelse break;
-        q = close + 1;
-        if (q >= cursor and open < cursor) continue;
+    while (q < text.len) {
+        const sp = sql_lexer.spanAt(text, q) orelse {
+            q += 1;
+            continue;
+        };
+        const open = q;
+        q = sp.end;
+        if (sp.kind != .string or !sp.closed or (q >= cursor and open < cursor)) continue;
         const lit = text[open..q];
         const file_like = for ([_][]const u8{ ".csv'", ".parquet'", ".gz'", ".zst'", ".arrow'", ".arrows'", ".feather'", ".ipc'", ".avro'" }) |ext| {
             if (std.ascii.endsWithIgnoreCase(lit, ext)) break true;

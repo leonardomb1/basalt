@@ -5,8 +5,8 @@
 //!
 //! What is offered, by where the cursor is:
 //!   - `\…` at the start of the entry: the meta commands;
-//!   - inside an unclosed `'…'`: a file path, asked of the caller, which replaces
-//!     from just after the opening quote;
+//!   - inside an unclosed `'…'`, as the lexer reads it: a file path, asked of the
+//!     caller, which replaces from just after the opening quote;
 //!   - `$…`: params and LETs;
 //!   - `conn.…`: that connection's tables, `schema.table`; `x.…` otherwise: columns;
 //!   - a bare word: CTEs, connections, declared functions, the columns of the
@@ -26,6 +26,7 @@ const std = @import("std");
 const msgfmt = @import("../../format/msgfmt.zig");
 const hilite = @import("hilite.zig");
 const eval = @import("../../exec/eval.zig");
+const sql_lexer = @import("../../lang/sql_lexer.zig");
 
 pub const Kind = enum { meta, param, cte, connection, function, table, column, keyword, path };
 
@@ -235,21 +236,21 @@ fn isWordByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_' or c >= 0x80;
 }
 
-/// Is `at` inside a single-quoted string on its line? Quotes are counted from
-/// the line's start, a doubled quote being one literal character.
+/// Where the single-quoted string `at` is inside opens, or null: the text up to
+/// `at` read by the lexer's spans, so a quote in a comment, name or dollar quote
+/// opens nothing.
 fn stringStart(text: []const u8, at: usize) ?usize {
-    const ls = if (std.mem.lastIndexOfScalar(u8, text[0..at], '\n')) |p| p + 1 else 0;
-    var open: ?usize = null;
-    var i = ls;
-    while (i < at) : (i += 1) {
-        if (text[i] != '\'') continue;
-        if (open == null) {
-            open = i;
-        } else if (i + 1 < at and text[i + 1] == '\'') {
+    const upto = text[0..at];
+    var i: usize = 0;
+    while (i < upto.len) {
+        const sp = sql_lexer.spanAt(upto, i) orelse {
             i += 1;
-        } else open = null;
+            continue;
+        };
+        if (!sp.closed) return if (sp.kind == .string) i else null;
+        i = sp.end;
     }
-    return open;
+    return null;
 }
 
 fn startsWithFold(s: []const u8, prefix: []const u8) bool {

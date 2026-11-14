@@ -1,7 +1,8 @@
 //! Syntax colouring for the REPL's entry: a style per byte, from a scanner that
 //! never fails on half-typed text — an unclosed string is coloured to the end and
-//! the rest is left plain. Deliberately not the parser's lexer: that one skips
-//! comments and stops at the first bad byte, both wrong for text being typed.
+//! the rest is left plain. Not the parser's token stream: that one skips comments
+//! and stops at the first bad byte, both wrong for text being typed; strings,
+//! comments and dollar quotes end where the lexer's `spanAt` says.
 //!
 //! `keywords` is the parser's keyword set (`sql_parser.zig`'s `isKw`) plus the
 //! aggregate, window and type names that read as keywords to a person. Only a bare
@@ -9,6 +10,7 @@
 //! as a call (`trim(`, `erp.QUERY(`) unless it is a keyword (`IN (`, `AS (`).
 
 const std = @import("std");
+const sql_lexer = @import("../../lang/sql_lexer.zig");
 
 pub const Style = enum(u8) { plain, keyword, string, number, comment, param, punct, func };
 
@@ -46,32 +48,13 @@ pub fn scan(text: []const u8, out: []Style) void {
     var i: usize = 0;
     while (i < text.len) {
         const c = text[i];
-        if (c == '-' and i + 1 < text.len and text[i + 1] == '-') {
-            const end = std.mem.indexOfScalarPos(u8, text, i, '\n') orelse text.len;
-            @memset(out[i..end], .comment);
-            i = end;
-        } else if (c == '/' and i + 1 < text.len and text[i + 1] == '*') {
-            const end = if (std.mem.indexOfPos(u8, text, i + 2, "*/")) |p| p + 2 else text.len;
-            @memset(out[i..end], .comment);
-            i = end;
-        } else if (c == '\'' or c == '"') {
-            var j = i + 1;
-            while (j < text.len) : (j += 1) {
-                if (text[j] == c) {
-                    if (j + 1 < text.len and text[j + 1] == c) {
-                        j += 1;
-                        continue;
-                    }
-                    j += 1;
-                    break;
-                }
-            }
-            @memset(out[i..j], if (c == '\'') .string else .plain);
-            i = j;
-        } else if (c == '$' and i + 1 < text.len and text[i + 1] == '$') {
-            const end = if (std.mem.indexOfPos(u8, text, i + 2, "$$")) |p| p + 2 else text.len;
-            @memset(out[i..end], .string);
-            i = end;
+        if (sql_lexer.spanAt(text, i)) |sp| {
+            @memset(out[i..sp.end], switch (sp.kind) {
+                .line_comment, .block_comment => .comment,
+                .string, .dollar_quote => .string,
+                .quoted_ident => .plain,
+            });
+            i = sp.end;
         } else if (c == '$' and i + 1 < text.len and (text[i + 1] == '{' or isIdent(text[i + 1]))) {
             var j = i + 1;
             if (text[j] == '{') {

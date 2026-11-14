@@ -6,71 +6,22 @@ const isClear = @import("repl/repl.zig").isClear;
 const isHelp = @import("repl/repl.zig").isHelp;
 const isQuit = @import("repl/repl.zig").isQuit;
 const parser = @import("../lang/sql_parser.zig");
+const sql_lexer = @import("../lang/sql_lexer.zig");
 const HeldLet = @import("../runtime/env.zig").HeldLet;
 const Value = @import("../exec/value.zig").Value;
 const nested = @import("../exec/nested.zig");
 const std = @import("std");
 const Catalog = @import("repl/catalog.zig").Catalog;
 
-/// Just past the quoted text opening at `s[at]`, whose delimiter is doubled inside it
-/// (`'it''s'`, `"a""b"`) and a backslash is an ordinary character, as the lexer reads
-/// strings and quoted names; `s.len` when it never closes.
-fn pastQuoted(s: []const u8, at: usize) usize {
-    const q = s[at];
-    var i = at + 1;
-    while (i < s.len) : (i += 1) {
-        if (s[i] != q) continue;
-        if (i + 1 < s.len and s[i + 1] == q) {
-            i += 1;
-            continue;
-        }
-        return i + 1;
-    }
-    return s.len;
-}
-
 /// Next statement-level `;`, skipping strings, dollar quotes and comments by the
-/// lexer's own rules, so the REPL agrees with the parser on where a statement ends.
+/// lexer's own spans, so the REPL agrees with the parser on where a statement ends.
 pub fn nextTopSemi(s: []const u8, from: usize) ?usize {
     var i = from;
     while (i < s.len) {
-        switch (s[i]) {
-            ';' => return i,
-            '\'', '"' => i = pastQuoted(s, i),
-            '-' => {
-                if (i + 1 < s.len and s[i + 1] == '-') {
-                    i = std.mem.indexOfScalarPos(u8, s, i, '\n') orelse s.len;
-                } else i += 1;
-            },
-            '/' => {
-                if (i + 1 < s.len and s[i + 1] == '*') {
-                    const end = std.mem.indexOfPos(u8, s, i + 2, "*/");
-                    i = if (end) |e| e + 2 else s.len;
-                } else i += 1;
-            },
-            '$' => {
-                if (dollarTagLen(s, i)) |n| {
-                    const end = std.mem.indexOfPos(u8, s, i + n, s[i .. i + n]);
-                    i = if (end) |e| e + n else s.len;
-                } else i += 1;
-            },
-            else => i += 1,
-        }
+        if (s[i] == ';') return i;
+        i = if (sql_lexer.spanAt(s, i)) |sp| sp.end else i + 1;
     }
     return null;
-}
-
-/// Length of the dollar-quote opener at `s[i]` (`$$` = 2, `$tag$` = tag+2), or
-/// null when this `$` starts a `$param` reference instead.
-fn dollarTagLen(s: []const u8, i: usize) ?usize {
-    var j = i + 1;
-    while (j < s.len and s[j] != '$') : (j += 1) {
-        const c = s[j];
-        if (!std.ascii.isAlphanumeric(c) and c != '_') return null;
-        if (j == i + 1 and std.ascii.isDigit(c)) return null;
-    }
-    if (j >= s.len) return null;
-    return j + 1 - i;
 }
 
 /// Run or wait for more? SQL is whole at a top-level `;` unless the parser, given

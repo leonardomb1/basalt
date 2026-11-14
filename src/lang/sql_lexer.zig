@@ -12,7 +12,6 @@
 //!   - `;` statement terminator, `<>` as not-equal, `||` concat over bitwise `|`
 
 const std = @import("std");
-const msgfmt = @import("../format/msgfmt.zig");
 const token = @import("token.zig");
 
 const Token = token.Token;
@@ -53,26 +52,20 @@ pub const Lexer = struct {
             const c = self.src[self.i];
             if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
                 _ = self.bump();
-            } else if (c == '-' and self.peek(1) == '-') {
-                while (self.i < self.src.len and self.src[self.i] != '\n') _ = self.bump();
-            } else if (c == '/' and self.peek(1) == '*') {
+            } else if (c == '-' or c == '/') {
+                const sp = spanAt(self.src, self.i) orelse break;
                 const start = self.i;
                 const line = self.line;
                 const col = self.col;
-                _ = self.bump();
-                _ = self.bump();
-                while (true) {
-                    if (self.i >= self.src.len) return self.make(.invalid, self.src[start..], line, col);
-                    if (self.src[self.i] == '*' and self.peek(1) == '/') {
-                        _ = self.bump();
-                        _ = self.bump();
-                        break;
-                    }
-                    _ = self.bump();
-                }
+                self.bumpTo(sp.end);
+                if (!sp.closed) return self.make(.invalid, self.src[start..], line, col);
             } else break;
         }
         return null;
+    }
+
+    fn bumpTo(self: *Lexer, end: usize) void {
+        while (self.i < end) _ = self.bump();
     }
 
     /// Called once the token is consumed, so the lexer's position is its end.
@@ -158,80 +151,32 @@ pub const Lexer = struct {
             return self.make(if (is_float) .float else .int, self.src[start..self.i], line, col);
         }
 
-        if (c == '\'') {
-            _ = self.bump();
+        if (c == '\'' or c == '"') {
+            const sp = spanAt(self.src, self.i).?;
             const start = self.i;
-            while (self.i < self.src.len) {
-                if (self.src[self.i] == '\'') {
-                    if (self.peek(1) == '\'') {
-                        _ = self.bump();
-                        _ = self.bump();
-                        continue;
-                    }
-                    break;
-                }
-                _ = self.bump();
-            }
-            if (self.i >= self.src.len) return self.make(.invalid, self.src[start - 1 ..], line, col);
-            const body = self.src[start..self.i];
-            _ = self.bump();
-            return self.make(.string, try self.unquoteSingle(body), line, col);
-        }
-
-        if (c == '"') {
-            _ = self.bump();
-            const start = self.i;
-            while (self.i < self.src.len) {
-                if (self.src[self.i] == '"') {
-                    if (self.i + 1 < self.src.len and self.src[self.i + 1] == '"') {
-                        _ = self.bump();
-                        _ = self.bump();
-                        continue;
-                    }
-                    break;
-                }
-                _ = self.bump();
-            }
-            if (self.i >= self.src.len) return self.make(.invalid, self.src[start - 1 ..], line, col);
-            const body = self.src[start..self.i];
-            _ = self.bump();
-            if (body.len == 0) return self.make(.invalid, self.src[start - 1 ..], line, col);
+            self.bumpTo(sp.end);
+            if (!sp.closed) return self.make(.invalid, self.src[start..], line, col);
+            const body = self.src[start + 1 .. sp.end - 1];
+            if (c == '\'') return self.make(.string, try self.unquoteSingle(body), line, col);
+            if (body.len == 0) return self.make(.invalid, self.src[start..], line, col);
             return self.make(.qident, try self.unquoteIdent(body), line, col);
         }
 
         if (c == '$') {
-            if (self.peek(1) == '$') {
-                _ = self.bump();
-                _ = self.bump();
+            if (spanAt(self.src, self.i)) |sp| {
                 const start = self.i;
-                const end = std.mem.indexOfPos(u8, self.src, self.i, "$$") orelse {
-                    const rest = self.src[start - 2 ..];
+                if (!sp.closed) {
                     self.i = self.src.len;
-                    return self.make(.invalid, rest, line, col);
-                };
-                const body = self.src[start..end];
-                while (self.i < end + 2) _ = self.bump();
-                return self.make(.string, body, line, col);
+                    return self.make(.invalid, self.src[start..], line, col);
+                }
+                self.bumpTo(sp.end);
+                return self.make(.string, self.src[start + sp.open .. sp.end - sp.open], line, col);
             }
             if (isIdentStart(self.peek(1))) {
                 _ = self.bump();
                 const nstart = self.i;
                 while (self.i < self.src.len and isIdentChar(self.src[self.i])) _ = self.bump();
-                const name = self.src[nstart..self.i];
-                if (self.i < self.src.len and self.src[self.i] == '$') {
-                    _ = self.bump();
-                    const closer = msgfmt.allocPrint(self.alloc, "${s}$", .{name}) catch return error.OutOfMemory;
-                    const start = self.i;
-                    const end = std.mem.indexOfPos(u8, self.src, self.i, closer) orelse {
-                        const rest = self.src[nstart - 1 ..];
-                        self.i = self.src.len;
-                        return self.make(.invalid, rest, line, col);
-                    };
-                    const body = self.src[start..end];
-                    while (self.i < end + closer.len) _ = self.bump();
-                    return self.make(.string, body, line, col);
-                }
-                return self.make(.dollar_ident, name, line, col);
+                return self.make(.dollar_ident, self.src[nstart..self.i], line, col);
             }
             _ = self.bump();
             return self.make(.invalid, self.src[self.i - 1 .. self.i], line, col);
@@ -333,6 +278,61 @@ pub const Lexer = struct {
         }
     }
 };
+
+pub const SpanKind = enum { string, quoted_ident, line_comment, block_comment, dollar_quote };
+
+/// A span the lexer reads whole: `end` is just past it (`src.len` when it never
+/// closes), `open` its opener's length (`'` 1, `--` 2, `$tag$` 5); a line comment
+/// is always closed, ending before its newline.
+pub const Span = struct { kind: SpanKind, end: usize, open: usize, closed: bool };
+
+/// The string, quoted name, comment or dollar quote opening at `src[at]`, by the
+/// lexer's rules (a doubled quote stays inside, a backslash is ordinary), or null
+/// when none opens there. Never fails on unfinished text, so editors share it.
+pub fn spanAt(src: []const u8, at: usize) ?Span {
+    const c = src[at];
+    const next: u8 = if (at + 1 < src.len) src[at + 1] else 0;
+    switch (c) {
+        '\'', '"' => {
+            const kind: SpanKind = if (c == '\'') .string else .quoted_ident;
+            var i = at + 1;
+            while (i < src.len) : (i += 1) {
+                if (src[i] != c) continue;
+                if (i + 1 < src.len and src[i + 1] == c) {
+                    i += 1;
+                    continue;
+                }
+                return .{ .kind = kind, .end = i + 1, .open = 1, .closed = true };
+            }
+            return .{ .kind = kind, .end = src.len, .open = 1, .closed = false };
+        },
+        '-' => if (next == '-') {
+            const end = std.mem.indexOfScalarPos(u8, src, at, '\n') orelse src.len;
+            return .{ .kind = .line_comment, .end = end, .open = 2, .closed = true };
+        },
+        '/' => if (next == '*') {
+            const close = std.mem.indexOfPos(u8, src, at + 2, "*/");
+            return .{ .kind = .block_comment, .end = if (close) |p| p + 2 else src.len, .open = 2, .closed = close != null };
+        },
+        '$' => if (dollarOpener(src, at)) |n| {
+            const close = std.mem.indexOfPos(u8, src, at + n, src[at .. at + n]);
+            return .{ .kind = .dollar_quote, .end = if (close) |p| p + n else src.len, .open = n, .closed = close != null };
+        },
+        else => {},
+    }
+    return null;
+}
+
+/// Length of the dollar-quote opener at `src[at]` (`$$`, `$tag$`), or null when
+/// this `$` starts a `$name` reference or nothing.
+fn dollarOpener(src: []const u8, at: usize) ?usize {
+    var j = at + 1;
+    if (j < src.len and src[j] == '$') return 2;
+    if (j >= src.len or !Lexer.isIdentStart(src[j])) return null;
+    while (j < src.len and Lexer.isIdentChar(src[j])) j += 1;
+    if (j >= src.len or src[j] != '$') return null;
+    return j + 1 - at;
+}
 
 pub fn tokenize(alloc: std.mem.Allocator, src: []const u8) ![]Token {
     var lx = Lexer.init(alloc, src);
