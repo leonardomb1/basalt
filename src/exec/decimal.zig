@@ -176,25 +176,38 @@ pub fn withinPrecision(v: i128, precision: u8) bool {
     return v < bound and v > -bound;
 }
 
+/// `u / p` for a power of ten `p`, rounded by `r`; null when `exact` meets a
+/// remainder. The one rounding every decimal-to-whole path takes, in whatever
+/// integer width it divides.
+inline fn roundTo(comptime T: type, u: T, p: T, comptime r: Round) ?T {
+    const q = @divTrunc(u, p);
+    const rem2 = @abs(@rem(u, p)) * 2;
+    const away = switch (r) {
+        .exact => if (rem2 != 0) return null else false,
+        .half_away => rem2 >= @abs(p),
+        .half_even => rem2 > @abs(p) or (rem2 == @abs(p) and @rem(q, 2) != 0),
+    };
+    return if (!away) q else if (u < 0) q - 1 else q + 1;
+}
+
 /// `u / 10^drop` for an i128 or i256 `u`, rounded half away from zero.
 pub fn roundScaleDown(u: anytype, drop: u32) @TypeOf(u) {
     const table = if (@TypeOf(u) == i128) &pow10_i128 else &pow10_i256;
     if (drop >= table.len) return 0;
-    const p = table[drop];
-    const q = @divTrunc(u, p);
-    if (@abs(@rem(u, p)) * 2 >= @abs(p)) return if (u < 0) q - 1 else q + 1;
-    return q;
+    return roundTo(@TypeOf(u), u, table[drop], .half_away).?;
 }
 
-/// A decimal rounded half away from zero to an i64, null past its range: what
-/// `rescaleTo(d, 0)` gives, divided in i64 when the unscaled value fits one.
+/// A decimal rounded half away from zero to an i64, null past its range: `intOf`,
+/// divided in i64 when the unscaled value fits one, as a column cast does it.
 pub fn toInt(d: Decimal) ?i64 {
-    const s = (if (d.scale <= 18) std.math.cast(i64, d.unscaled) else null) orelse
-        return std.math.cast(i64, (rescaleTo(d, 0) orelse return null).unscaled);
-    const p: i64 = @intCast(pow10_i128[d.scale]);
-    const q = @divTrunc(s, p);
-    if (@abs(@rem(s, p)) * 2 >= p) return if (s < 0) q - 1 else q + 1;
-    return q;
+    const s = (if (d.scale <= 18) std.math.cast(i64, d.unscaled) else null) orelse return intOf(d, .half_away);
+    return roundTo(i64, s, @intCast(pow10_i128[d.scale]), .half_away).?;
+}
+
+/// A decimal, at its own scale, rounded by `r` to an int in exact i128 arithmetic;
+/// null outside i64 or, for `exact`, with a fraction.
+pub fn intOf(d: Decimal, comptime r: Round) ?i64 {
+    return std.math.cast(i64, roundedWhole(d, r) orelse return null);
 }
 
 /// Shifts a decimal to `want`, rounding half away from zero; null on overflow.
@@ -321,14 +334,6 @@ pub fn toMicros(d: Decimal) ?i64 {
     while (s < 6) : (s += 1) q = std.math.mul(i128, q, 10) catch return null;
     while (s > 6) : (s -= 1) q = @divTrunc(q + (if (s == 7) @as(i128, if (q < 0) -5 else 5) else 0), 10);
     return std.math.cast(i64, q);
-}
-
-/// The i64 a decimal equals exactly; null when it has a fraction or passes i64.
-pub fn exactInt(d: Decimal) ?i64 {
-    if (d.scale >= pow10_i128.len) return if (d.unscaled == 0) 0 else null;
-    const p = pow10_i128[d.scale];
-    if (@rem(d.unscaled, p) != 0) return null;
-    return std.math.cast(i64, @divExact(d.unscaled, p));
 }
 
 pub fn asDecimal(v: Value) ?Decimal {
@@ -1009,27 +1014,12 @@ pub fn roundedWhole(d: Decimal, comptime r: Round) ?i128 {
         .exact => if (d.unscaled == 0) 0 else null,
         else => 0,
     };
-    const p = pow10_i128[d.scale];
-    const q = @divTrunc(d.unscaled, p);
-    const rem2 = @abs(@rem(d.unscaled, p)) * 2;
-    const away = switch (r) {
-        .exact => if (rem2 != 0) return null else false,
-        .half_away => rem2 >= @abs(p),
-        .half_even => rem2 > @abs(p) or (rem2 == @abs(p) and @rem(q, 2) != 0),
-    };
-    return if (!away) q else if (d.unscaled < 0) q - 1 else q + 1;
+    return roundTo(i128, d.unscaled, pow10_i128[d.scale], r);
 }
 
 /// 10^n as an i128, null past 10^38, the largest power of ten an i128 holds.
 pub fn pow10Checked(n: anytype) ?i128 {
     return if (n < pow10_i128.len) pow10_i128[n] else null;
-}
-
-/// `d` rounded half away from zero to a whole number; null past scale 38, where
-/// no i128 power of ten divides it.
-pub inline fn roundWhole(d: Decimal) ?i128 {
-    if (d.scale >= pow10_i128.len) return null;
-    return roundScaleDown(d.unscaled, d.scale);
 }
 
 /// `unscaled * 10^-scale` with the power from `std.math.pow` rather than

@@ -192,7 +192,7 @@ pub fn limitValue(arena: std.mem.Allocator, e: *const ast.Expr, params: *const P
         .string => |t| std.fmt.parseInt(u64, std.mem.trim(u8, t, " "), 10) catch fail(diag, "{s} must be a whole number of rows, got '{s}'", .{ what, t }),
         .float => |f| roundedRows(diag, what, textconv.floatToInt(f, .half_even) orelse return fail(diag, "{s} {d} is out of range", .{ what, f })),
         .decimal => |d| blk: {
-            const q = decimal.roundWhole(d) orelse break :blk fail(diag, "{s} is out of range", .{what});
+            const q = decimal.roundedWhole(d, .half_away) orelse break :blk fail(diag, "{s} is out of range", .{what});
             break :blk roundedRows(diag, what, q);
         },
         else => fail(diag, "{s} must be an integer, got {s}", .{ what, @tagName(v) }),

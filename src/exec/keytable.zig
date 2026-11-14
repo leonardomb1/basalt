@@ -932,7 +932,7 @@ pub const Encoder = struct {
             const w: ?i64 = switch (kk) {
                 .i64k => switch (col.ty.kind) {
                     .float => textconv.floatToInt(col.data.f64[r], .exact),
-                    .decimal => decimal.exactInt(column.decimals(col).at(r)),
+                    .decimal => decimal.intOf(column.decimals(col).at(r), .exact),
                     else => null,
                 },
                 .f64k => switch (col.ty.kind) {

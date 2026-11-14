@@ -1,7 +1,7 @@
 //! Text to BOOL and float/decimal to INT, written once. Each reader of a boolean
 //! spelling picks a `Words` preset (the set of spellings it accepts) and one
 //! kernel, `boolText`, does the matching; each number-to-int site picks a `Round`
-//! and `floatToInt`/`floatToIntScaled`/`decimalToInt` guard the i64 range, NaN and
+//! and `floatToInt`/`floatToIntScaled` (and `decimal.intOf`) guard the i64 range, NaN and
 //! infinities, which `@intFromFloat` treats as illegal behaviour.
 //!
 //! SQL reads a boolean one way (`Words.sql`) in a CAST, a literal met by a BOOL and
@@ -135,12 +135,6 @@ fn halfEven(x: f64) f64 {
     const f = @floor(x);
     const d = x - f;
     return if (d < 0.5) f else if (d > 0.5) f + 1 else if (@mod(f, 2) == 0) f else f + 1;
-}
-
-/// A decimal value, at its own scale, rounded by `r` to an int in exact i128
-/// arithmetic; null when the result is outside i64 or, for `exact`, has a fraction.
-pub fn decimalToInt(d: Decimal, comptime r: Round) ?i64 {
-    return std.math.cast(i64, decimal.roundedWhole(d, r) orelse return null);
 }
 
 const testing = std.testing;
@@ -317,24 +311,24 @@ test "decimalToInt half_away is the CAST(decimal AS INT) path" {
     const rescaleTo = @import("decimal.zig").rescaleTo;
     for (dec_corpus) |d| {
         const want: ?i64 = if (rescaleTo(d, 0)) |z| std.math.cast(i64, z.unscaled) else null;
-        try testing.expectEqual(want, decimalToInt(d, .half_away));
+        try testing.expectEqual(want, decimal.intOf(d, .half_away));
     }
-    try testing.expectEqual(@as(?i64, 3), decimalToInt(dec(25, 1), .half_away));
-    try testing.expectEqual(@as(?i64, -3), decimalToInt(dec(-25, 1), .half_away));
-    try testing.expectEqual(@as(?i64, 2), decimalToInt(dec(24999, 4), .half_away));
-    try testing.expectEqual(@as(?i64, 1), decimalToInt(dec(5 * std.math.pow(i128, 10, 37), 38), .half_away));
-    try testing.expectEqual(@as(?i64, null), decimalToInt(dec(@as(i128, std.math.maxInt(i64)) * 10 + 5, 1), .half_away));
+    try testing.expectEqual(@as(?i64, 3), decimal.intOf(dec(25, 1), .half_away));
+    try testing.expectEqual(@as(?i64, -3), decimal.intOf(dec(-25, 1), .half_away));
+    try testing.expectEqual(@as(?i64, 2), decimal.intOf(dec(24999, 4), .half_away));
+    try testing.expectEqual(@as(?i64, 1), decimal.intOf(dec(5 * std.math.pow(i128, 10, 37), 38), .half_away));
+    try testing.expectEqual(@as(?i64, null), decimal.intOf(dec(@as(i128, std.math.maxInt(i64)) * 10 + 5, 1), .half_away));
 }
 
 test "decimalToInt half_away matches the LIMIT decimal rounding" {
     for (dec_corpus) |d| {
         const p = std.math.powi(i128, 10, d.scale) catch {
-            try testing.expectEqual(@as(?i64, 0), decimalToInt(d, .half_away));
+            try testing.expectEqual(@as(?i64, 0), decimal.intOf(d, .half_away));
             continue;
         };
         var q = @divTrunc(d.unscaled, p);
         if (@abs(@rem(d.unscaled, p)) * 2 >= p) q += if (d.unscaled < 0) -1 else 1;
-        try testing.expectEqual(std.math.cast(i64, q), decimalToInt(d, .half_away));
+        try testing.expectEqual(std.math.cast(i64, q), decimal.intOf(d, .half_away));
     }
 }
 
@@ -346,33 +340,33 @@ test "decimalToInt exact is keytable's intOfDec" {
             if (@rem(d.unscaled, p) != 0) break :blk null;
             break :blk std.math.cast(i64, @divExact(d.unscaled, p));
         };
-        try testing.expectEqual(want, decimalToInt(d, .exact));
+        try testing.expectEqual(want, decimal.intOf(d, .exact));
     }
-    try testing.expectEqual(@as(?i64, 12), decimalToInt(dec(1200, 2), .exact));
-    try testing.expectEqual(@as(?i64, null), decimalToInt(dec(1201, 2), .exact));
+    try testing.expectEqual(@as(?i64, 12), decimal.intOf(dec(1200, 2), .exact));
+    try testing.expectEqual(@as(?i64, null), decimal.intOf(dec(1201, 2), .exact));
 }
 
 test "decimalToInt half_even rounds ties to even and agrees with the float path" {
-    try testing.expectEqual(@as(?i64, 2), decimalToInt(dec(25, 1), .half_even));
-    try testing.expectEqual(@as(?i64, 4), decimalToInt(dec(35, 1), .half_even));
-    try testing.expectEqual(@as(?i64, -2), decimalToInt(dec(-25, 1), .half_even));
-    try testing.expectEqual(@as(?i64, -4), decimalToInt(dec(-35, 1), .half_even));
-    try testing.expectEqual(@as(?i64, 0), decimalToInt(dec(5, 1), .half_even));
-    try testing.expectEqual(@as(?i64, 3), decimalToInt(dec(250001, 5), .half_even));
+    try testing.expectEqual(@as(?i64, 2), decimal.intOf(dec(25, 1), .half_even));
+    try testing.expectEqual(@as(?i64, 4), decimal.intOf(dec(35, 1), .half_even));
+    try testing.expectEqual(@as(?i64, -2), decimal.intOf(dec(-25, 1), .half_even));
+    try testing.expectEqual(@as(?i64, -4), decimal.intOf(dec(-35, 1), .half_even));
+    try testing.expectEqual(@as(?i64, 0), decimal.intOf(dec(5, 1), .half_even));
+    try testing.expectEqual(@as(?i64, 3), decimal.intOf(dec(250001, 5), .half_even));
     for (0..2001) |i| {
         const u = @as(i128, @intCast(i)) - 1000;
         const d = dec(u, 1);
         const x = @as(f64, @floatFromInt(u)) / 10;
         if (@abs(@rem(u, 10)) == 5) {
-            try testing.expectEqual(floatToInt(x, .half_even), decimalToInt(d, .half_even));
-            try testing.expectEqual(floatToInt(x, .half_away), decimalToInt(d, .half_away));
+            try testing.expectEqual(floatToInt(x, .half_even), decimal.intOf(d, .half_even));
+            try testing.expectEqual(floatToInt(x, .half_away), decimal.intOf(d, .half_away));
         }
-        try testing.expectEqual(floatToInt(x, .exact), decimalToInt(d, .exact));
+        try testing.expectEqual(floatToInt(x, .exact), decimal.intOf(d, .exact));
     }
 }
 
 test "a decimal value's own scale decides, not a column's" {
-    try testing.expectEqual(decimalToInt(dec(25, 1), .half_away), decimalToInt(dec(2500, 3), .half_away));
-    try testing.expectEqual(decimalToInt(dec(25, 1), .half_even), decimalToInt(dec(25000000, 7), .half_even));
-    try testing.expectEqual(@as(?i64, 7), decimalToInt(dec(7000, 3), .exact));
+    try testing.expectEqual(decimal.intOf(dec(25, 1), .half_away), decimal.intOf(dec(2500, 3), .half_away));
+    try testing.expectEqual(decimal.intOf(dec(25, 1), .half_even), decimal.intOf(dec(25000000, 7), .half_even));
+    try testing.expectEqual(@as(?i64, 7), decimal.intOf(dec(7000, 3), .exact));
 }

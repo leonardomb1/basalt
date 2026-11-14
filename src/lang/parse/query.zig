@@ -945,7 +945,7 @@ fn limitCount(self: *Parser, what: []const u8, n: *u64, expr: *?*ast.Expr) Error
     }
     if (base.* == .dec_lit) {
         const d = base.dec_lit;
-        const q = decimal.roundWhole(.{ .unscaled = d.unscaled, .scale = d.scale }) orelse return self.fail(vpos, "{s} is out of range", .{what});
+        const q = decimal.roundedWhole(.{ .unscaled = d.unscaled, .scale = d.scale }, .half_away) orelse return self.fail(vpos, "{s} is out of range", .{what});
         var r: f64 = @floatFromInt(q);
         var shown = @as(f64, @floatFromInt(d.unscaled)) / @as(f64, @floatFromInt(decimal.pow10_i128[d.scale]));
         if (neg) {
