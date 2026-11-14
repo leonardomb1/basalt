@@ -1275,7 +1275,7 @@ pub const Join = struct {
         cur: ?usize = null,
         hit: bool = false,
         hits: []bool = &.{},
-        win: usize = first_win,
+        win: Window = .{},
         in_buf: usize = 0,
         fin: usize = 0,
         cl: std.ArrayListUnmanaged(usize) = .empty,
@@ -1284,7 +1284,6 @@ pub const Join = struct {
 
     const out_chunk = 1 << 16;
     const pair_chunk = 1 << 16;
-    const first_win = 1024;
 
     /// The next output of the probe side: up to `out_chunk` rows of the pending
     /// batch, a new probe batch read (into `probe_mem`) when none is pending. Null at
@@ -1335,7 +1334,7 @@ pub const Join = struct {
         p.cur = ix.first(p.probe, r);
         p.hit = p.cur != null;
         p.started = true;
-        p.win = first_win;
+        p.win.reset();
         p.in_buf = 0;
     }
 
@@ -1422,7 +1421,7 @@ pub const Join = struct {
     /// holds every pair at once. Rows are finished in order as their last pairs are
     /// evaluated: a row whose candidates all fail is unmatched. A semi or anti join
     /// needs only a row's first match, so a row's chain is cut at a window that starts
-    /// at `first_win` and doubles, and walked no further once it matched.
+    /// at a `Window`, and walked no further once it matched.
     fn stepResidual(self: *Join, out: std.mem.Allocator, ix: *JoinIndex) anyerror!Batch {
         const p = &self.pending.?;
         var o = Outs.init(fresh(self.state, &self.batch_mem), self.kind);
@@ -1433,8 +1432,8 @@ pub const Join = struct {
             if (!p.started) self.startRow(ix, p);
             const r = p.r;
             while (p.cur) |br| {
-                if (p.cl.items.len >= pair_chunk or (short and p.in_buf >= p.win)) {
-                    if (short and p.in_buf >= p.win) p.win *= 2;
+                if (p.cl.items.len >= pair_chunk or (short and p.in_buf >= p.win.size)) {
+                    if (short and p.in_buf >= p.win.size) p.win.widen();
                     try self.flushPairs(ix, p, &o);
                     p.in_buf = 0;
                     if (short and p.hits[r]) {
@@ -1494,6 +1493,25 @@ pub const Join = struct {
 
     fn gatherOuts(self: *Join, arena: std.mem.Allocator, ix: *JoinIndex, lb: Batch, o: Outs) anyerror!Batch {
         return self.gatherOut(arena, ix, lb, o.lidx.items, o.ridx.items, o.rnull.items, o.lidx.items.len, false);
+    }
+};
+
+/// How many of a row's pairs a semi or anti join tries before evaluating them: it
+/// starts at `first` for each row and doubles each time the row's pairs are cut
+/// there with no match, so a row that matches early walks few pairs and one that
+/// never matches costs a logarithmic number of evaluations. Hashed and nested-loop
+/// joins both cut by it.
+pub const Window = struct {
+    size: usize = first,
+
+    const first = 1024;
+
+    pub fn reset(self: *Window) void {
+        self.size = first;
+    }
+
+    pub fn widen(self: *Window) void {
+        self.size *= 2;
     }
 };
 

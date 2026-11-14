@@ -164,10 +164,8 @@ const Cur = struct {
     pos: usize = 0,
     hit: bool = false,
     spans: ?[]Span = null,
-    win: usize = first_win,
+    win: join.Window = .{},
 };
-
-const first_win = 1024;
 
 pub const NLJoin = struct {
     stats: Stats = .{},
@@ -348,9 +346,8 @@ pub const NLJoin = struct {
     /// ON evaluated over them, and the output: the pairs it holds for, and each
     /// probe row finished here that matched nothing, as its join kind wants it. A
     /// semi or anti join needs only a row's first match, so it tries a row's pairs in
-    /// a window that starts at `first_win` and doubles while nothing matches, and a
-    /// row that matched skips the rest of its pairs. The
-    /// pairs live in `pair_mem`, reset every step, and only the output in `out`: a
+    /// a `join.Window`, and a row that matched skips the rest of its pairs. The pairs
+    /// live in `pair_mem`, reset every step, and only the output in `out`: a
     /// semi or anti join's step often emits nothing, and `next` steps again with the
     /// same `out`, so pairs kept there grew with the whole probe side.
     fn step(self: *NLJoin, out: std.mem.Allocator, ix: *JoinIndex) anyerror!Batch {
@@ -372,8 +369,8 @@ pub const NLJoin = struct {
             const sp: Span = if (c.spans) |s| s[c.row] else .{ .lo = 0, .hi = nb };
             const from = sp.lo + c.pos;
             var take = @min(sp.hi -| from, self.chunk - cl.items.len);
-            const cut = short and take > c.win;
-            if (cut) take = c.win;
+            const cut = short and take > c.win.size;
+            if (cut) take = c.win.size;
             for (from..from + take) |i| {
                 try cl.append(c.row);
                 try cr.append(if (c.spans != null) self.sorted.?.order[i] else i);
@@ -382,9 +379,9 @@ pub const NLJoin = struct {
             if (from + take >= sp.hi) {
                 c.row += 1;
                 c.pos = 0;
-                c.win = first_win;
+                c.win.reset();
             } else if (cut) {
-                c.win *= 2;
+                c.win.widen();
                 break;
             }
         }
