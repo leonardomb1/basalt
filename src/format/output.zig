@@ -4,11 +4,11 @@
 //! file someone else owns (stdout), or memory. A `.gz` name gzips what is written.
 //! A format writer renders into `writer()` and never learns where its bytes go.
 //!
-//! On failure a local file keeps what was already flushed when appending, and is
-//! otherwise left as it was; an upload is never committed, so its staged blocks or
-//! multipart parts stay invisible. A local file this opened is synced to disk before
-//! `finish` closes it, and before its `.part` is renamed over the target, so a crash
-//! after the rename cannot leave the target torn.
+//! On failure a local file is left as it was: an append is cut back to where the
+//! file ended, a whole write's `.part` deleted; an upload is never committed, so its
+//! staged blocks or multipart parts stay invisible. A local file this opened is
+//! synced to disk before `finish` closes it, and before its `.part` is renamed over
+//! the target, so a crash after the rename cannot leave the target torn.
 
 const std = @import("std");
 const pagecache = @import("../exec/pagecache.zig");
@@ -26,6 +26,7 @@ pub const Output = struct {
     gz: ?*deflate.Deflate = null,
     part: Part = .{},
     end: u64 = 0,
+    appending: bool = false,
 
     const Backend = union(enum) {
         file: std.fs.File,
@@ -47,6 +48,7 @@ pub const Output = struct {
             if (mode == .append) {
                 errdefer self.backend.file.close();
                 self.end = try self.backend.file.getEndPos();
+                self.appending = true;
                 try self.fw.seekTo(self.end);
             }
         }
@@ -183,7 +185,29 @@ pub const Output = struct {
     }
 
     fn dropFile(self: *Output) void {
-        if (self.owns_file) self.backend.file.close();
+        if (self.owns_file) {
+            if (self.appending) self.backend.file.setEndPos(self.end) catch {};
+            self.backend.file.close();
+        }
         self.part.discard();
     }
 };
+
+test "an append that fails is cut back to where the file ended; one that finishes keeps its rows" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "id\n1\n" });
+    const path = try tmp.dir.realpathAlloc(a, "t.csv");
+    const failed = try Output.open(a, path, "text/csv", .append);
+    try failed.writer().writeAll("2\n3");
+    try failed.writer().flush();
+    failed.abort();
+    try std.testing.expectEqualStrings("id\n1\n", try tmp.dir.readFileAlloc(a, "t.csv", 1 << 10));
+    const kept = try Output.open(a, path, "text/csv", .append);
+    try kept.writer().writeAll("2\n");
+    try kept.finish();
+    try std.testing.expectEqualStrings("id\n1\n2\n", try tmp.dir.readFileAlloc(a, "t.csv", 1 << 10));
+}

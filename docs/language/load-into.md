@@ -87,7 +87,9 @@ AS
   the same order — or the load fails naming both headers before writing a byte;
   appending `b, a` under `a, b` would file every value under the wrong column. A
   file whose last line has no newline gets one first, so the first new row never
-  joins the last old one. Explicit `APPEND` is a plan-time error for `.parquet`,
+  joins the last old one. An append that fails is cut back to where the file
+  ended, so a failed `LOAD` leaves it as it was (a process killed mid-write can
+  still leave a partial last row). Explicit `APPEND` is a plan-time error for `.parquet`,
   `.xml` (its root closes on the last line) and Arrow IPC, whether named by extension or by `WITH (format = ...)` (the footer
   indexes every row group or batch and is written last,
   so appending means rewriting the file), for `az://` / `s3://` (an object is
