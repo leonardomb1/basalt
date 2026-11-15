@@ -761,11 +761,16 @@ pub const Parser = struct {
     }
 
     /// An `.invalid` token refused; an unclosed comment or dollar quote, whose text
-    /// runs to the end of the script, is named by its opener.
+    /// runs to the end of the script, is named by its opener, and a `0x` number
+    /// is pointed at the bytes literal and the function it may have meant.
     fn failInvalid(self: *Parser, t: Token) Error {
         const pos: Pos = .{ .line = t.line, .col = t.col };
         if (std.mem.startsWith(u8, t.text, "/*")) return self.fail(pos, "a `/*` comment here is never closed by `*/`", .{});
         if (t.text.len > 1 and t.text[0] == '$') return self.fail(pos, "a `$`-quoted string here is never closed", .{});
+        if (t.text.len > 2 and t.text[0] == '0' and (t.text[1] == 'x' or t.text[1] == 'X')) {
+            const h = try shownText(self.arena, t.text[2..]);
+            return self.fail(pos, "`{s}` is not a literal: write the bytes as x'{s}', or the integer as from_hex('{s}')", .{ try shownText(self.arena, t.text), h, h });
+        }
         return self.fail(pos, "invalid token `{s}`", .{try shownText(self.arena, t.text)});
     }
 

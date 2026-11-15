@@ -699,6 +699,18 @@ test "sql: a refused correlated subquery fails its statement alone; the statemen
     try testing.expect(semi and left);
 }
 
+test "sql: a `0x` number is refused naming the bytes literal and the function it may have meant, and a 0 before an alias still reads" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT 1;\nSELECT 0x41ff AS b;", &diag));
+    try testing.expectEqualStrings("`0x41ff` is not a literal: write the bytes as x'41ff', or the integer as from_hex('41ff')", diag.msg);
+    try testing.expectEqual(@as(u32, 2), diag.line);
+    try testing.expectEqual(@as(u32, 8), diag.col);
+    _ = try parseSource(a, "SELECT 0 x, 0x, 10 xs;", &diag);
+}
+
 test "sql: an unclosed `/*` or dollar quote refuses the script at its opener, never drops the statements after it" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

@@ -135,6 +135,11 @@ pub const Lexer = struct {
 
         if (isDigit(c) or (c == '.' and isDigit(self.peek(1)) and (self.i == 0 or !continuesName(self.src[self.i - 1])))) {
             const start = self.i;
+            if (c == '0' and (self.peek(1) == 'x' or self.peek(1) == 'X') and isIdentChar(self.peek(2))) {
+                _ = self.bump();
+                while (self.i < self.src.len and isIdentChar(self.src[self.i])) _ = self.bump();
+                return self.make(.invalid, self.src[start..self.i], line, col);
+            }
             var is_float = false;
             self.digits();
             if (self.i < self.src.len and self.src[self.i] == '.' and isDigit(self.peek(1))) {
