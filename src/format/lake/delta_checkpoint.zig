@@ -349,7 +349,13 @@ fn pointAt(arena: std.mem.Allocator, root: []const u8, c: Written) !void {
         return w.finish();
     }
     const tmp = try msgfmt.allocPrint(arena, "{s}{s}._last_checkpoint.{s}.tmp", .{ root, delta.log_dir, &dlog.uuid() });
-    try std.fs.cwd().writeFile(.{ .sub_path = tmp, .data = text });
+    {
+        const file = try std.fs.cwd().createFile(tmp, .{});
+        defer file.close();
+        errdefer std.fs.cwd().deleteFile(tmp) catch {};
+        try file.writeAll(text);
+        try file.sync();
+    }
     std.fs.cwd().rename(tmp, at) catch |e| {
         std.fs.cwd().deleteFile(tmp) catch {};
         return e;

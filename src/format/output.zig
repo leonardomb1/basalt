@@ -6,7 +6,9 @@
 //!
 //! On failure a local file keeps what was already flushed when appending, and is
 //! otherwise left as it was; an upload is never committed, so its staged blocks or
-//! multipart parts stay invisible.
+//! multipart parts stay invisible. A local file this opened is synced to disk before
+//! `finish` closes it, and before its `.part` is renamed over the target, so a crash
+//! after the rename cannot leave the target torn.
 
 const std = @import("std");
 const pagecache = @import("../exec/pagecache.zig");
@@ -154,7 +156,13 @@ pub const Output = struct {
                     self.dropFile();
                     return e;
                 };
-                if (self.owns_file) f.close();
+                if (self.owns_file) {
+                    f.sync() catch |e| {
+                        self.dropFile();
+                        return e;
+                    };
+                    f.close();
+                }
                 try self.part.commit();
             },
             .object => |o| o.finish() catch |e| return self.specific(e),

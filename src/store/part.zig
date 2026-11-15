@@ -44,11 +44,16 @@ pub const Part = struct {
         return file;
     }
 
-    /// Call once the file is flushed and closed.
+    /// Call once the file is synced and closed; the directory is synced after the
+    /// rename, so the rename itself survives a crash.
     pub fn commit(self: *Part) !void {
         if (self.len == 0) return;
         defer self.len = 0;
-        try std.fs.cwd().rename(self.buf[0..self.len], self.buf[0 .. self.len - suffix.len]);
+        const target = self.buf[0 .. self.len - suffix.len];
+        try std.fs.cwd().rename(self.buf[0..self.len], target);
+        var dir = try std.fs.cwd().openDir(std.fs.path.dirname(target) orelse ".", .{ .iterate = true });
+        defer dir.close();
+        try std.posix.fsync(dir.fd);
     }
 
     pub fn discard(self: *Part) void {
