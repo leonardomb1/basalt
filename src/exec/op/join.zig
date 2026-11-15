@@ -79,6 +79,26 @@ fn drainBuild(pull: std.mem.Allocator, child: Op, bytes_out: *usize, cap: usize)
     return chunks.items;
 }
 
+/// Each row's string and byte lengths summed over `b`'s columns, or null when it has
+/// none of either, so a caller sizing output by bytes skips the count.
+fn rowWidths(arena: std.mem.Allocator, b: Batch) !?[]const usize {
+    var w: ?[]usize = null;
+    for (b.columns) |c| {
+        const dict = if (c.codes_only) c.dict.? else null;
+        if (dict == null and c.data != .bytes) continue;
+        const out = w orelse blk: {
+            const z = try arena.alloc(usize, b.len);
+            @memset(z, 0);
+            w = z;
+            break :blk z;
+        };
+        if (dict) |d| {
+            for (out, d.codes[0..b.len]) |*o, k| o.* += d.values[k].len;
+        } else for (out, 0..) |*o, i| o.* += c.data.bytes.at(i).len;
+    }
+    return w;
+}
+
 /// A NOT IN subquery past its cap: it never spills, so the way out is more memory.
 pub fn notInTooLarge(ec: *ErrCtx, cap: usize) void {
     ec.set("NOT IN subquery's rows pass the {d}-byte limit — a NOT IN build side never spills; raise --op-memory, or filter the subquery", .{cap});
@@ -845,6 +865,10 @@ pub const Join = struct {
     cross_batch: ?Batch = null,
     cross_pos: usize = 0,
     cross_chunk: usize = 1 << 16,
+    cross_bytes: usize = 16 << 20,
+    cross_lw: ?[]const usize = null,
+    cross_rw: ?[]const usize = null,
+    cross_rw_done: bool = false,
 
     const drain_chunk = 4096;
 
@@ -864,8 +888,9 @@ pub const Join = struct {
     }
 
     /// CROSS: each probe batch, held in `cross_mem`, paired with every build row
-    /// at most `cross_chunk` pairs per call, so no output batch grows with the
-    /// product of the sides. `cross_mem` is backed by `state`, so a consumer that
+    /// at most `cross_chunk` pairs and about `cross_bytes` of strings per call, so
+    /// no output batch grows with the product of the sides, nor with how wide its
+    /// rows are. `cross_mem` is backed by `state`, so a consumer that
     /// stops pulling (a LIMIT, an error) leaves nothing behind the plan.
     fn nextCross(self: *Join, arena: std.mem.Allocator, ix: *JoinIndex) anyerror!?Batch {
         const nb = ix.build_batch.len;
@@ -885,9 +910,14 @@ pub const Join = struct {
                 if (lb.len == 0) continue;
                 self.cross_batch = lb;
                 self.cross_pos = 0;
+                self.cross_lw = try rowWidths(self.cross_mem.?.allocator(), lb);
+                if (!self.cross_rw_done) {
+                    self.cross_rw = try rowWidths(self.state, ix.build_batch);
+                    self.cross_rw_done = true;
+                }
             }
             const lb = self.cross_batch.?;
-            const end = @min(lb.len * nb, self.cross_pos + self.cross_chunk);
+            const end = self.crossEnd(lb.len * nb, nb);
             const n = end - self.cross_pos;
             const lidx = try arena.alloc(usize, n);
             const ridx = try arena.alloc(usize, n);
@@ -899,6 +929,21 @@ pub const Join = struct {
             if (end == lb.len * nb) self.cross_batch = null;
             return try self.gatherOut(arena, ix, lb, lidx, ridx, &.{}, n, false);
         }
+    }
+
+    /// Where the pairs from `cross_pos` stop: `cross_chunk` on, or sooner once their
+    /// strings pass `cross_bytes`, never before one pair.
+    fn crossEnd(self: *const Join, total: usize, nb: usize) usize {
+        const cap = @min(total, self.cross_pos + self.cross_chunk);
+        if (self.cross_lw == null and self.cross_rw == null) return cap;
+        var bytes: usize = 0;
+        var p = self.cross_pos;
+        while (p < cap) : (p += 1) {
+            if (self.cross_lw) |w| bytes += w[p / nb];
+            if (self.cross_rw) |w| bytes += w[p % nb];
+            if (bytes > self.cross_bytes and p > self.cross_pos) break;
+        }
+        return p;
     }
 
     /// The in-memory probe side as `probeStep` reads it.
@@ -2178,6 +2223,44 @@ test "join: a cross or NOT IN build side is held once, not also in the caller's 
         _ = try jn.next(pull.allocator());
         try testing.expect(pull.queryCapacity() < 256 * 1024);
     }
+}
+
+test "join: cross bounds each batch by its strings' bytes, so wide rows paired many times stream" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const wide = try a.alloc(u8, 1000);
+    @memset(wide, 'w');
+    const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1, 2 }, &.{ wide, wide })};
+    const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 7, 8, 9, 10, 11 }, &.{ "x", "y", "z", "u", "v" })};
+    var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+    var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+    var lscan = Scan{ .src = lts.src() };
+    var rscan = Scan{ .src = rts.src() };
+    var jn = Join{
+        .probe = .{ .scan = &lscan },
+        .build = .{ .scan = &rscan },
+        .left_keys = &.{},
+        .right_keys = &.{},
+        .left_schema = &join_left_schema,
+        .right_schema = &join_right_schema,
+        .out_schema = &join_both_schema,
+        .kind = .cross,
+        .state = a,
+        .cross_bytes = 2500,
+    };
+    var keys = std.array_list.Managed(i64).init(a);
+    var rvs = std.array_list.Managed(u8).init(a);
+    while (try jn.next(a)) |b| {
+        try testing.expect(b.len <= 3);
+        for (0..b.len) |r| {
+            try keys.append(b.columns[0].getValue(r).int);
+            try rvs.appendSlice(b.columns[3].getValue(r).string);
+        }
+    }
+    try testing.expectEqualSlices(i64, &.{ 1, 1, 1, 1, 1, 2, 2, 2, 2, 2 }, keys.items);
+    try testing.expectEqualStrings("xyzuvxyzuv", rvs.items);
 }
 
 test "join: a cross join stopped early holds its probe batch in the plan arena, which frees it" {
