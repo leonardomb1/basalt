@@ -40,7 +40,7 @@ pub fn intrinsics(d: sql.Dialect) Intrinsics {
         }.f },
         .sqlserver => .{ .begin = "BEGIN TRANSACTION", .commit = "COMMIT TRANSACTION", .truncate_in_txn = true, .createLike = struct {
             fn f(a: std.mem.Allocator, stg: []const u8, target: []const u8) error{OutOfMemory}![]const u8 {
-                return msgfmt.allocPrint(a, "SELECT * INTO {s} FROM {s} WHERE 1 = 0", .{ stg, target });
+                return msgfmt.allocPrint(a, "SELECT * INTO {s} FROM {s} WHERE 1 = 0 UNION ALL SELECT * FROM {s} WHERE 1 = 0", .{ stg, target, target });
             }
         }.f },
         .mysql, .starrocks, .doris => .{ .begin = "START TRANSACTION", .commit = "COMMIT", .truncate_in_txn = false, .createLike = struct {
@@ -72,20 +72,28 @@ pub fn setupSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, stagin
 
 /// The cutover: one transaction that clears the target and copies the staging rows
 /// in by column name, so a target with its columns in another order still lines up.
+/// On SQL Server a target that fills a loaded column by IDENTITY takes the staged
+/// values as given (`sql.identityInsertSql`), as a bulk APPEND keeps them; its staging table
+/// (`createLike`'s UNION ALL) has no IDENTITY of its own to renumber them.
 pub fn cutoverSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, staging: []const u8, schema: types.Schema, how: Cutover) ![]const []const u8 {
     const in = intrinsics(d);
     const qt = try sql.quoteIdent(a, d, target);
     const qs = try sql.quoteIdent(a, d, staging);
     const cols = try sql.colList(a, d, schema);
-    const out = try a.alloc([]const u8, 4);
-    out[0] = in.begin;
-    out[1] = if (how == .truncate and in.truncate_in_txn)
+    var out = std.array_list.Managed([]const u8).init(a);
+    try out.append(in.begin);
+    try out.append(if (how == .truncate and in.truncate_in_txn)
         try msgfmt.allocPrint(a, "TRUNCATE TABLE {s}", .{qt})
     else
-        try msgfmt.allocPrint(a, "DELETE FROM {s}", .{qt});
-    out[2] = try msgfmt.allocPrint(a, "INSERT INTO {s} ({s}) SELECT {s} FROM {s}", .{ qt, cols, cols, qs });
-    out[3] = in.commit;
-    return out;
+        try msgfmt.allocPrint(a, "DELETE FROM {s}", .{qt}));
+    const insert = try msgfmt.allocPrint(a, "INSERT INTO {s} ({s}) SELECT {s} FROM {s}", .{ qt, cols, cols, qs });
+    if (d == .sqlserver) {
+        try out.append(try sql.identityInsertSql(a, qt, schema, true));
+        try out.append(insert);
+        try out.append(try sql.identityInsertSql(a, qt, schema, false));
+    } else try out.append(insert);
+    try out.append(in.commit);
+    return out.items;
 }
 
 pub fn dropSql(a: std.mem.Allocator, d: sql.Dialect, staging: []const u8) ![]const u8 {
@@ -122,6 +130,10 @@ test "the cutover clears and copies in one transaction, per dialect" {
     try std.testing.expectEqualStrings("COMMIT", pg[3]);
     const ms = try cutoverSql(a, .sqlserver, "dbo.t", "dbo._basalt_stage_t_00000001", schema, .delete);
     try std.testing.expectEqualStrings("DELETE FROM [dbo].[t]", ms[1]);
+    try std.testing.expectEqualStrings("IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[t]') AND is_identity = 1 AND name IN (N'id',N'v')) SET IDENTITY_INSERT [dbo].[t] ON", ms[2]);
+    try std.testing.expectEqualStrings("INSERT INTO [dbo].[t] ([id],[v]) SELECT [id],[v] FROM [dbo].[_basalt_stage_t_00000001]", ms[3]);
+    try std.testing.expectEqualStrings("IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[t]') AND is_identity = 1 AND name IN (N'id',N'v')) SET IDENTITY_INSERT [dbo].[t] OFF", ms[4]);
+    try std.testing.expectEqualStrings("COMMIT TRANSACTION", ms[5]);
     const my = try cutoverSql(a, .mysql, "t", "_basalt_stage_t_00000001", schema, .truncate);
     try std.testing.expectEqualStrings("START TRANSACTION", my[0]);
     try std.testing.expectEqualStrings("DELETE FROM `t`", my[1]);

@@ -626,6 +626,40 @@ LOAD INTO '$out/pg_bytea_$fmt.csv' AS SELECT k, hex(b) AS b, t FROM db.it_bytea 
   pgq -c "ALTER DATABASE it RESET bytea_output;" >/dev/null 2>&1
 fi
 
+# A load into an existing SQL Server table with a (max) text column or an IDENTITY
+# column: INSERT BULK declared every column nvarchar(4000), which the server
+# refuses for a (max) column, and kept no identity values, which it refuses for an
+# IDENTITY one. Each load must land its rows whole, with the ids it brings.
+if runs sqlserver; then
+  msq() { docker compose -f tests/integration/compose.yaml exec -T mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P It_Passw0rd1 -C -h -1 -W -s, "$@"; }
+  for def in "id bigint, v nvarchar(max)" "id bigint, v varchar(max)" "id bigint NOT NULL, v nvarchar(max)" "id bigint IDENTITY(1,1) PRIMARY KEY, v nvarchar(max)"; do
+    for mode in APPEND REPLACE "UPSERT ON (id)"; do
+      msq -Q "USE master; DROP TABLE IF EXISTS dbo.it_bulkcols; CREATE TABLE dbo.it_bulkcols ($def);" >/dev/null 2>&1
+      if $B run -q -c "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);
+LOAD INTO db.dbo.it_bulkcols $mode AS SELECT CAST(40 + range AS INT) AS id, rpad('x', 5000 + range, 'y') AS v FROM RANGE(3);" >"$out/ms_bulkcols.log" 2>&1; then
+        got=$(msq -Q "SET NOCOUNT ON; SELECT STRING_AGG(CAST(id AS varchar(10)) + ':' + CAST(LEN(v) AS varchar(10)), ' ') WITHIN GROUP (ORDER BY id) FROM master.dbo.it_bulkcols;" | tr -d '\r' | head -1)
+        if [ "$got" = "40:5000 41:5001 42:5002" ]; then report "sqlserver-bulk-columns [$def] $mode" ok
+        else report "sqlserver-bulk-columns [$def] $mode (got $got)" bad; fi
+      else
+        report "sqlserver-bulk-columns [$def] $mode ($(head -1 "$out/ms_bulkcols.log"))" bad
+      fi
+    done
+  done
+  # A load that leaves the IDENTITY column out lets the table number its rows.
+  if $B run -q -c "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);
+LOAD INTO db.dbo.it_bulkcols APPEND AS SELECT 'z' AS v FROM RANGE(2);" >"$out/ms_bulkcols.log" 2>&1 &&
+     [ "$(msq -Q "SET NOCOUNT ON; SELECT COUNT(*), MAX(id) FROM master.dbo.it_bulkcols;" | tr -d '\r' | head -1)" = "5,44" ]; then
+    report sqlserver-identity-numbered ok
+  else report "sqlserver-identity-numbered ($(head -1 "$out/ms_bulkcols.log"))" bad; fi
+  # A batch longer than one TDS packet over TLS: each packet goes out as written,
+  # or SQL Server drops the connection.
+  long=$(printf 'x%.0s' $(seq 1 20000))
+  if [ "$($B run -q --format csv -c "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);
+SELECT length(t) AS n FROM (SELECT * FROM db.QUERY(\$\$SELECT N'$long' AS t\$\$)) q;" 2>&1 | tail -1)" = 20000 ]; then
+    report sqlserver-long-batch-tls ok
+  else report sqlserver-long-batch-tls bad; fi
+fi
+
 # SQL Server money and time. `money` is a scaled integer of ten-thousandths sent
 # high word first, not a float — decoding it as one turned -0.0001 into NaN — and
 # the fixed-length forms (money NOT NULL) were missing from the type switch

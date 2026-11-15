@@ -210,13 +210,11 @@ pub const Conn = struct {
             "SET NUMERIC_ROUNDABORT OFF; SET IMPLICIT_TRANSACTIONS OFF");
     }
 
-    /// Run a batch for its effect (DDL, a SET, a swap), its reply read to the last DONE
-    /// (`TdsCursor.drainBatch`): a result set it returns is read and dropped, so an
-    /// ERROR after it still fails the batch.
-    pub fn exec(self: *Conn, statement: []const u8) !void {
+    /// A cursor over the reply to `statement`, on this connection, which stays open
+    /// after it: `release` frees the cursor, never the connection.
+    fn replyCursor(self: *Conn, statement: []const u8) !*TdsCursor {
         try self.sendBatch(statement);
         const cur = try self.wire.gpa.create(TdsCursor);
-        defer self.wire.gpa.destroy(cur);
         cur.* = .{
             .gpa = self.wire.gpa,
             .conn = self,
@@ -226,10 +224,26 @@ pub const Conn = struct {
             .schema = undefined,
             .done = false,
         };
-        defer {
-            cur.reader.deinit();
-            cur.meta_arena.deinit();
-        }
+        return cur;
+    }
+
+    /// The rows `statement` returns, in `arena`, on this connection, which stays open
+    /// for what follows (a bulk load's catalog question, asked on its own connection).
+    pub fn rowsOf(self: *Conn, arena: std.mem.Allocator, statement: []const u8) ![]const Batch {
+        const cur = try self.replyCursor(statement);
+        defer cur.release();
+        try cur.readHeader();
+        var out = std.array_list.Managed(Batch).init(arena);
+        while (try cur.fetchBatch(arena)) |b| try out.append(try b.deepCopy(arena));
+        return out.items;
+    }
+
+    /// Run a batch for its effect (DDL, a SET, a swap), its reply read to the last DONE
+    /// (`TdsCursor.drainBatch`): a result set it returns is read and dropped, so an
+    /// ERROR after it still fails the batch.
+    pub fn exec(self: *Conn, statement: []const u8) !void {
+        const cur = try self.replyCursor(statement);
+        defer cur.release();
         return cur.drainBatch();
     }
 
@@ -264,6 +278,10 @@ pub const Conn = struct {
         }
     }
 
+    /// A message cut into packets; under TLS each packet is flushed as it is written,
+    /// as `bulkPacket` does, since SQL Server drops a TLS connection whose packets of
+    /// one message reach it held back together (a batch past one packet failed with
+    /// `ConnectionIoFailed`).
     fn writePacket(self: *Conn, ptype: u8, payload: []const u8) !void {
         const w = self.wire.wr();
         var off: usize = 0;
@@ -278,6 +296,7 @@ pub const Conn = struct {
             try w.writeAll(payload[off .. off + chunk]);
             off += chunk;
             if (last) break;
+            if (self.wire.tls != null) try self.wire.flush();
         }
         try self.wire.flush();
     }
@@ -1180,6 +1199,13 @@ const TdsCursor = struct {
         return out;
     }
 
+    /// Frees a cursor `Conn.replyCursor` made, leaving its connection open.
+    fn release(self: *TdsCursor) void {
+        self.reader.deinit();
+        self.meta_arena.deinit();
+        self.gpa.destroy(self);
+    }
+
     fn handleError(self: *TdsCursor) !void {
         const len = try self.reader.readU16();
         const body = try self.reader.readSlice(self.gpa, len);
@@ -1203,24 +1229,62 @@ const BulkProto = struct {
     pub const dialect: sql.Dialect = .sqlserver;
     pub const stmt = "INSERT BULK";
 
-    pub fn command(arena: std.mem.Allocator, qtable: []const u8, schema: types.Schema) ![]const u8 {
+    /// What the target table makes of the load's columns: which are `(max)`, sent
+    /// as `nvarchar(max)` in PLP chunks rather than cut to 4000 characters, which
+    /// are NOT NULL, declared so (the server refuses a nullable one for them), and
+    /// whether one of the loaded columns is its IDENTITY, whose given values the load
+    /// keeps by turning IDENTITY_INSERT on for `qtable` ahead of each INSERT BULK.
+    pub const Layout = struct { max: []const bool, not_null: []const bool, keep_identity: bool, qtable: []const u8 };
+
+    /// The target's columns as `sys.columns` lists them, matched to `schema` by name.
+    pub fn inspect(conn: *Conn, gpa: std.mem.Allocator, qtable: []const u8, schema: types.Schema) !Layout {
+        var aa = std.heap.ArenaAllocator.init(gpa);
+        defer aa.deinit();
+        const a = aa.allocator();
+        var q = std.array_list.Managed(u8).init(a);
+        try q.appendSlice("SELECT c.name, CAST(c.max_length AS int), CAST(c.is_identity AS int), CAST(c.is_nullable AS int) FROM sys.columns c WHERE c.object_id = OBJECT_ID(");
+        try sql.Dialect.sqlserver.writeStrLit(q.writer(), qtable, .catalog_name);
+        try q.appendSlice(")");
+        const flags = try gpa.alloc(bool, 2 * schema.fields.len);
+        errdefer gpa.free(flags);
+        @memset(flags, false);
+        const max = flags[0..schema.fields.len];
+        const not_null = flags[schema.fields.len..];
+        var keep_identity = false;
+        for (try conn.rowsOf(a, q.items)) |b| for (0..b.len) |r| {
+            const name = b.columns[0].getValue(r).string;
+            for (schema.fields, max, not_null) |f, *m, *nn| if (std.ascii.eqlIgnoreCase(f.name, name)) {
+                m.* = b.columns[1].getValue(r).int == -1;
+                nn.* = b.columns[3].getValue(r).int == 0;
+                if (b.columns[2].getValue(r).int != 0) keep_identity = true;
+            };
+        };
+        return .{ .max = max, .not_null = not_null, .keep_identity = keep_identity, .qtable = try gpa.dupe(u8, qtable) };
+    }
+
+    pub fn freeLayout(gpa: std.mem.Allocator, layout: Layout) void {
+        gpa.free(layout.max.ptr[0 .. 2 * layout.max.len]);
+        gpa.free(layout.qtable);
+    }
+
+    pub fn command(arena: std.mem.Allocator, qtable: []const u8, schema: types.Schema, layout: Layout) ![]const u8 {
         var cols = std.array_list.Managed(u8).init(arena);
-        for (schema.fields, 0..) |f, i| {
+        for (schema.fields, layout.max, 0..) |f, m, i| {
             if (i > 0) try cols.appendSlice(", ");
             try cols.appendSlice(try sql.quoteName(arena, .sqlserver, f.name));
-            try cols.appendSlice(" nvarchar(4000)");
+            try cols.appendSlice(if (m) " nvarchar(max)" else " nvarchar(4000)");
         }
         return msgfmt.allocPrint(arena, "INSERT BULK {s} ({s})", .{ qtable, cols.items });
     }
 
-    pub fn segmentHeader(w: anytype, gpa: std.mem.Allocator, schema: types.Schema) !void {
+    pub fn segmentHeader(w: anytype, gpa: std.mem.Allocator, schema: types.Schema, layout: Layout) !void {
         try w.writeByte(0x81);
         try writeU16(w, @intCast(schema.fields.len));
-        for (schema.fields) |f| {
+        for (schema.fields, layout.max, layout.not_null) |f, m, nn| {
             try writeU32(w, 0);
-            try writeU16(w, 0x0009);
+            try writeU16(w, if (nn) 0x0008 else 0x0009);
             try w.writeByte(0xE7);
-            try writeU16(w, NVARCHAR_MAX_BYTES);
+            try writeU16(w, if (m) 0xFFFF else NVARCHAR_MAX_BYTES);
             try w.writeAll(&BULK_COLLATION);
             const name16 = try utf16.encodeLeAlloc(gpa, f.name);
             defer gpa.free(name16);
@@ -1230,20 +1294,31 @@ const BulkProto = struct {
     }
 
     /// Each cell's text is transcoded through one UTF-16 buffer, grown to the
-    /// longest cell of the batch.
-    pub fn appendBatch(w: anytype, arena: std.mem.Allocator, batch: Batch) !void {
+    /// longest cell of the batch; a `(max)` column's goes whole, as one PLP chunk of
+    /// a value whose total is left unknown, as SqlBulkCopy sends one: a server
+    /// loading PLP reads a stated total as a cut-short row.
+    pub fn appendBatch(w: anytype, arena: std.mem.Allocator, batch: Batch, layout: Layout) !void {
         var units = std.array_list.Managed(u8).init(arena);
         var buf: [celltext.scalar_bound]u8 = undefined;
         for (0..batch.len) |r| {
             try w.writeByte(0xD1);
-            for (batch.columns, batch.schema.fields) |*col, f| {
+            for (batch.columns, batch.schema.fields, layout.max) |*col, f, m| {
                 if (celltext.isNull(col, r)) {
-                    try writeU16(w, 0xFFFF);
+                    if (m) try w.writeAll(&@as([8]u8, @splat(0xFF))) else try writeU16(w, 0xFFFF);
                     continue;
                 }
                 const s = celltext.text(col, r, &buf, sql.BulkText(.{ .bool_true = "1", .bool_false = "0" }){});
                 try units.resize(2 * s.len);
                 const le = units.items[0 .. utf16.encodeLe(units.items, s) catch return notUtf8(f.name)];
+                if (m) {
+                    try w.writeAll(&[_]u8{ 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF });
+                    if (le.len > 0) {
+                        try writeU32(w, @intCast(le.len));
+                        try w.writeAll(le);
+                    }
+                    try writeU32(w, 0);
+                    continue;
+                }
                 const blen = utf16.cutLe(le, NVARCHAR_MAX_BYTES);
                 try writeU16(w, @intCast(blen));
                 try w.writeAll(le[0..blen]);
@@ -1251,7 +1326,11 @@ const BulkProto = struct {
         }
     }
 
-    pub fn send(conn: *Conn, cmd: []const u8, data: []const u8, rows: u64) !u64 {
+    pub fn send(conn: *Conn, cmd: []const u8, data: []const u8, rows: u64, layout: Layout) !u64 {
+        if (layout.keep_identity) {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            try conn.exec(std.fmt.bufPrint(&buf, "SET IDENTITY_INSERT {s} ON", .{layout.qtable}) catch return error.TdsProtocol);
+        }
         try conn.bulkStart(cmd);
         var off: usize = 0;
         while (data.len - off > conn.pkt_payload) {
@@ -1276,6 +1355,44 @@ fn textBatch(a: std.mem.Allocator, kind: types.TypeKind, texts: []const []const 
     return .{ .schema = schema, .columns = cols, .len = texts.len };
 }
 
+/// A bulk layout for `n` columns none of which is `(max)`, into a table with no IDENTITY.
+fn plainLayout(a: std.mem.Allocator, n: usize) !BulkProto.Layout {
+    const flags = try a.alloc(bool, n);
+    @memset(flags, false);
+    return .{ .max = flags, .not_null = flags, .keep_identity = false, .qtable = "" };
+}
+
+test "INSERT BULK declares a (max) column nvarchar(max) and sends its cells whole as PLP, a NULL as the PLP null, and a NOT NULL column as not nullable" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const long = try a.alloc(u8, 5000);
+    @memset(long, 'y');
+    const ty = types.Type.init(.string).asNullable();
+    var b = column.Builder.init(a, ty);
+    try b.append(.{ .string = long });
+    try b.append(.null);
+    try b.append(.{ .string = "" });
+    const cols = try a.alloc(column.Column, 1);
+    cols[0] = try b.finish();
+    const schema = try a.create(types.Schema);
+    schema.* = .{ .fields = try a.dupe(types.Schema.Field, &.{.{ .name = "v", .ty = ty }}) };
+    const layout = BulkProto.Layout{ .max = &.{true}, .not_null = &.{false}, .keep_identity = true, .qtable = "[t]" };
+    try std.testing.expectEqualStrings("INSERT BULK [t] ([v] nvarchar(max))", try BulkProto.command(a, "[t]", schema.*, layout));
+    var hw = std.Io.Writer.Allocating.init(a);
+    try BulkProto.segmentHeader(&hw.writer, a, schema.*, .{ .max = &.{true}, .not_null = &.{true}, .keep_identity = false, .qtable = "[t]" });
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 0, 0, 0, 0, 0, 0x08, 0, 0xE7, 0xFF, 0xFF }, hw.written()[0..12]);
+    var w = std.Io.Writer.Allocating.init(a);
+    try BulkProto.appendBatch(&w.writer, a, .{ .schema = schema, .columns = cols, .len = 3 }, layout);
+    const got = w.written();
+    try std.testing.expectEqual(@as(u8, 0xD1), got[0]);
+    try std.testing.expectEqual(@as(u64, 0xFFFFFFFFFFFFFFFE), std.mem.readInt(u64, got[1..9], .little));
+    try std.testing.expectEqual(@as(u32, 10000), std.mem.readInt(u32, got[9..13], .little));
+    const after = 13 + 10000;
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, got[after..][0..4], .little));
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xD1} ++ [_]u8{0xFF} ** 8 ++ [_]u8{ 0xD1, 0xFE } ++ [_]u8{0xFF} ** 7 ++ [_]u8{0} ** 4), got[after + 4 ..]);
+}
+
 inline fn wide(comptime s: []const u8) []const u8 {
     @setEvalBranchQuota(1_000_000);
     return comptime std.mem.sliceAsBytes(std.unicode.utf8ToUtf16LeStringLiteral(s));
@@ -1289,7 +1406,7 @@ test "INSERT BULK rows of every kind" {
     const got = try a.alloc([]const u8, batches.len);
     for (batches, got) |batch, *g| {
         var w = std.Io.Writer.Allocating.init(a);
-        try BulkProto.appendBatch(&w.writer, a, batch);
+        try BulkProto.appendBatch(&w.writer, a, batch, try plainLayout(a, batch.columns.len));
         g.* = w.written();
     }
     const tiny = celltext.golden_tiny;
@@ -1321,7 +1438,7 @@ test "INSERT BULK cuts a long cell before a split surrogate pair and refuses inv
         t.* = s;
     }
     var got = std.array_list.Managed(u8).init(a);
-    try BulkProto.appendBatch(got.writer(), a, try textBatch(a, .string, &texts));
+    try BulkProto.appendBatch(got.writer(), a, try textBatch(a, .string, &texts), try plainLayout(a, 1));
     const kept = [_]struct { usize, []const u8 }{
         .{ 7998, "x\x00=\xd8\x00\xde" },
         .{ 8000, "x\x00=\xd8\x00\xde" },
@@ -1336,8 +1453,8 @@ test "INSERT BULK cuts a long cell before a split surrogate pair and refuses inv
         try std.testing.expectEqualSlices(u8, k[1], got.items[off - k[1].len .. off]);
     }
     try std.testing.expectEqual(got.items.len, off);
-    try std.testing.expectError(error.InvalidUtf8, BulkProto.appendBatch(got.writer(), a, try textBatch(a, .bytes, &.{ "ok", "\xff\xfe bad" })));
-    try std.testing.expectError(error.InvalidUtf8, BulkProto.appendBatch(got.writer(), a, try textBatch(a, .bytes, &.{"\xc3"})));
+    try std.testing.expectError(error.InvalidUtf8, BulkProto.appendBatch(got.writer(), a, try textBatch(a, .bytes, &.{ "ok", "\xff\xfe bad" }), try plainLayout(a, 1)));
+    try std.testing.expectError(error.InvalidUtf8, BulkProto.appendBatch(got.writer(), a, try textBatch(a, .bytes, &.{"\xc3"}), try plainLayout(a, 1)));
     try std.testing.expectEqualStrings("column `c` holds text that is not valid UTF-8, which SQL Server's nvarchar cannot take unaltered; repair or drop it before the load", eval.takeFailure(error.InvalidUtf8).?);
 }
 
@@ -2618,7 +2735,7 @@ test "tds: INSERT BULK names a column by its UTF-16 unit count, a pair counting 
         .{ .name = "a\u{e7}\u{e3}o\u{1F600}", .ty = types.Type.init(.string).asNullable() },
     };
     var w = std.Io.Writer.Allocating.init(a);
-    try BulkProto.segmentHeader(&w.writer, a, .{ .fields = &fields });
+    try BulkProto.segmentHeader(&w.writer, a, .{ .fields = &fields }, try plainLayout(a, 1));
     const got = w.written();
     const name = wide("a\u{e7}\u{e3}o\u{1F600}");
     try std.testing.expectEqual(@as(usize, 6), name.len / 2);

@@ -651,12 +651,16 @@ const sink_vtable = driver.sinkVTable(Sink);
 
 /// The segment-streaming sink shared by every bulk protocol. `Proto` supplies
 /// `Connection`, `dialect`, `stmt`, `command`, `appendBatch`, `send` (returning the
-/// server's row count) and optionally `segmentHeader` (tds COLMETADATA).
+/// server's row count) and optionally `segmentHeader` (tds COLMETADATA) and a
+/// `Layout` it reads from the target with `inspect` before the first row (freed by
+/// `freeLayout`), which `command`, `segmentHeader` and `appendBatch` then take.
 pub fn BulkSink(comptime Proto: type) type {
+    const Layout = if (@hasDecl(Proto, "Layout")) Proto.Layout else void;
     return struct {
         gpa: std.mem.Allocator,
         conn: *Proto.Connection,
         schema: types.Schema,
+        layout: Layout,
         buffer: std.array_list.Managed(u8),
         command: []const u8,
         seg_rows: u64 = 0,
@@ -677,10 +681,12 @@ pub fn BulkSink(comptime Proto: type) type {
             const a = aa.allocator();
             const qtable = try quoteIdent(a, Proto.dialect, table_name);
             conn.exec(try createTableSql(a, Proto.dialect, qtable, schema, mode)) catch |e| return onWire(e);
-            const command = try gpa.dupe(u8, try Proto.command(a, qtable, schema));
+            const layout: Layout = if (Layout == void) {} else Proto.inspect(conn, gpa, qtable, owned) catch |e| return onWire(e);
+            errdefer if (Layout != void) Proto.freeLayout(gpa, layout);
+            const command = try gpa.dupe(u8, try if (Layout == void) Proto.command(a, qtable, schema) else Proto.command(a, qtable, schema, layout));
             errdefer gpa.free(command);
 
-            self.* = .{ .gpa = gpa, .conn = conn, .schema = owned, .buffer = std.array_list.Managed(u8).init(gpa), .command = command, .redial = redial };
+            self.* = .{ .gpa = gpa, .conn = conn, .schema = owned, .layout = layout, .buffer = std.array_list.Managed(u8).init(gpa), .command = command, .redial = redial };
             errdefer self.buffer.deinit();
             try self.startSegment();
             return self;
@@ -691,7 +697,7 @@ pub fn BulkSink(comptime Proto: type) type {
         }
 
         pub fn writeBatch(self: *Self, arena: std.mem.Allocator, batch: Batch) !void {
-            try Proto.appendBatch(self.buffer.writer(), arena, batch);
+            try if (Layout == void) Proto.appendBatch(self.buffer.writer(), arena, batch) else Proto.appendBatch(self.buffer.writer(), arena, batch, self.layout);
             self.seg_rows += batch.len;
             if (self.buffer.items.len >= SEGMENT_BYTES) {
                 try self.commitSegment();
@@ -700,7 +706,7 @@ pub fn BulkSink(comptime Proto: type) type {
         }
 
         fn startSegment(self: *Self) !void {
-            if (@hasDecl(Proto, "segmentHeader")) try Proto.segmentHeader(self.buffer.writer(), self.gpa, self.schema);
+            if (@hasDecl(Proto, "segmentHeader")) try if (Layout == void) Proto.segmentHeader(self.buffer.writer(), self.gpa, self.schema) else Proto.segmentHeader(self.buffer.writer(), self.gpa, self.schema, self.layout);
         }
 
         /// Send the buffered segment and verify the row count, redialing once and
@@ -724,7 +730,7 @@ pub fn BulkSink(comptime Proto: type) type {
         }
 
         fn sendSegment(self: *Self) !void {
-            const n = Proto.send(self.conn, self.command, self.buffer.items, self.seg_rows) catch |e| return onWire(e);
+            const n = (if (Layout == void) Proto.send(self.conn, self.command, self.buffer.items, self.seg_rows) else Proto.send(self.conn, self.command, self.buffer.items, self.seg_rows, self.layout)) catch |e| return onWire(e);
             if (n != self.seg_rows) {
                 if (self.conn.wire.last_error.len == 0)
                     try self.conn.wire.printError("{s} count mismatch: sent {d} rows, server loaded {d}", .{ Proto.stmt, self.seg_rows, n });
@@ -747,6 +753,7 @@ pub fn BulkSink(comptime Proto: type) type {
             self.conn.close();
             self.buffer.deinit();
             self.gpa.free(self.command);
+            if (Layout != void) Proto.freeLayout(self.gpa, self.layout);
             freeSchema(self.gpa, self.schema);
             self.gpa.destroy(self);
         }
@@ -912,8 +919,25 @@ fn statementParts(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8
     return .{ .head = head, .tail = try buf.toOwnedSlice() };
 }
 
+/// SQL Server's `SET IDENTITY_INSERT qtable ON` (or `OFF`), run only when one of
+/// `schema`'s columns is the table's IDENTITY: then the load gives its values and
+/// the table must take them; a load that leaves the column out lets it number.
+pub fn identityInsertSql(arena: std.mem.Allocator, qtable: []const u8, schema: types.Schema, on: bool) ![]const u8 {
+    var buf = std.array_list.Managed(u8).init(arena);
+    const w = buf.writer();
+    try w.writeAll("IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(");
+    try Dialect.sqlserver.writeStrLit(w, qtable, .catalog_name);
+    try w.writeAll(") AND is_identity = 1 AND name IN (");
+    for (schema.fields, 0..) |f, i| {
+        if (i > 0) try w.writeByte(',');
+        try Dialect.sqlserver.writeStrLit(w, f.name, .catalog_name);
+    }
+    try w.print(")) SET IDENTITY_INSERT {s} {s}", .{ qtable, if (on) "ON" else "OFF" });
+    return buf.items;
+}
+
 fn mergeParts(arena: std.mem.Allocator, dialect: Dialect, qtable: []const u8, schema: types.Schema, keys: []const []const u8, cols: []const u8) !Parts {
-    const head = try msgfmt.allocPrint(arena, "MERGE INTO {s} AS T USING (VALUES ", .{qtable});
+    const head = try msgfmt.allocPrint(arena, "{s}; MERGE INTO {s} AS T USING (VALUES ", .{ try identityInsertSql(arena, qtable, schema, true), qtable });
     var buf = std.array_list.Managed(u8).init(arena);
     const w = buf.writer();
     try w.print(") AS S ({s}) ON ", .{cols});

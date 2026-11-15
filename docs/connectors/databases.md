@@ -193,3 +193,9 @@ reference). Fix it at the source (for example `REPLACE` it) or read the column `
 A column name or a server error message with one shows U+FFFD in its place. A bulk load
 (`LOAD INTO`) refuses text that is not valid UTF-8, naming the column, rather
 than repairing it.
+
+A load into an existing SQL Server table reads its columns first: a `(max)`
+column (`varchar(max)`, `nvarchar(max)`) takes each value whole, a `NOT NULL`
+one is loaded as such, and an IDENTITY column the load carries keeps the values
+it brings, under `IDENTITY_INSERT`, for `APPEND`, `REPLACE` and `UPSERT` alike; a
+load that leaves the IDENTITY column out lets the table number its rows.
