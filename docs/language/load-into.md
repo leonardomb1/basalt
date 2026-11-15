@@ -46,7 +46,9 @@ AS
   `encoding` (a `format = 'records'` file, [Records](formats.md#records)) and
   `label_prefix` (StarRocks, Doris), `cutover` (a REPLACE into PostgreSQL, MySQL
   or SQL Server); a key the target does not read, or any
-  other key, is a plan-time error rather than ignored.
+  other key, is a plan-time error rather than ignored. Each value is a constant
+  expression, as a read's is ([Sources](sources.md#option-values)):
+  `WITH (compression = $codec)`.
 - Dispositions on a **table target**: `APPEND` (default, omissible) · `REPLACE`
   (overwrite) · `UPSERT ON (k1, k2)` · `UPSERT ON (id) PARTIAL COLS (a, b)` ·
   bare `UPSERT` (infer the PK from the source table's metadata at plan time —

@@ -282,6 +282,12 @@ pub const HintVal = union(enum) {
     str: []const u8,
     int: i64,
     ident: []const u8,
+    /// A constant expression (`10 * $n`, `CAST($d AS STRING)`), which the run
+    /// evaluates against the script's and the loop's names before anything reads it.
+    expr: *const Expr,
+    /// A value known only once the statement runs (a `$name` or a `${...}` hole),
+    /// as `check` sees it: its key is checked, its value when it runs.
+    later,
 };
 
 pub const Read = struct {

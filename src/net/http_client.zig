@@ -723,8 +723,9 @@ pub const OptionProblem = struct { msg: []const u8, pos: ast.Pos };
 /// text where a number does, a flag that is neither true nor false, a header with
 /// no `Name:`, and, when `hints` are a whole read's (`whole`), a body on a method
 /// that sends none. They are in the order the read applies them, a connection's
-/// before its read's. With `holes` a value still holding a loop's `${...}` is left
-/// alone, for the run to check once filled in.
+/// before its read's. A value known only when it runs (`.later`), and with `holes`
+/// one still holding a loop's `${...}`, is left alone, for the run to check once
+/// filled in.
 pub fn optionProblem(arena: std.mem.Allocator, hints: []const ast.Hint, holes: bool, whole: bool) error{OutOfMemory}!?OptionProblem {
     var method: Method = .get;
     var method_at: ?ast.Pos = null;
@@ -743,13 +744,13 @@ pub fn optionProblem(arena: std.mem.Allocator, hints: []const ast.Hint, holes: b
             .str, .ident => |v| v,
             else => null,
         };
-        if (holes) if (text) |t| if (std.mem.indexOf(u8, t, "${") != null) {
+        if (h.value == .later or (holes and text != null and std.mem.indexOf(u8, text.?, "${") != null)) {
             if (std.mem.eql(u8, h.key, "body")) {
                 body_at = h.pos;
                 body = null;
             }
             continue;
-        };
+        }
         const why: ?[]const u8 = switch (takes) {
             .text => if (text == null) "takes a quoted string" else null,
             .header => if (text) |t| headerWhy(t) else "takes one header, as 'Name: value'",
@@ -820,6 +821,7 @@ fn givenText(arena: std.mem.Allocator, v: ast.HintVal) ![]const u8 {
         .int => |n| msgfmt.allocPrint(arena, " (given {d})", .{n}),
         .str => |s| msgfmt.allocPrint(arena, " (given '{s}')", .{if (s.len > 60) s[0..60] else s}),
         .ident => |s| msgfmt.allocPrint(arena, " (given `{s}`)", .{s}),
+        .later, .expr => " (given a value known when it runs)",
     };
 }
 

@@ -330,22 +330,34 @@ matched in any case; a value holding a loop's `${...}` is checked once filled in
 | `timeout_ms` | `300000` | the limit on one page's fetch or one login, retries included |
 | `progress_ms` | `30000` | how often a long fetch logs its progress |
 
-A value the API wants computed — a token hashed from a password and the date, a
-date window — is a LET, put into any option's text with `${...}`. The holes are
-filled in once, before the first request, from the script's PARAMs and LETs (a
-LET may read `env()`, see [Parameters](parameters.md)), and the option is then
-checked as filled in, so a `page_size = '${n}'` that comes out `0` fails before any
-request:
+### Option values
+
+Every option — in `WITH (...)`, `PAGINATE BY ... (...)` and a connection's
+`OPTIONS (...)` — is `key = <expression>`, and the URL of `HTTP(...)` is an
+expression too (built as a dynamic path is, so without `CAST` or `CASE`: compute
+those in a LET). `USING changes (...)` has the same form, its values expressions
+over the rows ([Change feeds](load-into.md#change-feeds)). A string, a number or a bare word (`tab`, `gzip`) is
+taken as written; any other expression is constant, computed once when the
+statement runs from the script's PARAMs and LETs and the loop's variables, so a
+value the API wants computed — a token hashed from a password and the date, a
+date window, a page size — is a LET read by `$name` (a LET may read `env()`, see
+[Parameters](parameters.md)). The option is checked as computed, so a
+`size = $n - 1` that comes out `0` fails before any request, and a `$name`
+nothing declares is an error naming it. `basalt check` checks the key at once
+and the value when the script runs:
 
 ```sql
 LET token = sha256(env('API_PASS') || strftime(now(), '%d/%m/%Y'));
-SELECT * FROM HTTP('https://api.example.com/v1/items')
-  PAGINATE BY page
-  WITH (method = 'post', body_type = 'json', body = '{"user": "etl", "token": "${token}"}',
-        header = 'X-Token: ${token}');
+LET n = 100;
+SELECT * FROM HTTP('https://api.example.com/v1/' || 'items')
+  PAGINATE BY page (size = $n, max = 10 * $n)
+  WITH (method = 'post', body_type = 'json',
+        body = '{"user": "etl", "token": "' || $token || '"}',
+        header = 'X-Token: ' || $token);
 ```
 
-A connection's options take the same, and a `$name` alone ([Connections](connections.md)).
+A value's text may still hold `${...}` holes, filled in the same way. A value
+that is a number comes out a number, so `size = $n` reads `100`, not `'100'`.
 
 A page or login reply that decodes past 256 MiB stops the read (`HttpBodyTooLarge`),
 so a compressed bomb cannot exhaust memory; ask the endpoint for smaller pages.

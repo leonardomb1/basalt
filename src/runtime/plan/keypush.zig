@@ -83,7 +83,7 @@ pub fn disabled(hints: []const ast.Hint) bool {
         return switch (h.value) {
             .ident, .str => |s| !textconv.boolText(.key_pushdown, s).?,
             .int => |i| i == 0,
-            .flag => false,
+            .flag, .later, .expr => false,
         };
     }
     return false;

@@ -315,7 +315,7 @@ pub fn queryParams(arena: std.mem.Allocator, hints: []const ast.Hint) ![]const h
         const val = switch (h.value) {
             .str, .ident => |s| s,
             .int => |i| try msgfmt.allocPrint(arena, "{d}", .{i}),
-            .flag => "",
+            .flag, .later, .expr => "",
         };
         for (out.items) |*kv| {
             if (std.mem.eql(u8, kv.key, key)) {

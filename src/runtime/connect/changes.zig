@@ -96,7 +96,7 @@ fn position(env: *Env, hints: []const ast.Hint, key: []const u8) !?[]const u8 {
     for (hints) |h| if (std.mem.eql(u8, h.key, key)) {
         const text = switch (h.value) {
             .str, .ident => |s| s,
-            .flag => return null,
+            .flag, .later, .expr => return null,
             .int => return planErr(env.diag, try msgfmt.allocPrint(env.arena, "`{s}` on a SQL Server table is an LSN as text, 20 hex digits (`0000002B000004280003`), as `_commit_version` reads it", .{key})),
         };
         return lsn(env, key, text);

@@ -1217,10 +1217,12 @@ test "a LET reads env() once before the run, a later LET and a hole build on it,
     try std.testing.expectError(error.FileNotFound, tmp.dir.access("never.csv", .{}));
 }
 
-test "a REST option filled from a LET by a `${...}` is checked as filled in, before any request" {
+test "a REST option filled from a LET, by a `${...}` or an expression, is checked as filled in, before any request" {
     const alloc = std.testing.allocator;
     const cases = [_][2][]const u8{
-        .{ "LET n = 0;\nSELECT * FROM HTTP('http://127.0.0.1:1/x') PAGINATE BY page WITH (page_size = '${n}');", "REST option `page_size` must be at least 1 (given '0')" },
+        .{ "LET n = 0;\nSELECT * FROM HTTP('http://127.0.0.1:1/x') PAGINATE BY page WITH (page_size = '${n}');", "REST option `page_size` must be at least 1 (given 0)" },
+        .{ "LET n = 1;\nSELECT * FROM HTTP('http://127.0.0.1:1/x') PAGINATE BY page (size = $n - 1);", "REST option `page_size` must be at least 1 (given 0)" },
+        .{ "LET m = 'FETCH';\nSELECT * FROM HTTP('http://127.0.0.1:1/' || lower($m)) WITH (method = lower($m));", "REST option `method` is one of get, post, put, patch or delete (given 'fetch')" },
         .{ "LET m = 'fetch';\nSELECT * FROM HTTP('http://127.0.0.1:1/x') WITH (method = '${m}');", "REST option `method` is one of get, post, put, patch or delete (given 'fetch')" },
     };
     for (cases) |c| {
@@ -1233,6 +1235,45 @@ test "a REST option filled from a LET by a `${...}` is checked as filled in, bef
         try std.testing.expectError(error.PlanFailed, exec(alloc, c[0], .{ .log = .{ .quiet = true, .summary = .none } }, &rdiag));
         try std.testing.expectEqualStrings(c[1], rdiag.msg);
     }
+}
+
+test "an option takes a constant expression: a $name, a call, a CASE over a typed LET, checked by check and filled in by the run" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "s.csv", .data = "a;b\n1;2\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "LET d = ';';\nLET n = 5;\n" ++
+            "LOAD INTO '{s}/o1.csv' AS SELECT a, b FROM '{s}/s.csv' WITH (delimiter = $d);\n" ++
+            "LOAD INTO '{s}/o2.csv' AS SELECT a, b FROM '{s}/s.csv' WITH (delimiter = chr(59));\n" ++
+            "LOAD INTO '{s}/o3.csv' WITH (delimiter = CASE WHEN $n > 1 THEN '|' ELSE ',' END) AS SELECT a, b FROM '{s}/s.csv' WITH (delimiter = CAST($d AS STRING));\n",
+        .{ base, base, base, base, base, base },
+    );
+    defer alloc.free(script);
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    var adiag = analyze.Diag{};
+    _ = try analyze.analyze(parena.allocator(), try parser.parseSource(parena.allocator(), script, &pdiag), &adiag);
+    var rdiag: Diag = .{};
+    _ = try exec(alloc, script, .{ .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+    for ([_][]const u8{ "o1.csv", "o2.csv" }) |f| {
+        const out = try tmp.dir.readFileAlloc(alloc, f, 1 << 20);
+        defer alloc.free(out);
+        try std.testing.expectEqualStrings("a,b\n1,2\n", out);
+    }
+    const piped = try tmp.dir.readFileAlloc(alloc, "o3.csv", 1 << 20);
+    defer alloc.free(piped);
+    try std.testing.expectEqualStrings("a|b\n1|2\n", piped);
+
+    const bad = try std.fmt.allocPrint(alloc, "SELECT * FROM '{s}/s.csv' WITH (delimiter = $nope || '');", .{base});
+    defer alloc.free(bad);
+    try std.testing.expectError(error.PlanFailed, exec(alloc, bad, .{ .log = .{ .quiet = true, .summary = .none } }, &rdiag));
+    try std.testing.expectEqualStrings("option `delimiter` names `$nope`, which no PARAM, LET or loop variable declares", rdiag.msg);
 }
 
 test "LET reads a param, so `-p` reaches it indirectly" {

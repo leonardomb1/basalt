@@ -319,6 +319,7 @@ pub fn maxBuild(arena: std.mem.Allocator, h: ast.Hint) Error!BuildCap {
     const txt: []const u8 = switch (h.value) {
         .str, .ident => |v| v,
         .int => |v| return if (v > 0) .{ .bytes = @intCast(v) } else .{ .problem = "max_build must be positive" },
+        .later, .expr => return .{ .bytes = std.math.maxInt(usize) },
         .flag => "",
     };
     if (env_mod.parseByteSize(txt)) |v| if (std.math.cast(usize, v)) |cap| return .{ .bytes = cap };

@@ -43,7 +43,7 @@ script while a value is computed from it once before the run:
 ```sql
 LET token = sha256(env('API_PASS') || strftime(now(), '%d/%m/%Y'));
 SELECT * FROM HTTP('https://api.example.com/v1/items')
-  WITH (header = 'X-Token: ${token}');
+  WITH (header = 'X-Token: ' || $token);
 ```
 
 The variable is read when the script runs, never by `basalt check`, which types

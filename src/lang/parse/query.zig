@@ -396,26 +396,35 @@ pub fn parseWithHints(self: *Parser, hints: *std.array_list.Managed(ast.Hint)) E
     while (!self.at(.rparen)) {
         const pos = self.curPos();
         const key = try self.expectIdent();
-        var val: ast.HintVal = .flag;
-        if (self.eat(.assign)) {
-            if (self.at(.string)) {
-                val = .{ .str = self.advance().text };
-            } else if (self.at(.int)) {
-                const t = self.advance();
-                val = .{ .int = std.fmt.parseInt(i64, t.text, 10) catch
-                    return self.fail(pos, "bad number `{s}`", .{t.text}) };
-            } else if (self.at(.ident)) {
-                val = .{ .ident = self.advance().text };
-            } else if (self.at(.dollar_ident)) {
-                val = .{ .ident = try std.mem.concat(self.arena, u8, &.{ "$", self.advance().text }) };
-            } else {
-                return self.fail(self.curPos(), "expected a hint value, found {s}", .{self.curTag().describe()});
-            }
-        }
+        const val: ast.HintVal = if (self.eat(.assign)) try self.parseOptionValue() else .flag;
         try hints.append(.{ .key = key, .value = val, .pos = pos });
         if (!self.eat(.comma)) break;
     }
     _ = try self.expect(.rparen);
+}
+
+/// An option's value after its `=`, a constant expression: a string, a whole number,
+/// a bare word (`tab`, `zstd`) or a `$name` standing alone is kept as written; any
+/// other expression is kept to be evaluated when the statement runs, so
+/// `page_size = 10 * $n` needs no `'${...}'`.
+pub fn parseOptionValue(self: *Parser) Error!ast.HintVal {
+    const pos = self.curPos();
+    const alone = switch (self.peekTag()) {
+        .comma, .rparen => true,
+        else => false,
+    };
+    if (alone) switch (self.curTag()) {
+        .string => return .{ .str = self.advance().text },
+        .int => {
+            const t = self.advance();
+            return .{ .int = std.fmt.parseInt(i64, t.text, 10) catch return self.fail(pos, "bad number `{s}`", .{t.text}) };
+        },
+        .ident => return .{ .ident = self.advance().text },
+        .dollar_ident => return .{ .ident = try std.mem.concat(self.arena, u8, &.{ "$", self.advance().text }) },
+        else => {},
+    };
+    if (self.at(.rparen) or self.at(.comma)) return self.fail(pos, "expected an option value, found {s}", .{self.curTag().describe()});
+    return .{ .expr = try self.parseExpr() };
 }
 
 /// `[WITH ctes] core [set ops] [ORDER BY ...] [LIMIT n [OFFSET m]]`. Hidden sort keys are

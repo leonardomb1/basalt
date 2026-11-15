@@ -869,6 +869,7 @@ pub const Parser = struct {
     pub const changeNeed = @import("parse/query.zig").changeNeed;
     pub const parseTerminalQuery = @import("parse/query.zig").parseTerminalQuery;
     pub const parseWithHints = @import("parse/query.zig").parseWithHints;
+    pub const parseOptionValue = @import("parse/query.zig").parseOptionValue;
     pub const parseQuery = @import("parse/query.zig").parseQuery;
     pub const lastSelectIdx = @import("parse/query.zig").lastSelectIdx;
     pub const distinctDropTail = @import("parse/query.zig").distinctDropTail;

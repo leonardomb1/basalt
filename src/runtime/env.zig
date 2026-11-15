@@ -563,6 +563,9 @@ pub const LoopRow = struct {
     outer: ?*const LoopRow = null,
     script: bool = false,
     nulls: []const bool = &.{},
+    /// The script scope's PARAMs and LETs as the values they hold, so a hole or an
+    /// option compares `$n > 1` as the INT it is, not its text.
+    values: []const Value = &.{},
 
     pub fn typeAt(self: LoopRow, i: usize) ?types.Type {
         return if (i < self.types.len) self.types[i] else null;
@@ -570,6 +573,7 @@ pub const LoopRow = struct {
 
     /// A cell's value; a NULL PARAM or LET renders as "" but stays NULL here.
     fn valueAt(self: LoopRow, arena: std.mem.Allocator, i: usize) Value {
+        if (i < self.values.len) return self.values[i];
         if (i < self.nulls.len and self.nulls[i]) return .null;
         return loopValue(arena, self.cells[i], self.typeAt(i));
     }

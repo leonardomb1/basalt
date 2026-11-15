@@ -221,7 +221,9 @@ fn renderWrite(arena: std.mem.Allocator, w: ast.Write, lr: LoopRow) !ast.Write {
 }
 
 /// A query parameter whose whole value is a NULL (`a = $p` with `$p` NULL) is left
-/// out, as `a = NULL` is.
+/// out, as `a = NULL` is. A value that is one hole, or a `$name` in scope, takes the
+/// value's type (`page_size = 10 * $n` an INT); a `$name` out of scope is left for
+/// the read that binds it (`changes_from = $since`).
 fn renderHints(arena: std.mem.Allocator, hints: []const ast.Hint, lr: LoopRow) ![]const ast.Hint {
     if (hints.len == 0) return hints;
     var out = try std.array_list.Managed(ast.Hint).initCapacity(arena, hints.len);
@@ -229,13 +231,59 @@ fn renderHints(arena: std.mem.Allocator, hints: []const ast.Hint, lr: LoopRow) !
         if (h.value == .str and std.mem.startsWith(u8, h.key, "query:") and try holeIsNull(arena, h.value.str, lr)) continue;
         var o = h;
         o.value = switch (h.value) {
-            .str => |s| .{ .str = try interpAll(arena, s, lr) },
-            .ident => |s| .{ .ident = try interpAll(arena, s, lr) },
+            .str => |s| if (wholeHole(s)) |inner| try holeHint(arena, s, inner, lr) else .{ .str = try interpAll(arena, s, lr) },
+            .ident => |s| if (s.len > 1 and s[0] == '$' and lr.lookup(s[1..]) != null) try holeHint(arena, s, s[1..], lr) else .{ .ident = try interpAll(arena, s, lr) },
+            .expr => |e| try exprHint(arena, h.key, e, lr),
             else => h.value,
         };
         out.appendAssumeCapacity(o);
     }
     return out.items;
+}
+
+/// An option given as an expression, evaluated against the scope as a hole is and
+/// typed as `holeHint` types one.
+fn exprHint(arena: std.mem.Allocator, key: []const u8, e: *const ast.Expr, lr: LoopRow) !ast.HintVal {
+    var names = std.array_list.Managed([]const u8).init(arena);
+    var vals = std.array_list.Managed(Value).init(arena);
+    try lr.appendScope(arena, &names, &vals);
+    var refs = std.array_list.Managed(ast.QualName).init(arena);
+    try ast.fieldsOf(e, &refs);
+    for (refs.items) |q| if (q.dollar and q.parts.len == 1 and !ast.nameIn(names.items, q.parts[0]))
+        return eval.explain(error.InterpFailed, try msgfmt.allocPrint(arena, "option `{s}` names `${s}`, which no PARAM, LET or loop variable declares", .{ key, q.parts[0] }));
+    const v = eval.constEval(arena, e, names.items, vals.items) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        const why = eval.takeFailure(err) orelse op.errLabel(err);
+        return eval.explain(error.InterpFailed, try msgfmt.allocPrint(arena, "option `{s}`: {s}", .{ key, why }));
+    };
+    return hintOf(arena, v);
+}
+
+/// A rendered option's value: an INT as a number, anything else as its text, NULL
+/// as empty text, as `interpAll` splices it.
+fn hintOf(arena: std.mem.Allocator, v: Value) !ast.HintVal {
+    return switch (v) {
+        .int => |n| .{ .int = n },
+        .null => .{ .str = "" },
+        else => .{ .str = try eval.valueToString(arena, v) },
+    };
+}
+
+/// The expression inside `s` when `s` is one `${...}` hole and nothing else.
+fn wholeHole(s: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, s, "${") or holes.close(s, 2) != s.len - 1) return null;
+    return s[2 .. s.len - 1];
+}
+
+/// An option whose whole value is the hole `inner` of `text`: an INT as a number,
+/// anything else as its text, NULL as empty text, as `interpAll` splices it; a bare
+/// name nothing binds is left as written.
+fn holeHint(arena: std.mem.Allocator, text: []const u8, inner: []const u8, lr: LoopRow) !ast.HintVal {
+    if (holes.bare(inner) and lr.lookup(inner) == null) return .{ .str = text };
+    return switch (try evalHole(arena, inner, lr)) {
+        .value => |v| hintOf(arena, v),
+        .fail => |why| interpFail(arena, inner, why),
+    };
 }
 
 /// Whether `s` is one `${...}` hole, bound, whose value is NULL.
@@ -501,15 +549,17 @@ pub fn buildScriptScope(arena: std.mem.Allocator, params: *std.StringHashMap(Val
     const names = try arena.alloc([]const u8, n);
     const cells = try arena.alloc([]const u8, n);
     const nulls = try arena.alloc(bool, n);
+    const values = try arena.alloc(Value, n);
     var i: usize = 0;
     var it = params.iterator();
     while (it.next()) |kv| {
         names[i] = kv.key_ptr.*;
         cells[i] = try eval.valueToString(arena, kv.value_ptr.*);
         nulls[i] = kv.value_ptr.isNull();
+        values[i] = kv.value_ptr.*;
         i += 1;
     }
-    return .{ .names = names, .cells = cells, .script = true, .nulls = nulls };
+    return .{ .names = names, .cells = cells, .script = true, .nulls = nulls, .values = values };
 }
 
 /// `c` with its options bound to the script's PARAMs and LETs once, before any read:

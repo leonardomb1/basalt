@@ -38,9 +38,9 @@ pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array
     } else if (self.isKw("http") and self.peekTag() == .lparen) {
         _ = self.advance();
         _ = try self.expect(.lparen);
-        const url = try self.expect(.string);
+        const url = try self.exprToTemplate(try self.parseExpr());
         _ = try self.expect(.rparen);
-        node = .{ .read = .{ .connector = "http", .form = .{ .path = url.text } } };
+        node = .{ .read = .{ .connector = "http", .form = .{ .path = url } } };
     } else if (self.isKw("stdin") and self.peekTag() != .dot) {
         _ = self.advance();
         node = .{ .read = .{ .connector = "stdin", .form = .unit } };
@@ -240,16 +240,7 @@ pub fn parsePaginate(self: *Parser, hints: *std.array_list.Managed(ast.Hint)) Er
                 "max_pages"
             else
                 key;
-            if (self.at(.string)) {
-                try hints.append(.{ .key = hint_key, .value = .{ .str = self.advance().text }, .pos = kpos });
-            } else if (self.at(.int)) {
-                const t = self.advance();
-                const v = std.fmt.parseInt(i64, t.text, 10) catch
-                    return self.fail(kpos, "bad number `{s}`", .{t.text});
-                try hints.append(.{ .key = hint_key, .value = .{ .int = v }, .pos = kpos });
-            } else {
-                return self.fail(self.curPos(), "expected a string or number, found {s}", .{self.curTag().describe()});
-            }
+            try hints.append(.{ .key = hint_key, .value = try self.parseOptionValue(), .pos = kpos });
             if (!self.eat(.comma)) break;
         }
         _ = try self.expect(.rparen);

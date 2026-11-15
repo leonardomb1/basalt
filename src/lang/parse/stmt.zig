@@ -352,7 +352,7 @@ pub fn unparse(self: *Parser, buf: *std.array_list.Managed(u8), e: *const ast.Ex
     var w = buf.writer().adaptToNewApi(&.{});
     print.Printer(void, hole).walk(.{ .ctx = {}, .w = &w.new_interface }, e) catch |err| switch (err) {
         error.WriteFailed => return error.OutOfMemory,
-        error.Refused => return self.fail(self.curPos(), "expression too complex to use as a dynamic identifier or predicate", .{}),
+        error.Refused => return self.fail(self.curPos(), "this expression cannot be filled in when the statement runs (no CAST, CASE, IS NULL, index, LET ... IN or lambda): compute it in a LET and use its `$name`", .{}),
     };
 }
 

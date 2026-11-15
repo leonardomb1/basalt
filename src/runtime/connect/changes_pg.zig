@@ -107,7 +107,7 @@ fn positionOf(env: *Env, hints: []const ast.Hint, key: []const u8) !?u64 {
                 if (v.isNull()) return null;
                 break :blk try fmtnum.valueToString(env.arena, v);
             } else s,
-            .flag => return null,
+            .flag, .later, .expr => return null,
             .int => return planErr(env.diag, try msgfmt.allocPrint(env.arena, "`{s}` on a PostgreSQL table is an LSN as text, 16 hex digits as `_commit_version` reads it (`0000000001A4E3B8`) or `0/1A4E3B8`", .{key})),
         };
         return parseLsn(text) catch planErr(env.diag, try msgfmt.allocPrint(env.arena, "`{s} = '{s}'` is not an LSN: it takes 16 hex digits, as `_commit_version` reads it, or `0/1A4E3B8`", .{ key, text }));

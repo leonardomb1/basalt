@@ -875,6 +875,33 @@ fn checkStageHoles(arena: std.mem.Allocator, st: ast.Stage, diag: *Diag) Error!v
     for (texts.items) |s| if (try holes.problem(arena, s)) |why| return failPos(diag, st.pos, "{s}", .{why});
 }
 
+/// `stages` with their options as `check` reads them (`laterHints`).
+fn laterStages(arena: std.mem.Allocator, stages: []const ast.Stage) ![]const ast.Stage {
+    const out = try arena.dupe(ast.Stage, stages);
+    for (out) |*st| st.hints = try laterHints(arena, st.hints);
+    return out;
+}
+
+/// `hints` as `check` reads them: a value known only once the statement runs, a
+/// `$name`, an expression or text holding a `${...}` hole, is `.later`, so its key
+/// is checked here and its value by the run, which renders it first.
+pub fn laterHints(arena: std.mem.Allocator, hints: []const ast.Hint) ![]const ast.Hint {
+    var out: ?[]ast.Hint = null;
+    for (hints, 0..) |h, i| {
+        const later = switch (h.value) {
+            .str => |s| std.mem.indexOf(u8, s, "${") != null,
+            .ident => |s| std.mem.startsWith(u8, s, "$"),
+            .expr => true,
+            else => false,
+        };
+        if (!later) continue;
+        const o = out orelse try arena.dupe(ast.Hint, hints);
+        o[i].value = .later;
+        out = o;
+    }
+    return out orelse hints;
+}
+
 pub const KnownTable = struct { name: []const u8, schema: ?types.Schema = null };
 
 pub const Issue = struct { msg: []const u8, pos: ?ast.Pos = null, end: ?ast.Pos = null };
@@ -1395,13 +1422,14 @@ const Ctx = struct {
         const raw = try bindLimits(self.arena, pipe.stages, self.params, self.diag);
         const head = try self.inlineHead(raw);
         const via = head.via;
-        const stages = (pushdown.hoistFilters(self.arena, self.arena, head.stages, self.bindings, self.tables) catch null) orelse head.stages;
-        if (stages[stages.len - 1].node != .write)
+        const stages_seen = (pushdown.hoistFilters(self.arena, self.arena, head.stages, self.bindings, self.tables) catch null) orelse head.stages;
+        if (stages_seen[stages_seen.len - 1].node != .write)
             return fail(self.diag, "a top-level query must be a `LOAD INTO` or a terminal `SELECT`", .{});
-        for (stages) |st| {
+        for (stages_seen) |st| {
             try checkStageLiterals(self.diag, st);
             try checkStageHoles(self.arena, st, self.diag);
         }
+        const stages = try laterStages(self.arena, stages_seen);
         try checkJoinHints(self.arena, stages, self.diag);
 
         var source = self.resolveSource(stages[0]) catch |e| {
@@ -1583,7 +1611,9 @@ const Ctx = struct {
         };
     }
 
-    fn resolveSource(self: *Ctx, lead: ast.Stage) !Source {
+    fn resolveSource(self: *Ctx, lead_seen: ast.Stage) !Source {
+        var lead = lead_seen;
+        lead.hints = try laterHints(self.arena, lead_seen.hints);
         switch (lead.node) {
             .read => |rd| {
                 const conn: ?ast.Connection = self.connections.get(rd.connector);
@@ -1622,8 +1652,11 @@ const Ctx = struct {
                     _ = try dialectFromHints(lead.hints, self.diag);
                     _ = try lakeAt(lead.hints, self.diag);
                 }
-                const rewritten = rd.form == .path and ast.nameIn(self.written, rd.form.path);
-                if (!rewritten and rd.form == .path and std.mem.eql(u8, connector, "csv")) {
+                const later = for (lead.hints) |h| {
+                    if (h.value == .later) break true;
+                } else false;
+                const unread_offline = later or (rd.form == .path and ast.nameIn(self.written, rd.form.path));
+                if (!unread_offline and rd.form == .path and std.mem.eql(u8, connector, "csv")) {
                     const t = offlineTable(self.arena, rd.form.path, lead.hints, self.tables) catch |e|
                         return fail(self.diag, "{s}", .{eval.takeFailure(e) orelse @errorName(e)});
                     if (t) |tb| return .{
@@ -1633,7 +1666,7 @@ const Ctx = struct {
                         .format = @tagName(tb.kind),
                     };
                 }
-                const schema = if (rewritten) null else offlineSchema(self.arena, rd, lead.hints, self.tables);
+                const schema = if (unread_offline) null else offlineSchema(self.arena, rd, lead.hints, self.tables);
                 return .{ .connector = connector, .detail = detail, .schema = schema };
             },
             .ref => |name| {

@@ -93,7 +93,7 @@ pub fn lakeAt(hints: []const ast.Hint, diag: *Diag) Error!lake.At {
     var at = lake.At{};
     var to: ?lake.At.Point = null;
     for (hints) |h| {
-        if (h.value == .ident and std.mem.startsWith(u8, h.value.ident, "$")) continue;
+        if (h.value == .later or (h.value == .ident and std.mem.startsWith(u8, h.value.ident, "$"))) continue;
         const which: ?[]const u8 = if (std.mem.eql(u8, h.key, "changes_from")) "changes_from" else if (std.mem.eql(u8, h.key, "changes_to")) "changes_to" else null;
         if (which) |k| {
             const p = try changePoint(h.value, k, diag);
@@ -112,7 +112,7 @@ pub fn lakeAt(hints: []const ast.Hint, diag: *Diag) Error!lake.At {
         const n: ?i64 = switch (h.value) {
             .int => |i| i,
             .str, .ident => |s| std.fmt.parseInt(i64, s, 10) catch null,
-            .flag => null,
+            .flag, .later, .expr => null,
         };
         if (std.mem.eql(u8, h.key, "version")) {
             const v = n orelse -1;
@@ -137,7 +137,7 @@ fn changePoint(v: ast.HintVal, key: []const u8, diag: *Diag) Error!lake.At.Point
     const text = switch (v) {
         .int => |i| return if (i >= 0) .{ .version = @intCast(i) } else fail(diag, "`{s}` is a commit version from 0, or a time as text", .{key}),
         .str, .ident => |s| s,
-        .flag => return fail(diag, "`{s}` is a commit version (`{s} = 3`) or a time (`{s} = '2026-11-01 08:00:00'`)", .{ key, key, key }),
+        .flag, .later, .expr => return fail(diag, "`{s}` is a commit version (`{s} = 3`) or a time (`{s} = '2026-11-01 08:00:00'`)", .{ key, key, key }),
     };
     if (std.fmt.parseInt(u64, text, 10)) |n| return .{ .version = n } else |_| {}
     const us = @import("../../exec/eval.zig").parseTimestampText(text) orelse
@@ -251,6 +251,7 @@ pub fn hintBool(hints: []const ast.Hint, key: []const u8, diag: *Diag) Error!?bo
             .flag => true,
             .int => |n| n != 0,
             .str, .ident => |s| textconv.boolText(textconv.Words.hint, s) orelse fail(diag, "`{s}` is true or false, not `{s}`", .{ key, s }),
+            .later, .expr => null,
         };
     }
     return null;
