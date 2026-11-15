@@ -788,6 +788,8 @@ pub const FnDecl = struct {
     replace: bool = false,
     pos: Pos,
     table_check: ?TableCheck = null,
+    /// Declared `EXPORT FUNCTION`: what a library included `AS` lets its includer call.
+    exported: bool = false,
 };
 
 /// A table function's body as parsed where it is declared, its `$params` left

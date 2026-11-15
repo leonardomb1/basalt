@@ -61,7 +61,7 @@ pub fn opensBlock(self: *Parser, i: usize) bool {
     const t = self.toks[i];
     if (t.tag != .ident) return false;
     if (eqlNoCase(t.text, "for") or eqlNoCase(t.text, "case")) return true;
-    if (!eqlNoCase(t.text, "create")) return false;
+    if (!eqlNoCase(t.text, "create") and !eqlNoCase(t.text, "export")) return false;
     for (self.toks[i + 1 .. @min(self.toks.len, i + 4)]) |n| {
         if (n.tag == .ident and eqlNoCase(n.text, "function")) return true;
     }
@@ -76,7 +76,7 @@ pub fn parseStatement(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Err
         return self.fail(self.curPos(), "statements nest more than {d} levels deep", .{Parser.max_stmt_depth});
     self.stmt_depth += 1;
     defer self.stmt_depth -= 1;
-    if (self.isKw("create")) return self.parseCreate(out);
+    if (self.isKw("create") or self.isKw("export")) return self.parseCreate(out);
     if (self.isKw("param")) return out.append(.{ .param = try self.parseParam() });
     if (self.isKw("let")) {
         const l = try self.parseLetStmt();
@@ -253,13 +253,22 @@ pub fn parsePrintStmt(self: *Parser) Error!ast.Print {
     return .{ .expr = expr, .pos = pos };
 }
 
+/// `CREATE [OR REPLACE] CONNECTION | FUNCTION ...`, or `EXPORT [OR REPLACE] FUNCTION
+/// ...`, a function a library included `AS` shares with its includer.
 pub fn parseCreate(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
     const pos = self.curPos();
-    try self.expectKw("create");
+    const exported = self.eatKw("export");
+    if (!exported) try self.expectKw("create");
     const replace = if (self.eatKw("or")) blk: {
         try self.expectKw("replace");
         break :blk true;
     } else false;
+    if (exported) {
+        if (!self.eatKw("function")) return self.fail(self.curPos(), "EXPORT declares a function a library shares: `EXPORT FUNCTION name(...) AS ...`", .{});
+        var fd = try self.parseFunction(pos, replace);
+        fd.exported = true;
+        return out.append(.{ .func = fd });
+    }
     if (self.eatKw("connection")) {
         const conn = try self.parseConnection(pos);
         try self.conn_names.append(conn.name);

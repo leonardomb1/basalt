@@ -4,7 +4,7 @@ A script is a sequence of `;`-terminated statements:
 
 ```sql ignore
 @include 'lib.sql';               -- top of file only; C-style, relative to this file
-@include 'lib/stats.sql' AS st;   -- a library: its functions as st.f(...)
+@include 'lib/stats.sql' AS st;   -- a library: its EXPORT FUNCTIONs as st.f(...)
 @include 'github.com/org/repo/sql/kit.sql@v1.2.0' AS kit;  -- remote, pinned in basalt.sum
 PARAM ...;                        -- CLI inputs
 LET name = <expr>;                -- a variable, evaluated when it runs
@@ -37,10 +37,15 @@ reach it.
 `@include 'lib/stats.sql' AS st;` includes a **library**: it may only declare
 functions — scalar, statement and table — and any other statement in it (a
 `LOAD INTO`, `SELECT`, `PARAM`, `LET`, connection or `CALL`) is an error naming
-it, so including a library never runs anything. Its functions are namespaced
-under the alias: `st.median(x)`, `CALL st.refresh(...)`, `FROM st.orders($since)`;
-inside the library they call each other by their plain names, and outside it
-the plain names do not exist, so two libraries may each define `clean()`. An
+it, so including a library never runs anything. A library shares only what it
+declares `EXPORT FUNCTION` (in place of `CREATE FUNCTION`, `OR REPLACE` too), and
+one that exports nothing is an error at its `@include`. Its exported functions are
+namespaced under the alias: `st.median(x)`, `CALL st.refresh(...)`, `FROM
+st.orders($since)`; a function it declares with `CREATE FUNCTION` is private to it,
+and `st.helper(...)` from outside is an error naming what it exports. Inside the
+library every function calls the others by their plain names, private or not, and
+outside it the plain names do not exist, so two libraries may each define
+`clean()`. An
 alias is private to the file that writes it, as a Go import is: a library's own
 `@include 'util.sql' AS u` makes `u.f(...)` callable there and nowhere else, so
 two libraries may each use `u` for different files, and a file it includes

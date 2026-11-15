@@ -140,6 +140,24 @@ const Ctx = struct {
     }
 };
 
+/// What the library `sub`, included `AS alias` into namespace `ns` from `resolved`,
+/// shares: its own functions (`ns.f`, not a nested library's `ns.u.f`) declared
+/// `EXPORT FUNCTION`. One that exports none is refused at the directive `d`.
+fn library(ctx: *Ctx, sub: ast.Program, alias: []const u8, ns: []const u8, resolved: []const u8, label: []const u8, d: Directive) Error!parser.Library {
+    var exports = std.array_list.Managed([]const u8).init(ctx.arena);
+    var private = std.array_list.Managed([]const u8).init(ctx.arena);
+    for (stmtsOf(sub)) |st| if (st == .func) {
+        const n = st.func.name;
+        if (n.len <= ns.len + 1 or !std.ascii.eqlIgnoreCase(n[0..ns.len], ns) or n[ns.len] != '.') continue;
+        const own = n[ns.len + 1 ..];
+        if (std.mem.indexOfScalar(u8, own, '.') != null) continue;
+        try (if (st.func.exported) &exports else &private).append(own);
+    };
+    if (exports.items.len == 0)
+        return ctx.fail(label, d.line, d.col, "`{s}` is included AS {s}, a library, but exports no function: declare the ones it shares `EXPORT FUNCTION`", .{ resolved, alias });
+    return .{ .alias = alias, .path = resolved, .exports = exports.items, .private = private.items };
+}
+
 fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, namespace: ?[]const u8) Error!ast.Program {
     var incs = std.array_list.Managed(Directive).init(ctx.arena);
     const body_at = try scanDirectives(ctx, text, label, &incs);
@@ -149,6 +167,7 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
     var subs = std.array_list.Managed(ast.Program).init(ctx.arena);
     var seen = std.array_list.Managed(ast.Program).init(ctx.arena);
     var my_aliases = std.array_list.Managed([]const u8).init(ctx.arena);
+    var libs = std.array_list.Managed(parser.Library).init(ctx.arena);
     var same_ns = std.array_list.Managed(ast.Program).init(ctx.arena);
     for (incs.items) |d| {
         const at = try locate(ctx, base, d, label);
@@ -173,6 +192,7 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
         if (canonical) if (ctx.memo.get(memo_key)) |cached| {
             try seen.append(cached);
             if (d.alias == null) try same_ns.append(cached);
+            if (d.alias) |a| try libs.append(try library(ctx, cached, a, sub_ns.?, resolved, label, d));
             continue;
         };
         const src = at.text orelse std.fs.cwd().readFileAlloc(ctx.arena, resolved, max_file_bytes) catch |e| {
@@ -195,6 +215,7 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
             const pos = ast.stmtPos(st) orelse ast.Pos{ .line = 0, .col = 0 };
             return ctx.fail(resolved, pos.line, pos.col, "`{s}` is included AS {s}, a library, so it may only declare functions; this {s} would run — include it without AS to run its statements", .{ resolved, a, stmtWord(st) });
         };
+        if (d.alias) |a| try libs.append(try library(ctx, sub, a, sub_ns.?, resolved, label, d));
         if (canonical) try ctx.memo.put(memo_key, sub);
         try subs.append(sub);
         try seen.append(sub);
@@ -230,6 +251,7 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
             .errors = if (ctx.depth == 0) ctx.errors else null,
             .file = file,
             .aliases = my_aliases.items,
+            .libraries = libs.items,
             .namespace = namespace,
             .own = own.items,
         }) catch |e| switch (e) {
@@ -796,14 +818,15 @@ test "an include-only script contributes just the included statements" {
     try testing.expectEqualStrings("dbl", prog.stmts[1].func.name);
 }
 
-test "@include AS: a library's functions are namespaced, call each other, and do not leak" {
+test "@include AS: a library's functions are namespaced, call each other private or exported, and only the exported reach its includer" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try writeFile(&tmp, "lib/s.sql", "CREATE FUNCTION sq(x) AS x * x;\nCREATE FUNCTION hyp(a, b) AS sqrt(sq(a) + sq(b));\nCREATE FUNCTION nums(n INT) RETURNS TABLE AS SELECT range AS v, sq(range) AS v2 FROM RANGE($n);\n");
-    try writeFile(&tmp, "lib/o.sql", "CREATE FUNCTION sq(x) AS x + 1;\n");
+    try writeFile(&tmp, "lib/s.sql", "CREATE FUNCTION sq(x) AS x * x;\nEXPORT FUNCTION hyp(a, b) AS sqrt(sq(a) + sq(b));\nEXPORT FUNCTION nums(n INT) RETURNS TABLE AS SELECT range AS v, sq(range) AS v2 FROM RANGE($n);\n");
+    try writeFile(&tmp, "lib/o.sql", "EXPORT FUNCTION sq(x) AS x + 1;\n");
+    try writeFile(&tmp, "lib/none.sql", "CREATE FUNCTION sq(x) AS x + 1;\n");
     const base = try tmp.dir.realpathAlloc(a, ".");
     var diag: Diag = .{};
     const prog = try loadProgram(a, "@include 'lib/s.sql' AS st;\n@include 'lib/o.sql' AS ot;\nSELECT st.hyp(3, 4) AS h, ot.sq(1) AS o FROM st.nums(2) n;\n", "main.sql", base, &diag);
@@ -814,6 +837,11 @@ test "@include AS: a library's functions are namespaced, call each other, and do
     const hyp = prog.stmts[2].func.body.expr;
     try testing.expectEqualStrings("st.sq", hyp.call.args[0].binary.l.call.name);
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'lib/s.sql' AS st;\nSELECT * FROM nums(2);\n", "main.sql", base, &diag));
+    try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'lib/s.sql' AS st;\nSELECT st.sq(2) AS v;\n", "main.sql", base, &diag));
+    try testing.expect(std.mem.startsWith(u8, diag.parse.msg, "`st.sq` is private to `"));
+    try testing.expect(std.mem.endsWith(u8, diag.parse.msg, "lib/s.sql`, which exports hyp, nums; declare it `EXPORT FUNCTION` there to call it here"));
+    try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'lib/none.sql' AS n;\nSELECT 1 AS v;\n", "main.sql", base, &diag));
+    try testing.expect(std.mem.endsWith(u8, diag.parse.msg, "lib/none.sql` is included AS n, a library, but exports no function: declare the ones it shares `EXPORT FUNCTION`"));
 }
 
 test "@include AS: a library declares functions only; aliases are one per library and not a connection's name" {
@@ -823,8 +851,8 @@ test "@include AS: a library declares functions only; aliases are one per librar
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try writeFile(&tmp, "run.sql", "CREATE FUNCTION f(x) AS x;\nLOAD INTO 'o.csv' AS SELECT 1 AS a;\n");
-    try writeFile(&tmp, "f.sql", "CREATE FUNCTION f(x) AS x;\n");
-    try writeFile(&tmp, "g.sql", "CREATE FUNCTION g(x) AS x;\n");
+    try writeFile(&tmp, "f.sql", "EXPORT FUNCTION f(x) AS x;\n");
+    try writeFile(&tmp, "g.sql", "EXPORT FUNCTION g(x) AS x;\n");
     const base = try tmp.dir.realpathAlloc(a, ".");
     var diag: Diag = .{};
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'run.sql' AS r;\nSELECT 1 AS a;\n", "m.sql", base, &diag));
@@ -855,8 +883,8 @@ test "remote @include: refused until pinned, pinned by check, verified, its own 
     defer tmp.cleanup();
     const base = try tmp.dir.realpathAlloc(a, ".");
     var host = FakeHost{ .files = &.{
-        .{ "https://raw.githubusercontent.com/acme/kit/v1/sql/lib.sql", "@include 'util.sql' AS u;\nCREATE FUNCTION twice(x) AS u.inc(u.inc(x));\n" },
-        .{ "https://raw.githubusercontent.com/acme/kit/v1/sql/util.sql", "CREATE FUNCTION inc(x) AS x + 1;\n" },
+        .{ "https://raw.githubusercontent.com/acme/kit/v1/sql/lib.sql", "@include 'util.sql' AS u;\nEXPORT FUNCTION twice(x) AS u.inc(u.inc(x));\n" },
+        .{ "https://raw.githubusercontent.com/acme/kit/v1/sql/util.sql", "EXPORT FUNCTION inc(x) AS x + 1;\n" },
         .{ "https://raw.githubusercontent.com/acme/kit/v1/sql/evil.sql", "@include '/etc/passwd';\n" },
         .{ "https://raw.githubusercontent.com/acme/kit/v1/sql/up.sql", "@include '../../x.sql';\n" },
     } };
@@ -906,11 +934,11 @@ test "@include AS: an alias is private to its file, so two libraries may both us
     const a = ar.allocator();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try writeFile(&tmp, "a/lib.sql", "@include 'util.sql' AS u;\n@include 'help.sql';\nCREATE FUNCTION f(x) AS u.g(h(x));\n");
-    try writeFile(&tmp, "a/util.sql", "CREATE FUNCTION g(x) AS x + 1;\n");
+    try writeFile(&tmp, "a/lib.sql", "@include 'util.sql' AS u;\n@include 'help.sql';\nEXPORT FUNCTION f(x) AS u.g(h(x));\n");
+    try writeFile(&tmp, "a/util.sql", "EXPORT FUNCTION g(x) AS x + 1;\n");
     try writeFile(&tmp, "a/help.sql", "CREATE FUNCTION h(x) AS x * 10;\n");
-    try writeFile(&tmp, "b/lib.sql", "@include 'util.sql' AS u;\nCREATE FUNCTION f(x) AS u.g(x);\n");
-    try writeFile(&tmp, "b/util.sql", "CREATE FUNCTION g(x) AS x - 1;\n");
+    try writeFile(&tmp, "b/lib.sql", "@include 'util.sql' AS u;\nEXPORT FUNCTION f(x) AS u.g(x);\n");
+    try writeFile(&tmp, "b/util.sql", "EXPORT FUNCTION g(x) AS x - 1;\n");
     const base = try tmp.dir.realpathAlloc(a, ".");
     var diag: Diag = .{};
     const prog = try loadProgram(a, "@include 'a/lib.sql' AS a;\n@include 'b/lib.sql' AS b;\nSELECT a.f(1) AS x, b.f(1) AS y;\n", "m.sql", base, &diag);
@@ -921,4 +949,6 @@ test "@include AS: an alias is private to its file, so two libraries may both us
     try testing.expectEqualStrings("a.u.g", prog.stmts[3].func.body.expr.call.name);
     try testing.expectEqualStrings("a.h", prog.stmts[3].func.body.expr.call.args[0].call.name);
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'a/lib.sql' AS a;\nSELECT u.g(1) AS x;\n", "m.sql", base, &diag));
+    try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'a/lib.sql' AS a;\nSELECT a.h(1) AS x;\n", "m.sql", base, &diag));
+    try testing.expect(std.mem.startsWith(u8, diag.parse.msg, "`a.h` is private to `"));
 }

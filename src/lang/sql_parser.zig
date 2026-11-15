@@ -100,15 +100,28 @@ pub const Options = struct {
     errors: ?*std.array_list.Managed(Diagnostic) = null,
     file: u16 = 0,
     aliases: []const []const u8 = &.{},
+    libraries: []const Library = &.{},
     namespace: ?[]const u8 = null,
     own: []const []const u8 = &.{},
+};
+
+/// A library this file includes `AS alias`: the functions it exports, which
+/// `alias.f(...)` may call, and the ones private to it, which it may not.
+pub const Library = struct {
+    alias: []const u8,
+    path: []const u8,
+    exports: []const []const u8,
+    private: []const []const u8,
 };
 
 pub fn parseSourceOpts(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic, opts: Options) Error!ast.Program {
     var toks = lexer.tokenize(arena, src) catch return error.OutOfMemory;
     for (toks) |*t| t.file = opts.file;
-    if (opts.aliases.len > 0 or opts.namespace != null) toks = try qualify(arena, toks, opts.aliases, opts.namespace, opts.own);
     var p = Parser{ .arena = arena, .toks = toks, .diag = diag };
+    if (opts.aliases.len > 0 or opts.namespace != null) {
+        toks = try qualify(&p, toks, opts.aliases, opts.libraries, opts.namespace, opts.own);
+        p.toks = toks;
+    }
     for (toks) |t| {
         if (t.tag == .invalid) return p.failInvalid(t);
     }
@@ -125,8 +138,10 @@ pub fn parseSourceOpts(arena: std.mem.Allocator, src: []const u8, diag: *Diagnos
 /// functions, declared or called (`f(`), as `ns.f`, as are the plain names in
 /// `extra` its unaliased includes declared; and `alias.f(`, calling into a library
 /// this file includes, is joined to one name, `ns.alias.f`. An alias is private to
-/// the file that writes it, so two libraries may each use the same one.
-fn qualify(arena: std.mem.Allocator, toks: []Token, aliases: []const []const u8, namespace: ?[]const u8, extra: []const []const u8) Error![]Token {
+/// the file that writes it, so two libraries may each use the same one. A call of a
+/// function a library keeps private is refused, naming what it exports.
+fn qualify(p: *Parser, toks: []Token, aliases: []const []const u8, libraries: []const Library, namespace: ?[]const u8, extra: []const []const u8) Error![]Token {
+    const arena = p.arena;
     var own = std.array_list.Managed([]const u8).init(arena);
     try own.appendSlice(extra);
     if (namespace != null) for (toks, 0..) |t, i| {
@@ -140,6 +155,10 @@ fn qualify(arena: std.mem.Allocator, toks: []Token, aliases: []const []const u8,
         const after_dot = i > 0 and toks[i - 1].tag == .dot;
         if (t.tag == .ident and !after_dot and i + 3 < toks.len and toks[i + 1].tag == .dot and toks[i + 2].tag == .ident and toks[i + 3].tag == .lparen) {
             if (containsNoCase(aliases, t.text)) {
+                for (libraries) |l| if (eqlNoCase(l.alias, t.text) and containsNoCase(l.private, toks[i + 2].text) and !containsNoCase(l.exports, toks[i + 2].text)) {
+                    const shown = try std.mem.join(arena, ", ", l.exports);
+                    return p.fail(.{ .line = t.line, .col = t.col, .file = t.file }, "`{s}.{s}` is private to `{s}`, which exports {s}; declare it `EXPORT FUNCTION` there to call it here", .{ t.text, toks[i + 2].text, l.path, shown });
+                };
                 const lib = if (namespace) |ns| try qualified(arena, ns, t.text) else t.text;
                 t.text = try qualified(arena, lib, toks[i + 2].text);
                 t.end_line = toks[i + 2].end_line;

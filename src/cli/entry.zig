@@ -102,7 +102,7 @@ pub fn declOf(stmt: []const u8) ?DeclId {
         const n = identPrefix(nextWord(stmt, &i) orelse return null);
         return if (n.len == 0) null else .{ .kind = .let, .name = n };
     }
-    if (!std.ascii.eqlIgnoreCase(w, "create")) return null;
+    if (!std.ascii.eqlIgnoreCase(w, "create") and !std.ascii.eqlIgnoreCase(w, "export")) return null;
     w = nextWord(stmt, &i) orelse return null;
     if (std.ascii.eqlIgnoreCase(w, "or")) {
         w = nextWord(stmt, &i) orelse return null;
