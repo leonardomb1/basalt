@@ -296,19 +296,24 @@ pub const Conn = struct {
         }
     }
 
+    /// Run `stmt` for its effect, its reply read to ReadyForQuery: after an
+    /// ErrorResponse the server still sends one, and leaving it unread would have the
+    /// next statement take it for its own reply.
     pub fn exec(self: *Conn, stmt: []const u8) !void {
         try self.sendQuery(stmt);
+        var failed = false;
         while (true) {
             const t = try self.readMsg();
             switch (t) {
-                'E' => {
+                'E' => if (!failed) {
                     try self.wire.setError(errMessage(self.wire.msg.items));
-                    return error.PgQueryFailed;
+                    failed = true;
                 },
                 'Z' => break,
                 else => {},
             }
         }
+        if (failed) return error.PgQueryFailed;
     }
 
     fn sendQuery(self: *Conn, stmt: []const u8) !void {
@@ -793,6 +798,19 @@ test "a bytea reads as BYTES in either output format and a time as TIME; timetz 
         try std.testing.expect(std.mem.indexOf(u8, s, "TimeZone\x00UTC\x00") != null);
         try std.testing.expect(std.mem.indexOf(u8, s, "bytea_output") == null);
     }
+}
+
+test "exec reads a failed statement's reply to its ReadyForQuery, so the next statement's error is its own" {
+    const FakePg = @import("../testing/postgres_fake.zig").FakePg;
+    const gpa = std.testing.allocator;
+    const srv = try FakePg.start(gpa, &.{});
+    defer srv.finish();
+    srv.fail_on = "BOOM";
+    srv.fail_msg = "boom";
+    const c = try Conn.connect(gpa, "127.0.0.1", srv.port(), "u", "p", "d", .off, .{ .connect_s = 5 });
+    defer c.close();
+    try std.testing.expectError(error.PgQueryFailed, c.exec("SELECT * FROM t WHERE BOOM"));
+    try std.testing.expectError(error.PgQueryFailed, c.exec("SELECT * FROM nowhere"));
 }
 
 test "a cleartext password request on a plain connection, and a SCRAM nonce that is not the client's, are refused before any secret is sent" {
