@@ -870,6 +870,14 @@ test "sql: scalar subquery desugars to a query LET ahead of the statement" {
     try testing.expectEqualStrings("hi", prog2.stmts[1].let_const.name);
 }
 
+test "sql: anchor and pushdown, no longer keywords, name a source without AS" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    _ = try parseTest(a, "SELECT anchor.id FROM 'in.csv' anchor;");
+    _ = try parseTest(a, "SELECT pushdown.id FROM 'in.csv' pushdown JOIN 'b.csv' b ON pushdown.id = b.id;");
+}
+
 test "sql: a select item's alias may omit AS, but not swallow the clause after it" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

@@ -98,7 +98,7 @@ AS
   a plan-time error, as is `JOBS 0`.
 
 **stdout is not syntax**: a terminal `SELECT ...;` statement prints the result
-as an aligned table — `basalt run -c "SELECT * FROM 'x.csv'"` works as a
+as an aligned table — `basalt run -c "SELECT * FROM 'x.csv';"` works as a
 mini-DuckDB.
 
 ## Change feeds

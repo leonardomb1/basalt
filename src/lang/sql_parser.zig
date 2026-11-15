@@ -300,14 +300,14 @@ pub const AliasSet = struct {
 };
 
 const reserved_after_source = [_][]const u8{
-    "where",    "group",    "order",  "limit",   "union",  "anchor",    "join",
-    "inner",    "left",     "right",  "full",    "cross",  "semi",      "anti",
-    "on",       "pushdown", "with",   "as",      "end",    "when",      "then",
-    "else",     "case",     "select", "from",    "load",   "for",       "using",
-    "natural",  "upsert",   "append", "replace", "split",  "jobs",      "offset",
-    "paginate", "retry",    "create", "param",   "having", "and",       "or",
-    "not",      "explain",  "costs",  "analyze", "except", "intersect", "window",
-    "fetch",    "qualify",  "pivot",  "unpivot",
+    "where",  "group",   "order",  "limit",     "union",  "join",     "inner",
+    "left",   "right",   "full",   "cross",     "semi",   "anti",     "on",
+    "with",   "as",      "end",    "when",      "then",   "else",     "case",
+    "select", "from",    "load",   "for",       "using",  "natural",  "upsert",
+    "append", "replace", "split",  "jobs",      "offset", "paginate", "retry",
+    "create", "param",   "having", "and",       "or",     "not",      "explain",
+    "costs",  "analyze", "except", "intersect", "window", "fetch",    "qualify",
+    "pivot",  "unpivot",
 };
 
 fn isKwIn(name: []const u8, kws: []const []const u8) bool {

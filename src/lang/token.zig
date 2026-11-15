@@ -1,6 +1,6 @@
-//! Token definitions for the DSL. The lexer is whitespace-insensitive (newlines
-//! are trivia); structure comes from `|`, commas, and leading keywords. Keywords
-//! are not distinguished here: they are plain `ident`s recognized contextually by
+//! Token definitions for the SQL dialect. The lexer is whitespace-insensitive
+//! (newlines are trivia); `pipe` is `||` and `bar` a lone `|`. Keywords are not
+//! distinguished here: they are plain `ident`s recognized contextually by
 //! the parser, so `filter` can be an operator or, in another position, a field.
 //!
 //! `qident` is a double-quoted name, an ANSI SQL quoted identifier: `"Exchange
@@ -14,10 +14,8 @@ pub const Tag = enum {
     string,
     int,
     float,
-    interp,
 
     pipe,
-    at,
 
     lparen,
     rparen,
@@ -32,7 +30,6 @@ pub const Tag = enum {
     star,
 
     assign,
-    fat_arrow,
     arrow,
     eq,
     ne,
@@ -66,9 +63,7 @@ pub const Tag = enum {
             .string => "string",
             .int => "integer",
             .float => "float",
-            .interp => "interpolation `${...}`",
-            .pipe => "'|'",
-            .at => "'@'",
+            .pipe => "'||'",
             .lparen => "'('",
             .rparen => "')'",
             .lbracket => "'['",
@@ -80,7 +75,6 @@ pub const Tag = enum {
             .colon => "':'",
             .star => "'*'",
             .assign => "'='",
-            .fat_arrow => "'=>'",
             .arrow => "'->'",
             .eq => "'=='",
             .ne => "'!='",

@@ -699,6 +699,15 @@ test "sql: a refused correlated subquery fails its statement alone; the statemen
     try testing.expect(semi and left);
 }
 
+test "sql: an error names `||` as written, not a lone bar" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT 'a' AS x || 'b';", &diag));
+    try testing.expectEqualStrings("expected ';', found '||'", diag.msg);
+}
+
 test "sql: a `0x` number is refused naming the bytes literal and the function it may have meant, and a 0 before an alias still reads" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
