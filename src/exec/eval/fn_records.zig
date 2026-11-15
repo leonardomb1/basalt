@@ -475,7 +475,8 @@ pub fn BinIntAt(comptime T: type, comptime endian: std.builtin.Endian) type {
             const n = @sizeOf(T);
             const raw = try fieldOf("binary integer", rec, pos, n);
             const x = std.mem.readInt(T, raw[0..n], endian);
-            return std.math.cast(i64, x) orelse failWith(error.CastFailed, "binary integer {d} does not fit an INT", .{x});
+            const suffix = if (endian == .little) "le_at" else "be_at";
+            return std.math.cast(i64, x) orelse failWith(error.CastFailed, "`" ++ @typeName(T) ++ suffix ++ "`: {d} does not fit an INT, at most 2^63-1: `i64" ++ suffix ++ "` reads the same 8 bytes as a signed INT", .{x});
         }
     };
 }
@@ -973,6 +974,8 @@ test "record decoders: time and timestamp fields, overpunch and EBCDIC zones, re
         .{ .src = "encode('\u{20AC}', 'latin1')", .msg = "`encode`: `\\xE2\\x82\\xAC` is not text the charset holds" },
         .{ .src = "int_at('+', 0, 1)", .msg = "`int_at`: `+` is not an integer" },
         .{ .src = "int_at('99999999999999999999', 0, 20)", .msg = "`int_at`: `99999999999999999999` is not an integer in range" },
+        .{ .src = "u64le_at(x'0000000000000080', 0)", .msg = "`u64le_at`: 9223372036854775808 does not fit an INT, at most 2^63-1: `i64le_at` reads the same 8 bytes as a signed INT" },
+        .{ .src = "u64be_at(x'ffffffffffffffff', 0)", .msg = "`u64be_at`: 18446744073709551615 does not fit an INT, at most 2^63-1: `i64be_at` reads the same 8 bytes as a signed INT" },
     };
     for (refused) |r| {
         errdefer std.debug.print("in `{s}`\n", .{r.src});
