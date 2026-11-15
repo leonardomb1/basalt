@@ -1330,6 +1330,31 @@ test "CALL renders a statement function per call (defaults fill the omitted arg)
     try std.testing.expectEqualStrings("id,v,tag\n3,30,Z\n", b);
 }
 
+test "CALL of a statement function without parameters runs its body" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "CREATE FUNCTION refresh() AS\n" ++
+            "  LOAD INTO '{s}/out.csv' AS SELECT 1 AS id;\n" ++
+            "END;\n" ++
+            "CALL refresh();\n",
+        .{base},
+    );
+    defer alloc.free(script);
+
+    var rdiag: Diag = .{};
+    const stats = try exec(alloc, script, .{}, &rdiag);
+    try std.testing.expectEqual(@as(u64, 1), stats.rows_out);
+    const out = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 20);
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("id\n1\n", out);
+}
+
 test "CALL nesting is depth-guarded (mutual recursion)" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -56,15 +56,17 @@ const ForMode = enum { sequential, parallel };
 const OnError = enum { stop, continue_ };
 
 /// Identify a for-each row the way the script names it (`n=0`, `db=sales, tbl=orders`),
-/// falling back to the first cell if the label cannot be built.
+/// falling back to the first cell if the label cannot be built, and empty for a
+/// row of no cells (a `CALL` of a function without parameters).
 fn rowLabel(arena: std.mem.Allocator, names: []const []const u8, row: Row) []const u8 {
+    const first: []const u8 = if (row.len > 0) row[0] else "";
     var out: []const u8 = "";
     for (names, 0..) |n, i| {
         if (i >= row.len) break;
         const sep: []const u8 = if (out.len > 0) ", " else "";
-        out = msgfmt.allocPrint(arena, "{s}{s}{s}={s}", .{ out, sep, n, row[i] }) catch return row[0];
+        out = msgfmt.allocPrint(arena, "{s}{s}{s}={s}", .{ out, sep, n, row[i] }) catch return first;
     }
-    return if (out.len > 0) out else row[0];
+    return if (out.len > 0) out else first;
 }
 
 /// Render every `${...}` in `s`. A bare `${var}` substitutes the loop variable,
