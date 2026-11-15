@@ -405,21 +405,16 @@ pub const StreamLoadSink = struct {
             self.tee.end = 0;
         }
         errdefer self.freeGzip();
-        if (cfg.auto_create) {
-            var aa = std.heap.ArenaAllocator.init(gpa);
-            defer aa.deinit();
-            const a = aa.allocator();
-            if (!try self.exists("information_schema.tables", "TABLE_SCHEMA", cfg.database, table)) {
-                if (!try self.exists("information_schema.schemata", "SCHEMA_NAME", cfg.database, null)) {
-                    try self.runDDL(try msgfmt.allocPrint(a, "CREATE DATABASE IF NOT EXISTS {s}", .{try sql.quoteName(a, cfg.flavor.dialect(), cfg.database)}));
-                }
-                try self.runDDL(try genCreateTable(a, cfg.flavor, cfg.database, table, schema, mode, cfg.buckets, cfg.replication_num));
+        var aa = std.heap.ArenaAllocator.init(gpa);
+        defer aa.deinit();
+        const a = aa.allocator();
+        if (cfg.auto_create) if (!try self.exists("information_schema.tables", "TABLE_SCHEMA", cfg.database, table)) {
+            if (!try self.exists("information_schema.schemata", "SCHEMA_NAME", cfg.database, null)) {
+                try self.runDDL(try msgfmt.allocPrint(a, "CREATE DATABASE IF NOT EXISTS {s}", .{try sql.quoteName(a, cfg.flavor.dialect(), cfg.database)}));
             }
-
-            if (mode == .overwrite) {
-                try self.runDDL(try msgfmt.allocPrint(a, "TRUNCATE TABLE {s}", .{try qualified(a, cfg.flavor, cfg.database, table)}));
-            }
-        }
+            try self.runDDL(try genCreateTable(a, cfg.flavor, cfg.database, table, schema, mode, cfg.buckets, cfg.replication_num));
+        };
+        if (mode == .overwrite) try self.runDDL(try msgfmt.allocPrint(a, "TRUNCATE TABLE {s}", .{try qualified(a, cfg.flavor, cfg.database, table)}));
         self.setup_ns = (try std.time.Instant.now()).since(self.opened);
         return self;
     }

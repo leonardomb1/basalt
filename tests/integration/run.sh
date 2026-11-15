@@ -791,6 +791,17 @@ LOAD INTO sr.it_strict APPEND AS SELECT 1 AS id, 'abcdefgh' AS s;" >"$out/sr_str
     report "starrocks-strict" ok
   fi
 
+  # REPLACE truncates the table first whether or not `auto_create` may create it;
+  # with `auto_create = false` the TRUNCATE was skipped and REPLACE appended.
+  $B run -q -c "$SR_CONN LOAD INTO sr.it_replace_nc REPLACE AS SELECT * FROM RANGE(3);" >/dev/null 2>&1
+  if brun run -c "CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '', auto_create = false);
+LOAD INTO sr.it_replace_nc REPLACE AS SELECT 7 AS range;"; then
+    n=$($B run --format csv -q -c "$SR_CONN SELECT count(*) AS n FROM sr.it_replace_nc;" 2>&1 | tail -1)
+    if [ "$n" = 1 ]; then report starrocks-replace-no-autocreate ok; else report "starrocks-replace-no-autocreate ($n rows, not 1)" bad; fi
+  else
+    report "starrocks-replace-no-autocreate (run error)" bad
+  fi
+
   # read back through a starrocks connection, so the starrocks dialect renders it
   topnrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_topn"
   paramrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');"
