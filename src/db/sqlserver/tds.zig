@@ -210,10 +210,27 @@ pub const Conn = struct {
             "SET NUMERIC_ROUNDABORT OFF; SET IMPLICIT_TRANSACTIONS OFF");
     }
 
+    /// Run a batch for its effect (DDL, a SET, a swap), its reply read to the last DONE
+    /// (`TdsCursor.drainBatch`): a result set it returns is read and dropped, so an
+    /// ERROR after it still fails the batch.
     pub fn exec(self: *Conn, statement: []const u8) !void {
         try self.sendBatch(statement);
-        try self.readMessage();
-        try self.scanResultTokens();
+        const cur = try self.wire.gpa.create(TdsCursor);
+        defer self.wire.gpa.destroy(cur);
+        cur.* = .{
+            .gpa = self.wire.gpa,
+            .conn = self,
+            .reader = PacketReader.init(self.wire.gpa, self.wire.rd()),
+            .meta_arena = std.heap.ArenaAllocator.init(self.wire.gpa),
+            .cols = &.{},
+            .schema = undefined,
+            .done = false,
+        };
+        defer {
+            cur.reader.deinit();
+            cur.meta_arena.deinit();
+        }
+        return cur.drainBatch();
     }
 
     /// Scan a reply's tokens; an ERROR token sets `last_error` and returns QueryFailed.
@@ -1101,6 +1118,68 @@ const TdsCursor = struct {
         }
     }
 
+    /// A batch `exec` ran, read to its last DONE: rows are parsed and dropped, every
+    /// statement's ERROR is read and the first one's text kept, failing the batch once
+    /// its reply is whole so the connection stays in step, and a transaction's
+    /// descriptor and the last DONE count are noted on the connection.
+    fn drainBatch(self: *TdsCursor) !void {
+        var rows = std.heap.ArenaAllocator.init(self.gpa);
+        defer rows.deinit();
+        var builders: []column.Builder = &.{};
+        var n: usize = 0;
+        var failed = false;
+        while (true) {
+            const token = self.reader.readByte() catch |e| {
+                if (e == error.EndOfMessage) break;
+                return e;
+            };
+            switch (token) {
+                0x81 => {
+                    try self.parseColMeta(self.meta_arena.allocator());
+                    builders = try self.rowBuilders(&rows);
+                    n = 0;
+                },
+                0xD1, 0xD2 => {
+                    if (self.cols.len == 0) return error.TdsProtocol;
+                    if (n == sql.STREAM_ROWS) {
+                        builders = try self.rowBuilders(&rows);
+                        n = 0;
+                    }
+                    try self.parseRow(rows.allocator(), builders, token == 0xD2);
+                    n += 1;
+                },
+                0xAA, 0xE3 => {
+                    const body = try self.reader.readSlice(self.gpa, try self.reader.readU16());
+                    defer self.gpa.free(body);
+                    if (token == 0xE3) {
+                        self.conn.noteEnvChange(body);
+                    } else if (!failed) {
+                        self.conn.wire.putError(try errorText(self.gpa, body));
+                        failed = true;
+                    }
+                },
+                0xAB, 0xA9, 0xA4, 0xA5 => try self.reader.skip(try self.reader.readU16()),
+                0x79 => try self.reader.skip(4),
+                0xFD, 0xFE, 0xFF => {
+                    var d: [12]u8 = undefined;
+                    try self.reader.readBytes(&d);
+                    if (parseDoneRowCount(token, &d)) |c| self.conn.last_done_count = c;
+                    if (std.mem.readInt(u16, d[0..2], .little) & 0x0001 == 0) break;
+                },
+                else => return error.TdsProtocol,
+            }
+        }
+        if (failed) return error.QueryFailed;
+    }
+
+    /// Fresh builders for the current columns' rows, the previous rows freed.
+    fn rowBuilders(self: *TdsCursor, rows: *std.heap.ArenaAllocator) ![]column.Builder {
+        _ = rows.reset(.retain_capacity);
+        const out = try rows.allocator().alloc(column.Builder, self.cols.len);
+        for (self.cols, out) |c, *b| b.* = column.Builder.init(rows.allocator(), c.engine_type);
+        return out;
+    }
+
     fn handleError(self: *TdsCursor) !void {
         const len = try self.reader.readU16();
         const body = try self.reader.readSlice(self.gpa, len);
@@ -1650,6 +1729,44 @@ fn framePackets(a: std.mem.Allocator, payload: []const u8, chunk: usize) ![]cons
         off += n;
     }
     return stream.items;
+}
+
+test "exec reads a batch to its last DONE: a result set is dropped, an ERROR after it fails the batch, a BEGIN TRANSACTION is noted" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const colmeta = [_]u8{ 0x81, 1, 0, 0, 0, 0, 0, 0, 0, 0x38, 1, 'c', 0 };
+    const row = [_]u8{ 0xD1, 7, 0, 0, 0 };
+    const done_more = [_]u8{ 0xFD, 0x11, 0, 0xC1, 0, 1, 0, 0, 0, 0, 0, 0, 0 };
+    const begin_txn = [_]u8{ 0xE3, 11, 0, 8, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0 };
+    const err = [_]u8{ 0xAA, 18, 0, 0x51, 0xC3, 0, 0, 1, 16, 4, 0, 'b', 0, 'o', 0, 'o', 0, 'm', 0, 0, 0 };
+    const done_err = [_]u8{ 0xFD, 0x02, 0, 0xC1, 0 } ++ [_]u8{0} ** 8;
+    const cases = [_]struct { payload: []const u8, fails: bool }{
+        .{ .payload = &(colmeta ++ row ++ row ++ done_more ++ begin_txn ++ err ++ done_err), .fails = true },
+        .{ .payload = &(colmeta ++ row ++ done_more ++ begin_txn ++ done_final), .fails = false },
+    };
+    for (cases) |c| {
+        var conn: Conn = .{ .wire = .{ .gpa = gpa, .stream = undefined, .msg = .init(gpa) } };
+        defer conn.wire.msg.deinit();
+        defer if (conn.wire.last_error.len > 0) gpa.free(conn.wire.last_error);
+        var src = std.Io.Reader.fixed(try framePackets(a, c.payload, 16));
+        const cur = try gpa.create(TdsCursor);
+        defer gpa.destroy(cur);
+        cur.* = .{ .gpa = gpa, .conn = &conn, .reader = PacketReader.init(gpa, &src), .meta_arena = std.heap.ArenaAllocator.init(gpa), .cols = &.{}, .schema = undefined, .done = false };
+        defer {
+            cur.reader.deinit();
+            cur.meta_arena.deinit();
+        }
+        if (c.fails) {
+            try std.testing.expectError(error.QueryFailed, cur.drainBatch());
+            try std.testing.expectEqualStrings("boom", conn.wire.last_error);
+        } else {
+            try cur.drainBatch();
+            try std.testing.expectEqual(@as(?u64, 1), conn.last_done_count);
+        }
+        try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &conn.txn_desc);
+    }
 }
 
 test "a rowset cut off before its DONE, by a closed socket, an early EOM or an unknown token, is an error, never a short read" {
