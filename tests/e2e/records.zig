@@ -11,7 +11,7 @@ const checkAndRun = harness.checkAndRun;
 const expectRefusedAlike = harness.expectRefusedAlike;
 const expectFile = harness.expectFile;
 
-test "lines, fixed, split and chunks: n, offset and the raw record" {
+test "lines, fixed, split and chunks: n, offset and the raw record, base64 in a CSV as BYTES are" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -19,10 +19,10 @@ test "lines, fixed, split and chunks: n, offset and the raw record" {
     try tmp.dir.writeFile(.{ .sub_path = "f.txt", .data = "abc\r\ndef\nghi\n" });
     try tmp.dir.writeFile(.{ .sub_path = "e.edi", .data = "ISA*1'GS*2'ST'\n" });
     try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT n, offset, rec, length(rec) AS len FROM lines('$B/l.txt');", 1, &.{});
-    try expectFile(&tmp, "o.csv", "n,offset,rec,len\n1,0,a,1\n2,3,bb,2\n3,6,\"\",0\n4,7,ccc,3\n");
-    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT n, offset, rec FROM fixed('$B/f.txt', 3, TRUE);", 1, &.{});
+    try expectFile(&tmp, "o.csv", "n,offset,rec,len\n1,0,YQ==,1\n2,3,YmI=,2\n3,6,\"\",0\n4,7,Y2Nj,3\n");
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT n, offset, CAST(rec AS STRING) AS rec FROM fixed('$B/f.txt', 3, TRUE);", 1, &.{});
     try expectFile(&tmp, "o.csv", "n,offset,rec\n1,0,abc\n2,5,def\n3,9,ghi\n");
-    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT n, offset, rec FROM split('$B/e.edi', '''') WHERE offset > 0;", 1, &.{});
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT n, offset, CAST(rec AS STRING) AS rec FROM split('$B/e.edi', '''') WHERE offset > 0;", 1, &.{});
     try expectFile(&tmp, "o.csv", "n,offset,rec\n2,6,GS*2\n3,11,ST\n");
     try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT n, offset, length(rec) AS len FROM chunks('$B/l.txt', 4);", 1, &.{});
     try expectFile(&tmp, "o.csv", "n,offset,len\n1,0,4\n2,4,4\n3,8,2\n");
@@ -36,7 +36,7 @@ test "records read through the stream: a gzipped file and a zip member" {
     try checkAndRun(alloc, &tmp, "LOAD INTO '$B/g.csv.gz' AS SELECT range AS v FROM RANGE(3000);", 1, &.{});
     try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT count(*) AS c, max(n) AS m, sum(length(rec)) AS b FROM lines('$B/g.csv.gz');", 1, &.{});
     try expectFile(&tmp, "o.csv", "c,m,b\n3001,3001,10891\n");
-    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT n, rec FROM lines('$B/t.zip :: a.csv');", 1, &.{});
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT n, CAST(rec AS STRING) AS rec FROM lines('$B/t.zip :: a.csv');", 1, &.{});
     try expectFile(&tmp, "o.csv", "n,rec\n1,\"id,v\"\n2,\"1,x\"\n3,\"2,y\"\n");
 }
 
@@ -48,12 +48,12 @@ test "a record source's path and sizes are constants: params, LETs, loop variabl
     try checkAndRun(alloc, &tmp,
         \\PARAM w INT DEFAULT 2;
         \\LET stem = 'x';
-        \\LOAD INTO '$B/o.csv' AS SELECT n, rec FROM fixed('$B/' || $stem || '.txt', $w + 1);
+        \\LOAD INTO '$B/o.csv' AS SELECT n, CAST(rec AS STRING) AS rec FROM fixed('$B/' || $stem || '.txt', $w + 1);
     , 1, &.{});
     try expectFile(&tmp, "o.csv", "n,rec\n1,abc\n2,def\n");
     try checkAndRun(alloc, &tmp,
         \\FOR EACH ROW OF (SELECT 'x' AS f) AS (f)
-        \\  LOAD INTO '$B/o.csv' AS SELECT n, rec FROM chunks('$B/' || $f || '.txt', 4);
+        \\  LOAD INTO '$B/o.csv' AS SELECT n, CAST(rec AS STRING) AS rec FROM chunks('$B/' || $f || '.txt', 4);
         \\END FOR;
     , 1, &.{});
     try expectFile(&tmp, "o.csv", "n,rec\n1,abcd\n2,ef\n");

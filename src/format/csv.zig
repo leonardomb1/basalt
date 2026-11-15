@@ -1131,6 +1131,16 @@ fn CsvText(comptime quote_scalars: bool) type {
         pub fn string(self: @This(), w: *std.Io.Writer, s: []const u8) !void {
             return writeField(w, s, self.delim);
         }
+
+        /// Base64, as JSON, XML and Excel write it and `CAST(… AS BYTES)` reads it
+        /// back, never the raw bytes, which may hold a NUL, a quote or a line break;
+        /// quoted when empty, so it is not NULL, or under a delimiter its alphabet holds.
+        pub fn bytes(self: @This(), w: *std.Io.Writer, s: []const u8) !void {
+            const q = s.len == 0 or std.ascii.isAlphanumeric(self.delim) or self.delim == '+' or self.delim == '/' or self.delim == '=';
+            if (q) try w.writeByte('"');
+            try std.base64.standard.Encoder.encodeWriter(w, s);
+            if (q) try w.writeByte('"');
+        }
     };
 }
 
@@ -2250,7 +2260,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
             "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
-            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "\"\"\ncGxhaW4=\nAQIgXCAJCiI=\nw7M=\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
             "1970-01-01 00:00:00\n2024-01-01 00:00:00.123456\n1969-12-31 23:59:59.999999\n0001-01-01 00:00:00\n\n",
@@ -2263,7 +2273,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
             "\"\"\nplain\n\"tab\there\"\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\na,b;c:d.e-1 0\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
-            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "\"\"\ncGxhaW4=\nAQIgXCAJCiI=\nw7M=\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
             "1970-01-01 00:00:00\n2024-01-01 00:00:00.123456\n1969-12-31 23:59:59.999999\n0001-01-01 00:00:00\n\n",
@@ -2276,7 +2286,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "\"0.1\"\n0\n-0\n\"" ++ tiny ++ "\"\n1000000000000000000000\n\"-2.25\"\nnan\ninf\n-inf\n\n",
             "\"123.45\"\n\"-0.0007\"\n5\n\"0.12345\"\n\"-18446744073709.551615\"\n\"0.00\"\n\n",
             "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
-            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "\"\"\ncGxhaW4=\nAQIgXCAJCiI=\nw7M=\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "00:00:00\n\"01:02:03.000001\"\n\"23:59:59.999999\"\n\n",
             "1970-01-01 00:00:00\n\"2024-01-01 00:00:00.123456\"\n\"1969-12-31 23:59:59.999999\"\n0001-01-01 00:00:00\n\n",
@@ -2289,7 +2299,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0.1\n0\n\"-0\"\n" ++ tiny ++ "\n1000000000000000000000\n\"-2.25\"\nnan\ninf\n\"-inf\"\n\n",
             "123.45\n\"-0.0007\"\n5\n0.12345\n\"-18446744073709.551615\"\n0.00\n\n",
             "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
-            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "\"\"\ncGxhaW4=\nAQIgXCAJCiI=\nw7M=\n\n",
             "\"1970-01-01\"\n\"2024-01-01\"\n\"0000-01-01\"\n\"-5877641-06-24\"\n\n",
             "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
             "\"1970-01-01 00:00:00\"\n\"2024-01-01 00:00:00.123456\"\n\"1969-12-31 23:59:59.999999\"\n\"0001-01-01 00:00:00\"\n\n",
@@ -2302,7 +2312,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
             "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
-            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "\"\"\ncGxhaW4=\nAQIgXCAJCiI=\nw7M=\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "\"00:00:00\"\n\"01:02:03.000001\"\n\"23:59:59.999999\"\n\n",
             "\"1970-01-01 00:00:00\"\n\"2024-01-01 00:00:00.123456\"\n\"1969-12-31 23:59:59.999999\"\n\"0001-01-01 00:00:00\"\n\n",
@@ -2315,7 +2325,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
             "\"\"\nplain\n\"tab\there\"\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\n\"O'Brien\"\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\n\"sixteen bytes and more\x01\"\n\n",
-            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "\"\"\n\"cGxhaW4=\"\n\"AQIgXCAJCiI=\"\n\"w7M=\"\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
             "1970-01-01 00:00:00\n2024-01-01 00:00:00.123456\n1969-12-31 23:59:59.999999\n0001-01-01 00:00:00\n\n",
@@ -2328,7 +2338,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "\"0.1\"\n\"0\"\n\"-0\"\n\"" ++ tiny ++ "\"\n\"1000000000000000000000\"\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n\"-0.0007\"\n5\n\"0.12345\"\n\"-18446744073709.551615\"\n\"0.00\"\n\n",
             "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\\N \nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\xc3\xb3 \xf0\x9f\x98\x80\n\x00nul\nsixteen bytes and more\x01\n\n",
-            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "\"\"\n\"cGxhaW4=\"\n\"AQIgXCAJCiI=\"\n\"w7M=\"\n\n",
             "\"1970-01-01\"\n\"2024-01-01\"\n\"0000-01-01\"\n\"-5877641-06-24\"\n\n",
             "\"00:00:00\"\n\"01:02:03.000001\"\n23:59:59.999999\n\n",
             "\"1970-01-01 00:00:00\"\n\"2024-01-01 00:00:00.123456\"\n1969-12-31 23:59:59.999999\n\"0001-01-01 00:00:00\"\n\n",
@@ -2341,7 +2351,7 @@ test "csv writer: rows of every kind, for every kind of delimiter" {
             "0.1\n0\n-0\n" ++ tiny ++ "\n1000000000000000000000\n-2.25\nnan\ninf\n-inf\n\n",
             "123.45\n-0.0007\n5\n0.12345\n-18446744073709.551615\n0.00\n\n",
             "\"\"\nplain\ntab\there\n\"line\nbreak\"\n\"cr\rlf\r\n\"\n\"say \"\"hi\"\"\"\nO'Brien\nback\\slash\\\na\\Nb\n\"\\N \"\nNULL\na\x01b\x02c\n\"a,b;c:d.e-1 0\"\n\"\xc3\xb3 \xf0\x9f\x98\x80\"\n\x00nul\n\"sixteen bytes and more\x01\"\n\n",
-            "\"\"\nplain\n\"\x01\x02 \\ \t\n\"\"\"\n\xc3\xb3\n\n",
+            "\"\"\ncGxhaW4=\nAQIgXCAJCiI=\nw7M=\n\n",
             "1970-01-01\n2024-01-01\n0000-01-01\n-5877641-06-24\n\n",
             "00:00:00\n01:02:03.000001\n23:59:59.999999\n\n",
             "\"1970-01-01 00:00:00\"\n\"2024-01-01 00:00:00.123456\"\n\"1969-12-31 23:59:59.999999\"\n\"0001-01-01 00:00:00\"\n\n",

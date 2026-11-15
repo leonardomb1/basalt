@@ -19,6 +19,7 @@ const Batch = @import("../exec/batch.zig").Batch;
 const celltext = @import("../exec/celltext.zig");
 const textconv = @import("../exec/textconv.zig");
 const driver = @import("../exec/driver.zig");
+const hex = @import("../base/hex.zig");
 
 pub const Grid = struct {
     names: []const []const u8,
@@ -117,7 +118,7 @@ pub const TableWriter = struct {
             const overflow = self.tty and self.nrows >= keep_max;
             const into = if (overflow) self.gpa else kept;
             for (batch.columns, 0..) |*col, c| {
-                const s: ?[]const u8 = if (celltext.isNull(col, r)) null else try into.dupe(u8, celltext.text(col, r, &buf, celltext.Plain{}));
+                const s: ?[]const u8 = if (celltext.isNull(col, r)) null else if (col.ty.kind == .bytes) try bytesCell(into, col.data.bytes.at(r)) else try into.dupe(u8, celltext.text(col, r, &buf, celltext.Plain{}));
                 if (!overflow) {
                     try self.cells.append(s);
                 } else if (self.tail.items.len < tail_rows * self.ncols) {
@@ -256,6 +257,16 @@ pub const palette = struct {
         };
     }
 };
+
+/// A BYTES cell as PostgreSQL shows one, `\x` and its hex, so a NUL, an escape or
+/// a line break in it can neither break the grid nor reach the terminal.
+fn bytesCell(into: std.mem.Allocator, b: []const u8) ![]const u8 {
+    const out = try into.alloc(u8, 2 + 2 * b.len);
+    out[0] = '\\';
+    out[1] = 'x';
+    _ = hex.encode(out[2..], b, .lower);
+    return out;
+}
 
 pub const TermSize = struct { cols: usize = 80, rows: usize = 24 };
 
@@ -551,7 +562,7 @@ test "table cells of every kind" {
         "[0.1] [0] [-0] [" ++ tiny ++ "] [1000000000000000000000] [-2.25] [nan] [inf] [-inf] null",
         "[123.45] [-0.0007] [5] [0.12345] [-18446744073709.551615] [0.00] null",
         "[] [plain] [tab\there] [line\nbreak] [cr\rlf\r\n] [say \"hi\"] [O'Brien] [back\\slash\\] [a\\Nb] [\\N ] [NULL] [a\x01b\x02c] [a,b;c:d.e-1 0] [\xc3\xb3 \xf0\x9f\x98\x80] [\x00nul] [sixteen bytes and more\x01] null",
-        "[] [plain] [\x01\x02 \\ \t\n\"] [\xc3\xb3] null",
+        "[\\x] [\\x706c61696e] [\\x0102205c20090a22] [\\xc3b3] null",
         "[1970-01-01] [2024-01-01] [0000-01-01] [-5877641-06-24] null",
         "[00:00:00] [01:02:03.000001] [23:59:59.999999] null",
         "[1970-01-01 00:00:00] [2024-01-01 00:00:00.123456] [1969-12-31 23:59:59.999999] [0001-01-01 00:00:00] null",

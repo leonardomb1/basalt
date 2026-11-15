@@ -49,7 +49,9 @@ text, bytes as base64), and a `LOAD` run emits one summary object instead.
 a `.csv` sink quotes them, a null as an empty field — and nothing else: no rule,
 no `(N rows)` footer, so `| wc -l`, `| cut` and `| column -t` see only data. The
 default `table` is for reading and does close with `(N rows)`, on stdout, the way
-`psql` does; reach for `csv`, `tsv` or `json` when a program is the reader.
+`psql` does; reach for `csv`, `tsv` or `json` when a program is the reader. It
+shows a `BYTES` cell as PostgreSQL does, `\x` and its hex (`\x0a00ff`), and
+`csv` and `tsv` write it as base64, as a `.csv` sink does.
 `--format arrow` emits the `SELECT` as an Arrow IPC stream — one record batch
 per engine batch, typed (`DECIMAL` as decimal128, dates as date32, times and
 timestamps in microseconds), readable with `pyarrow.ipc.open_stream`,

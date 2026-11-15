@@ -42,6 +42,12 @@ type, as SQL types a NULL: it compares and unifies with any type (`id NOT IN
 is a string where shown or written. A larger file's empty sample stays a string,
 since the rows past it may hold text.
 
+A CSV is written as it is read back: a null is an empty field and an empty
+string `""`. A `BYTES` cell is written as base64 (an empty one `""`), as JSON, XML
+and Excel write it, never as its raw bytes, which may hold a NUL, a quote or a
+line break; `from_base64(col)` reads it back, and `CAST(rec AS STRING)` writes
+a record source's `rec` as the text it holds.
+
 ## Parquet
 
 Parquet reads use column projection, row-group skipping from statistics, and
