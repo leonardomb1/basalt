@@ -789,6 +789,34 @@ test "sql: a loop variable is typed after its name, as a PARAM is, and a string 
     try testing.expectEqualStrings("", un.discover_json);
 }
 
+test "sql: a grouped query calling a function nothing defines names the function, not the column it reads" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Builtins = struct {
+        fn is(name: []const u8) bool {
+            return std.mem.eql(u8, name, "upper");
+        }
+    };
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const grouped = "SELECT g, {s}(v) AS x FROM 'in.csv' GROUP BY g;";
+    try testing.expectError(error.ParseFailed, parseSourceOpts(a, try std.fmt.allocPrint(a, grouped, .{"nosuchagg"}), &diag, .{ .is_builtin = Builtins.is }));
+    try testing.expectEqualStrings("unknown function `nosuchagg`: no builtin, aggregate or function of this script has that name", diag.msg);
+    try testing.expectEqual(@as(u32, 11), diag.col);
+    const plain = "`v` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY";
+    for ([_][]const u8{
+        try std.fmt.allocPrint(a, grouped, .{"upper"}),
+        try std.fmt.allocPrint(a, "{s}\nCREATE FUNCTION later(x) AS x + 1;", .{try std.fmt.allocPrint(a, grouped, .{"later"})}),
+    }) |src| {
+        try testing.expectError(error.ParseFailed, parseSourceOpts(a, src, &diag, .{ .is_builtin = Builtins.is }));
+        try testing.expectEqualStrings(plain, diag.msg);
+    }
+    try testing.expectError(error.ParseFailed, parseSourceOpts(a, try std.fmt.allocPrint(a, grouped, .{"shared"}), &diag, .{ .is_builtin = Builtins.is, .known_names = &.{"shared"} }));
+    try testing.expectEqualStrings(plain, diag.msg);
+    try testing.expectError(error.ParseFailed, parseSourceOpts(a, try std.fmt.allocPrint(a, grouped, .{"nosuchagg"}), &diag, .{}));
+    try testing.expectEqualStrings(plain, diag.msg);
+}
+
 test "sql: an error names `||` as written, not a lone bar" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

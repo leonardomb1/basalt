@@ -38,6 +38,7 @@ const Parser = @import("../sql_parser.zig").Parser;
 const Error = @import("../sql_parser.zig").Error;
 const Pos = @import("../sql_parser.zig").Pos;
 const aggregates = @import("../aggregates.zig");
+const stats = @import("stats.zig");
 const ast = @import("../ast.zig");
 const civil = @import("../../base/civil.zig");
 const std = @import("std");
@@ -525,7 +526,37 @@ pub fn groupedOnly(self: *Parser, e: *ast.Expr, group: []const ast.QualName, agg
     _ = try S.recur(.{ .p = self, .group = group, .aggs = aggs, .calls = calls, .bad = &bad }, e);
     if (bad) |q| if (std.mem.startsWith(u8, q.last(), "__sq"))
         return self.fail(pos, "a correlated subquery in the SELECT list of a grouped query is not supported outside an aggregate — it is evaluated per input row; wrap it in an aggregate, or group in a derived table and correlate the query around it", .{});
-    if (bad) |q| return self.fail(pos, "`{s}` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY", .{try self.spelled(q)});
+    if (bad) |q| {
+        if (try unknownCall(self, e)) |c| return self.fail(if (c.span) |sp| sp.start else pos, "unknown function `{s}`: no builtin, aggregate or function of this script has that name", .{c.name});
+        return self.fail(pos, "`{s}` is neither an aggregate nor a grouping key — wrap it in an aggregate, or name it in GROUP BY", .{try self.spelled(q)});
+    }
+}
+
+/// The first call in `e` to a name nothing defines: no scalar builtin (asked only
+/// when the caller handed the parser `is_builtin`), aggregate, statistic, or
+/// function this script or its includes declare. A misspelled aggregate is then
+/// named for itself rather than for the column it reads.
+fn unknownCall(self: *Parser, e: *ast.Expr) Error!?ast.Expr.Call {
+    const is_builtin = self.is_builtin orelse return null;
+    const Ctx = struct { p: *Parser, is_builtin: *const fn ([]const u8) bool, found: *?ast.Expr.Call };
+    const S = struct {
+        fn recur(cx: Ctx, node: *const ast.Expr) Error!*ast.Expr {
+            if (cx.found.* == null and node.* == .call and !known(cx, node.call.name)) cx.found.* = node.call;
+            return ast.rebuildExpr(cx.p.arena, node, cx, recur);
+        }
+        fn known(cx: Ctx, name: []const u8) bool {
+            if (cx.is_builtin(name) or aggregates.lookup(name) != null or stats.isStat(name)) return true;
+            for (cx.p.known_names) |k| if (std.ascii.eqlIgnoreCase(k, name)) return true;
+            const toks = cx.p.toks;
+            for (toks, 0..) |t, i| {
+                if (t.tag == .ident and std.ascii.eqlIgnoreCase(t.text, "function") and i + 1 < toks.len and std.ascii.eqlIgnoreCase(toks[i + 1].text, name)) return true;
+            }
+            return false;
+        }
+    };
+    var found: ?ast.Expr.Call = null;
+    _ = try S.recur(.{ .p = self, .is_builtin = is_builtin, .found = &found }, e);
+    return found;
 }
 
 /// `e` with each part that a computed grouping key spells (through the SELECT

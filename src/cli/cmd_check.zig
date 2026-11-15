@@ -38,7 +38,7 @@ pub fn checkText(a: std.mem.Allocator, text: []const u8, label: []const u8, dir:
     for (opts.known) |k| try names.append(k.name);
     var perrs = std.array_list.Managed(parser.Diagnostic).init(a);
     var idiag: include.Diag = .{};
-    const prog = include.loadProgramOpts(a, text, label, dir, &idiag, .{ .parse = .{ .known_tables = names.items, .errors = &perrs }, .remote = opts.remote }) catch |e| switch (e) {
+    const prog = include.loadProgramOpts(a, text, label, dir, &idiag, .{ .parse = .{ .known_tables = names.items, .errors = &perrs, .is_builtin = @import("../exec/builtins.zig").isBuiltin }, .remote = opts.remote }) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.ParseFailed => {
             const p = idiag.parse;

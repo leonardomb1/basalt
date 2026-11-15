@@ -79,6 +79,7 @@ pub fn loadProgramOpts(
         .stack = std.array_list.Managed(Frame).init(arena),
         .memo = std.StringHashMap(ast.Program).init(arena),
         .known_tables = opts.parse.known_tables,
+        .is_builtin = opts.parse.is_builtin,
         .errors = opts.parse.errors,
         .files = std.array_list.Managed([]const u8).init(arena),
         .aliases = std.StringHashMap([]const u8).init(arena),
@@ -111,6 +112,7 @@ const Ctx = struct {
     depth: u32 = 0,
     stmt_budget: usize = max_total_stmts,
     known_tables: []const []const u8 = &.{},
+    is_builtin: ?*const fn ([]const u8) bool = null,
     errors: ?*std.array_list.Managed(parser.Diagnostic) = null,
     files: std.array_list.Managed([]const u8),
     aliases: std.StringHashMap([]const u8),
@@ -233,9 +235,11 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
     if (has_body) {
         var known = std.array_list.Managed(ast.Connection).init(ctx.arena);
         var known_fns = std.array_list.Managed(ast.FnDecl).init(ctx.arena);
+        var known_names = std.array_list.Managed([]const u8).init(ctx.arena);
         for (seen.items) |sp| for (stmtsOf(sp)) |st| {
             if (st == .connection) try known.append(st.connection);
             if (st == .func and st.func.body == .table) try known_fns.append(st.func);
+            if (st == .func) try known_names.append(st.func.name);
         };
         var own = std.array_list.Managed([]const u8).init(ctx.arena);
         if (namespace) |ns| for (same_ns.items) |sp| for (stmtsOf(sp)) |st| if (st == .func) {
@@ -248,6 +252,8 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
             .known_conns = known.items,
             .known_fns = known_fns.items,
             .known_tables = ctx.known_tables,
+            .is_builtin = ctx.is_builtin,
+            .known_names = known_names.items,
             .errors = if (ctx.depth == 0) ctx.errors else null,
             .file = file,
             .aliases = my_aliases.items,
@@ -951,4 +957,25 @@ test "@include AS: an alias is private to its file, so two libraries may both us
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'a/lib.sql' AS a;\nSELECT u.g(1) AS x;\n", "m.sql", base, &diag));
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'a/lib.sql' AS a;\nSELECT a.h(1) AS x;\n", "m.sql", base, &diag));
     try testing.expect(std.mem.startsWith(u8, diag.parse.msg, "`a.h` is private to `"));
+}
+
+test "a grouped query's unknown function is told from one an included file declares" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(&tmp, "fns.sql", "CREATE FUNCTION shared(x) AS x + 1;\n");
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const Builtins = struct {
+        fn is(_: []const u8) bool {
+            return false;
+        }
+    };
+    var diag: Diag = .{};
+    const opts = Options{ .parse = .{ .is_builtin = Builtins.is } };
+    try testing.expectError(error.ParseFailed, loadProgramOpts(a, "@include 'fns.sql';\nSELECT g, shared(v) AS x FROM 'in.csv' GROUP BY g;\n", "m.sql", base, &diag, opts));
+    try testing.expect(std.mem.startsWith(u8, diag.parse.msg, "`v` is neither an aggregate"));
+    try testing.expectError(error.ParseFailed, loadProgramOpts(a, "@include 'fns.sql';\nSELECT g, sharde(v) AS x FROM 'in.csv' GROUP BY g;\n", "m.sql", base, &diag, opts));
+    try testing.expectEqualStrings("unknown function `sharde`: no builtin, aggregate or function of this script has that name", diag.parse.msg);
 }

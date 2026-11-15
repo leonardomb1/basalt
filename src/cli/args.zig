@@ -226,7 +226,7 @@ test "wantsJsonLog: the last --log-format wins" {
 /// it. An error in an included file names that file's path and lines.
 pub fn parseSrcTo(arena: std.mem.Allocator, src: Source, eo: ErrOut) !?ast.Program {
     var diag: include.Diag = .{};
-    return include.loadProgramOpts(arena, src.text, src.label, src.dir, &diag, .{ .fetch = include_fetch.fetch() }) catch |e| switch (e) {
+    return include.loadProgramOpts(arena, src.text, src.label, src.dir, &diag, .{ .fetch = include_fetch.fetch(), .parse = .{ .is_builtin = @import("../exec/builtins.zig").isBuiltin } }) catch |e| switch (e) {
         error.ParseFailed => {
             const p = diag.parse;
             try eo.report(.{

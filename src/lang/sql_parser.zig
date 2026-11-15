@@ -97,6 +97,12 @@ pub const Options = struct {
     known_conns: []const ast.Connection = &.{},
     known_fns: []const ast.FnDecl = &.{},
     known_tables: []const []const u8 = &.{},
+    /// Whether a name is a scalar builtin, which this layer cannot ask the engine;
+    /// with it, a grouped query calling a function nothing defines is refused as
+    /// that, rather than for the column the call reads.
+    is_builtin: ?*const fn ([]const u8) bool = null,
+    /// The functions the program's other files (its includes) declare.
+    known_names: []const []const u8 = &.{},
     errors: ?*std.array_list.Managed(Diagnostic) = null,
     file: u16 = 0,
     aliases: []const []const u8 = &.{},
@@ -128,6 +134,8 @@ pub fn parseSourceOpts(arena: std.mem.Allocator, src: []const u8, diag: *Diagnos
     p.known_conns = opts.known_conns;
     p.known_fns = opts.known_fns;
     p.known_tables = opts.known_tables;
+    p.is_builtin = opts.is_builtin;
+    p.known_names = opts.known_names;
     p.errors = opts.errors;
     return p.parseProgram();
 }
@@ -495,6 +503,8 @@ pub const Parser = struct {
     known_conns: []const ast.Connection = &.{},
     known_fns: []const ast.FnDecl = &.{},
     known_tables: []const []const u8 = &.{},
+    is_builtin: ?*const fn ([]const u8) bool = null,
+    known_names: []const []const u8 = &.{},
     errors: ?*std.array_list.Managed(Diagnostic) = null,
     table_fns: std.array_list.Managed(ast.FnDecl) = undefined,
     tvf: ?*TableFrame = null,

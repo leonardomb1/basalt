@@ -80,7 +80,7 @@ pub fn prepareEntry(a: std.mem.Allocator, decls: *const DeclStore, block: []cons
     const entry_at = joined.entry_at;
     if (text_out) |t| t.* = text;
 
-    const prog = include.loadProgramOpts(a, text, "<repl>", ".", diag, .{ .fetch = include_fetch.fetch() }) catch |e| switch (e) {
+    const prog = include.loadProgramOpts(a, text, "<repl>", ".", diag, .{ .fetch = include_fetch.fetch(), .parse = .{ .is_builtin = @import("../exec/builtins.zig").isBuiltin } }) catch |e| switch (e) {
         error.ParseFailed => return error.ParseFailed,
         error.OutOfMemory => return error.OutOfMemory,
     };
