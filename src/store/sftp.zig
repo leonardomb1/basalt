@@ -369,8 +369,8 @@ pub const Client = struct {
         }
     }
 
-    /// Uses posix-rename@openssh.com when offered; plain RENAME refuses an existing
-    /// target, so that is removed first.
+    /// Uses posix-rename@openssh.com when offered; else `renameOver`, as a plain
+    /// RENAME may refuse an existing target.
     fn rename(self: *Client, from: []const u8, to: []const u8) !void {
         if (self.posix_rename) {
             const id = try self.begin(fxp.extended);
@@ -380,7 +380,12 @@ pub const Client = struct {
             try self.finish();
             return self.statusOf(try self.replyFor(id));
         }
-        self.remove(to) catch {};
+        var buf: [std.fs.max_path_bytes + 32]u8 = undefined;
+        const keep = std.fmt.bufPrint(&buf, "{s}.basalt-old-{x:0>8}", .{ to, std.crypto.random.int(u32) }) catch return error.NameTooLong;
+        return renameOver(self, from, to, keep);
+    }
+
+    fn plainRename(self: *Client, from: []const u8, to: []const u8) !void {
         const id = try self.begin(fxp.rename);
         try self.out.str(from);
         try self.out.str(to);
@@ -628,6 +633,60 @@ const Proto = struct {
         return c.listDir(arena, dir) catch |e| return noted(c, e);
     }
 };
+
+/// `from` moved over `to` with a RENAME that may refuse an existing target: tried as
+/// is, then with the old `to` set aside as `keep` first, put back if the second
+/// RENAME fails and removed once it succeeds, so no failure loses the old file.
+fn renameOver(fs: anytype, from: []const u8, to: []const u8, keep: []const u8) !void {
+    fs.plainRename(from, to) catch |first| {
+        fs.plainRename(to, keep) catch return first;
+        fs.plainRename(from, to) catch |e| {
+            fs.plainRename(keep, to) catch {};
+            return e;
+        };
+        fs.remove(keep) catch {};
+    };
+}
+
+test "renameOver keeps the old target through every failure a plain RENAME can meet" {
+    const Fake = struct {
+        names: std.StringArrayHashMap([]const u8),
+        refuse_over: bool = true,
+        fail_on: ?usize = null,
+        calls: usize = 0,
+        fn plainRename(self: *@This(), from: []const u8, to: []const u8) !void {
+            self.calls += 1;
+            if (self.fail_on == self.calls) return error.SftpFailure;
+            if (self.refuse_over and self.names.contains(to)) return error.SftpFailure;
+            const v = self.names.fetchSwapRemove(from) orelse return error.SftpNoSuchFile;
+            try self.names.put(to, v.value);
+        }
+        fn remove(self: *@This(), path: []const u8) !void {
+            _ = self.names.swapRemove(path);
+        }
+    };
+    for ([_]?usize{ null, 1, 3 }) |fail| {
+        var fs = Fake{ .names = .init(std.testing.allocator), .fail_on = fail };
+        defer fs.names.deinit();
+        try fs.names.put("t.csv", "old");
+        try fs.names.put("t.csv.part", "new");
+        const got = renameOver(&fs, "t.csv.part", "t.csv", "t.csv.keep");
+        if (fail != 3) {
+            try got;
+            try std.testing.expectEqualStrings("new", fs.names.get("t.csv").?);
+            try std.testing.expectEqual(@as(usize, 1), fs.names.count());
+        } else {
+            try std.testing.expectError(error.SftpFailure, got);
+            try std.testing.expectEqualStrings("old", fs.names.get("t.csv").?);
+            try std.testing.expect(!fs.names.contains("t.csv.keep"));
+        }
+    }
+    var fresh = Fake{ .names = .init(std.testing.allocator) };
+    defer fresh.names.deinit();
+    try fresh.names.put("n.csv.part", "new");
+    try renameOver(&fresh, "n.csv.part", "n.csv", "n.csv.keep");
+    try std.testing.expectEqualStrings("new", fresh.names.get("n.csv").?);
+}
 
 test "sftp URLs: user, port, home-relative, registered names" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
