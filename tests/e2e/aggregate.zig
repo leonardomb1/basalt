@@ -193,7 +193,7 @@ test "aggregate: a loop variable and a function parameter count as constants" {
         "  LOAD INTO '/tmp/o.csv' AS SELECT $x AS a, COUNT(*) AS n FROM 'in.csv';\n" ++
         "END FOR;", &pdiag);
 
-    _ = try parser.parseSource(ar.allocator(), "CREATE FUNCTION f(t) AS\n" ++
+    _ = try parser.parseSource(ar.allocator(), "CREATE FUNCTION f(t) AS BEGIN\n" ++
         "  LOAD INTO '/tmp/o.csv' AS SELECT $t AS a, COUNT(*) AS n FROM 'in.csv';\n" ++
         "END;\nCALL f('x');", &pdiag);
 }

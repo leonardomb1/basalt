@@ -11,7 +11,7 @@ LET name = <expr>;                -- a variable, evaluated when it runs
 THROW 'msg' WHEN <condition>;     -- fail the plan on the script's own invariant
 CREATE CONNECTION ...;            -- named data endpoints
 CREATE FUNCTION f(a) AS <expr>;   -- scalar functions (inlined at plan time)
-CREATE FUNCTION p(a) AS ... END;  -- statement functions, invoked with CALL
+CREATE FUNCTION p(a) AS BEGIN ... END;  -- statement functions, invoked with CALL
 CREATE FUNCTION t(a) RETURNS TABLE AS SELECT ...;  -- table functions, read with FROM t('x')
 LOAD INTO ... AS <query>;         -- output pipeline(s)
 <query>;                          -- terminal SELECT = print to stdout

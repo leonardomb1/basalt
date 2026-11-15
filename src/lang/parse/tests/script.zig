@@ -358,14 +358,36 @@ test "sql: http reads — GET/POST calls, connection clauses, an endpoint as a t
     }
 }
 
-test "sql: a statement function may open with the statement CASE; the scalar CASE stays an expression" {
+test "sql: a statement body opens with BEGIN, so it may start with any statement; without BEGIN it is refused naming it, and LET ... IN stays scalar" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parseSource(a,
+        \\CREATE FUNCTION p() AS BEGIN
+        \\  PRINT 'start';
+        \\  SELECT 1 AS x;
+        \\END;
+        \\CREATE FUNCTION twice(v) AS LET d = $v * 2 IN d + 0;
+        \\CALL p();
+    , &diag);
+    try testing.expect(prog.stmts[1].func.body == .stmts);
+    try testing.expectEqual(@as(usize, 2), prog.stmts[1].func.body.stmts.len);
+    try testing.expect(prog.stmts[2].func.body == .expr);
+    for ([_][]const u8{ "CREATE FUNCTION p() AS\n  SELECT 1 AS x;\nEND;", "CREATE FUNCTION p() AS LOAD INTO 'o.csv' AS SELECT 1 AS x;\nEND;" }) |src| {
+        try testing.expectError(error.ParseFailed, parseSource(a, src, &diag));
+        try testing.expectEqualStrings("`p`: a body of statements is written `AS BEGIN ... END;`", diag.msg);
+    }
+}
+
+test "sql: a statement function's BEGIN body may open with the statement CASE; the scalar CASE stays an expression" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
     const prog = try parseSource(a,
         \\CREATE FUNCTION pick(x) AS CASE $x WHEN 'a' THEN 1 ELSE CASE WHEN $x = 'b' THEN 2 ELSE 0 END END;
-        \\CREATE FUNCTION branch(x) AS
+        \\CREATE FUNCTION branch(x) AS BEGIN
         \\  CASE $x
         \\    WHEN 'a' THEN PRINT 'a'; FOR EACH ROW OF (SELECT 1 AS n) AS (n) PRINT $n; END FOR;
         \\    ELSE PRINT CASE WHEN $x = '' THEN 'blank' ELSE $x END;
@@ -465,7 +487,7 @@ test "sql: CREATE FUNCTION — expression, typed/DEFAULT params, statement body,
         \\CREATE OR REPLACE FUNCTION round_to(x, n INT DEFAULT 2) AS round(x, n);
         \\CREATE CONNECTION erp TYPE sqlserver OPTIONS (host = 'h', database = 'd');
         \\CREATE CONNECTION sr TYPE starrocks OPTIONS (fe_host = 'h', database = 'b');
-        \\CREATE FUNCTION sync_table(name, filter) AS
+        \\CREATE FUNCTION sync_table(name, filter) AS BEGIN
         \\  LOAD INTO sr.IDENTIFIER('bronze_' || lower($name)) UPSERT AS
         \\  SELECT * FROM erp.dbo.IDENTIFIER($name) WHERE D_E_L_E_T_ <> $filter;
         \\END;
@@ -586,7 +608,7 @@ test "sql: PRINT is a statement inside a FOR EACH body and a statement function"
     const a = ar.allocator();
 
     const prog = try parseTest(a,
-        \\CREATE FUNCTION note(msg) AS
+        \\CREATE FUNCTION note(msg) AS BEGIN
         \\  PRINT 'note: ' || $msg;
         \\END;
         \\FOR EACH ROW OF (SELECT name FROM 'catalog.csv') AS (name)

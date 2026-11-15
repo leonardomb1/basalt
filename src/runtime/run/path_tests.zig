@@ -270,7 +270,7 @@ const report_cases = [_]ReportCase{
     .{ .script = "EXPLAIN ANALYZE SELECT g, COUNT(*) AS n FROM pg.public.t GROUP BY ROLLUP(g);", .threads = 4 },
     .{ .script = "EXPLAIN ANALYZE SELECT id, v FROM pg.public.t UNPIVOT (x FOR w IN (g));", .threads = 4 },
     .{ .script = "DESCRIBE pg.public.t;", .explain = true, .says = &.{"DESCRIBE (actuals)"} },
-    .{ .script = "CREATE FUNCTION f(a) AS\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND;\nCALL f('x');", .explain = true, .says = &.{"CALL f(a=x)"} },
+    .{ .script = "CREATE FUNCTION f(a) AS BEGIN\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND;\nCALL f('x');", .explain = true, .says = &.{"CALL f(a=x)"} },
     .{ .script = "CASE WHEN 1 = 2 THEN PRINT 'no'; WHEN 1 = 1 THEN LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t; END CASE;", .explain = true, .says = &.{"CASE: arm 2 of 2"} },
     .{ .script = "LOAD INTO '$B/d/' WITH (format = 'delta') AS SELECT id, v FROM '$B/in.csv';\nEXPLAIN ANALYZE SELECT id FROM '$B/d/';", .says = &.{ "log replay (#", "live files: ", "└─ log read (#", "├─ list (#", "entries: " } },
     .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/d/' WITH (merge_schema = true) UPSERT ON (id) USING changes (sequence_by = id, position = id) AS SELECT id, v FROM '$B/in.csv';", .says = &.{ "log replay (#", "Sink: delta " } },

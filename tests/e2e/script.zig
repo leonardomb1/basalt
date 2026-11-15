@@ -231,7 +231,7 @@ test "EXPLAIN ANALYZE CALL runs the function's statements moving no data, and th
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);
     const script = try std.fmt.allocPrint(alloc,
-        \\CREATE FUNCTION copy_to(name) AS
+        \\CREATE FUNCTION copy_to(name) AS BEGIN
         \\  LOAD INTO IDENTIFIER('{s}/' || $name || '.csv') AS SELECT * FROM '{s}/in.csv';
         \\END;
         \\EXPLAIN ANALYZE CALL copy_to('never');
@@ -1348,7 +1348,7 @@ test "CALL renders a statement function per call (defaults fill the omitted arg)
 
     const script = try std.fmt.allocPrint(
         alloc,
-        "CREATE FUNCTION sync(name, tag DEFAULT 'Z') AS\n" ++
+        "CREATE FUNCTION sync(name, tag DEFAULT 'Z') AS BEGIN\n" ++
             "  LOAD INTO '{s}/out_${{name}}.csv' AS SELECT id, v, '${{tag}}' AS tag FROM '{s}/${{name}}.csv';\n" ++
             "END;\n" ++
             "CALL sync('alpha', 'A');\n" ++
@@ -1380,7 +1380,7 @@ test "CALL of a statement function without parameters runs its body" {
 
     const script = try std.fmt.allocPrint(
         alloc,
-        "CREATE FUNCTION refresh() AS\n" ++
+        "CREATE FUNCTION refresh() AS BEGIN\n" ++
             "  LOAD INTO '{s}/out.csv' AS SELECT 1 AS id;\n" ++
             "END;\n" ++
             "CALL refresh();\n",
@@ -1406,8 +1406,8 @@ test "CALL nesting is depth-guarded (mutual recursion)" {
 
     const script = try std.fmt.allocPrint(
         alloc,
-        "CREATE FUNCTION ping(n) AS\n  CALL pong($n);\nEND;\n" ++
-            "CREATE FUNCTION pong(n) AS\n  LOAD INTO '{s}/out.csv' AS SELECT id FROM '{s}/in.csv';\n  CALL ping($n);\nEND;\n" ++
+        "CREATE FUNCTION ping(n) AS BEGIN\n  CALL pong($n);\nEND;\n" ++
+            "CREATE FUNCTION pong(n) AS BEGIN\n  LOAD INTO '{s}/out.csv' AS SELECT id FROM '{s}/in.csv';\n  CALL ping($n);\nEND;\n" ++
             "CALL ping('x');\n",
         .{ base, base },
     );
@@ -1721,7 +1721,7 @@ test "CALL: a nested FOR EACH in a statement function sees its argument and the 
     defer tmp.cleanup();
     try checkAndRun(alloc, &tmp,
         \\PARAM tag STRING;
-        \\CREATE FUNCTION fan(src) AS
+        \\CREATE FUNCTION fan(src) AS BEGIN
         \\  FOR EACH ROW OF ('$B/inner.csv') AS (suffix)
         \\    LOAD INTO IDENTIFIER('$B/' || $tag || '_' || $src || '_' || $suffix || '.csv') AS
         \\    SELECT COUNT(*) AS n, $src AS s, $suffix AS sfx FROM IDENTIFIER('$B/' || $src || '.csv');
@@ -1800,7 +1800,7 @@ test "EXCEPT (IDENTIFIER($cols)): a comma list excludes each name, an empty one 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try checkAndRun(alloc, &tmp,
-        \\CREATE FUNCTION slim(ex) AS
+        \\CREATE FUNCTION slim(ex) AS BEGIN
         \\  LOAD INTO IDENTIFIER('$B/out_' || length($ex) || '.csv') AS SELECT * EXCEPT (IDENTIFIER($ex)) FROM '$B/a.csv' WHERE id = 1;
         \\END;
         \\CALL slim('grp, amt');
@@ -1918,7 +1918,7 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "LET q = (SELECT COUNT(*) AS c FROM '$B/a.csv');\nLET m = $q + 1;\nLOAD INTO '$B/o.csv' AS SELECT $m AS a;", "LET `m` reads `$q`, a query LET" },
         .{ "LET m = $zz + 1;\nLOAD INTO '$B/o.csv' AS SELECT $m AS a;", "unknown `$zz`" },
         .{ "FOR EACH ROW OF (SELECT x FROM '$B/a.csv' WHERE 1 = 0) AS (x)\n  LET y = 1;\n  LOAD INTO '$B/o.csv' AS SELECT 1 AS a;\nEND FOR;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "LET `y` must be declared at the top level" },
-        .{ "CREATE FUNCTION p(v) AS\n  LOAD INTO '$B/o.csv' AS SELECT 1 AS a;\n  LET y = 1;\nEND;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "LET `y` must be declared at the top level" },
+        .{ "CREATE FUNCTION p(v) AS BEGIN\n  LOAD INTO '$B/o.csv' AS SELECT 1 AS a;\n  LET y = 1;\nEND;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "LET `y` must be declared at the top level" },
         .{ "PARAM a INT DEFAULT 2;\nPARAM a INT DEFAULT 3;\nLOAD INTO '$B/o.csv' AS SELECT $a AS a;", "duplicate PARAM `a`" },
         .{ "LET a = 1;\nLET a = 2;\nLOAD INTO '$B/o.csv' AS SELECT $a AS a;", "duplicate LET `a`" },
         .{ "PARAM n INT DEFAULT 5;\nCASE $n WHEN 5 THEN LOAD INTO '$B/o.csv' AS SELECT 1 AS a; WHEN 'x' THEN LOAD INTO '$B/o.csv' AS SELECT 2 AS a; END CASE;", "CASE pattern 'x' is not int" },
@@ -1941,12 +1941,12 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "PARAM n INT DEFAULT 1;\nCASE WHEN $n = 'x' THEN LOAD INTO '$B/o.csv' AS SELECT 1 AS a; END CASE;", "match guard: type mismatch" },
         .{ "PARAM n INT DEFAULT 1;\nCASE $n WHEN 1 / 0 THEN LOAD INTO '$B/o.csv' AS SELECT 1 AS a; END CASE;", "match pattern: division by zero" },
         .{ "PRINT 1 / 0;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "PRINT: division by zero" },
-        .{ "CREATE FUNCTION f(a) AS\n  LOAD INTO '$B/o.csv' AS SELECT $a AS a;\nEND;\nCALL f(1 / 0);", "CALL f: argument `a`: division by zero" },
+        .{ "CREATE FUNCTION f(a) AS BEGIN\n  LOAD INTO '$B/o.csv' AS SELECT $a AS a;\nEND;\nCALL f(1 / 0);", "CALL f: argument `a`: division by zero" },
         .{ "PARAM n STRING DEFAULT upper('x');\nLOAD INTO '$B/o.csv' AS SELECT $n AS a;", "param default must be a literal" },
         .{ "LET q = (SELECT x, x AS y FROM '$B/a.csv');\nLOAD INTO '$B/o.csv' AS SELECT $q AS a;", "LET `q`: must produce exactly one column, got 2" },
         .{ "FOR EACH ROW OF (SELECT x FROM '$B/a.csv' WHERE 1 = 0) AS (x)\n  LOAD INTO '$B/o.csv' WITH (bogus = 1) AS SELECT 1 AS a;\nEND FOR;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "unknown `LOAD INTO` option `bogus`" },
         .{ "CASE WHEN 1 = 0 THEN LOAD INTO '$B/o.xlsx' WITH (sheet = 'a/b') AS SELECT 1 AS a; END CASE;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "cannot hold any of" },
-        .{ "CREATE FUNCTION p(v) AS\n  LOAD INTO '$B/o.csv' USING stream_load AS SELECT 1 AS a;\nEND;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "unknown load path `USING stream_load`" },
+        .{ "CREATE FUNCTION p(v) AS BEGIN\n  LOAD INTO '$B/o.csv' USING stream_load AS SELECT 1 AS a;\nEND;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "unknown load path `USING stream_load`" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/a.csv' a JOIN '$B/a.csv' b ON a.x = b.x WITH (join_order = 'bad');", "join_order is 'auto' or 'written'" },
         .{ "LOAD INTO '$B/o.csv' WITH (jobs = 2) AS SELECT * FROM '$B/a.csv';", "unknown `LOAD INTO` option `jobs`" },
         .{ "LOAD INTO '$B/o.csv' WITH (split = 'x') AS SELECT * FROM '$B/a.csv';", "unknown `LOAD INTO` option `split`" },
@@ -2002,7 +2002,7 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "PRINT 1;\nCALL nope(1);", "CALL: no function named `nope`" },
         .{ "CREATE FUNCTION f(a) AS a + 1;\nCALL f(1);", "`f` is a scalar function" },
         .{ "CREATE FUNCTION f(a) RETURNS TABLE AS SELECT $a AS x;\nCALL f(1);", "`f` is a table function" },
-        .{ "CREATE FUNCTION f(a) AS\n  PRINT $a;\nEND;\nCALL f(1, 2);", "`f` expects 1 argument(s), got 2" },
+        .{ "CREATE FUNCTION f(a) AS BEGIN\n  PRINT $a;\nEND;\nCALL f(1, 2);", "`f` expects 1 argument(s), got 2" },
         .{ "FOR EACH ROW OF (SELECT x FROM '$B/a.csv' WHERE 1 = 0) AS (x)\n  CALL nope($x);\nEND FOR;", "CALL: no function named `nope`" },
         .{ "LET x = 1;\nPARAM x INT DEFAULT 2;\nLOAD INTO '$B/o.csv' AS SELECT $x AS a;", "`x` is declared twice: LET and PARAM share one name space" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT p.x FROM '$B/a.csv' p WHERE EXISTS (SELECT 1 FROM '$B/a.csv' q WHERE CAST(q.x AS string) = p.x);", "a correlated subquery compares `x` (int) with a column of its own (string)" },

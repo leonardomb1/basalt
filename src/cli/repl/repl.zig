@@ -809,7 +809,7 @@ test "entryStatements: a statement function is one declaration, its body's `;`s 
     const prelude = "CREATE CONNECTION sr TYPE starrocks OPTIONS (host = 'h', database = 'd');\n";
     const entry =
         \\CREATE FUNCTION f(x) AS x * 2;
-        \\CREATE OR REPLACE FUNCTION load(name) AS
+        \\CREATE OR REPLACE FUNCTION load(name) AS BEGIN
         \\  PRINT 'loading ' || $name;
         \\  LOAD INTO sr.IDENTIFIER('t_' || $name) AS SELECT 1 AS v;
         \\END;

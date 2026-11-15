@@ -721,7 +721,7 @@ test "expandProgram: statement functions survive, and the two forms don't cross 
 
     var diag = parser.Diagnostic{ .msg = "", .line = 0, .col = 0 };
     const prog = try parser.parseSource(a, "CREATE FUNCTION inc(x) AS x + 1;\n" ++
-        "CREATE FUNCTION sync(name) AS\n  LOAD INTO 'out_${name}.csv' AS SELECT inc(id) AS id FROM 'in.csv';\nEND;\n" ++
+        "CREATE FUNCTION sync(name) AS BEGIN\n  LOAD INTO 'out_${name}.csv' AS SELECT inc(id) AS id FROM 'in.csv';\nEND;\n" ++
         "CALL sync('a');", &diag);
     var msg: []const u8 = "";
     const out = try expandProgram(a, prog, &msg);
@@ -748,11 +748,11 @@ test "expandProgram: statement functions survive, and the two forms don't cross 
     const m1 = try expandErr(a, "CREATE FUNCTION inc(x) AS x + 1;\nCALL inc(1);\nSELECT id FROM 'd';");
     try std.testing.expect(std.mem.indexOf(u8, m1, "scalar function") != null);
 
-    const m2 = try expandErr(a, "CREATE FUNCTION sync(n) AS\n  LOAD INTO 'o.csv' AS SELECT * FROM 'i.csv';\nEND;\n" ++
+    const m2 = try expandErr(a, "CREATE FUNCTION sync(n) AS BEGIN\n  LOAD INTO 'o.csv' AS SELECT * FROM 'i.csv';\nEND;\n" ++
         "SELECT sync(id) AS v FROM 'd';");
     try std.testing.expect(std.mem.indexOf(u8, m2, "statement function") != null);
 
-    const m3 = try expandErr(a, "CREATE FUNCTION sync(n, m) AS\n  LOAD INTO 'o.csv' AS SELECT * FROM 'i.csv';\nEND;\n" ++
+    const m3 = try expandErr(a, "CREATE FUNCTION sync(n, m) AS BEGIN\n  LOAD INTO 'o.csv' AS SELECT * FROM 'i.csv';\nEND;\n" ++
         "CALL sync('x');");
     try std.testing.expectEqualStrings("`sync` expects 2 argument(s), got 1", m3);
 }

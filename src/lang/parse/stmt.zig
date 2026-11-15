@@ -188,7 +188,7 @@ pub fn parseExplainStmt(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) E
     const mode = try explainMode(self);
 
     const base = out.items.len;
-    if (self.isKw("call") or self.isKw("for") or (self.isKw("case") and self.atStmtCase())) {
+    if (self.isKw("call") or self.isKw("for") or self.isKw("case")) {
         const what = if (self.isKw("call")) "CALL" else if (self.isKw("for")) "FOR EACH" else "CASE";
         if (mode != .analyze)
             return self.fail(self.curPos(), "EXPLAIN {s} needs ANALYZE: its statements are rendered as it runs, so `EXPLAIN ANALYZE {s} ...` runs each one, moving no data, and shows its plan with actuals", .{ what, what });

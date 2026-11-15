@@ -97,8 +97,9 @@ pub fn envCall(self: *Parser, conn_name: []const u8, suffix: []const u8) Error!*
     return self.mk(.{ .call = .{ .name = "env", .args = args } });
 }
 
-/// `CREATE [OR REPLACE] FUNCTION name(params) AS <expr>;` or `AS <stmts> END;`. A
-/// statement function's parameters are script constants inside it, like loop variables.
+/// `CREATE [OR REPLACE] FUNCTION name(params) AS <expr>;` or `AS BEGIN <stmts> END;`.
+/// A statement function's parameters are script constants inside it, like loop
+/// variables. A body of statements without `BEGIN` is refused naming it.
 pub fn parseFunction(self: *Parser, pos: Pos, replace: bool) Error!ast.FnDecl {
     const name = try self.expectIdent();
     _ = try self.expect(.lparen);
@@ -132,7 +133,7 @@ pub fn parseFunction(self: *Parser, pos: Pos, replace: bool) Error!ast.FnDecl {
     }
     try self.expectKw("as");
 
-    if (self.atStmtBody()) {
+    if (self.eatKw("begin")) {
         var body = std.array_list.Managed(ast.Stmt).init(self.arena);
         while (!self.at(.eof) and !self.isKw("end")) {
             try self.parseStatement(&body);
@@ -144,37 +145,18 @@ pub fn parseFunction(self: *Parser, pos: Pos, replace: bool) Error!ast.FnDecl {
         return .{ .name = name, .params = try params.toOwnedSlice(), .body = .{ .stmts = try body.toOwnedSlice() }, .replace = replace, .pos = pos };
     }
 
+    if (atStmtStart(self))
+        return self.fail(self.curPos(), "`{s}`: a body of statements is written `AS BEGIN ... END;`", .{name});
     const body = try self.parseExpr();
     _ = try self.expect(.semi);
     return .{ .name = name, .params = try params.toOwnedSlice(), .body = .{ .expr = body }, .replace = replace, .pos = pos };
 }
 
-/// Whether the body after `AS` opens a statement block. A `CASE` does only when
-/// closed by `END CASE`; otherwise it is the scalar form.
-pub fn atStmtBody(self: *Parser) bool {
-    return self.isKw("load") or self.isKw("for") or self.isKw("call") or
-        self.isKw("print") or self.isKw("throw") or self.isKw("select") or self.isKw("with") or
-        (self.isKw("case") and self.atStmtCase());
-}
-
-/// Whether the `CASE` here is closed by `END CASE`, pairing each block opener ahead
-/// (`case`, `for`) with its `end`.
-pub fn atStmtCase(self: *Parser) bool {
-    var depth: usize = 0;
-    var j = self.i;
-    while (j < self.toks.len) : (j += 1) {
-        const t = self.toks[j];
-        if (t.tag != .ident) continue;
-        if (eqlNoCase(t.text, "case") or eqlNoCase(t.text, "for")) {
-            depth += 1;
-        } else if (eqlNoCase(t.text, "end")) {
-            depth -= 1;
-            const next = if (j + 1 < self.toks.len) self.toks[j + 1] else return false;
-            const closes_named = next.tag == .ident and (eqlNoCase(next.text, "case") or eqlNoCase(next.text, "for"));
-            if (depth == 0) return closes_named and eqlNoCase(next.text, "case");
-            if (closes_named) j += 1;
-        }
-    }
+/// Whether the body after `AS` starts as only a statement does, so a body missing
+/// its `BEGIN` is named for it rather than read as an expression.
+fn atStmtStart(self: *Parser) bool {
+    for ([_][]const u8{ "load", "for", "call", "print", "throw", "select", "with", "explain" }) |kw|
+        if (self.isKw(kw)) return true;
     return false;
 }
 

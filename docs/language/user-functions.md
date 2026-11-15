@@ -11,9 +11,9 @@ body may call scalar functions, declared before or after it.
 forms. `AS <expr>;` is a scalar function, inlined at plan time; recursion and
 arity mismatches are compile errors, declared types are checked against
 literal arguments at the call site, defaults fill omitted trailing arguments.
-A body starting with `LOAD`/`FOR`/`CALL`/`SELECT`/`WITH`/`PRINT`/`THROW`, or
-with the statement `CASE` (the one closed by `END CASE`), is a **statement
-function** terminated by `END;` and invoked with `CALL nome(args);` — its
+`AS BEGIN <statements> END;` is a **statement function**, invoked with `CALL
+nome(args);`; a body of statements without its `BEGIN` is an error naming it.
+Its
 params bind like loop variables (`$name`, `IDENTIFIER($name)`,
 `${name}` in strings), rendered per call through the same machinery as a `FOR
 EACH ROW OF` body. CALL nesting is depth-guarded (16); a statement function is
