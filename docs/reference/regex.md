@@ -6,8 +6,9 @@ SQL actually carries rather than for a dependency. It supports `^ $ . |`,
 character classes with ranges and negation, capturing and non-capturing
 groups, the escapes `\d \w \s` (and their negations), the quantifiers
 `* + ?` and counted `{n} {n,} {n,m}` — each greedy, or lazy with a `?`
-suffix (`*?`, `{2,4}?`), and `\n \t \r` and an escaped punctuation character
-(`\.`, `\$`). Lookaround, backreferences (`\1`) and every other letter or
+suffix (`*?`, `{2,4}?`), `\n \t \r`, `\xHH` and `\x{H…}` for a character by
+its code point (`\x41` is `A`, `\x{20AC}` is `€`), and an escaped punctuation
+character (`\.`, `\$`). Lookaround, backreferences (`\1`) and every other letter or
 digit escape (`\b`, `\A`) are **rejected at compile time** rather than read as
 literal characters, so an unsupported pattern is an error and never a silently
 wrong match.
@@ -15,7 +16,9 @@ wrong match.
 Patterns match characters, not bytes: `.`, a class (`[ç]`, `[à-ú]`, `[^a]`) and
 a literal each take one UTF-8 code point, so `regexp_matches('ação', '^a.ão$')`
 is true and `regexp_extract('ação', '[ç]')` returns `ç`; a byte that starts no
-valid UTF-8 sequence counts as one character. `\d \w \s` cover ASCII only, and
+valid UTF-8 sequence counts as one character. So `\xe9` is `é`, as in RE2 and
+PCRE, not the byte `0xE9`: match bytes with the record functions over `BYTES`
+(`hex(b) LIKE …`, `u8_at`). `\d \w \s` cover ASCII only, and
 `i` folds ASCII letters.
 
 The matcher backtracks, so a pattern that backtracks without end — a nested

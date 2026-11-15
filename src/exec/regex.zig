@@ -1,7 +1,8 @@
 //! A small backtracking regular-expression matcher, enough for the pattern
 //! vocabulary SQL queries actually use: anchors, `.`, character classes,
 //! capturing and non-capturing groups, alternation, and quantifiers (`*`, `+`,
-//! `?`, counted `{n}`/`{n,}`/`{n,m}`), each greedy or lazy. Deliberately a
+//! `?`, counted `{n}`/`{n,}`/`{n,m}`), each greedy or lazy, and a character
+//! by its code point (`\xHH`, `\x{H…}`). Deliberately a
 //! subset, with no lookaround and no backreferences inside the pattern, so it
 //! stays a few hundred lines instead of pulling in a regex dependency. What is
 //! out of scope fails with `BadPattern` rather than matching literally: `(?=`
@@ -37,6 +38,7 @@
 
 const std = @import("std");
 const simd = @import("simd.zig");
+const hex = @import("../base/hex.zig");
 
 pub const Error = error{ BadPattern, OutOfMemory, PatternTooComplex };
 
@@ -620,6 +622,7 @@ const Parser = struct {
                 const e = self.src[self.i];
                 if (e >= 0x80) return .{ .lit = self.unit() };
                 self.i += 1;
+                if (e == 'x') return self.literal(try self.hexEscape());
                 return try escapeAtom(e);
             },
             else => {
@@ -627,13 +630,34 @@ const Parser = struct {
                     self.i -= 1;
                     return .{ .lit = self.unit() };
                 }
-                if (!self.icase or !std.ascii.isAlphabetic(c)) return .{ .lit = c };
-                var cl = Class{};
-                cl.set(std.ascii.toLower(c));
-                cl.set(std.ascii.toUpper(c));
-                return .{ .class = cl };
+                return self.literal(c);
             },
         }
+    }
+
+    /// The atom matching `c`, either case of an ASCII letter under `icase`.
+    fn literal(self: *Parser, c: u21) Atom {
+        if (!self.icase or c >= 0x80 or !std.ascii.isAlphabetic(@intCast(c))) return .{ .lit = c };
+        var cl = Class{};
+        cl.set(std.ascii.toLower(@intCast(c)));
+        cl.set(std.ascii.toUpper(@intCast(c)));
+        return .{ .class = cl };
+    }
+
+    /// The character a `\x` escape names, its `x` consumed: `\xHH`, two hex digits,
+    /// or `\x{H…}`, one to six, a code point as RE2 and PCRE read them, not a byte.
+    fn hexEscape(self: *Parser) Error!u21 {
+        const braced = self.i < self.src.len and self.src[self.i] == '{';
+        const lo = self.i + @intFromBool(braced);
+        var hi = lo;
+        while (hi < self.src.len and hi - lo < 6 and hex.digit(self.src[hi]) != null) hi += 1;
+        if (braced) {
+            if (hi == lo or hi >= self.src.len or self.src[hi] != '}') return Error.BadPattern;
+        } else if (hi - lo < 2) return Error.BadPattern else hi = lo + 2;
+        const cp = hex.int(u21, self.src[lo..hi]) orelse return Error.BadPattern;
+        if (cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF)) return Error.BadPattern;
+        self.i = hi + @intFromBool(braced);
+        return cp;
     }
 
     /// The pattern's unit at `i`, consumed.
@@ -657,7 +681,9 @@ const Parser = struct {
             if (self.src[self.i] == '\\' and self.i + 1 < self.src.len and self.src[self.i + 1] < 0x80) {
                 const e = self.src[self.i + 1];
                 self.i += 2;
-                switch (try escapeAtom(e)) {
+                if (e == 'x') {
+                    lo = try self.hexEscape();
+                } else switch (try escapeAtom(e)) {
                     .class => |sub| {
                         for (0..256) |b| {
                             if (sub.has(@intCast(b))) cl.set(@intCast(b));
@@ -892,6 +918,28 @@ test "regex: a backreference or an unknown letter escape is refused, a punctuati
     var caps: Captures = undefined;
     const re = try Regex.compile(a, "\\.\\$\\\\\\-");
     try std.testing.expectEqual([2]usize{ 0, 4 }, (try re.find(".$\\-", 0, &caps)).?);
+}
+
+test "regex: \\xHH and \\x{H..} name a code point, in a class and out, folded under icase, and a malformed one is refused" {
+    var buf: [16 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+    var caps: Captures = undefined;
+
+    var re = try Regex.compile(a, "^\\x41\\x{42}c$");
+    try std.testing.expect((try re.find("ABc", 0, &caps)) != null);
+    re = try Regex.compile(a, "^\\x411$");
+    try std.testing.expect((try re.find("A1", 0, &caps)) != null);
+    re = try Regex.compile(a, "^[\\x30-\\x39\\x{e9}]+$");
+    try std.testing.expect((try re.find("09\u{e9}5", 0, &caps)) != null);
+    try std.testing.expect((try re.find("0a", 0, &caps)) == null);
+    re = try Regex.compile(a, "\\x{20AC}");
+    try std.testing.expectEqual([2]usize{ 1, 4 }, (try re.find("x\u{20ac}", 0, &caps)).?);
+    re = try Regex.compileOpts(a, "^\\x61$", .{ .icase = true });
+    try std.testing.expect((try re.find("A", 0, &caps)) != null);
+    for ([_][]const u8{ "\\x", "\\x4", "\\xg1", "\\x{}", "\\x{41", "\\x{110000}", "\\x{d800}", "[\\x4]" }) |pat| {
+        try std.testing.expectError(Error.BadPattern, Regex.compile(a, pat));
+    }
 }
 
 test "regex: characters are UTF-8 code points, a stray byte one of its own" {
