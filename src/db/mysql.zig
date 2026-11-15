@@ -147,13 +147,29 @@ pub const Conn = struct {
         if (self.no_backslash) try self.exec("SET SESSION sql_mode = REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', '')");
     }
 
-    /// Run a statement that returns no result set (DDL). Errors on an ERR packet.
+    /// Run a statement for its effect (DDL, a SET). Errors on an ERR packet; a result
+    /// set it returns is read to its end and dropped, so the next statement reads its
+    /// own reply rather than this one's rows.
     pub fn exec(self: *Conn, stmt: []const u8) !void {
         _ = try self.query(stmt);
         const p = self.wire.msg.items;
-        if (p.len > 0 and p[0] == 0xff) {
+        if (p.len == 0) return error.MysqlProtocol;
+        if (p[0] == 0xff) {
             try self.wire.setError(errMessage(p));
             return error.MysqlQueryFailed;
+        }
+        if (p[0] == 0x00 or p[0] == 0xfe) return;
+        var head: Pkt = .{ .p = p };
+        const ncol = try columnCount(&head);
+        for (0..ncol + 1) |_| _ = try self.readPacket();
+        while (true) {
+            _ = try self.readPacket();
+            const r = self.wire.msg.items;
+            if (r.len > 0 and r[0] == 0xfe and r.len < 9) return;
+            if (r.len > 0 and r[0] == 0xff) {
+                try self.wire.setError(errMessage(r));
+                return error.MysqlQueryFailed;
+            }
         }
     }
 
@@ -913,6 +929,64 @@ test "a session is set to UTC before connect returns, so a TIMESTAMP reads as Po
     t.join();
     _ = try c;
     try std.testing.expectEqualStrings("\x03SET time_zone = '+00:00'", first[0..n]);
+}
+
+test "exec reads a result set to its end, so the next statement reads its own reply" {
+    const http_fake = @import("../testing/http_fake.zig");
+    var listener = try http_fake.listen(1);
+    defer listener.deinit();
+    const Srv = struct {
+        fn readFull(s: std.net.Stream, out: []u8) !void {
+            var got: usize = 0;
+            while (got < out.len) {
+                const k = try s.read(out[got..]);
+                if (k == 0) return error.EndOfStream;
+                got += k;
+            }
+        }
+        fn packet(s: std.net.Stream, buf: []u8) ![]u8 {
+            var hdr: [4]u8 = undefined;
+            try readFull(s, &hdr);
+            const len: usize = @as(usize, hdr[0]) | (@as(usize, hdr[1]) << 8) | (@as(usize, hdr[2]) << 16);
+            if (len > buf.len) return error.TooLong;
+            try readFull(s, buf[0..len]);
+            return buf[0..len];
+        }
+        fn send(s: std.net.Stream, seq: u8, body: []const u8) !void {
+            const hdr = [4]u8{ @intCast(body.len & 0xff), @intCast(body.len >> 8), 0, seq };
+            try s.writeAll(&hdr);
+            try s.writeAll(body);
+        }
+        fn serve(l: *std.net.Server) void {
+            const conn = l.accept() catch return;
+            defer conn.stream.close();
+            var body: [128]u8 = undefined;
+            var w = std.Io.Writer.fixed(&body);
+            w.writeAll("\x0a8.0\x00\x01\x00\x00\x00abcdefgh\x00\x00\xff\x21\x00\x00\x08\x80\x15") catch return;
+            w.writeAll(&([_]u8{0} ** 10)) catch return;
+            w.writeAll("ijklmnopqrst\x00mysql_native_password\x00") catch return;
+            send(conn.stream, 0, w.buffered()) catch return;
+            var buf: [1024]u8 = undefined;
+            _ = packet(conn.stream, &buf) catch return;
+            send(conn.stream, 2, "\x00\x00\x00\x02\x00\x00\x00") catch return;
+            _ = packet(conn.stream, &buf) catch return;
+            send(conn.stream, 1, "\x00\x00\x00\x02\x00\x00\x00") catch return;
+            _ = packet(conn.stream, &buf) catch return;
+            send(conn.stream, 1, "\x01") catch return;
+            send(conn.stream, 2, "\x03def\x00\x00\x00\x01c\x00\x0c\x21\x00\x01\x00\x00\x00\xfd\x00\x00\x00\x00\x00") catch return;
+            send(conn.stream, 3, "\xfe\x00\x00\x02\x00") catch return;
+            send(conn.stream, 4, "\x01a") catch return;
+            send(conn.stream, 5, "\xfe\x00\x00\x02\x00") catch return;
+            _ = packet(conn.stream, &buf) catch return;
+            send(conn.stream, 1, "\xff\x28\x04#42000second refused") catch return;
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Srv.serve, .{&listener});
+    defer t.join();
+    const c = try Conn.connect(std.testing.allocator, "127.0.0.1", listener.listen_address.getPort(), "u", "", "", .off, .{});
+    defer c.close();
+    try c.exec("SHOW VARIABLES LIKE 'x'");
+    try std.testing.expectError(error.MysqlQueryFailed, c.exec("DROP TABLE t"));
 }
 
 test "noBackslashEscapes reads the OK packet's status, past its two lenenc counts" {
