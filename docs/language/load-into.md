@@ -56,15 +56,16 @@ AS
   needs a table read on a SQL source that exposes it). An empty/unresolved
   upsert key is an error, never a silent no-op.
 - `REPLACE` into PostgreSQL, MySQL or SQL Server loads a staging table
-  (`_basalt_stage_<table>`, in the target's schema) from every lane, then in one
+  (`_basalt_stage_<table>_<run tag>`, in the target's schema) from every lane, then in one
   transaction clears the target and copies the staged rows in, and drops the
   staging table. The target stays the same table — grants, views, foreign keys,
   triggers and indexes stay — readers see the old rows until the commit, and a
   failed load leaves the target as it was. `WITH (cutover = 'delete')` clears
   with `DELETE` instead of the default `TRUNCATE`, for a login without the right
   to truncate or a deferrable foreign key; MySQL always deletes, as its
-  `TRUNCATE` commits on its own. Running two REPLACEs into one target at once is
-  the caller's to prevent: they share the staging table.
+  `TRUNCATE` commits on its own. Each run stages into a table of its own, so two
+  REPLACEs into one target at once never mix their rows: the last to commit holds
+  the target. A run killed before its cleanup leaves its staging table behind.
 - Dispositions on a **file target** — the omissible default is *not* `APPEND`:
   a bare `LOAD INTO 'x.csv'`, like `REPLACE`, replaces the file, so a rerun
   replaces it. A local file is written whole: the rows go to `x.csv.part`,

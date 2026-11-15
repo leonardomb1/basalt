@@ -71,32 +71,35 @@ pub const ReplacePlan = struct {
     schema: types.Schema,
     how: replace.Cutover,
     errctx: ?*op.ErrCtx,
+    staging: []const u8 = "",
 
-    pub fn stagingTarget(self: *const ReplacePlan, arena: std.mem.Allocator) ![]const u8 {
-        return replace.stagingName(arena, self.target);
+    pub fn stagingTarget(self: *const ReplacePlan) []const u8 {
+        return self.staging;
     }
 
-    pub fn prepare(self: *ReplacePlan) !void {
+    /// Names this run's staging table, in `arena`, and creates it.
+    pub fn prepare(self: *ReplacePlan, arena: std.mem.Allocator) !void {
+        self.staging = try replace.stagingName(arena, self.target, std.crypto.random.int(u32));
         var aa = std.heap.ArenaAllocator.init(self.gpa);
         defer aa.deinit();
-        try self.run(try replace.setupSql(aa.allocator(), self.dialect, self.target), "staging");
+        try self.run(try replace.setupSql(aa.allocator(), self.dialect, self.target, self.staging), "staging");
     }
 
     pub fn finish(self: *ReplacePlan) !void {
         var aa = std.heap.ArenaAllocator.init(self.gpa);
         defer aa.deinit();
         const a = aa.allocator();
-        self.run(try replace.cutoverSql(a, self.dialect, self.target, self.schema, self.how), "cutover") catch |e| {
+        self.run(try replace.cutoverSql(a, self.dialect, self.target, self.staging, self.schema, self.how), "cutover") catch |e| {
             self.abort();
             return e;
         };
-        self.run(&.{try replace.dropSql(a, self.dialect, self.target)}, "staging cleanup") catch {};
+        self.run(&.{try replace.dropSql(a, self.dialect, self.staging)}, "staging cleanup") catch {};
     }
 
     pub fn abort(self: *ReplacePlan) void {
         var aa = std.heap.ArenaAllocator.init(self.gpa);
         defer aa.deinit();
-        const drop = replace.dropSql(aa.allocator(), self.dialect, self.target) catch return;
+        const drop = replace.dropSql(aa.allocator(), self.dialect, self.staging) catch return;
         self.run(&.{drop}, "staging cleanup") catch {};
     }
 
@@ -238,9 +241,9 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
     if (w.mode == .overwrite) {
         const plan = try env.arena.create(ReplacePlan);
         plan.* = .{ .gpa = env.gpa, .kind = kind, .cfg = cfg, .dialect = dialect, .target = w.target, .schema = schema, .how = env.cutover, .errctx = env.errctx };
-        plan.prepare() catch |e|
+        plan.prepare(env.arena) catch |e|
             return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} REPLACE staging failed ({s})", .{ conn.connector, @errorName(e) }));
-        spec.target = try plan.stagingTarget(env.arena);
+        spec.target = plan.stagingTarget();
         spec.replace_plan = plan;
     }
     return spec;

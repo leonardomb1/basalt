@@ -474,6 +474,28 @@ fi
 # A union under schema_from casts each branch to the named branch's types, so a
 # filter descends into a branch only over columns declared alike: compared as
 # varchar before the cast, '2024-01-15 00:00:00' would miss a date that matches.
+# Two REPLACEs into one table at once each stage into a table of their own: the
+# target ends up holding exactly one run's rows, never a mix, and neither leaves
+# a staging table behind. A staging name fixed per target let the second drop and
+# recreate the first's mid-load.
+if runs postgres; then
+  pgq() { docker compose -f tests/integration/compose.yaml exec -T postgres psql -U postgres -d it -t -A -F, "$@"; }
+  pgq -c "DROP TABLE IF EXISTS it_conc; CREATE TABLE it_conc (k int, v int);" >/dev/null 2>&1
+  for v in 1 2; do
+    $B run -q -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
+LOAD INTO db.it_conc REPLACE AS SELECT range AS k, $v AS v FROM RANGE(300000);" >"$out/pg_conc_$v.log" 2>&1 &
+  done
+  wait
+  got=$(pgq -c "SELECT count(*), count(DISTINCT v), min(v) = max(v) FROM it_conc;")
+  left=$(pgq -c "SELECT count(*) FROM pg_tables WHERE tablename LIKE '_basalt_stage_it_conc%';")
+  if [ "$got" = "300000,1,t" ] && [ "$left" = 0 ]; then
+    report postgres-concurrent-replace ok
+  else
+    report "postgres-concurrent-replace (rows $got, staging left $left)" bad
+    cat "$out/pg_conc_1.log" "$out/pg_conc_2.log" | head -4
+  fi
+fi
+
 if runs postgres; then
   pgq() { docker compose -f tests/integration/compose.yaml exec -T postgres psql -U postgres -d it -t -A -F, "$@"; }
   pgq -c "DROP TABLE IF EXISTS it_ua, it_ub;

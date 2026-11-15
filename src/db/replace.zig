@@ -5,8 +5,10 @@
 //! dropped. The target stays the same object, so its grants, views, foreign keys,
 //! triggers, indexes and owner stay; readers see the old rows until the commit; a
 //! run that fails before the cutover leaves the target as it was and drops the
-//! staging table. Coordinating runs on one target is the caller's: the staging name
-//! is fixed per target, so two at once would share it.
+//! staging table. Each run's staging table has a name of its own, so two REPLACEs
+//! into one target at once never load or drop each other's rows: each cutover is
+//! one transaction, and the last to commit holds the target. A run killed before
+//! it could drop its staging table leaves it behind, named for its target.
 //!
 //! The sequence is written once here; what differs by database is `Intrinsics`, a
 //! few statements each dialect supplies. A `TRUNCATE` is the default clear, being
@@ -49,33 +51,31 @@ pub fn intrinsics(d: sql.Dialect) Intrinsics {
     };
 }
 
-/// The staging table's raw name: the target's own schema, its table name behind a
-/// `_basalt_stage_` prefix, cut to PostgreSQL's 63-byte identifier limit.
-pub fn stagingName(a: std.mem.Allocator, target: []const u8) ![]const u8 {
+/// The staging table's raw name: the target's own schema, then `_basalt_stage_`,
+/// the table name cut so the whole fits PostgreSQL's 63-byte identifier limit, and
+/// this run's `tag` (8 hex digits).
+pub fn stagingName(a: std.mem.Allocator, target: []const u8, tag: u32) ![]const u8 {
     const dot = std.mem.lastIndexOfScalar(u8, target, '.');
     const schema = if (dot) |i| target[0 .. i + 1] else "";
     const table = if (dot) |i| target[i + 1 ..] else target;
-    const name = try msgfmt.allocPrint(a, "_basalt_stage_{s}", .{table});
-    return msgfmt.allocPrint(a, "{s}{s}", .{ schema, name[0..@min(name.len, 63)] });
+    const room = 63 - "_basalt_stage_".len - "_00000000".len;
+    return msgfmt.allocPrint(a, "{s}_basalt_stage_{s}_{x:0>8}", .{ schema, table[0..@min(table.len, room)], tag });
 }
 
-/// Statements that make a fresh staging table shaped like the target, which must
-/// already exist; a staging table a killed run left behind is dropped first.
-pub fn setupSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8) ![]const []const u8 {
-    const qt = try sql.quoteIdent(a, d, target);
-    const qs = try sql.quoteIdent(a, d, try stagingName(a, target));
-    const out = try a.alloc([]const u8, 2);
-    out[0] = try dropSql(a, d, target);
-    out[1] = try intrinsics(d).createLike(a, qs, qt);
+/// The statement that makes this run's staging table `staging`, shaped like the
+/// target, which must already exist.
+pub fn setupSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, staging: []const u8) ![]const []const u8 {
+    const out = try a.alloc([]const u8, 1);
+    out[0] = try intrinsics(d).createLike(a, try sql.quoteIdent(a, d, staging), try sql.quoteIdent(a, d, target));
     return out;
 }
 
 /// The cutover: one transaction that clears the target and copies the staging rows
 /// in by column name, so a target with its columns in another order still lines up.
-pub fn cutoverSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, schema: types.Schema, how: Cutover) ![]const []const u8 {
+pub fn cutoverSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, staging: []const u8, schema: types.Schema, how: Cutover) ![]const []const u8 {
     const in = intrinsics(d);
     const qt = try sql.quoteIdent(a, d, target);
-    const qs = try sql.quoteIdent(a, d, try stagingName(a, target));
+    const qs = try sql.quoteIdent(a, d, staging);
     const cols = try sql.colList(a, d, schema);
     const out = try a.alloc([]const u8, 4);
     out[0] = in.begin;
@@ -88,8 +88,8 @@ pub fn cutoverSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, sche
     return out;
 }
 
-pub fn dropSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8) ![]const u8 {
-    return msgfmt.allocPrint(a, "DROP TABLE IF EXISTS {s}", .{try sql.quoteIdent(a, d, try stagingName(a, target))});
+pub fn dropSql(a: std.mem.Allocator, d: sql.Dialect, staging: []const u8) ![]const u8 {
+    return msgfmt.allocPrint(a, "DROP TABLE IF EXISTS {s}", .{try sql.quoteIdent(a, d, staging)});
 }
 
 /// Runs `stmts` in order on `conn`; on a failure a transaction left open by it is
@@ -98,14 +98,16 @@ pub fn execAll(conn: sql.Conn, stmts: []const []const u8) !void {
     for (stmts) |s| try conn.exec(s);
 }
 
-test "staging name keeps the schema, prefixes the table and fits 63 bytes" {
+test "staging name keeps the schema, prefixes the table, ends in the run's tag and fits 63 bytes" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    try std.testing.expectEqualStrings("public._basalt_stage_orders", try stagingName(a, "public.orders"));
-    try std.testing.expectEqualStrings("_basalt_stage_t", try stagingName(a, "t"));
-    const long = try stagingName(a, "s." ++ "x" ** 80);
+    try std.testing.expectEqualStrings("public._basalt_stage_orders_00c0ffee", try stagingName(a, "public.orders", 0xc0ffee));
+    try std.testing.expectEqualStrings("_basalt_stage_t_00000001", try stagingName(a, "t", 1));
+    const long = try stagingName(a, "s." ++ "x" ** 80, 0xffffffff);
     try std.testing.expectEqual(@as(usize, 2 + 63), long.len);
+    try std.testing.expect(std.mem.endsWith(u8, long, "x_ffffffff"));
+    try std.testing.expect(!std.mem.eql(u8, try stagingName(a, "t", 1), try stagingName(a, "t", 2)));
 }
 
 test "the cutover clears and copies in one transaction, per dialect" {
@@ -113,14 +115,14 @@ test "the cutover clears and copies in one transaction, per dialect" {
     defer ar.deinit();
     const a = ar.allocator();
     const schema = types.Schema{ .fields = &.{ .{ .name = "id", .ty = types.Type.init(.int) }, .{ .name = "v", .ty = types.Type.init(.string) } } };
-    const pg = try cutoverSql(a, .postgres, "public.t", schema, .truncate);
+    const pg = try cutoverSql(a, .postgres, "public.t", "public._basalt_stage_t_00000001", schema, .truncate);
     try std.testing.expectEqualStrings("BEGIN", pg[0]);
     try std.testing.expectEqualStrings("TRUNCATE TABLE \"public\".\"t\"", pg[1]);
-    try std.testing.expectEqualStrings("INSERT INTO \"public\".\"t\" (\"id\",\"v\") SELECT \"id\",\"v\" FROM \"public\".\"_basalt_stage_t\"", pg[2]);
+    try std.testing.expectEqualStrings("INSERT INTO \"public\".\"t\" (\"id\",\"v\") SELECT \"id\",\"v\" FROM \"public\".\"_basalt_stage_t_00000001\"", pg[2]);
     try std.testing.expectEqualStrings("COMMIT", pg[3]);
-    const ms = try cutoverSql(a, .sqlserver, "dbo.t", schema, .delete);
+    const ms = try cutoverSql(a, .sqlserver, "dbo.t", "dbo._basalt_stage_t_00000001", schema, .delete);
     try std.testing.expectEqualStrings("DELETE FROM [dbo].[t]", ms[1]);
-    const my = try cutoverSql(a, .mysql, "t", schema, .truncate);
+    const my = try cutoverSql(a, .mysql, "t", "_basalt_stage_t_00000001", schema, .truncate);
     try std.testing.expectEqualStrings("START TRANSACTION", my[0]);
     try std.testing.expectEqualStrings("DELETE FROM `t`", my[1]);
 }

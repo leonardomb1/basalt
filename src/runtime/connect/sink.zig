@@ -263,11 +263,11 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                     };
                     const p = try env.arena.create(ReplacePlan);
                     p.* = .{ .gpa = env.gpa, .kind = info.kind, .cfg = cfg, .dialect = info.dialect, .target = w.target, .schema = schema, .how = env.cutover, .errctx = env.errctx };
-                    p.prepare() catch |e| {
+                    p.prepare(env.arena) catch |e| {
                         c.close();
                         return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} REPLACE staging failed ({s})", .{ conn.connector, @errorName(e) }));
                     };
-                    target = try p.stagingTarget(env.arena);
+                    target = p.stagingTarget();
                     mode = .append;
                     plan = p;
                 }
