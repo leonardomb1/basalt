@@ -230,28 +230,28 @@ Parquet (6 million `lineitem` rows), on a bare-metal server (AMD Ryzen 7 PRO 870
 8 cores), each engine run as a process with 8 threads, best of three; every engine's
 answers match DuckDB's. A query's time is its wall time less the engine's startup.
 The harness, its queries and the full results with memory are in
-[`bench/`](bench/README.md) ([this run](bench/results/2026-11-10-amd-ryzen-7-pro-8700ge-w-radeon-780m-gra.md)).
+[`bench/`](bench/README.md) ([this run](bench/results/2026-11-15-amd-ryzen-7-pro-8700ge-w-radeon-780m-gra.md)).
 
-| | basalt 0.13.4 | DuckDB 2.0 | ClickHouse 26.10 | Polars 2.1 | DataFusion 55 |
+| | basalt 0.14.2 | DuckDB 2.0 | ClickHouse 26.11 | Polars 2.1 | DataFusion 55 |
 |---|---|---|---|---|---|
-| startup | **1 ms**, 15 MB | 28 ms, 51 MB | 45 ms, 239 MB | 106 ms, 137 MB | 80 ms, 116 MB |
-| `count(DISTINCT)` | **22 ms** | 66 ms | 88 ms | 56 ms | 68 ms |
-| `LIKE` over long strings | **49 ms** | 78 ms | 96 ms | 63 ms | 72 ms |
-| TPC-H Q6 (filter) | 23 ms | 22 ms | 60 ms | **17 ms** | 29 ms |
-| TPC-H Q1 (aggregate) | 59 ms | **42 ms** | 105 ms | 55 ms | 74 ms |
-| TPC-H Q3 (join, top-N) | 55 ms | 38 ms | 109 ms | **29 ms** | 49 ms |
-| TPC-H Q18 (IN, HAVING) | 103 ms | **55 ms** | 135 ms | 58 ms | 148 ms |
-| exact median | 97 ms | **58 ms** | 120 ms | 160 ms | 96 ms |
-| `lineitem` Parquet → CSV | **0.41 s** | 0.64 s | 0.46 s | 0.47 s | 0.71 s |
-| `lineitem` Parquet → Parquet | 0.69 s | **0.45 s** | 0.80 s | 0.46 s | 1.10 s |
-| `lineitem` CSV → Parquet | 1.04 s | 0.97 s | 1.15 s | **0.79 s** | 1.17 s |
-| `lineitem` NDJSON → Parquet | 3.11 s | **1.10 s** | 1.86 s | 1.35 s | 1.66 s |
-| `lineitem` CSV.gz → Parquet | 5.93 s | 1.99 s | 1.30 s | **1.24 s** | 3.25 s |
+| startup | **1 ms**, 15 MB | 28 ms, 50 MB | 49 ms, 213 MB | 126 ms, 138 MB | 91 ms, 116 MB |
+| `count(DISTINCT)` | **22 ms** | 66 ms | 66 ms | 62 ms | 68 ms |
+| `LIKE` over long strings | **50 ms** | 76 ms | 52 ms | 59 ms | 72 ms |
+| TPC-H Q6 (filter) | 23 ms | 24 ms | 22 ms | **16 ms** | 30 ms |
+| TPC-H Q1 (aggregate) | 59 ms | **39 ms** | 72 ms | 58 ms | 76 ms |
+| TPC-H Q3 (join, top-N) | 54 ms | 42 ms | 72 ms | **28 ms** | 49 ms |
+| TPC-H Q18 (IN, HAVING) | 103 ms | **55 ms** | 72 ms | 61 ms | 148 ms |
+| exact median | 92 ms | **60 ms** | 71 ms | 156 ms | 95 ms |
+| `lineitem` Parquet → CSV | **0.44 s** | 0.81 s | 0.47 s | 0.62 s | 0.72 s |
+| `lineitem` Parquet → Parquet | 0.67 s | **0.49 s** | 0.68 s | 0.51 s | 1.07 s |
+| `lineitem` CSV → Parquet | 1.01 s | 0.92 s | 1.02 s | **0.83 s** | 1.17 s |
+| `lineitem` NDJSON → Parquet | **0.87 s** | 1.16 s | 1.80 s | 1.35 s | 1.67 s |
+| `lineitem` CSV.gz → Parquet | 1.60 s | 2.01 s | **1.25 s** | 1.27 s | 3.24 s |
 
-basalt starts in a millisecond and holds the least memory on most queries; it is the
-fastest at distinct counts, string matching and writing CSV, and on joins and
-aggregates one and a half to two and a half times slower than the fastest engine. Reading
-gzipped CSV and NDJSON are its slowest paths today.
+basalt starts in a millisecond and holds the least memory on most queries. It is the
+fastest at distinct counts, string matching, writing CSV and loading NDJSON, and loads
+gzipped CSV ahead of DuckDB and within a third of the fastest engine. On joins and
+aggregates it is one and a half to two times slower than the fastest engine.
 
 ## What sets it apart
 
