@@ -51,7 +51,7 @@ pub fn checkTableBody(self: *Parser) Error!struct { toks: []const Token, check: 
     var discard = std.array_list.Managed(ast.Stmt).init(self.arena);
     var stages = std.array_list.Managed(ast.Stage).init(self.arena);
     try self.parseQuery(&discard, &stages);
-    _ = try self.expect(.semi);
+    try self.endStmt();
     const body = self.toks[start..self.i];
     const toks = try self.arena.alloc(Token, body.len + 1);
     @memcpy(toks[0..body.len], body);
@@ -120,7 +120,7 @@ pub fn callTableFn(self: *Parser, name: []const u8, pos: Pos, place: enum { from
     var inner = std.array_list.Managed(ast.Stmt).init(self.arena);
     var stages = std.array_list.Managed(ast.Stage).init(self.arena);
     self.parseQuery(&inner, &stages) catch |e| return self.inTableFn(e, fd.name, pos);
-    _ = self.expect(.semi) catch |e| return self.inTableFn(e, fd.name, pos);
+    self.endStmt() catch |e| return self.inTableFn(e, fd.name, pos);
     if (try httpCall(self, fd, pos, stages.items, inner.items, args.items, correlated.items)) |lk| {
         if (lateral) return .{ .lookup = lk };
         return .{ .binding = try oneRowCall(self, fd.name, pos, lk) };

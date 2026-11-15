@@ -33,7 +33,7 @@ END FOR;
   and is scoped to the body: after the loop the name means whatever it meant
   before. At the top level a `WITH` is visible from its statement onwards, so
   two statements may reuse a CTE name and each reads its own.
-- Loop variables may be typed: `AS (name, port:INT)`.
+- Loop variables may be typed as a PARAM is: `AS (name, port INT)`.
 - A loop variable is also an ordinary expression **value**: `SELECT $name AS
   empresa`, `WHERE $port > 1000` (typed vars compare as their declared type).
   Only `$name` is the loop variable: a bare `name` in the body is still the

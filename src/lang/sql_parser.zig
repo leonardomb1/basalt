@@ -683,6 +683,12 @@ pub const Parser = struct {
         if (self.eatKw("last")) return false;
         return self.fail(self.curPos(), "expected FIRST or LAST after NULLS", .{});
     }
+    /// A statement's end: its `;`, which the script's last statement may leave out.
+    pub fn endStmt(self: *Parser) Error!void {
+        if (self.at(.eof)) return;
+        _ = try self.expect(.semi);
+    }
+
     pub fn expect(self: *Parser, tag: Tag) Error!Token {
         if (self.at(tag)) return self.advance();
         return self.fail(self.curPos(), "expected {s}, found {s}", .{ tag.describe(), self.curTag().describe() });

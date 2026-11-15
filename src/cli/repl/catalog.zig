@@ -202,7 +202,7 @@ pub fn suggest(ctx: *anyopaque, arena: std.mem.Allocator, text: []const u8, curs
     return .{ .start = offer.start, .items = items };
 }
 
-/// The variables of every `FOR EACH ... AS (a, b:INT)` still open at `cursor`, read
+/// The variables of every `FOR EACH ... AS (a, b INT)` still open at `cursor`, read
 /// from the text past the lexer's strings and comments, as a script being typed
 /// will not parse.
 fn loopVarsAt(text: []const u8, cursor: usize, out: *std.array_list.Managed([]const u8)) !void {
@@ -239,11 +239,12 @@ fn loopVarsAt(text: []const u8, cursor: usize, out: *std.array_list.Managed([]co
                 else => if (depth == 0 and wordsAt(upto, k, "as", "(") and !(std.ascii.isAlphanumeric(upto[k - 1]) or upto[k - 1] == '_')) {
                     const lp = std.mem.indexOfScalarPos(u8, upto, k, '(').?;
                     const rp = std.mem.indexOfScalarPos(u8, upto, lp, ')') orelse break;
-                    var it = std.mem.tokenizeAny(u8, upto[lp + 1 .. rp], ", \t\r\n");
-                    while (it.next()) |w| {
+                    var it = std.mem.splitScalar(u8, upto[lp + 1 .. rp], ',');
+                    while (it.next()) |item| {
+                        const w = std.mem.trimLeft(u8, item, " \t\r\n");
                         var e: usize = 0;
                         while (e < w.len and (std.ascii.isAlphanumeric(w[e]) or w[e] == '_')) e += 1;
-                        if (e > 0 and (e == w.len or w[e] == ':')) try out.append(w[0..e]);
+                        if (e > 0) try out.append(w[0..e]);
                     }
                     break;
                 },
@@ -411,7 +412,7 @@ test "suggestFor: a FOR EACH body offers its loop variables, and only inside the
     defer catalog.deinit();
     const cx = Completer{ .gpa = std.testing.allocator, .decls = &decls, .catalog = &catalog, .connect = false };
 
-    const inside = "FOR EACH ROW OF (WITH w AS (SELECT name AS has FROM 'u.csv') SELECT has, 1 FROM w) AS (nm, nx:INT)\n  SELECT $n";
+    const inside = "FOR EACH ROW OF (WITH w AS (SELECT name AS has FROM 'u.csv') SELECT has, 1 FROM w) AS (nm, nx INT)\n  SELECT $n";
     const got = try suggestFor(a, &cx, inside, inside.len);
     try std.testing.expectEqual(@as(usize, 2), got.items.len);
     try std.testing.expectEqualStrings("$nm", got.items[0].text);

@@ -125,7 +125,7 @@ pub fn parseDescribe(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Erro
         try stages.append(.{ .node = node, .hints = try hints.toOwnedSlice(), .pos = pos });
     }
     try stages.append(.{ .node = .{ .write = .{ .connector = "stdout", .form = null, .target = "", .mode = .default } }, .hints = &.{}, .pos = pos });
-    _ = try self.expect(.semi);
+    try self.endStmt();
     try out.append(.{ .explain = .{ .mode = .describe, .pipeline = .{ .stages = try stages.toOwnedSlice(), .pos = pos }, .pos = pos } });
 }
 
@@ -144,7 +144,7 @@ pub fn parseShow(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!vo
     if (self.eat(.dot)) schema = try self.expectIdent();
     var like: ?[]const u8 = null;
     if (self.eatKw("like")) like = (try self.expect(.string)).text;
-    _ = try self.expect(.semi);
+    try self.endStmt();
     if (std.mem.eql(u8, kind, "http")) {
         if (schema != null) return self.fail(pos, "SHOW TABLES FROM: `{s}` is an http connection, which has no schemas", .{conn});
         return self.fail(pos, "SHOW TABLES FROM: `{s}` is an http connection, which has no tables; an endpoint is a function, CREATE FUNCTION f() RETURNS TABLE AS SELECT * FROM {s}.GET('/...'), read FROM f()", .{ conn, conn });
@@ -237,11 +237,11 @@ pub fn parseLetStmt(self: *Parser) Error!ast.LetConst {
     if (self.at(.lparen) and (self.peekKw("select") or self.peekKw("with"))) {
         _ = self.advance();
         const pipe = try self.parseSubqueryPipeline();
-        _ = try self.expect(.semi);
+        try self.endStmt();
         return .{ .name = name, .expr = null, .query = pipe, .pos = pos };
     }
     const expr = try self.parseExpr();
-    _ = try self.expect(.semi);
+    try self.endStmt();
     return .{ .name = name, .expr = expr, .pos = pos };
 }
 
@@ -249,7 +249,7 @@ pub fn parsePrintStmt(self: *Parser) Error!ast.Print {
     const pos = self.curPos();
     try self.expectKw("print");
     const expr = try self.parseExpr();
-    _ = try self.expect(.semi);
+    try self.endStmt();
     return .{ .expr = expr, .pos = pos };
 }
 

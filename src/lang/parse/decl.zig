@@ -37,7 +37,7 @@ pub fn parseConnection(self: *Parser, pos: Pos) Error!ast.Connection {
     try self.parseHttpClauses(&hints);
     if (hints.items.len > 0 and !std.mem.eql(u8, connector, "http"))
         return self.fail(hints.items[0].pos, "PAGINATE / RETRY / WITH on a connection are for `http` connections only", .{});
-    _ = try self.expect(.semi);
+    try self.endStmt();
     if (!has_user) try attrs.append(.{ .key = "user", .value = try self.envCall(name, "_USER"), .pos = pos });
     if (!has_pass) try attrs.append(.{ .key = "password", .value = try self.envCall(name, "_PASS"), .pos = pos });
     return .{ .name = name, .connector = connector, .config = try attrs.toOwnedSlice(), .pos = pos, .hints = try hints.toOwnedSlice() };
@@ -58,15 +58,18 @@ pub fn parseHttpClauses(self: *Parser, hints: *std.array_list.Managed(ast.Hint))
     }
 }
 
-/// `GET(path, name = value ...)` / `POST(path, body = value, ...)` after `conn.`: every
-/// `name = value` but `body` is a query parameter, URL-encoded when the request is built.
+/// `GET(path, name = value ...)`, `POST`, `PUT`, `PATCH` (each may send `body = value`)
+/// and `DELETE` after `conn.`: every `name = value` but `body` is a query parameter,
+/// URL-encoded when the request is built.
 pub fn parseHttpCall(self: *Parser, conn: []const u8, hints: *std.array_list.Managed(ast.Hint)) Error!ast.Read {
     const pos = self.curPos();
-    const verb = self.advance().text;
-    const post = eqlNoCase(verb, "post");
+    const verb = try std.ascii.allocLowerString(self.arena, self.advance().text);
+    const sends_body = for (http_body_verbs) |v| {
+        if (std.mem.eql(u8, verb, v)) break true;
+    } else false;
     _ = try self.expect(.lparen);
     const path = try self.exprToTemplate(try self.parseExpr());
-    if (post) try hints.append(.{ .key = "method", .value = .{ .ident = "post" }, .pos = pos });
+    if (!std.mem.eql(u8, verb, "get")) try hints.append(.{ .key = "method", .value = .{ .ident = verb }, .pos = pos });
     while (self.eat(.comma)) {
         const apos = self.curPos();
         const key = try self.expectIdent();
@@ -74,7 +77,7 @@ pub fn parseHttpCall(self: *Parser, conn: []const u8, hints: *std.array_list.Man
         const expr = try self.parseExpr();
         const val = try self.exprToTemplate(expr);
         if (eqlNoCase(key, "body")) {
-            if (!post) return self.fail(apos, "GET takes no body — use {s}.POST(path, body = ...)", .{conn});
+            if (!sends_body) return self.fail(apos, "{s} takes no body — use {s}.POST, PUT or PATCH(path, body = ...)", .{ try std.ascii.allocUpperString(self.arena, verb), conn });
             try hints.append(.{ .key = "body", .value = .{ .str = val }, .pos = apos });
         } else if (expr.* != .null_lit) {
             try hints.append(.{ .key = try msgfmt.allocPrint(self.arena, "query:{s}", .{key}), .value = .{ .str = val }, .pos = apos });
@@ -84,8 +87,12 @@ pub fn parseHttpCall(self: *Parser, conn: []const u8, hints: *std.array_list.Man
     return .{ .connector = conn, .form = .{ .path = path } };
 }
 
+const http_body_verbs = [_][]const u8{ "post", "put", "patch" };
+
 pub fn isHttpVerb(self: *Parser) bool {
-    return (self.isKw("get") or self.isKw("post")) and self.peekTag() == .lparen;
+    if (self.peekTag() != .lparen) return false;
+    for ([_][]const u8{ "get", "post", "put", "patch", "delete" }) |v| if (self.isKw(v)) return true;
+    return false;
 }
 
 pub fn envCall(self: *Parser, conn_name: []const u8, suffix: []const u8) Error!*ast.Expr {
@@ -139,7 +146,7 @@ pub fn parseFunction(self: *Parser, pos: Pos, replace: bool) Error!ast.FnDecl {
             try self.parseStatement(&body);
         }
         try self.expectKw("end");
-        _ = try self.expect(.semi);
+        _ = self.eat(.semi);
         if (body.items.len == 0)
             return self.fail(pos, "`{s}`: statement function body is empty", .{name});
         return .{ .name = name, .params = try params.toOwnedSlice(), .body = .{ .stmts = try body.toOwnedSlice() }, .replace = replace, .pos = pos };
@@ -148,7 +155,7 @@ pub fn parseFunction(self: *Parser, pos: Pos, replace: bool) Error!ast.FnDecl {
     if (atStmtStart(self))
         return self.fail(self.curPos(), "`{s}`: a body of statements is written `AS BEGIN ... END;`", .{name});
     const body = try self.parseExpr();
-    _ = try self.expect(.semi);
+    try self.endStmt();
     return .{ .name = name, .params = try params.toOwnedSlice(), .body = .{ .expr = body }, .replace = replace, .pos = pos };
 }
 
@@ -182,7 +189,7 @@ pub fn parseCallStmt(self: *Parser) Error!ast.CallStmt {
         while (self.eat(.comma)) try args.append(try self.parseExpr());
     }
     _ = try self.expect(.rparen);
-    _ = try self.expect(.semi);
+    try self.endStmt();
     return .{ .name = name, .args = try args.toOwnedSlice(), .pos = pos };
 }
 
@@ -192,7 +199,7 @@ pub fn parseThrowStmt(self: *Parser) Error!ast.Throw {
     try self.expectKw("throw");
     const message = try self.parseExpr();
     const when: ?*ast.Expr = if (self.eatKw("when")) try self.parseExpr() else null;
-    _ = try self.expect(.semi);
+    try self.endStmt();
     return .{ .message = message, .when = when, .pos = pos };
 }
 
@@ -210,7 +217,7 @@ pub fn parseParam(self: *Parser) Error!ast.Param {
     }
     var default: ?*ast.Expr = null;
     if (self.eatKw("default")) default = try self.parseExpr();
-    _ = try self.expect(.semi);
+    try self.endStmt();
     return .{ .name = name, .ty = ty, .default = default, .pos = pos, .is_json = is_json };
 }
 

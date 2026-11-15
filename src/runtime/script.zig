@@ -107,7 +107,7 @@ fn interpFail(arena: std.mem.Allocator, text: []const u8, why: []const u8) anyer
     return eval.explain(error.InterpFailed, msg);
 }
 
-/// Variables bind as strings unless the `for` header typed them (`port:int`), so
+/// Variables bind as strings unless the `for` header typed them (`port INT`), so
 /// `${if(port > 1000, ...)}` compares numerically. A failure is permanent.
 fn evalInterpExpr(arena: std.mem.Allocator, text: []const u8, lr: LoopRow) ![]const u8 {
     return switch (try evalHole(arena, text, lr)) {

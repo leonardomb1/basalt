@@ -18,8 +18,9 @@ and `token_path`, `token_header`, `token_prefix` for where the token goes) or
 `oauth2` (`login_url` — `token_url` is accepted too — `client_id`,
 `client_secret`, `scope`). With no `auth`, no credentials are read at all.
 
-A read names its endpoint in place, `conn.GET(path, name = value, ...)` or
-`conn.POST(path, body = ...)`, each `name = value` a query parameter. To name an
+A read names its endpoint in place, `conn.GET(path, name = value, ...)`,
+`conn.POST(path, body = ...)`, `conn.PUT` and `conn.PATCH` (a body too) or
+`conn.DELETE` (none), each `name = value` a query parameter. To name an
 endpoint once and read it like a table, make it a table function
 ([user functions](../language/user-functions.md)):
 

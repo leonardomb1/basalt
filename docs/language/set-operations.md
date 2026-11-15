@@ -80,3 +80,6 @@ FROM EACH TABLE OF (SELECT name, substr(name, 4, 2) FROM erp.sys.tables WHERE na
 JSON form (array of `{table, tag}` objects, e.g. from a `JSON` param):
 `FROM EACH TABLE OF ($job.tables) IN erp AS (table_name, tag)` — element keys
 remappable via `WITH (table_field = ..., tag_field = ..., tag_substr = '4,2')`.
+A string names a file whose rows list the tables, as it does in `FOR EACH ROW OF
+('file')` and `FROM 'file'`: `FROM EACH TABLE OF ('tables.csv') IN erp AS
+(table_name, tag)`.

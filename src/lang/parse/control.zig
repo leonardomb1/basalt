@@ -45,12 +45,11 @@ pub fn parseForEach(self: *Parser, pre: *std.array_list.Managed(ast.Stmt)) Error
     var names = std.array_list.Managed([]const u8).init(self.arena);
     var tys = std.array_list.Managed(?types.Type).init(self.arena);
     while (true) {
-        try names.append(try self.expectIdent());
-        if (self.eat(.colon)) {
-            try tys.append(try self.parseTypeName());
-        } else {
-            try tys.append(null);
-        }
+        const name = try self.expectIdent();
+        try names.append(name);
+        if (self.at(.colon))
+            return self.fail(self.curPos(), "a loop variable's type follows its name as a PARAM's does: `{s} INT`, not `{s}:INT`", .{ name, name });
+        try tys.append(if (self.at(.comma) or self.at(.rparen)) null else try self.parseTypeName());
         if (!self.eat(.comma)) break;
     }
     _ = try self.expect(.rparen);

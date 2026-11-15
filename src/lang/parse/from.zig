@@ -146,9 +146,10 @@ pub fn parseSubQuery(self: *Parser, pos: Pos) Error!ast.Pipeline {
     return .{ .stages = try stages.toOwnedSlice(), .pos = pos };
 }
 
-/// `EACH TABLE OF (SELECT ... | conn.QUERY(...) | $param.path | '<json>' IN conn)
-/// [AS (name, tag)]`: one branch per row, on the discovery
-/// query's connection unless `IN conn` says otherwise.
+/// `EACH TABLE OF (SELECT ... | conn.QUERY(...) | $param.path IN conn | 'file' IN conn)
+/// [AS (name, tag)]`: one branch per row, on the discovery query's connection
+/// unless `IN conn` says otherwise. A string is a file whose rows name the tables,
+/// as it is in `FOR EACH ROW OF ('file')` and `FROM 'file'`.
 pub fn parseEachTableOf(self: *Parser, hints: *std.array_list.Managed(ast.Hint)) Error!ast.Stage.Node {
     const pos = self.curPos();
     try self.expectKw("each");
@@ -162,7 +163,10 @@ pub fn parseEachTableOf(self: *Parser, hints: *std.array_list.Managed(ast.Hint))
         const joined = try std.mem.join(self.arena, ".", q.parts);
         u.discover_json = try msgfmt.allocPrint(self.arena, "${{{s}}}", .{joined});
     } else if (self.at(.string)) {
-        u.discover_json = self.advance().text;
+        const spos = self.curPos();
+        const stages = try self.arena.alloc(ast.Stage, 1);
+        stages[0] = .{ .node = .{ .read = .{ .connector = "csv", .form = .{ .path = self.advance().text } } }, .hints = &.{}, .pos = spos };
+        u.discover_pipeline = .{ .stages = stages, .pos = spos };
     } else if (self.isKw("select")) {
         const pipe = try self.parseSubQuery(pos);
         u.discover_pipeline = pipe;
@@ -192,7 +196,7 @@ pub fn parseEachTableOf(self: *Parser, hints: *std.array_list.Managed(ast.Hint))
         u.discover_conn = conn;
     }
     if (u.discover_pipeline != null and u.discover_conn.len == 0)
-        return self.fail(pos, "EACH TABLE OF (SELECT ...): add `IN <conn>` to say where the discovered tables live", .{});
+        return self.fail(pos, "EACH TABLE OF (SELECT ...) or ('file'): add `IN <conn>` to say where the discovered tables live", .{});
 
     if (self.eatKw("as")) {
         _ = try self.expect(.lparen);

@@ -721,6 +721,74 @@ test "sql: a refused correlated subquery fails its statement alone; the statemen
     try testing.expect(semi and left);
 }
 
+test "sql: the script's last statement and a function's END may leave out their `;`, a statement in between may not" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const last = try parseSource(a, "SELECT 1 AS x", &diag);
+    try testing.expectEqual(@as(usize, 2), last.stmts.len);
+    const fns = try parseSource(a, "CREATE FUNCTION p() AS BEGIN PRINT 'a'; END\nCREATE FUNCTION t() RETURNS TABLE AS SELECT 1 AS x\n", &diag);
+    try testing.expect(fns.stmts[1].func.body == .stmts);
+    _ = try parseSource(a, "CREATE FUNCTION t() RETURNS TABLE AS SELECT 1 AS x;\nSELECT * FROM t()", &diag);
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT 1 AS x\nSELECT 2 AS y;", &diag));
+    try testing.expectEqualStrings("expected ';', found identifier", diag.msg);
+}
+
+test "sql: PARTIAL COLUMNS spells PARTIAL COLS" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    for ([_][]const u8{ "COLS", "COLUMNS" }) |kw| {
+        const src = try std.fmt.allocPrint(a, "LOAD INTO 'o/' UPSERT ON (id) PARTIAL {s} (amt, qty) AS SELECT 1 AS id, 2 AS amt, 3 AS qty;", .{kw});
+        const prog = try parseSource(a, src, &diag);
+        const st = prog.stmts[1].output.stages;
+        const partial = st[st.len - 1].node.write.mode.upsert.partial.?;
+        try testing.expectEqual(@as(usize, 2), partial.len);
+        try testing.expectEqualStrings("qty", partial[1]);
+    }
+}
+
+test "sql: an http connection's PUT, PATCH and DELETE set their method, PUT and PATCH take a body and DELETE none" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parseSource(a,
+        \\CREATE CONNECTION rc TYPE http OPTIONS (base_url = 'u');
+        \\SELECT * FROM rc.PUT('/x', body = '{}');
+        \\SELECT * FROM rc.patch('/x', body = '{}', id = 7);
+        \\SELECT * FROM rc.DELETE('/x', id = 7);
+    , &diag);
+    for ([_][]const u8{ "put", "patch", "delete" }, prog.stmts[2..5]) |m, st| {
+        const read = st.output.stages[0];
+        try testing.expectEqualStrings(m, hintStr(read.hints, "method").?);
+        try testing.expectEqual(!std.mem.eql(u8, m, "delete"), hintStr(read.hints, "body") != null);
+    }
+    try testing.expectError(error.ParseFailed, parseSource(a, "CREATE CONNECTION rc TYPE http OPTIONS (base_url = 'u'); SELECT * FROM rc.DELETE('/x', body = 'b');", &diag));
+    try testing.expectEqualStrings("DELETE takes no body — use rc.POST, PUT or PATCH(path, body = ...)", diag.msg);
+}
+
+test "sql: a loop variable is typed after its name, as a PARAM is, and a string source is a file in EACH TABLE OF as in FOR EACH" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parseSource(a, "FOR EACH ROW OF ('n.csv') AS (name, port INT, ok) PRINT $name; END FOR;", &diag);
+    const fe = prog.stmts[1].for_each;
+    try testing.expect(fe.var_types[0] == null and fe.var_types[2] == null);
+    try testing.expectEqual(types.TypeKind.int, fe.var_types[1].?.kind);
+    try testing.expectError(error.ParseFailed, parseSource(a, "FOR EACH ROW OF ('n.csv') AS (port:INT) PRINT $port; END FOR;", &diag));
+    try testing.expectEqualStrings("a loop variable's type follows its name as a PARAM's does: `port INT`, not `port:INT`", diag.msg);
+
+    const u = try parseSource(a, "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h'); SELECT * FROM EACH TABLE OF ('tables.csv') IN pg AS (name, tag);", &diag);
+    const un = u.stmts[2].output.stages[0].node.union_;
+    try testing.expectEqualStrings("pg", un.discover_conn);
+    try testing.expectEqualStrings("tables.csv", un.discover_pipeline.?.stages[0].node.read.form.path);
+    try testing.expectEqualStrings("", un.discover_json);
+}
+
 test "sql: an error names `||` as written, not a lone bar" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

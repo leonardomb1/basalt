@@ -89,7 +89,7 @@ pub fn parseLoadInto(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Erro
             }
             var partial: ?[]const []const u8 = null;
             if (self.eatKw("partial")) {
-                try self.expectKw("cols");
+                if (!self.eatKw("columns")) try self.expectKw("cols");
                 _ = try self.expect(.lparen);
                 var cols = std.array_list.Managed([]const u8).init(self.arena);
                 try cols.append(try self.expectColName());
@@ -124,7 +124,7 @@ pub fn parseLoadInto(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Erro
     try self.parseQuery(out, &stages);
     if (change_items) |items| try self.changeStages(&stages, &write, items, pos);
     try stages.append(.{ .node = .{ .write = write }, .hints = try whints.toOwnedSlice(), .pos = pos });
-    _ = try self.expect(.semi);
+    try self.endStmt();
     try out.append(.{ .output = .{ .stages = try stages.toOwnedSlice(), .pos = pos } });
 }
 
@@ -387,7 +387,7 @@ pub fn parseTerminalQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt))
         .hints = &.{},
         .pos = pos,
     });
-    _ = try self.expect(.semi);
+    try self.endStmt();
     try out.append(.{ .output = .{ .stages = try stages.toOwnedSlice(), .pos = pos } });
 }
 

@@ -50,7 +50,8 @@ AS
   expression, as a read's is ([Sources](sources.md#option-values)):
   `WITH (compression = $codec)`.
 - Dispositions on a **table target**: `APPEND` (default, omissible) · `REPLACE`
-  (overwrite) · `UPSERT ON (k1, k2)` · `UPSERT ON (id) PARTIAL COLS (a, b)` ·
+  (overwrite) · `UPSERT ON (k1, k2)` · `UPSERT ON (id) PARTIAL COLS (a, b)` (or
+  `PARTIAL COLUMNS`) ·
   bare `UPSERT` (infer the PK from the source table's metadata at plan time —
   needs a table read on a SQL source that exposes it). An empty/unresolved
   upsert key is an error, never a silent no-op.

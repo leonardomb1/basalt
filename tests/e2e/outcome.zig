@@ -188,7 +188,7 @@ test "on_load: every LOAD reports as it finishes — written, failed before writ
         }
         var log = LoadLog{ .arena = a, .list = .init(a) };
         const src = try std.fmt.allocPrint(a,
-            \\FOR EACH ROW OF ('{s}/sizes.csv') AS (n:INT) PARALLEL
+            \\FOR EACH ROW OF ('{s}/sizes.csv') AS (n INT) PARALLEL
             \\  LOAD INTO IDENTIFIER('{s}/par_' || $n || '.csv') AS SELECT v FROM IDENTIFIER('{s}/in_' || $n || '.csv');
             \\END FOR;
         , .{ base, base, base });
