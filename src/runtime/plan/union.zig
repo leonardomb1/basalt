@@ -58,7 +58,7 @@ pub fn synthReconcile(arena: std.mem.Allocator, src: types.Schema, canon: types.
 pub const UnionSpec = struct { read: ast.Read, tag: ?[]const u8, name: []const u8, pipeline: ?ast.Pipeline = null };
 
 /// A union's branch list: explicit branches, or tables discovered via a
-/// `(table_name, tag)` query.
+/// `(table_name, tag)` query, or a `(table_name)` one when `AS` names no tag.
 pub fn unionSpecs(env: *Env, u: ast.Union, hints: []const ast.Hint) ![]UnionSpec {
     const arena = env.arena;
     var specs = std.array_list.Managed(UnionSpec).init(arena);
@@ -97,18 +97,17 @@ pub fn unionSpecs(env: *Env, u: ast.Union, hints: []const ast.Hint) ![]UnionSpec
                 .name = tbl,
             });
         }
-    } else if (u.discover_pipeline) |pipe| {
-        for (try discoverRowsPipeline(env, pipe, 2)) |row| {
+    } else if (u.discover_pipeline != null or u.discover_query.len > 0) {
+        const tagged = forHintName(hints, "tag") != null;
+        const ncols: usize = if (tagged) 2 else 1;
+        const rows = if (u.discover_pipeline) |pipe|
+            try discoverRowsPipeline(env, pipe, ncols)
+        else
+            try discoverRows(env, .{ .connector = u.discover_conn, .form = .{ .query = u.discover_query } }, ncols);
+        for (rows) |row| {
             const parts = try arena.alloc([]const u8, 1);
             parts[0] = row[0];
-            try specs.append(.{ .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } } }, .tag = row[1], .name = row[0] });
-        }
-    } else if (u.discover_query.len > 0) {
-        const disc = ast.Read{ .connector = u.discover_conn, .form = .{ .query = u.discover_query } };
-        for (try discoverRows(env, disc, 2)) |row| {
-            const parts = try arena.alloc([]const u8, 1);
-            parts[0] = row[0];
-            try specs.append(.{ .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } } }, .tag = row[1], .name = row[0] });
+            try specs.append(.{ .read = .{ .connector = u.discover_conn, .form = .{ .table = .{ .parts = parts } } }, .tag = if (tagged) row[1] else null, .name = row[0] });
         }
     } else for (u.branches) |b| {
         const rd = b.read;

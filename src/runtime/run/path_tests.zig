@@ -272,6 +272,7 @@ const report_cases = [_]ReportCase{
     .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.csv' AS SELECT * FROM EACH TABLE OF (pg.QUERY($$SELECT \"tname\", \"tag\" FROM catalog$$));", .threads = 4, .says = &.{"postgres query, discovery"}, .never = unread },
     .{ .script = "EXPLAIN ANALYZE SELECT 'a' AS tag, t.* FROM pg.public.t t UNION ALL BY NAME SELECT 'b' AS tag, t.* FROM pg.public.t2 t;", .threads = 4, .says = &.{"sent: once per key range: SELECT"}, .never = unread },
     .{ .script = "EXPLAIN ANALYZE SELECT * FROM EACH TABLE OF (SELECT tname, tag FROM pg.public.catalog);", .says = &.{"2 branches, from discovery"} },
+    .{ .script = "EXPLAIN ANALYZE SELECT * FROM EACH TABLE OF (pg.QUERY($$SELECT \"tname\" FROM catalog$$)) AS (table_name);", .says = &.{ "2 branches, from discovery", "postgres table t2\n" } },
     .{ .script = "EXPLAIN ANALYZE SELECT id FROM '$B/in.csv' WHERE v = (SELECT MAX(v) AS m FROM pg.public.t);", .says = &.{"scalar subquery (actuals)"} },
     .{ .script = "LET top = (SELECT MAX(v) AS m FROM pg.public.t);\nLOAD INTO '$B/never.csv' AS SELECT id FROM '$B/in.csv' WHERE v = $top;", .explain = true, .says = &.{"LET `top` (actuals)"} },
     .{ .script = "FOR EACH ROW OF (SELECT tname, tag FROM pg.public.catalog) AS (a, b)\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND FOR;", .explain = true, .says = &.{"FOR EACH discovery (actuals)"} },
