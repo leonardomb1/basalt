@@ -175,49 +175,83 @@ fn keyKindFor(typname: []const u8) ?KeyKind {
     return null;
 }
 
-/// Up to `m` split predicates for `key` over the unsplit `base`, or null when the
-/// source is empty or the key has no usable bounds, so the caller reads serially.
-pub fn plan(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, key: Key, m: usize) !?Plan {
-    if (m <= 1) return null;
+/// Why `plan` cut no key ranges: the read has no key values (no rows, or all NULL),
+/// the key holds one value, it is no integer, date or timestamp (or its span
+/// overflows), its bounds could not be read, or one lane was asked for.
+pub const NoSplit = enum { no_rows, one_value, not_rangeable, unprobed, one_lane };
+
+/// Up to `m` split predicates for `key` over the unsplit `base`, or null, with
+/// `why`, when the key gives no ranges to cut, so the caller reads serially.
+pub fn plan(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, key: Key, m: usize, why: *NoSplit) !?Plan {
+    if (m <= 1) return noSplit(why, .one_lane);
     switch (key.kind) {
         .int => {
-            const b = (try intBounds(arena, prober, dialect, base, key.col)) orelse return null;
-            const preds = try intRangePreds(arena, dialect, key.col, b.min, b.max, m);
-            if (preds.len <= 1) return null;
+            const b = boundsOf(i128, try minMax(arena, prober, dialect, base, key.col), intKey, why) orelse return null;
+            const preds = try intRangePreds(arena, dialect, key.col, b[0], b[1], m);
+            if (preds.len <= 1) return noSplit(why, .not_rangeable);
             return Plan{ .key = key, .predicates = preds, .base_sql = base };
         },
         .uuid => {
-            if (dialect != .postgres) return null;
-            if (!(try hasAnyRow(arena, prober, base))) return null;
+            if (dialect != .postgres) return noSplit(why, .not_rangeable);
+            if (!(try hasAnyRow(arena, prober, base))) return noSplit(why, .no_rows);
             const preds = try uuidSpacePreds(arena, dialect, key.col, m);
             return Plan{ .key = key, .predicates = preds, .base_sql = base };
         },
         .date => {
-            const b = (try dateBounds(arena, prober, dialect, base, key.col)) orelse return null;
-            const preds = try dateRangePreds(arena, dialect, key.col, b.min, b.max, m);
-            if (preds.len <= 1) return null;
+            const b = boundsOf(i64, try minMax(arena, prober, dialect, base, key.col), dayOf, why) orelse return null;
+            const preds = try dateRangePreds(arena, dialect, key.col, b[0], b[1], m);
+            if (preds.len <= 1) return noSplit(why, .not_rangeable);
             return Plan{ .key = key, .predicates = preds, .base_sql = base };
         },
         .auto => {
-            const lh = (try minMax(arena, prober, dialect, base, key.col)) orelse return null;
-            if (intKey(lh[0])) |min| if (intKey(lh[1])) |max| {
-                if (max <= min) return null;
-                const preds = try intRangePreds(arena, dialect, key.col, min, max, m);
-                if (preds.len <= 1) return null;
+            const lh = try minMax(arena, prober, dialect, base, key.col);
+            if (lh) |v| if (intKey(v[0]) != null or intKey(v[1]) != null) {
+                const b = boundsOf(i128, lh, intKey, why) orelse return null;
+                const preds = try intRangePreds(arena, dialect, key.col, b[0], b[1], m);
+                if (preds.len <= 1) return noSplit(why, .not_rangeable);
                 return Plan{ .key = .{ .col = key.col, .kind = .int }, .predicates = preds, .base_sql = base };
             };
-            const lo = dayOf(lh[0]) orelse return null;
-            const hi = dayOf(lh[1]) orelse return null;
-            if (hi <= lo) return null;
-            const preds = try dateRangePreds(arena, dialect, key.col, lo, hi, m);
-            if (preds.len <= 1) return null;
+            const b = boundsOf(i64, lh, dayOf, why) orelse return null;
+            const preds = try dateRangePreds(arena, dialect, key.col, b[0], b[1], m);
+            if (preds.len <= 1) return noSplit(why, .not_rangeable);
             return Plan{ .key = .{ .col = key.col, .kind = .date }, .predicates = preds, .base_sql = base };
         },
     }
 }
 
-/// The key's MIN and MAX over `base`, as the driver types them; null when the
-/// probe fails or the table is empty.
+fn noSplit(why: *NoSplit, w: NoSplit) ?Plan {
+    why.* = w;
+    return null;
+}
+
+/// The key's bounds `lh` as `T`, low below high, or null with `why`: no bounds read,
+/// a NULL one (no rows, or every key NULL), one `conv` cannot read, or one value.
+fn boundsOf(comptime T: type, lh: ?[2]Value, conv: fn (Value) ?T, why: *NoSplit) ?[2]T {
+    const v = lh orelse {
+        why.* = .unprobed;
+        return null;
+    };
+    if (v[0].isNull() or v[1].isNull()) {
+        why.* = .no_rows;
+        return null;
+    }
+    const lo = conv(v[0]) orelse {
+        why.* = .not_rangeable;
+        return null;
+    };
+    const hi = conv(v[1]) orelse {
+        why.* = .not_rangeable;
+        return null;
+    };
+    if (hi <= lo) {
+        why.* = .one_value;
+        return null;
+    }
+    return .{ lo, hi };
+}
+
+/// The key's MIN and MAX over `base`, as the driver types them, NULL over no rows;
+/// null when the probe fails.
 fn minMax(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?[2]Value {
     const q = try msgfmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ try sql.quoteName(arena, dialect, col), base });
     const conn = prober.open() catch return null;
@@ -226,12 +260,9 @@ fn minMax(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []co
         return null;
     };
     defer cur.close();
-    const b = (try cur.nextBatch(arena)) orelse return null;
-    if (b.len == 0) return null;
-    const lo = b.columns[0].getValue(0);
-    const hi = b.columns[1].getValue(0);
-    if (lo.isNull() or hi.isNull()) return null;
-    return .{ lo, hi };
+    const b = (try cur.nextBatch(arena)) orelse return .{ .null, .null };
+    if (b.len == 0) return .{ .null, .null };
+    return .{ b.columns[0].getValue(0), b.columns[1].getValue(0) };
 }
 
 /// A `LIMIT 1` probe so a forced uuid split does not fan out over an empty table.
@@ -248,9 +279,6 @@ fn hasAnyRow(arena: std.mem.Allocator, prober: Prober, base: []const u8) !bool {
     return b.len > 0;
 }
 
-const Bounds = struct { min: i64, max: i64 };
-const IntBounds = struct { min: i128, max: i128 };
-
 /// An integer key's value: an INT, or a scale-0 DECIMAL such as the DECIMAL(20,0)
 /// a MySQL BIGINT UNSIGNED reads as (`types.unsignedType`).
 fn intKey(v: Value) ?i128 {
@@ -259,24 +287,6 @@ fn intKey(v: Value) ?i128 {
         .decimal => |d| if (d.scale == 0) d.unscaled else null,
         else => null,
     };
-}
-
-fn intBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?IntBounds {
-    const q = try msgfmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ try sql.quoteName(arena, dialect, col), base });
-    const conn = prober.open() catch return null;
-    var cur = conn.queryCursor(q) catch {
-        conn.close();
-        return null;
-    };
-    defer cur.close();
-    const b = (try cur.nextBatch(arena)) orelse return null;
-    if (b.len == 0) return null;
-    const lo = b.columns[0].getValue(0);
-    const hi = b.columns[1].getValue(0);
-    const min = intKey(lo) orelse return null;
-    const max = intKey(hi) orelse return null;
-    if (max <= min) return null;
-    return IntBounds{ .min = min, .max = max };
 }
 
 /// Up to `m_in` covering, disjoint range predicates over [min, max]; a single
@@ -307,24 +317,6 @@ fn intRangePreds(arena: std.mem.Allocator, dialect: Dialect, col: []const u8, mi
         }
     }
     return list.toOwnedSlice();
-}
-
-/// MIN/MAX of a date/timestamp key as days since 1970, or null when the cursor
-/// did not yield `.date` or `.timestamp` (e.g. a driver left it as text).
-fn dateBounds(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, col: []const u8) !?Bounds {
-    const q = try msgfmt.allocPrint(arena, "SELECT MIN({0s}) AS lo, MAX({0s}) AS hi FROM ({1s}) _b", .{ try sql.quoteName(arena, dialect, col), base });
-    const conn = prober.open() catch return null;
-    var cur = conn.queryCursor(q) catch {
-        conn.close();
-        return null;
-    };
-    defer cur.close();
-    const b = (try cur.nextBatch(arena)) orelse return null;
-    if (b.len == 0) return null;
-    const lo = dayOf(b.columns[0].getValue(0)) orelse return null;
-    const hi = dayOf(b.columns[1].getValue(0)) orelse return null;
-    if (hi <= lo) return null;
-    return Bounds{ .min = lo, .max = hi };
 }
 
 fn dayOf(v: Value) ?i64 {
@@ -701,8 +693,40 @@ test "plan-level guards: m<=1 and non-postgres uuid never split" {
     defer ar.deinit();
     const a = ar.allocator();
     const failing = Prober{ .ctx = undefined, .openFn = failOpen };
-    try std.testing.expectEqual(@as(?Plan, null), try plan(a, failing, .postgres, "SELECT * FROM t", .{ .col = "id", .kind = .int }, 1));
-    try std.testing.expectEqual(@as(?Plan, null), try plan(a, failing, .mysql, "SELECT * FROM t", .{ .col = "id", .kind = .uuid }, 4));
+    try std.testing.expectEqual(@as(?Plan, null), try planned(a, failing, .postgres, "SELECT * FROM t", .{ .col = "id", .kind = .int }, 1));
+    try std.testing.expectEqual(@as(?Plan, null), try planned(a, failing, .mysql, "SELECT * FROM t", .{ .col = "id", .kind = .uuid }, 4));
+}
+
+fn planned(a: std.mem.Allocator, prober: Prober, dialect: Dialect, base: []const u8, key: Key, m: usize) !?Plan {
+    var why: NoSplit = .one_lane;
+    return plan(a, prober, dialect, base, key, m, &why);
+}
+
+test "a key with no ranges to cut says why: no rows, one value, no integer or date, no bounds read, one lane" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = "SELECT * FROM t";
+    const Case = struct { rows: []const []const Value, kind: KeyKind, m: usize = 4, why: NoSplit };
+    const cases = [_]Case{
+        .{ .rows = &.{&.{ .null, .null }}, .kind = .int, .why = .no_rows },
+        .{ .rows = &.{&.{ .null, .null }}, .kind = .auto, .why = .no_rows },
+        .{ .rows = &.{&.{ .null, .null }}, .kind = .date, .why = .no_rows },
+        .{ .rows = &.{&.{ .{ .int = 7 }, .{ .int = 7 } }}, .kind = .auto, .why = .one_value },
+        .{ .rows = &.{&.{ .{ .date = 19000 }, .{ .date = 19000 } }}, .kind = .date, .why = .one_value },
+        .{ .rows = &.{&.{ .{ .string = "a" }, .{ .string = "z" } }}, .kind = .auto, .why = .not_rangeable },
+        .{ .rows = &.{&.{ .{ .int = 1 }, .{ .int = 9 } }}, .kind = .int, .m = 1, .why = .one_lane },
+    };
+    for (cases) |c| {
+        var f = FakeConn{ .arena = a, .rows = c.rows };
+        var why: NoSplit = .one_lane;
+        try std.testing.expectEqual(@as(?Plan, null), try plan(a, f.prober(), .postgres, base, .{ .col = "id", .kind = c.kind }, c.m, &why));
+        try std.testing.expectEqual(c.why, why);
+    }
+    var why: NoSplit = .one_lane;
+    const failing = Prober{ .ctx = undefined, .openFn = failOpen };
+    try std.testing.expectEqual(@as(?Plan, null), try plan(a, failing, .postgres, base, .{ .col = "id", .kind = .int }, 4, &why));
+    try std.testing.expectEqual(NoSplit.unprobed, why);
 }
 
 fn failOpen(_: *anyopaque) anyerror!Conn {
@@ -825,7 +849,7 @@ test "plan probes the key's bounds and slices them per kind, the NULL keys in sl
     const base = "SELECT * FROM t";
 
     var f = FakeConn{ .arena = a, .rows = &.{&.{ .{ .int = 1 }, .{ .int = 1000 } }} };
-    const p = (try plan(a, f.prober(), .postgres, base, .{ .col = "id", .kind = .int }, 4)).?;
+    const p = (try planned(a, f.prober(), .postgres, base, .{ .col = "id", .kind = .int }, 4)).?;
     try std.testing.expectEqualStrings("SELECT MIN(\"id\") AS lo, MAX(\"id\") AS hi FROM (SELECT * FROM t) _b", f.queries.items[0]);
     try std.testing.expectEqual(KeyKind.int, p.key.kind);
     try std.testing.expectEqualStrings(base, p.base_sql);
@@ -840,7 +864,7 @@ test "plan probes the key's bounds and slices them per kind, the NULL keys in sl
     try std.testing.expectEqual(@as(usize, 1), f.cursor_closes);
 
     f = FakeConn{ .arena = a, .rows = &.{&.{ .{ .date = 19723 }, .{ .date = 19725 } }} };
-    const pd = (try plan(a, f.prober(), .sqlserver, base, .{ .col = "d", .kind = .date }, 8)).?;
+    const pd = (try planned(a, f.prober(), .sqlserver, base, .{ .col = "d", .kind = .date }, 8)).?;
     try std.testing.expectEqualStrings("SELECT MIN([d]) AS lo, MAX([d]) AS hi FROM (SELECT * FROM t) _b", f.queries.items[0]);
     const want_date = [_][]const u8{
         "(([d] >= '2024-01-01' AND [d] < '2024-01-02') OR [d] IS NULL)",
@@ -851,20 +875,20 @@ test "plan probes the key's bounds and slices them per kind, the NULL keys in sl
     for (want_date, pd.predicates) |w, g| try std.testing.expectEqualStrings(w, g);
 
     f = FakeConn{ .arena = a, .rows = &.{&.{ .{ .int = -5 }, .{ .int = 5 } }} };
-    const pa = (try plan(a, f.prober(), .mysql, base, .{ .col = "k", .kind = .auto }, 2)).?;
+    const pa = (try planned(a, f.prober(), .mysql, base, .{ .col = "k", .kind = .auto }, 2)).?;
     try std.testing.expectEqual(KeyKind.int, pa.key.kind);
     try std.testing.expectEqualStrings("((`k` >= -5 AND `k` < 1) OR `k` IS NULL)", pa.predicates[0]);
     try std.testing.expectEqualStrings("`k` >= 1", pa.predicates[1]);
 
     f = FakeConn{ .arena = a, .rows = &.{&.{ .{ .timestamp = 19723 * 86_400_000_000 + 5 }, .{ .timestamp = 19724 * 86_400_000_000 + 7 } }} };
-    const pt = (try plan(a, f.prober(), .postgres, base, .{ .col = "ts", .kind = .auto }, 4)).?;
+    const pt = (try planned(a, f.prober(), .postgres, base, .{ .col = "ts", .kind = .auto }, 4)).?;
     try std.testing.expectEqual(KeyKind.date, pt.key.kind);
     try std.testing.expectEqual(@as(usize, 2), pt.predicates.len);
     try std.testing.expectEqualStrings("((\"ts\" >= '2024-01-01' AND \"ts\" < '2024-01-02') OR \"ts\" IS NULL)", pt.predicates[0]);
     try std.testing.expectEqualStrings("\"ts\" >= '2024-01-02'", pt.predicates[1]);
 
     f = FakeConn{ .arena = a, .rows = &.{&.{.{ .int = 1 }}} };
-    const pu = (try plan(a, f.prober(), .postgres, base, .{ .col = "u", .kind = .uuid }, 2)).?;
+    const pu = (try planned(a, f.prober(), .postgres, base, .{ .col = "u", .kind = .uuid }, 2)).?;
     try std.testing.expectEqualStrings("SELECT 1 FROM (SELECT * FROM t) _e LIMIT 1", f.queries.items[0]);
     try std.testing.expectEqualStrings("(\"u\" < '80000000-0000-0000-0000-000000000000' OR \"u\" IS NULL)", pu.predicates[0]);
     try std.testing.expectEqualStrings("\"u\" >= '80000000-0000-0000-0000-000000000000'", pu.predicates[1]);
@@ -880,7 +904,7 @@ test "a BIGINT UNSIGNED key, read as DECIMAL(20,0), splits over its whole unsign
     const hi = Value{ .decimal = .{ .unscaled = top, .scale = 0 } };
     for ([_]KeyKind{ .int, .auto }) |kind| {
         var f = FakeConn{ .arena = a, .rows = &.{&.{ lo, hi }} };
-        const p = (try plan(a, f.prober(), .mysql, base, .{ .col = "id", .kind = kind }, 4)).?;
+        const p = (try planned(a, f.prober(), .mysql, base, .{ .col = "id", .kind = kind }, 4)).?;
         try std.testing.expectEqual(KeyKind.int, p.key.kind);
         const want = [_][]const u8{
             "((`id` >= 0 AND `id` < 4611686018427387904) OR `id` IS NULL)",
@@ -892,7 +916,7 @@ test "a BIGINT UNSIGNED key, read as DECIMAL(20,0), splits over its whole unsign
         for (want, p.predicates) |w, g| try std.testing.expectEqualStrings(w, g);
     }
     var frac = FakeConn{ .arena = a, .rows = &.{&.{ Value{ .decimal = .{ .unscaled = 15, .scale = 1 } }, Value{ .decimal = .{ .unscaled = 95, .scale = 1 } } }} };
-    try std.testing.expectEqual(@as(?Plan, null), try plan(a, frac.prober(), .mysql, base, .{ .col = "id", .kind = .int }, 4));
+    try std.testing.expectEqual(@as(?Plan, null), try planned(a, frac.prober(), .mysql, base, .{ .col = "id", .kind = .int }, 4));
 }
 
 test "a DECIMAL(38,0) key whose span overflows i128 reads serially; one that fits still splits" {
@@ -906,9 +930,9 @@ test "a DECIMAL(38,0) key whose span overflows i128 reads serially; one that fit
     const pos = Value{ .decimal = .{ .unscaled = top, .scale = 0 } };
     for ([_]KeyKind{ .int, .auto }) |kind| {
         var f = FakeConn{ .arena = a, .rows = &.{&.{ neg, pos }} };
-        try std.testing.expectEqual(@as(?Plan, null), try plan(a, f.prober(), .postgres, base, .{ .col = "id", .kind = kind }, 4));
+        try std.testing.expectEqual(@as(?Plan, null), try planned(a, f.prober(), .postgres, base, .{ .col = "id", .kind = kind }, 4));
         var g = FakeConn{ .arena = a, .rows = &.{&.{ zero, pos }} };
-        const p = (try plan(a, g.prober(), .postgres, base, .{ .col = "id", .kind = kind }, 4)).?;
+        const p = (try planned(a, g.prober(), .postgres, base, .{ .col = "id", .kind = kind }, 4)).?;
         try std.testing.expectEqual(KeyKind.int, p.key.kind);
         try std.testing.expectEqual(@as(usize, 4), p.predicates.len);
         try std.testing.expectEqualStrings("\"id\" >= 75000000000000000000000000000000000000", p.predicates[3]);
@@ -930,20 +954,20 @@ test "a date or timestamp key with a bound before year 1 splits with BC on Postg
     };
     for (bounds) |b| for ([_]KeyKind{ .date, .auto }) |kind| {
         var f = FakeConn{ .arena = a, .rows = &.{&.{ b[0], b[1] }} };
-        const p = (try plan(a, f.prober(), .postgres, base, .{ .col = "d", .kind = kind }, 2)).?;
+        const p = (try planned(a, f.prober(), .postgres, base, .{ .col = "d", .kind = kind }, 2)).?;
         try std.testing.expectEqual(@as(usize, 2), p.predicates.len);
         try std.testing.expectEqualStrings("((\"d\" >= '0044-03-15 BC' AND \"d\" < '0990-08-08') OR \"d\" IS NULL)", p.predicates[0]);
         try std.testing.expectEqualStrings("\"d\" >= '0990-08-08'", p.predicates[1]);
         for ([_]Dialect{ .mysql, .sqlserver, .starrocks, .doris }) |d| {
             var g = FakeConn{ .arena = a, .rows = &.{&.{ b[0], b[1] }} };
-            try std.testing.expectEqual(@as(?Plan, null), try plan(a, g.prober(), d, base, .{ .col = "d", .kind = kind }, 2));
+            try std.testing.expectEqual(@as(?Plan, null), try planned(a, g.prober(), d, base, .{ .col = "d", .kind = kind }, 2));
         }
     };
     var far = FakeConn{ .arena = a, .rows = &.{&.{ .{ .date = @intCast(end) }, .{ .date = @intCast(civil.daysFromCivil(10000, 1, 1)) } }} };
-    const pf = (try plan(a, far.prober(), .mysql, base, .{ .col = "d", .kind = .date }, 2)).?;
+    const pf = (try planned(a, far.prober(), .mysql, base, .{ .col = "d", .kind = .date }, 2)).?;
     try std.testing.expectEqualStrings("`d` >= '6012-01-02'", pf.predicates[1]);
     var past = FakeConn{ .arena = a, .rows = &.{&.{ .{ .date = @intCast(civil.daysFromCivil(-5000, 1, 1)) }, .{ .date = @intCast(end) } }} };
-    try std.testing.expectEqual(@as(?Plan, null), try plan(a, past.prober(), .postgres, base, .{ .col = "d", .kind = .date }, 2));
+    try std.testing.expectEqual(@as(?Plan, null), try planned(a, past.prober(), .postgres, base, .{ .col = "d", .kind = .date }, 2));
 }
 
 test "plan stays serial when the bounds probe finds nothing to slice" {
@@ -979,7 +1003,7 @@ test "plan stays serial when the bounds probe finds nothing to slice" {
     };
     for (cases, 0..) |cs, i| {
         var f = FakeConn{ .arena = a, .rows = cs.rows, .no_batch = cs.no_batch, .fail_open = cs.fail_open, .fail_query = cs.fail_query };
-        const got = try plan(a, f.prober(), .postgres, base, .{ .col = "k", .kind = cs.kind }, 4);
+        const got = try planned(a, f.prober(), .postgres, base, .{ .col = "k", .kind = cs.kind }, 4);
         if (got != null) {
             std.debug.print("case {d} split into {d}\n", .{ i, got.?.predicates.len });
             return error.TestUnexpectedResult;
@@ -994,7 +1018,7 @@ test "a uuid split whose emptiness probe fails still fans out" {
     const a = ar.allocator();
     for ([_]bool{ true, false }) |fail_open| {
         var f = FakeConn{ .arena = a, .fail_open = fail_open, .fail_query = !fail_open };
-        const p = (try plan(a, f.prober(), .postgres, "SELECT * FROM t", .{ .col = "u", .kind = .uuid }, 3)).?;
+        const p = (try planned(a, f.prober(), .postgres, "SELECT * FROM t", .{ .col = "u", .kind = .uuid }, 3)).?;
         try std.testing.expectEqual(@as(usize, 3), p.predicates.len);
         try std.testing.expectEqualStrings("\"u\" >= '55555555-5555-5555-5555-555555555555' AND \"u\" < 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'", p.predicates[1]);
     }

@@ -447,8 +447,15 @@ pub fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: a
             pctx.base_sql = base;
         }
     }
-    const p = try split.plan(env.arena, prober, desc.dialect, base, key, m);
-    if (p == null) if (hints.col) |col| env.log.log(.warn, "SPLIT BY ({s}): no key ranges to cut, as the column is not an integer, date or timestamp with more than one value; reading on one lane", .{col});
+    var why: split.NoSplit = .not_rangeable;
+    const p = try split.plan(env.arena, prober, desc.dialect, base, key, m, &why);
+    if (p == null) if (hints.col) |col| switch (why) {
+        .one_lane => {},
+        .no_rows => env.log.log(.debug, "SPLIT BY ({s}): the read has no rows with a key to cut; reading on one lane", .{col}),
+        .one_value => env.log.log(.warn, "SPLIT BY ({s}): no key ranges to cut, as the column holds one value; reading on one lane", .{col}),
+        .not_rangeable => env.log.log(.warn, "SPLIT BY ({s}): no key ranges to cut, as the column is not an integer, date or timestamp; reading on one lane", .{col}),
+        .unprobed => env.log.log(.warn, "SPLIT BY ({s}): no key ranges to cut, as the column's MIN and MAX could not be read; reading on one lane", .{col}),
+    };
     return p;
 }
 
