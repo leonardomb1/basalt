@@ -485,12 +485,14 @@ fn flipName(env: *Env) !?[]const u8 {
     return null;
 }
 
-/// A lane aggregate's last join run the other way round, decided on the sizes the
-/// run meets: the joins before it can leave few rows (q03's customers and orders,
-/// 147K) while its right side is a large file (3.2M filtered lineitem rows, indexed
-/// to be probed 147K times). Only the last join, its right side a local CSV or
-/// Parquet file: a join after it would lose its runtime filter on that file (q18's
-/// IN). What comes before it, the head and the joins ahead, narrowed to the columns
+/// A lane aggregate's join run the other way round, decided on the sizes the run
+/// meets: the joins before it can leave few rows (q03's customers and orders, 147K)
+/// while its right side is a large file (3.2M filtered lineitem rows, indexed to be
+/// probed 147K times). The last join, its right side a local CSV or Parquet file, or
+/// an earlier one of more rows whose later joins all index sides estimated under its
+/// cap (q05's lineitem, then supplier, nation and region): a later join whose side is
+/// unknown or large could have cut the head with its runtime filter (q18's IN), and
+/// would cut the turned file instead. What comes before it, the head and the joins ahead, narrowed to the columns
 /// the rest reads, is run on lanes into memory first, while it stays under that
 /// side's estimated rows over `joinorder.flip_ratio`. Then the first join of what is
 /// left, this one, turns around (`lanes/join.zig` `flipFirstJoin`): those rows
@@ -504,20 +506,10 @@ fn flipName(env: *Env) !?[]const u8 {
 /// lanes into memory, then lineitem read on the lanes into the aggregate.
 fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: Turn, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!bool {
     const held_name = (try flipName(env)) orelse return false;
-    var last: ?usize = null;
-    for (shape.joins, 0..) |st, i| if (st.node == .join) {
-        last = i;
-    };
-    const ji = last orelse return false;
+    const pick = (try turnedJoin(env, shape)) orelse return false;
+    const ji = pick.at;
     const st = shape.joins[ji];
-    if (!joinorder.flippable(st)) return false;
-    const after = try std.mem.concat(env.arena, ast.Stage, &.{ shape.joins[ji + 1 ..], try shape.consumer(env.arena) });
-    const rst = try rightStagesFor(env, st.node.join, after);
-    if (rst.len == 0 or rst[0].node != .read or rst[0].hints.len > 0) return false;
-    const rd = rst[0].node.read;
-    if (!connect.isLocalCsvRead(rd) and !connect.isParquetFileRead(rd)) return false;
-    for (rst[1..]) |x| if (!analyze.isMap(x.node, false)) return false;
-    const rows = estimate.ofSide(env, rst).rows orelse return false;
+    const rows = pick.rows;
     const cap = rows / joinorder.flip_ratio;
     if (cap < min_flip_rows) return false;
     var head_rows: u64 = 0;
@@ -577,6 +569,64 @@ fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: Turn, w: ast.Write
         p.path = try msgfmt.allocPrint(env.arena, "{s} read into memory first, then {s}, that join turned around", .{ what, p.path });
         try p.describe(profile.keyOf(pos), .scan, try msgfmt.allocPrint(env.arena, "{s}, in memory", .{what}));
     }
+    return true;
+}
+
+const Pick = struct { at: usize, rows: u64 };
+
+/// The join of `shape` a turn takes, with its right side's estimated rows: of the joins
+/// whose right side is a local CSV or Parquet file read through map stages, the one of
+/// the most rows whose later joins all index sides of known rows under its cap and
+/// key on the turned side or a join after it (`cutsHead`).
+fn turnedJoin(env: *Env, shape: Turn) !?Pick {
+    const consumer = try shape.consumer(env.arena);
+    var best: ?Pick = null;
+    var later_max: u64 = 0;
+    var later_unknown = false;
+    var i = shape.joins.len;
+    while (i > 0) {
+        i -= 1;
+        const st = shape.joins[i];
+        if (st.node != .join) continue;
+        const after = try std.mem.concat(env.arena, ast.Stage, &.{ shape.joins[i + 1 ..], consumer });
+        const rst = try rightStagesFor(env, st.node.join, after);
+        const est = estimate.ofSide(env, rst).rows;
+        if (est) |n| if (joinorder.flippable(st) and fileSide(rst) and !later_unknown and later_max <= n / joinorder.flip_ratio and !cutsHead(shape.joins[i..])) {
+            if (best == null or n > best.?.rows) best = .{ .at = i, .rows = n };
+        };
+        if (est) |n| later_max = @max(later_max, n) else later_unknown = true;
+    }
+    return best;
+}
+
+/// Whether a join after `span[0]` keys only on the rows held before it: no key names
+/// `span[0]`'s side or a join between, by its qualifier. As written its runtime filter
+/// cut the head (q18's IN, on `o.o_orderkey`), which a turn of
+/// `span[0]` would lose. A bare key could be either side's, and counts as held.
+fn cutsHead(span: []const ast.Stage) bool {
+    for (span[1..], 1..) |st, k| {
+        if (st.node != .join) continue;
+        const j = st.node.join;
+        const reaches = for (j.left_keys) |q| {
+            if (q.parts.len < 2) continue;
+            const named = for (span[0..k]) |x| {
+                if (x.node != .join) continue;
+                const xj = x.node.join;
+                if (std.mem.eql(u8, q.parts[0], if (xj.alias.len > 0) xj.alias else xj.binding)) break true;
+            } else false;
+            if (named) break true;
+        } else false;
+        if (!reaches) return true;
+    }
+    return false;
+}
+
+/// Whether `rst` is a local CSV or Parquet file read through map stages alone.
+fn fileSide(rst: []const ast.Stage) bool {
+    if (rst.len == 0 or rst[0].node != .read or rst[0].hints.len > 0) return false;
+    const rd = rst[0].node.read;
+    if (!connect.isLocalCsvRead(rd) and !connect.isParquetFileRead(rd)) return false;
+    for (rst[1..]) |x| if (!analyze.isMap(x.node, false)) return false;
     return true;
 }
 
