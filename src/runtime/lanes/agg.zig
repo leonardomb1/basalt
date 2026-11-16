@@ -680,8 +680,8 @@ pub fn runParallelAgg(env: *Env, m_in: ?*const Morsels, head: ?ast.Stage, shape:
     if (env.profile) |pr| {
         for (joins) |lj| if (lj.build_root) |b| try pr.graftBuild(lj.at, b);
         if (m.* == .sql) {
-            pr.path = try msgfmt.allocPrint(env.arena, "{s} split-parallel aggregate, {d} key ranges", .{ m.label(), m.count() });
-            try pr.sentOnLanes(p.read_at, try msgfmt.allocPrint(env.arena, "once per key range: {s}", .{m.sql.split.base_sql}));
+            pr.path = try msgfmt.allocPrint(env.arena, "{s} split-parallel aggregate, {d} {s}", .{ m.label(), m.count(), m.unitName() });
+            try pr.sentOnLanes(p.read_at, try m.sql.split.sentNote(env.arena));
         } else pr.path = try msgfmt.allocPrint(env.arena, "{s} parallel aggregate{s}, {d} {s}", .{ m.label(), if (joins.len > 0) " over joins" else "", mm.count(), m.unitName() });
     }
     return true;
@@ -752,7 +752,7 @@ pub fn runParallelSqlAgg(env: *Env, pipe: *const Pipe, stages: []const ast.Stage
     env.sources.shrinkRetainingCapacity(src_base);
 
     const split = try arena.create(SplitCtx);
-    split.* = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .proj_select = pd.proj_select, .where_extra = pd.where_extra, .report = try connect_mod.readReport(env, @tagName(desc.kind)), .want = eff };
+    split.* = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .proj_select = pd.proj_select, .where_extra = pd.where_extra, .report = try connect_mod.readReport(env, @tagName(desc.kind)), .want = eff, .reach = sp.reach };
     env.log.log(.debug, "parallel sql aggregate: {d} key ranges (projection: {d}/{d} cols, filter pushdown: {s})", .{
         sp.predicates.len,
         eff.fields.len,

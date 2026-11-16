@@ -101,6 +101,7 @@ pub const Cursor = struct {
         close: *const fn (*anyopaque) void,
         last_error: ?*const fn (*anyopaque) []const u8 = null,
         detach: ?*const fn (*anyopaque) bool = null,
+        release: ?*const fn (*anyopaque) bool = null,
     };
 
     pub fn schema(self: Cursor) types.Schema {
@@ -122,6 +123,15 @@ pub const Cursor = struct {
     /// mid-stream, and an open transaction holds locks another connection may wait on.
     pub fn detach(self: Cursor) bool {
         const f = self.vtable.detach orelse {
+            self.vtable.close(self.ptr);
+            return false;
+        };
+        return f(self.ptr);
+    }
+    /// `detach`, keeping the connection even inside a transaction: for the caller that
+    /// opened that transaction and goes on using it.
+    pub fn release(self: Cursor) bool {
+        const f = self.vtable.release orelse {
             self.vtable.close(self.ptr);
             return false;
         };
@@ -185,9 +195,9 @@ pub fn closeTextCursor(conn: anytype) void {
     conn.close();
 }
 
-pub fn detachTextCursor(conn: anytype) bool {
+pub fn detachTextCursor(conn: anytype, need_idle: bool) bool {
     conn.meta_arena.deinit();
-    if (conn.done and conn.idle()) return true;
+    if (conn.done and (!need_idle or conn.idle())) return true;
     conn.close();
     return false;
 }
@@ -302,7 +312,12 @@ pub fn textCursorVTable(comptime T: type) Cursor.VTable {
         }.f,
         .detach = struct {
             fn f(p: *anyopaque) bool {
-                return detachTextCursor(@as(*T, @ptrCast(@alignCast(p))));
+                return detachTextCursor(@as(*T, @ptrCast(@alignCast(p))), true);
+            }
+        }.f,
+        .release = struct {
+            fn f(p: *anyopaque) bool {
+                return detachTextCursor(@as(*T, @ptrCast(@alignCast(p))), false);
             }
         }.f,
     };

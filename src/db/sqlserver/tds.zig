@@ -616,7 +616,7 @@ const TlsShim = struct {
 
 const sql_vtable = sql.connVTable(Conn);
 
-const cursor_vtable = sql.Cursor.VTable{ .schema = curSchema, .nextBatch = curNext, .close = curClose, .last_error = curLastError, .detach = curDetach };
+const cursor_vtable = sql.Cursor.VTable{ .schema = curSchema, .nextBatch = curNext, .close = curClose, .last_error = curLastError, .detach = curDetach, .release = curRelease };
 
 fn curLastError(ptr: *anyopaque) []const u8 {
     const self: *TdsCursor = @ptrCast(@alignCast(ptr));
@@ -639,7 +639,16 @@ fn curClose(ptr: *anyopaque) void {
 /// A cursor whose batch ran to its last DONE leaves its connection idle (`release`).
 fn curDetach(ptr: *anyopaque) bool {
     const self: *TdsCursor = @ptrCast(@alignCast(ptr));
-    if (!self.done or !self.conn.idle()) {
+    return endCursor(self, true);
+}
+
+fn curRelease(ptr: *anyopaque) bool {
+    const self: *TdsCursor = @ptrCast(@alignCast(ptr));
+    return endCursor(self, false);
+}
+
+fn endCursor(self: *TdsCursor, need_idle: bool) bool {
+    if (!self.done or (need_idle and !self.conn.idle())) {
         self.closeCursor();
         return false;
     }

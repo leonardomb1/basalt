@@ -158,7 +158,12 @@ fn physical(w: anytype, ph: Physical) !void {
                 .map_join => " map+join",
             };
             try w.print("{s} split-parallel{s}{s}, unless ", .{ ph.sql_kind, what, if (ph.sink_parallel) " with a per-lane sink" else "" });
-            try w.writeAll(if (ph.split_forced) "the key holds fewer than two values" else "the table has no integer, date or uuid key or under 2M rows");
+            try w.writeAll(if (ph.split_forced)
+                "the key holds fewer than two values"
+            else if (std.mem.eql(u8, ph.sql_kind, "postgres"))
+                "the table is under 200K rows (before PostgreSQL 14: has no integer, date or uuid key or is under 2M rows)"
+            else
+                "the table has no integer, date or uuid key or under 2M rows");
             if (s.split == .map_join) try w.writeAll(" or the join's build side is past --op-memory");
         },
     }

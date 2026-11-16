@@ -29,7 +29,6 @@ const openSqlQuery = @import("../connect.zig").openSqlQuery;
 const pqdecode = @import("../../format/parquet/read.zig");
 const trace = @import("../../exec/trace.zig");
 const types = @import("../../lang/types.zig");
-const wrapProjected = @import("../connect/split.zig").wrapProjected;
 const runtime_filters = @import("../plan/runtime_filters.zig");
 
 const max_csv_morsels: usize = 1 << 16;
@@ -108,7 +107,7 @@ pub const Morsels = union(enum) {
         return switch (self.*) {
             .csv => "chunks",
             .parquet => |m| if (m.items.len > 0 and m.items[0].rg_end == null) "files" else "row groups",
-            .sql => "key ranges",
+            .sql => |s| if (s.split.reach.inner) "page ranges" else "key ranges",
         };
     }
 
@@ -125,7 +124,7 @@ pub const Morsels = union(enum) {
                 return .{ .ptr = &rd.item, .vtable = &ReaderSource.vtable };
             },
             .sql => |s| {
-                const q = try wrapProjected(scratch, s.split.base_sql, s.split.proj_select, s.predicates[i], s.split.where_extra);
+                const q = try s.split.rangeQuery(scratch, s.predicates[i]);
                 return try openSqlQuery(s.split, rd.gpa, q);
             },
         }

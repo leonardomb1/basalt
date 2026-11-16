@@ -118,7 +118,9 @@ AS
   a plan-time error, as is `JOBS 0`. A read with no ranges to cut — the column
   holding one value, of a kind that has no ranges, or its MIN and MAX unreadable
   — runs on one lane with a warning saying which; one with no rows at all does so
-  quietly.
+  quietly. Without it, a large SQL table read under `-j` is cut on its own: by
+  primary-key ranges, or a PostgreSQL table by page ranges
+  ([SQL databases](../connectors/databases.md#postgresql-and-mysql)).
 
 **stdout is not syntax**: a terminal `SELECT ...;` statement prints the result
 as an aligned table — `basalt run -c "SELECT * FROM 'x.csv';"` works as a

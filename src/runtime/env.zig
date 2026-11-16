@@ -402,6 +402,9 @@ pub const Env = struct {
     facts_cache: ?*FactsCache = null,
     /// The run's idle SQL connections (`connect/pool.zig`).
     conn_pool: ?*@import("connect/pool.zig").Pool = null,
+    /// Connections holding open the transaction whose snapshot a page-range read's
+    /// lanes import (`connect/split.zig`), closed as the statement ends.
+    snapshot_holders: std.ArrayListUnmanaged(sql.Conn) = .empty,
     rows_read: *obs.RowCounter,
     json_params: *std.StringHashMap(std.json.Value),
     fns: *const std.StringHashMap(ast.FnDecl),
@@ -491,6 +494,8 @@ pub const Env = struct {
     /// and after it `wrote` every table is.
     pub fn endStatement(self: *Env, wrote: bool) void {
         if (self.tables) |m| m.endStatement(wrote);
+        for (self.snapshot_holders.items) |c| c.close();
+        self.snapshot_holders = .empty;
         self.probes = .empty;
         self.change_meta = .empty;
         self.pg_feeds = .empty;

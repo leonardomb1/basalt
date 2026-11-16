@@ -281,7 +281,7 @@ getting data out of the systems that hold it and into the ones that need it:
 - **One script across systems.** A join can take a SQL Server table, a Postgres
   table and a CSV on a Windows share, and write the result to a lake or another
   database. Each `WHERE` runs in the database it filters, and a large SQL read is
-  split into key ranges read in parallel.
+  split into key ranges (a PostgreSQL table into page ranges) read in parallel.
 - **The systems pipelines actually touch.** SFTP, FTP and SMB shares (NTLMv2 or
   Kerberos); SQL Server, StarRocks and Doris as well as Postgres and MySQL; REST
   APIs with paging, retries and OAuth2; Excel and XML written as well as read;

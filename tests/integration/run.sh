@@ -605,7 +605,40 @@ WITH labels AS (SELECT id, name FROM 'tests/integration/seed.csv')
 SELECT t.id, l.name FROM db.basalt_it t WITH (split = id, splits = 4) JOIN labels l ON t.id = l.id;"
 }
 
+# A PostgreSQL table read with no key named is cut by ctid pages, every lane under
+# the snapshot one transaction exported, the read's own filter inside each range's
+# query. `splits` forces it on db.it_push (3000 rows, under the automatic size); the
+# lanes must answer what one lane does, into CSV and into Parquet (encoded on the
+# lanes), and EXPLAIN ANALYZE must say how it read.
+pgpages() { # $1 threads, $2 output
+  brun run -j "$1" -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
+LOAD INTO '$2' AS SELECT id, qty, note FROM db.it_push WITH (splits = 4) WHERE id > 100;"
+}
+
+pgpagesum() { # $1 parquet file
+  $B run -q --format csv -c "SELECT count(*) AS n, sum(id) AS s, sum(qty) AS q, max(note) AS m FROM '$1';"
+}
+
 if runs postgres; then
+  if pgpages 4 "$out/pg_pages_j4.csv" && pgpages 1 "$out/pg_pages_j1.csv" &&
+     pgpages 4 "$out/pg_pages_j4.parquet" && pgpages 1 "$out/pg_pages_j1.parquet"; then
+    sort "$out/pg_pages_j4.csv" >"$out/pg_pages_j4.sorted"
+    sort "$out/pg_pages_j1.csv" >"$out/pg_pages_j1.sorted"
+    check postgres-page-ranges "$out/pg_pages_j4.sorted" "$out/pg_pages_j1.sorted"
+    pgpagesum "$out/pg_pages_j4.parquet" >"$out/pg_pages_j4.sum"
+    pgpagesum "$out/pg_pages_j1.parquet" >"$out/pg_pages_j1.sum"
+    check postgres-page-ranges-parquet "$out/pg_pages_j4.sum" "$out/pg_pages_j1.sum"
+    $B run -j 4 -c "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);
+EXPLAIN ANALYZE LOAD INTO '$out/pg_pages_x.csv' AS SELECT id FROM db.it_push WITH (splits = 4) WHERE id > 100;" >"$out/pg_pages_x.txt" 2>&1 || true
+    if grep -q "4 page ranges" "$out/pg_pages_x.txt" && grep -q "once per page range: .* WHERE (\"id\" > 100)" "$out/pg_pages_x.txt"; then
+      report postgres-page-ranges-explain ok
+    else
+      report postgres-page-ranges-explain bad; grep -E "Path:|sent:" "$out/pg_pages_x.txt" | cut -c1-200
+    fi
+  else
+    report "postgres-page-ranges (run error)" bad
+  fi
+
   if pgjoin 4 "$out/pg_join_j4.csv" && pgjoin 1 "$out/pg_join_j1.csv"; then
     sort "$out/pg_join_j4.csv" >"$out/pg_join_j4.sorted"
     sort "$out/pg_join_j1.csv" >"$out/pg_join_j1.sorted"

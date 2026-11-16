@@ -895,15 +895,16 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
 
                 for (env.sources.items[src_base..]) |sc| sc.close();
                 env.sources.shrinkRetainingCapacity(src_base);
-                var ctx = SplitCtx{ .gpa = gpa, .kind = pipe.sql_desc.?.kind, .cfg = pipe.sql_desc.?.cfg, .base_sql = sp.base_sql, .proj_select = proj_select, .where_extra = where_extra, .report = try readReport(env, @tagName(pipe.sql_desc.?.kind)), .want = want };
+                var ctx = SplitCtx{ .gpa = gpa, .kind = pipe.sql_desc.?.kind, .cfg = pipe.sql_desc.?.cfg, .base_sql = sp.base_sql, .proj_select = proj_select, .where_extra = where_extra, .report = try readReport(env, @tagName(pipe.sql_desc.?.kind)), .want = want, .reach = sp.reach };
+                const ranges = if (sp.reach.inner) "page ranges" else "key ranges";
                 lanes_used.* = @max(lanes_used.*, @min(opts.lanes(), sp.predicates.len));
-                env.log.log(.debug, "split-parallel: {d} splits over {d} lanes on key range (projection: {s}, filter pushdown: {s})", .{ sp.predicates.len, @min(opts.lanes(), sp.predicates.len), proj_select orelse "all", if (where_extra != null) "yes" else "no" });
+                env.log.log(.debug, "split-parallel: {d} {s} over {d} lanes (projection: {s}, filter pushdown: {s})", .{ sp.predicates.len, ranges, @min(opts.lanes(), sp.predicates.len), proj_select orelse "all", if (where_extra != null) "yes" else "no" });
                 const profiled: ?parallel.Profiled = if (env.profile) |p| blk: {
                     const root = if (lane_stages.len > 0) lane_stages[lane_stages.len - 1].asOp() else res.op;
                     const ids = try arena.alloc(profile.Id, lane_stages.len + 1);
-                    p.path = try msgfmt.allocPrint(arena, "{s} split-parallel, {d} key ranges", .{ @tagName(pipe.sql_desc.?.kind), sp.predicates.len });
+                    p.path = try msgfmt.allocPrint(arena, "{s} split-parallel, {d} {s}", .{ @tagName(pipe.sql_desc.?.kind), sp.predicates.len, ranges });
                     const chain = p.chainIds(try p.shape(root), ids);
-                    try p.splitRead(chain[chain.len - 1], try msgfmt.allocPrint(arena, "once per key range: {s}", .{sp.base_sql}));
+                    try p.splitRead(chain[chain.len - 1], try ctx.sentNote(arena));
                     break :blk .{ .prof = p, .ids = chain };
                 } else null;
                 const mode = (try buildParallelSink(env, wr, schema)) orelse parallel.SinkMode{ .shared = try openSink(env, wr, schema) };

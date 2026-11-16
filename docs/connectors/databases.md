@@ -87,6 +87,17 @@ Arrow `UInt64` do, so every value up to 18446744073709551615 reads exactly. A
 `BIGINT UNSIGNED` primary key still splits a read under `-j`, over its whole
 unsigned range.
 
+Under `-j`, a PostgreSQL table (or materialized view) the catalog estimates at
+200K rows or more reads in page ranges, cut by `ctid`, with no key or index: each
+range is a TID range scan, which PostgreSQL 14 brought. One read-only transaction
+exports its snapshot and every lane reads under it, so the lanes see the table at
+one moment, as a single read does; that transaction stays open until the
+statement ends. A view, a partitioned table, an older server, or one that exports
+no snapshot is cut by key ranges instead, as the other databases are: a
+single-column integer, date or uuid primary key, from 2M rows. `SPLIT BY (col)`
+cuts by `col` all the same, and `WITH (splits = n)` sets the number of ranges and
+cuts a smaller table too.
+
 ## StarRocks
 
 A `starrocks` connection is both ends: `LOAD INTO sr.t` writes by stream load

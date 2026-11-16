@@ -365,6 +365,44 @@ pub fn dispatchWorker(comptime Ctx: type, comptime workOne: anytype) fn (*Ctx, u
     }.go;
 }
 
+/// A lane's own unit of a shared sink that encodes units (Parquet): its rows encoded
+/// on the lane as they come, and only the encoded unit appended under the sink's lock,
+/// once it holds the sink's `unitRows` and when the lane ends. Ranges keep no order
+/// among themselves, so units go in as they fill; each batch written under the lock
+/// had the whole encode run one lane at a time, half a PostgreSQL read into Parquet.
+const LaneUnit = struct {
+    arena: std.heap.ArenaAllocator,
+    enc: ?driver.UnitEncoder = null,
+    rows: usize = 0,
+
+    fn add(u: *LaneUnit, snk: driver.Sink, mtx: *std.Thread.Mutex, scratch: std.mem.Allocator, b: Batch) !void {
+        if (u.enc == null) u.enc = try snk.openUnit(u.arena.allocator()).?;
+        try u.enc.?.write(scratch, b);
+        u.rows += b.len;
+        if (u.rows >= snk.unitRows()) try u.commit(mtx);
+    }
+
+    fn commit(u: *LaneUnit, mtx: *std.Thread.Mutex) !void {
+        const e = u.enc orelse return;
+        u.enc = null;
+        e.seal() catch |err| {
+            e.discard();
+            return err;
+        };
+        mtx.lock();
+        const r = e.commit();
+        mtx.unlock();
+        _ = u.arena.reset(.retain_capacity);
+        u.rows = 0;
+        return r;
+    }
+
+    fn deinit(u: *LaneUnit) void {
+        if (u.enc) |e| e.discard();
+        u.arena.deinit();
+    }
+};
+
 fn lane(sh: *Shared, lane_idx: usize) void {
     var lane_gpa = std.heap.GeneralPurposeAllocator(.{ .thread_safe = false }){};
     defer _ = lane_gpa.deinit();
@@ -372,6 +410,9 @@ fn lane(sh: *Shared, lane_idx: usize) void {
     var arena = std.heap.ArenaAllocator.init(lane_alloc);
     defer arena.deinit();
     const a = arena.allocator();
+    const units = sh.sink_mode == .shared and sh.sink_mode.shared.unitRows() > 0;
+    var unit = LaneUnit{ .arena = std.heap.ArenaAllocator.init(lane_alloc) };
+    defer unit.deinit();
 
     var own_sink = SinkGuard.empty;
     defer own_sink.settle(sh.queue.failed.load(.seq_cst)) catch |e| sh.queue.fail(e);
@@ -420,13 +461,15 @@ fn lane(sh: *Shared, lane_idx: usize) void {
             if (!ok) return;
             if (b.len == 0) continue;
 
-            writeLaneBatch(sh.sink_mode, &sh.sink_mtx, own_sink.get(), a, b) catch |e| {
+            const wrote = if (units) unit.add(sh.sink_mode.shared, &sh.sink_mtx, a, b) else writeLaneBatch(sh.sink_mode, &sh.sink_mtx, own_sink.get(), a, b);
+            wrote catch |e| {
                 sh.queue.fail(e);
                 return;
             };
             _ = sh.rows.fetchAdd(b.len, .seq_cst);
         }
     }
+    if (units and !sh.queue.failed.load(.seq_cst)) unit.commit(&sh.sink_mtx) catch |e| sh.queue.fail(e);
 }
 
 /// Adds the time since `clock` and a batch of `rows` to `t`, and restarts the clock.
@@ -791,6 +834,88 @@ test "run: per_lane sinks are opened by lanes and committed (closed) on success"
     try testing.expectEqual(@as(usize, 0), totals.aborted.load(.seq_cst));
     const opened = totals.opened.load(.seq_cst);
     try testing.expect(opened >= 1 and opened <= 2);
+}
+
+/// A shared sink that encodes units: counts what each step saw, and whether two
+/// commits ever ran at once.
+const UnitSink = struct {
+    writes: std.atomic.Value(usize) = .init(0),
+    seals: std.atomic.Value(usize) = .init(0),
+    commits: std.atomic.Value(usize) = .init(0),
+    discards: std.atomic.Value(usize) = .init(0),
+    committed_rows: std.atomic.Value(usize) = .init(0),
+    small_units: std.atomic.Value(usize) = .init(0),
+    committing: std.atomic.Value(usize) = .init(0),
+    overlapped: std.atomic.Value(bool) = .init(false),
+
+    const unit_rows = 3;
+
+    const Enc = struct { sink: *UnitSink, rows: usize = 0 };
+
+    fn sink(self: *UnitSink) driver.Sink {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+    const vtable = driver.Sink.VTable{ .writeBatch = vtWrite, .close = vtClose, .abort = vtAbort, .openUnit = vtOpenUnit, .unit_rows = unit_rows };
+    const enc_vtable = driver.UnitEncoder.VTable{ .write = encWrite, .seal = encSeal, .commit = encCommit, .discard = encDiscard };
+    fn vtWrite(ptr: *anyopaque, _: std.mem.Allocator, _: Batch) anyerror!void {
+        const self: *UnitSink = @ptrCast(@alignCast(ptr));
+        _ = self.writes.fetchAdd(1, .seq_cst);
+    }
+    fn vtOpenUnit(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!driver.UnitEncoder {
+        const e = try arena.create(Enc);
+        e.* = .{ .sink = @ptrCast(@alignCast(ptr)) };
+        return .{ .ptr = e, .vtable = &enc_vtable };
+    }
+    fn encWrite(ptr: *anyopaque, _: std.mem.Allocator, b: Batch) anyerror!void {
+        const e: *Enc = @ptrCast(@alignCast(ptr));
+        e.rows += b.len;
+    }
+    fn encSeal(ptr: *anyopaque) anyerror!void {
+        const e: *Enc = @ptrCast(@alignCast(ptr));
+        _ = e.sink.seals.fetchAdd(1, .seq_cst);
+    }
+    fn encCommit(ptr: *anyopaque) anyerror!void {
+        const e: *Enc = @ptrCast(@alignCast(ptr));
+        const s = e.sink;
+        if (s.committing.fetchAdd(1, .seq_cst) != 0) s.overlapped.store(true, .seq_cst);
+        for (0..100_000) |_| std.atomic.spinLoopHint();
+        _ = s.committed_rows.fetchAdd(e.rows, .seq_cst);
+        if (e.rows < unit_rows) _ = s.small_units.fetchAdd(1, .seq_cst);
+        _ = s.commits.fetchAdd(1, .seq_cst);
+        _ = s.committing.fetchSub(1, .seq_cst);
+    }
+    fn encDiscard(ptr: *anyopaque) void {
+        const e: *Enc = @ptrCast(@alignCast(ptr));
+        _ = e.sink.discards.fetchAdd(1, .seq_cst);
+    }
+    fn vtClose(_: *anyopaque) anyerror!void {}
+    fn vtAbort(_: *anyopaque) void {}
+};
+
+test "run: a unit-encoding shared sink gets each lane's units sealed on the lane and committed one at a time, the last part-filled" {
+    var snk = UnitSink{};
+    var rows_read = obs.RowCounter.init(0);
+    var dummy: u8 = 0;
+    const preds = [_][]const u8{ "5", "3", "4", "1", "7", "2" };
+    const n = try run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .shared = snk.sink() }, 3, &rows_read, null);
+    try testing.expectEqual(@as(usize, 22), n);
+    try testing.expectEqual(@as(usize, 22), snk.committed_rows.load(.seq_cst));
+    try testing.expectEqual(@as(usize, 0), snk.writes.load(.seq_cst));
+    try testing.expectEqual(snk.seals.load(.seq_cst), snk.commits.load(.seq_cst));
+    try testing.expect(snk.small_units.load(.seq_cst) <= 3);
+    try testing.expectEqual(@as(usize, 0), snk.discards.load(.seq_cst));
+    try testing.expect(!snk.overlapped.load(.seq_cst));
+}
+
+test "run: a lane that fails discards its open unit and commits nothing more" {
+    var snk = UnitSink{};
+    var rows_read = obs.RowCounter.init(0);
+    var dummy: u8 = 0;
+    const preds = [_][]const u8{ "2", "fail-read" };
+    try testing.expectError(error.SplitReadFailed, run(testing.allocator, &preds, testOpenSplit, &dummy, &.{}, .{ .shared = snk.sink() }, 1, &rows_read, null));
+    _ = eval.takeFailure(error.SplitReadFailed);
+    try testing.expectEqual(@as(usize, 0), snk.commits.load(.seq_cst));
+    try testing.expectEqual(@as(usize, 1), snk.discards.load(.seq_cst));
 }
 
 test "defaultLanes: one per physical core, within the logical count" {

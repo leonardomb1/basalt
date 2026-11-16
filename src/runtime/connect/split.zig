@@ -21,6 +21,16 @@
 //! Below `min_rows_to_split` estimated rows the planner stays serial: each lane
 //! reconnects, and that setup costs more than it saves. An explicit @[split] or
 //! @[splits] overrides. Each probe consumes the connection `Prober` opens for it.
+//!
+//! A PostgreSQL table is cut by pages instead (`pagePlan`), where no `SPLIT BY` names
+//! a column: each lane reads a range of the table's physical pages, `ctid` between
+//! two block numbers, which PostgreSQL 14 and later answer with a TID range scan
+//! reading only those pages. No key or index is needed, so a table of a quarter
+//! million rows splits; a key range over a column without an index read the whole
+//! table once per range. The range goes into the read's own WHERE (`Reach.inner`),
+//! where the scan sees it, and every lane reads under one exported snapshot
+//! (`Reach.snapshot`), so a row an UPDATE moves to another page during the read is
+//! read once, from the table as it stood when the plan was made.
 
 const std = @import("std");
 const msgfmt = @import("../../base/msgfmt.zig");
@@ -49,11 +59,98 @@ pub const Prober = struct {
     }
 };
 
+/// How a lane's range reaches the source: outside the read as a wrapping WHERE (a key
+/// range), or with `inner` in the read's own WHERE, `own_where` being the read's own
+/// filter and `base_sql` the read without it (a page range, which must reach the table
+/// scan); `snapshot` names a PostgreSQL snapshot each lane imports before it reads.
+pub const Reach = struct { inner: bool = false, own_where: []const u8 = "", snapshot: ?[]const u8 = null };
+
 pub const Plan = struct {
     key: Key,
     predicates: []const []const u8,
     base_sql: []const u8,
+    reach: Reach = .{},
 };
+
+/// The query one lane sends for range `pred`: `wrapProjected`'s for a key range; for a
+/// page range, the read with `pred` AND-ed into its own WHERE, under the projection
+/// and filter that pushdown sends.
+pub fn rangeQuery(arena: std.mem.Allocator, base: []const u8, reach: Reach, proj: ?[]const u8, pred: []const u8, extra: ?[]const u8) ![]const u8 {
+    if (!reach.inner) return wrapProjected(arena, base, proj, pred, extra);
+    const inner = if (reach.own_where.len > 0)
+        try msgfmt.allocPrint(arena, "{s} WHERE ({s}) AND {s}", .{ base, reach.own_where, pred })
+    else
+        try msgfmt.allocPrint(arena, "{s} WHERE {s}", .{ base, pred });
+    const sel = proj orelse "*";
+    if (extra) |x| return msgfmt.allocPrint(arena, "SELECT {s} FROM ({s}) _split WHERE {s}", .{ sel, inner, x });
+    return msgfmt.allocPrint(arena, "SELECT {s} FROM ({s}) _split", .{ sel, inner });
+}
+
+/// The rows from which a PostgreSQL table is cut by pages: below it the lanes'
+/// logins cost more than the parallel read saves.
+pub const min_rows_page_split: i64 = 200_000;
+
+/// The pages from which a table never analyzed (no row estimate) is cut by pages.
+pub const min_pages_page_split: u64 = 2048;
+
+/// PostgreSQL's first version with a TID range scan; before it every page range read
+/// the whole table.
+pub const min_page_split_version: i64 = 140000;
+
+/// `m` page ranges over a table of `pages` pages, half-open, the last open-ended so a
+/// page added after the probe still lands in a lane.
+pub fn pageRangePreds(arena: std.mem.Allocator, pages: u64, m: usize) ![]const []const u8 {
+    const n: u64 = @min(@as(u64, @intCast(m)), pages);
+    const out = try arena.alloc([]const u8, @intCast(n));
+    for (out, 0..) |*p, i| {
+        const lo = pages * i / n;
+        const hi = pages * (i + 1) / n;
+        p.* = if (i == 0)
+            try msgfmt.allocPrint(arena, "ctid < '({d},0)'::tid", .{hi})
+        else if (i + 1 == n)
+            try msgfmt.allocPrint(arena, "ctid >= '({d},0)'::tid", .{lo})
+        else
+            try msgfmt.allocPrint(arena, "ctid >= '({d},0)'::tid AND ctid < '({d},0)'::tid", .{ lo, hi });
+    }
+    return out;
+}
+
+/// A PostgreSQL table's size in pages and its estimated rows, read when it is an
+/// ordinary table or materialized view (a view or a partitioned table has no pages of
+/// its own) on a server with a TID range scan; null otherwise, or when the catalog
+/// cannot be read.
+pub const Pages = struct { pages: u64, est_rows: i64 };
+
+pub fn tablePages(arena: std.mem.Allocator, prober: Prober, parts: []const []const u8) !?Pages {
+    const q = try msgfmt.allocPrint(arena,
+        \\SELECT CAST(pg_relation_size(c.oid) / current_setting('block_size')::int AS bigint),
+        \\CAST(c.reltuples AS bigint), CAST(current_setting('server_version_num') AS int), CAST(c.relkind AS text)
+        \\FROM pg_class c WHERE c.oid = to_regclass({s})
+    , .{try catalogObjectLit(arena, .postgres, parts)});
+    const conn = prober.open() catch return null;
+    var cur = conn.queryCursor(q) catch {
+        conn.close();
+        return null;
+    };
+    defer cur.close();
+    const b = (cur.nextBatch(arena) catch return null) orelse return null;
+    if (b.len == 0) return null;
+    const pages = intOf(b.columns[0].getValue(0)) orelse return null;
+    const est = intOf(b.columns[1].getValue(0)) orelse return null;
+    const ver = intOf(b.columns[2].getValue(0)) orelse return null;
+    const kind = b.columns[3].getValue(0);
+    if (ver < min_page_split_version or pages <= 0) return null;
+    if (kind != .string or !(std.mem.eql(u8, kind.string, "r") or std.mem.eql(u8, kind.string, "m"))) return null;
+    return .{ .pages = @intCast(pages), .est_rows = est };
+}
+
+fn intOf(v: Value) ?i64 {
+    return switch (v) {
+        .int => |i| i,
+        .string => |t| std.fmt.parseInt(i64, std.mem.trim(u8, t, " "), 10) catch null,
+        else => null,
+    };
+}
 
 pub fn wrap(arena: std.mem.Allocator, base: []const u8, pred: []const u8) ![]const u8 {
     return wrapProjected(arena, base, null, pred, null);
@@ -1062,6 +1159,72 @@ test "wrap and wrapProjected put the split predicate and a pushed filter around 
         "SELECT \"a\", \"b\" FROM (SELECT * FROM t) _split WHERE id >= 5 AND (c > 1 OR c IS NULL)",
         try wrapProjected(a, "SELECT * FROM t", "\"a\", \"b\"", "id >= 5", "c > 1 OR c IS NULL"),
     );
+}
+
+test "page ranges cover every page, half-open, the last open-ended, at most one per page" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const four = try pageRangePreds(a, 10, 4);
+    try std.testing.expectEqual(@as(usize, 4), four.len);
+    try std.testing.expectEqualStrings("ctid < '(2,0)'::tid", four[0]);
+    try std.testing.expectEqualStrings("ctid >= '(2,0)'::tid AND ctid < '(5,0)'::tid", four[1]);
+    try std.testing.expectEqualStrings("ctid >= '(5,0)'::tid AND ctid < '(7,0)'::tid", four[2]);
+    try std.testing.expectEqualStrings("ctid >= '(7,0)'::tid", four[3]);
+    try std.testing.expectEqual(@as(usize, 3), (try pageRangePreds(a, 3, 8)).len);
+}
+
+test "a page range goes inside the read, beside its own filter, the pushed projection and filter outside" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const pred = "ctid < '(2,0)'::tid";
+    try std.testing.expectEqualStrings(
+        "SELECT * FROM (SELECT * FROM t WHERE ctid < '(2,0)'::tid) _split",
+        try rangeQuery(a, "SELECT * FROM t", .{ .inner = true }, null, pred, null),
+    );
+    try std.testing.expectEqualStrings(
+        "SELECT \"a\" FROM (SELECT * FROM t WHERE (b = 1 OR c = 2) AND ctid < '(2,0)'::tid) _split WHERE c > 1",
+        try rangeQuery(a, "SELECT * FROM t", .{ .inner = true, .own_where = "b = 1 OR c = 2" }, "\"a\"", pred, "c > 1"),
+    );
+    try std.testing.expectEqualStrings(
+        "SELECT * FROM (SELECT * FROM t) _split WHERE id >= 5 AND (c > 1)",
+        try rangeQuery(a, "SELECT * FROM t", .{}, null, "id >= 5", "c > 1"),
+    );
+}
+
+test "tablePages reads an ordinary table's pages on PostgreSQL 14 or later, null for a view, an older server or no pages" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var f = FakeConn{ .arena = a, .rows = &.{&.{ .{ .int = 27696 }, .{ .int = 1_500_000 }, .{ .int = 160004 }, .{ .string = "r" } }} };
+    const got = (try tablePages(a, f.prober(), &.{ "s", "Orders" })).?;
+    try std.testing.expectEqual(@as(u64, 27696), got.pages);
+    try std.testing.expectEqual(@as(i64, 1_500_000), got.est_rows);
+    try std.testing.expect(std.mem.indexOf(u8, f.queries.items[0], "WHERE c.oid = to_regclass('\"s\".\"Orders\"')") != null);
+
+    f = FakeConn{ .arena = a, .rows = &.{&.{ .{ .int = 9 }, .{ .int = -1 }, .{ .int = 140000 }, .{ .string = "m" } }} };
+    try std.testing.expectEqual(@as(i64, -1), (try tablePages(a, f.prober(), &.{"t"})).?.est_rows);
+
+    const refused = [_][]const Value{
+        &.{ .{ .int = 9 }, .{ .int = 9 }, .{ .int = 160004 }, .{ .string = "v" } },
+        &.{ .{ .int = 9 }, .{ .int = 9 }, .{ .int = 160004 }, .{ .string = "p" } },
+        &.{ .{ .int = 9 }, .{ .int = 9 }, .{ .int = 130010 }, .{ .string = "r" } },
+        &.{ .{ .int = 0 }, .{ .int = 0 }, .{ .int = 160004 }, .{ .string = "r" } },
+        &.{ .null, .{ .int = 9 }, .{ .int = 160004 }, .{ .string = "r" } },
+    };
+    for (refused) |row| {
+        f = FakeConn{ .arena = a, .rows = &.{row} };
+        try std.testing.expectEqual(@as(?Pages, null), try tablePages(a, f.prober(), &.{"t"}));
+    }
+    for ([_]FakeConn{
+        .{ .arena = a, .no_batch = true },
+        .{ .arena = a, .fail_open = true },
+        .{ .arena = a, .fail_query = true },
+    }) |base| {
+        f = base;
+        try std.testing.expectEqual(@as(?Pages, null), try tablePages(a, f.prober(), &.{"t"}));
+    }
 }
 
 test "introspectKey reads a single-column primary key's name, kind and row estimate" {

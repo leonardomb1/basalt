@@ -90,6 +90,20 @@ pub const SplitCtx = struct {
     want: ?*const types.Schema = null,
     prof: ?*@import("../exec/profile.zig").Profile = null,
     pool: ?*@import("connect/pool.zig").Pool = null,
+    /// How each range reaches the source, and the snapshot it reads under (`split.Reach`).
+    reach: split.Reach = .{},
+
+    /// The query a lane sends for range `pred`.
+    pub fn rangeQuery(self: *const SplitCtx, arena: std.mem.Allocator, pred: []const u8) ![]const u8 {
+        return split.rangeQuery(arena, self.base_sql, self.reach, self.proj_select, pred, self.where_extra);
+    }
+
+    /// What EXPLAIN ANALYZE says the lanes sent, the query once for every range.
+    pub fn sentNote(self: *const SplitCtx, arena: std.mem.Allocator) ![]const u8 {
+        if (!self.reach.inner) return msgfmt.allocPrint(arena, "once per key range: {s}", .{self.base_sql});
+        if (self.reach.own_where.len == 0) return msgfmt.allocPrint(arena, "once per page range: {s}", .{self.base_sql});
+        return msgfmt.allocPrint(arena, "once per page range: {s} WHERE {s}", .{ self.base_sql, self.reach.own_where });
+    }
 };
 
 const ReadReport = struct {
@@ -140,6 +154,14 @@ pub fn connectSql(gpa: std.mem.Allocator, kind: SqlKind, cfg: DbConfig) !sql.Con
     }
 }
 
+/// `conn` in a read-only transaction that sees the database as snapshot `id` does,
+/// exported by the transaction a page-range plan holds open.
+fn importSnapshot(conn: sql.Conn, id: []const u8) !void {
+    var buf: [128]u8 = undefined;
+    try conn.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY");
+    try conn.exec(std.fmt.bufPrint(&buf, "SET TRANSACTION SNAPSHOT '{s}'", .{id}) catch return error.InvalidSnapshot);
+}
+
 /// A connection for a query, from the run's pool of idle ones when it has one.
 pub fn pooledSql(gpa: std.mem.Allocator, pool: ?*@import("connect/pool.zig").Pool, kind: SqlKind, cfg: DbConfig) !sql.Conn {
     const p = pool orelse return connectSql(gpa, kind, cfg);
@@ -148,16 +170,22 @@ pub fn pooledSql(gpa: std.mem.Allocator, pool: ?*@import("connect/pool.zig").Poo
 
 pub fn openSplitSource(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, pred: []const u8) anyerror!driver.Source {
     const ctx: *SplitCtx = @ptrCast(@alignCast(ctx_ptr));
-    const q = try split.wrapProjected(gpa, ctx.base_sql, ctx.proj_select, pred, ctx.where_extra);
+    const q = try ctx.rangeQuery(gpa, pred);
     defer gpa.free(q);
     return openSqlQuery(ctx, gpa, q);
 }
 
-/// One key range's query, checked against `want`, the columns the lanes were planned
-/// on, when set. A query that fails to open reports the server's words, or a fired
-/// `query_timeout` with the host, as a serial read does.
+/// One range's query, checked against `want`, the columns the lanes were planned
+/// on, when set, and read under the plan's snapshot when it has one. A query that
+/// fails to open reports the server's words, or a fired `query_timeout` with the
+/// host, as a serial read does.
 pub fn openSqlQuery(ctx: *const SplitCtx, gpa: std.mem.Allocator, query: []const u8) anyerror!driver.Source {
     const conn = try connectSql(gpa, ctx.kind, ctx.cfg);
+    if (ctx.reach.snapshot) |id| importSnapshot(conn, id) catch |e| {
+        if (ctx.report) |r| if (conn.lastError().len > 0) r.f(r.ctx, e, conn.lastError());
+        conn.close();
+        return e;
+    };
     const s = sql.Source.open(gpa, conn, query) catch |e| {
         if (ctx.report) |r| if (conn.lastError().len > 0) r.f(r.ctx, e, conn.lastError());
         conn.close();

@@ -8,6 +8,7 @@ const SqlDesc = @import("../env.zig").SqlDesc;
 pub const SqlKind = @import("../env.zig").SqlKind;
 const ast = @import("../../lang/ast.zig");
 const pooledSql = @import("../connect.zig").pooledSql;
+const connectSql = @import("../connect.zig").connectSql;
 const connectorType = @import("../connect.zig").connectorType;
 const forHintName = @import("../env.zig").forHintName;
 const openSourceProjected = @import("source.zig").openSourceProjected;
@@ -429,6 +430,7 @@ pub fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: a
     if (hints.col) |col| {
         key = .{ .col = col, .kind = hints.kind orelse .auto };
     } else if (desc.read.form == .table) {
+        if (desc.dialect == .postgres) if (try pagePlan(env, desc, prober, m, forced)) |p| return p;
         const info = (try split.introspectKey(env.arena, prober, desc.dialect, desc.read.form.table.parts)) orelse return null;
         if (!forced and info.est_rows < split.min_rows_to_split) return null;
         key = info.key;
@@ -461,6 +463,58 @@ pub fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: a
         .unprobed => env.log.log(.warn, "SPLIT BY ({s}): no key ranges to cut, as the column's MIN and MAX could not be read; reading on one lane", .{col}),
     };
     return p;
+}
+
+/// A PostgreSQL table cut by pages (`split.zig`): its size from the catalog, its
+/// lanes under one exported snapshot. Null to cut it by key or read it whole: a table
+/// under `split.min_rows_page_split` estimated rows (or, never analyzed, under
+/// `split.min_pages_page_split` pages), a server before PostgreSQL 14, or one that
+/// exports no snapshot, as a standby may not.
+fn pagePlan(env: *Env, desc: SqlDesc, prober: split.Prober, m: usize, forced: bool) !?split.Plan {
+    const pg = (try split.tablePages(env.arena, prober, desc.read.form.table.parts)) orelse return null;
+    const big = if (pg.est_rows >= 0) pg.est_rows >= split.min_rows_page_split else pg.pages >= split.min_pages_page_split;
+    if (!forced and !big) return null;
+    const preds = try split.pageRangePreds(env.arena, pg.pages, m);
+    if (preds.len < 2) return null;
+    const snap = (try exportSnapshot(env, desc)) orelse return null;
+    var rd = desc.read;
+    const own_where = rd.where;
+    rd.where = "";
+    return .{
+        .key = .{ .col = "ctid", .kind = .int },
+        .predicates = preds,
+        .base_sql = try readSql(env, rd),
+        .reach = .{ .inner = true, .own_where = own_where, .snapshot = snap },
+    };
+}
+
+/// A snapshot exported by a read-only repeatable-read transaction held open on a
+/// connection of its own until the statement ends (`Env.snapshot_holders`), so each
+/// lane can import it; null when the server does not export one.
+fn exportSnapshot(env: *Env, desc: SqlDesc) !?[]const u8 {
+    const conn = connectSql(env.gpa, desc.kind, desc.cfg) catch return null;
+    conn.exec("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY") catch {
+        conn.close();
+        return null;
+    };
+    const cur = conn.queryCursor("SELECT pg_export_snapshot()") catch {
+        conn.close();
+        return null;
+    };
+    var id: ?[]const u8 = null;
+    while (cur.nextBatch(env.arena) catch null) |b| {
+        if (id == null and b.len > 0) switch (b.columns[0].getValue(0)) {
+            .string => |s| id = try env.arena.dupe(u8, s),
+            else => {},
+        };
+    }
+    if (!cur.release()) return null;
+    const got = id orelse {
+        conn.close();
+        return null;
+    };
+    try env.snapshot_holders.append(env.arena, conn);
+    return got;
 }
 
 pub fn proberOpen(ctx_ptr: *anyopaque) anyerror!sql.Conn {
