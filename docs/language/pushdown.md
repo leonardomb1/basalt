@@ -60,9 +60,12 @@ crosses the wire. The answer never changes, only where the work happens;
   are asked for — so `JOIN itens($filial) i` reads that branch's rows, not the
   table. A filter written *after* an inner join that names only the right side's
   columns, each by its alias (`WHERE i.valor > 0`), joins that read too — and
-  descends with it. After a `LEFT`, `RIGHT` or `FULL` join it stays above the
-  join, since there it also decides the unmatched rows; so does a condition
-  naming both sides, or a bare column name, which could be either side's.
+  descends with it. So does one of bare names (`WHERE n_name = 'BRAZIL'`) that
+  only that side has, where every other table of the query has known columns
+  (a local file's header or footer, a select list) and none of them. After a
+  `LEFT`, `RIGHT` or `FULL` join it stays above the join, since there it also
+  decides the unmatched rows; so does a condition naming both sides, or a bare
+  column name whose side cannot be told.
 - **Text comparisons follow the column's collation**, so the source never keeps
   fewer rows than basalt would. basalt compares text byte by byte; a source
   compares by collation — case-insensitive by default on SQL Server and MySQL,

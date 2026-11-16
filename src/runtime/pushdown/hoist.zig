@@ -4,7 +4,8 @@
 //! A WHERE splits at its ANDs and each conjunct moves on its own. One naming only
 //! the left input goes below an inner, cross, LEFT, semi or anti join, never below
 //! a RIGHT or FULL one, which null-extends the left. One naming only a joined
-//! side's alias goes into that side under an inner, cross or RIGHT join, never a
+//! side's alias, or bare names only that side has where every other input's names
+//! are known, goes into that side under an inner, cross or RIGHT join, never a
 //! LEFT or FULL one, which null-extends it; on the way it may pass any join but a
 //! RIGHT or FULL one. A bare name counts as the left's only when the right side's
 //! names are known (its select list, or a local file's header or footer) and lack
@@ -378,14 +379,19 @@ pub fn hoistFilters(
         changed = true;
         if (try hoistThroughSelects(arena, cur)) |t| cur = t;
     }
-    if (try pushIntoJoinSides(arena, cur)) |s| {
+    if (try pushIntoJoinSides(arena, cur, bindings, tables)) |s| {
         cur = s;
         changed = true;
     }
     return if (changed) cur else null;
 }
 
-pub fn pushIntoJoinSides(arena: std.mem.Allocator, stages: []const ast.Stage) !?[]const ast.Stage {
+pub fn pushIntoJoinSides(
+    arena: std.mem.Allocator,
+    stages: []const ast.Stage,
+    bindings: *const std.StringHashMap(ast.Pipeline),
+    tables: ?*Tables,
+) !?[]const ast.Stage {
     var list = std.array_list.Managed(ast.Stage).init(arena);
     try list.appendSlice(stages);
     var changed = false;
@@ -400,33 +406,15 @@ pub fn pushIntoJoinSides(arena: std.mem.Allocator, stages: []const ast.Stage) !?
         var stay: ?*ast.Expr = null;
         var moved = false;
         for (parts.items) |c| {
-            const found = if (ast.hasSearch(c) or mayRaise(c)) null else try rightAliasOf(arena, c);
-            const target = found orelse {
+            const found = if (ast.hasSearch(c) or mayRaise(c)) null else try sideFor(arena, c, list.items[0..i], bindings, tables);
+            const side = found orelse {
                 stay = try andWith(arena, stay, c);
                 continue;
             };
-            var k = i;
-            const at: ?usize = while (k > 0) {
-                k -= 1;
-                switch (list.items[k].node) {
-                    .filter => {},
-                    .join => |j| {
-                        if (std.mem.eql(u8, j.alias, target) or std.mem.eql(u8, j.binding, target)) {
-                            if (j.kind != .inner and j.kind != .cross and j.kind != .right) break null;
-                            break k;
-                        }
-                        if (!hoistableKind(j.kind)) break null;
-                    },
-                    else => break null,
-                }
-            } else null;
-            const jk = at orelse {
-                stay = try andWith(arena, stay, c);
-                continue;
-            };
-            var j = list.items[jk].node.join;
-            j.right_filter = try andWith(arena, j.right_filter, try unqualify(arena, c, target));
-            list.items[jk].node = .{ .join = j };
+            var j = list.items[side.at].node.join;
+            const own = if (side.alias) |a| try unqualify(arena, c, a) else c;
+            j.right_filter = try andWith(arena, j.right_filter, own);
+            list.items[side.at].node = .{ .join = j };
             moved = true;
         }
         if (!moved) {
@@ -441,6 +429,87 @@ pub fn pushIntoJoinSides(arena: std.mem.Allocator, stages: []const ast.Stage) !?
     }
     if (!changed) return null;
     return try list.toOwnedSlice();
+}
+
+const Side = struct { at: usize, alias: ?[]const u8 };
+
+/// The join among the last of `stages`, past filters and joins that let a filter
+/// through, whose right side conjunct `c` names alone: by that side's alias, or by
+/// bare names only that side has (`bareOwner`). Null when that join null-extends it.
+fn sideFor(
+    arena: std.mem.Allocator,
+    c: *const ast.Expr,
+    stages: []const ast.Stage,
+    bindings: *const std.StringHashMap(ast.Pipeline),
+    tables: ?*Tables,
+) !?Side {
+    const alias = try rightAliasOf(arena, c);
+    const owner = if (alias == null) try bareOwner(arena, c, stages, bindings, tables) else null;
+    if (alias == null and owner == null) return null;
+    var k = stages.len;
+    while (k > 0) {
+        k -= 1;
+        switch (stages[k].node) {
+            .filter => {},
+            .join => |j| {
+                const hit = if (alias) |a| std.mem.eql(u8, j.alias, a) or std.mem.eql(u8, j.binding, a) else k == owner.?;
+                if (hit) {
+                    if (j.kind != .inner and j.kind != .cross and j.kind != .right) return null;
+                    return .{ .at = k, .alias = alias };
+                }
+                if (!hoistableKind(j.kind)) return null;
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+/// The join, among the joins and filters that end `stages`, whose right side alone
+/// has every name `c` names, all of them bare: the input ahead of those joins and
+/// every other side they join have known names, and none of them has one of these
+/// (or one a join renames it apart to, `_r`), so each can only be that side's.
+fn bareOwner(
+    arena: std.mem.Allocator,
+    c: *const ast.Expr,
+    stages: []const ast.Stage,
+    bindings: *const std.StringHashMap(ast.Pipeline),
+    tables: ?*Tables,
+) !?usize {
+    var refs = std.array_list.Managed(ast.QualName).init(arena);
+    try ast.fieldsOf(c, &refs);
+    var names = std.array_list.Managed([]const u8).init(arena);
+    for (refs.items) |q| {
+        if (q.dollar) continue;
+        if (q.parts.len != 1) return null;
+        try names.append(q.parts[0]);
+    }
+    if (names.items.len == 0) return null;
+    var b = stages.len;
+    while (b > 0 and (stages[b - 1].node == .filter or stages[b - 1].node == .join)) b -= 1;
+    if (b == 0) return null;
+    var owner: ?usize = null;
+    for (stages[b..], b..) |st, k| {
+        if (st.node != .join or st.node.join.kind == .semi or st.node.join.kind == .anti) continue;
+        const side = (try bindingNames(arena, bindings, st.node.join.binding, tables)) orelse return null;
+        for (names.items) |n| {
+            if (!ast.nameIn(side, n)) break;
+        } else {
+            if (owner != null) return null;
+            owner = k;
+            continue;
+        }
+        if (anyRightName(names.items, side)) return null;
+    }
+    const at = owner orelse return null;
+    var head = std.array_list.Managed([]const u8).init(arena);
+    if (!try stageNames(bindings, stages[0..b], &head, 0, tables)) return null;
+    return if (anyRightName(names.items, head.items)) null else at;
+}
+
+fn anyRightName(names: []const []const u8, of: []const []const u8) bool {
+    for (names) |n| if (isRightName(n, of)) return true;
+    return false;
 }
 
 fn rightAliasOf(arena: std.mem.Allocator, e: *const ast.Expr) !?[]const u8 {
@@ -640,16 +709,17 @@ test "push: a filter on an inner join's right side by its alias becomes the join
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
+    const no_binds = std.StringHashMap(ast.Pipeline).init(a);
     const stages = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(try bin(a, .@"and", try bin(a, .gt, try qfld(a, &.{ "r", "v" }), try intLit(a, 0)), try bin(a, .gt, try fld(a, "x"), try intLit(a, 1)))), writeStage() };
-    const out = (try pushIntoJoinSides(a, &stages)).?;
+    const out = (try pushIntoJoinSides(a, &stages, &no_binds, null)).?;
     const rf = out[1].node.join.right_filter.?;
     try std.testing.expectEqual(@as(usize, 1), rf.binary.l.field.parts.len);
     try std.testing.expectEqualStrings("v", rf.binary.l.field.parts[0]);
     try std.testing.expectEqualStrings("x", out[2].node.filter.binary.l.field.parts[0]);
     const whole = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(try bin(a, .gt, try qfld(a, &.{ "r", "v" }), try intLit(a, 0))), writeStage() };
-    try std.testing.expectEqual(@as(usize, 3), (try pushIntoJoinSides(a, &whole)).?.len);
+    try std.testing.expectEqual(@as(usize, 3), (try pushIntoJoinSides(a, &whole, &no_binds, null)).?.len);
     const two = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), try joinStage(a, .inner, "s", "k", "sk"), filterStage(try bin(a, .gt, try qfld(a, &.{ "r", "v" }), try intLit(a, 0))), writeStage() };
-    const o2 = (try pushIntoJoinSides(a, &two)).?;
+    const o2 = (try pushIntoJoinSides(a, &two, &no_binds, null)).?;
     try std.testing.expect(o2[1].node.join.right_filter != null and o2[2].node.join.right_filter == null);
 }
 
@@ -657,18 +727,19 @@ test "push: a filter stays after a LEFT or FULL join, across sides, on a bare na
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
+    const no_binds = std.StringHashMap(ast.Pipeline).init(a);
     const rv = try bin(a, .gt, try qfld(a, &.{ "r", "v" }), try intLit(a, 0));
     for ([_]ast.JoinKind{ .left, .full }) |kind| {
         const st = [_]ast.Stage{ readStage(), try joinStage(a, kind, "r", "k", "rk"), filterStage(rv), writeStage() };
-        try std.testing.expect((try pushIntoJoinSides(a, &st)) == null);
+        try std.testing.expect((try pushIntoJoinSides(a, &st, &no_binds, null)) == null);
     }
     const across = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(try bin(a, .@"or", rv, try bin(a, .eq, try fld(a, "x"), try intLit(a, 1)))), writeStage() };
-    try std.testing.expect((try pushIntoJoinSides(a, &across)) == null);
+    try std.testing.expect((try pushIntoJoinSides(a, &across, &no_binds, null)) == null);
     const bare = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(try bin(a, .gt, try fld(a, "v"), try intLit(a, 0))), writeStage() };
-    try std.testing.expect((try pushIntoJoinSides(a, &bare)) == null);
+    try std.testing.expect((try pushIntoJoinSides(a, &bare, &no_binds, null)) == null);
     for ([_]ast.JoinKind{ .right, .full }) |kind| {
         const past = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), try joinStage(a, kind, "s", "k", "sk"), filterStage(rv), writeStage() };
-        try std.testing.expect((try pushIntoJoinSides(a, &past)) == null);
+        try std.testing.expect((try pushIntoJoinSides(a, &past, &no_binds, null)) == null);
     }
 }
 
@@ -676,16 +747,55 @@ test "push: a filter on a RIGHT join's preserved side goes into it, and past a L
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
+    const no_binds = std.StringHashMap(ast.Pipeline).init(a);
     const rv = try bin(a, .gt, try qfld(a, &.{ "r", "v" }), try intLit(a, 0));
     const right = [_]ast.Stage{ readStage(), try joinStage(a, .right, "r", "k", "rk"), filterStage(rv), writeStage() };
-    const o1 = (try pushIntoJoinSides(a, &right)).?;
+    const o1 = (try pushIntoJoinSides(a, &right, &no_binds, null)).?;
     try std.testing.expectEqual(@as(usize, 3), o1.len);
     try std.testing.expectEqualStrings("v", o1[1].node.join.right_filter.?.binary.l.field.parts[0]);
     for ([_]ast.JoinKind{ .left, .semi, .anti }) |kind| {
         const past = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), try joinStage(a, kind, "s", "k", "sk"), filterStage(rv), writeStage() };
-        const o2 = (try pushIntoJoinSides(a, &past)).?;
+        const o2 = (try pushIntoJoinSides(a, &past, &no_binds, null)).?;
         try std.testing.expect(o2[1].node.join.right_filter != null and o2[2].node.join.right_filter == null);
     }
+}
+
+test "push: a filter of bare names goes into the one joined side that has them, every other input known to lack them" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var binds = try dimBindings(a);
+    defer binds.deinit();
+    const fact = try a.alloc(ast.Stage, 2);
+    fact[0] = readStage();
+    fact[1] = projStage(&.{ .{ .field = try qual(a, &.{"k"}) }, .{ .field = try qual(a, &.{"v"}) } });
+    try binds.put("f", .{ .stages = fact, .pos = .{ .line = 0, .col = 0 } });
+    const both = try a.alloc(ast.Stage, 2);
+    both[0] = readStage();
+    both[1] = projStage(&.{ .{ .field = try qual(a, &.{"sk"}) }, .{ .field = try qual(a, &.{"name"}) } });
+    try binds.put("s", .{ .stages = both, .pos = .{ .line = 0, .col = 0 } });
+    const head: ast.Stage = .{ .node = .{ .ref = "f" }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+    const name = try bin(a, .eq, try fld(a, "name"), try intLit(a, 1));
+
+    const st = [_]ast.Stage{ head, try joinStage(a, .inner, "r", "k", "rk"), filterStage(try bin(a, .@"and", name, try bin(a, .gt, try fld(a, "v"), try intLit(a, 0)))), writeStage() };
+    const out = (try pushIntoJoinSides(a, &st, &binds, null)).?;
+    try std.testing.expectEqual(name, out[1].node.join.right_filter.?);
+    try std.testing.expectEqualStrings("v", out[2].node.filter.binary.l.field.parts[0]);
+
+    const across = [_]ast.Stage{ head, try joinStage(a, .inner, "r", "k", "rk"), filterStage(try bin(a, .@"or", name, try bin(a, .gt, try fld(a, "v"), try intLit(a, 0)))), writeStage() };
+    try std.testing.expect((try pushIntoJoinSides(a, &across, &binds, null)) == null);
+    const two = [_]ast.Stage{ head, try joinStage(a, .inner, "r", "k", "rk"), try joinStage(a, .inner, "s", "k", "sk"), filterStage(name), writeStage() };
+    try std.testing.expect((try pushIntoJoinSides(a, &two, &binds, null)) == null);
+    const renamed = [_]ast.Stage{ head, try joinStage(a, .inner, "s", "k", "sk"), try joinStage(a, .inner, "r", "k", "rk"), filterStage(try bin(a, .eq, try fld(a, "name_r"), try intLit(a, 1))), writeStage() };
+    try std.testing.expect((try pushIntoJoinSides(a, &renamed, &binds, null)) == null);
+    const unknown = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(name), writeStage() };
+    try std.testing.expect((try pushIntoJoinSides(a, &unknown, &binds, null)) == null);
+    for ([_]ast.JoinKind{ .left, .full }) |kind| {
+        const outer = [_]ast.Stage{ head, try joinStage(a, kind, "r", "k", "rk"), filterStage(name), writeStage() };
+        try std.testing.expect((try pushIntoJoinSides(a, &outer, &binds, null)) == null);
+    }
+    const semi = [_]ast.Stage{ head, try joinStage(a, .inner, "r", "k", "rk"), try joinStage(a, .semi, "s", "k", "sk"), filterStage(name), writeStage() };
+    try std.testing.expect((try pushIntoJoinSides(a, &semi, &binds, null)).?[1].node.join.right_filter != null);
 }
 
 test "hoist: a WHERE splits at its ANDs; the left's conjuncts go below the join, the rest stay" {
@@ -725,7 +835,7 @@ test "hoist: a conjunct that may fail on a row stays above the join, beside one 
 
     const rcast = try bin(a, .gt, try mkExpr(a, .{ .cast = .{ .e = try qfld(a, &.{ "r", "t" }), .ty = .{ .kind = .int } } }), try intLit(a, 1));
     const right = [_]ast.Stage{ readStage(), try joinStage(a, .inner, "r", "k", "rk"), filterStage(rcast), writeStage() };
-    try std.testing.expect((try pushIntoJoinSides(a, &right)) == null);
+    try std.testing.expect((try pushIntoJoinSides(a, &right, &binds, null)) == null);
     const lit = try bin(a, .gt, try fld(a, "d"), try mkExpr(a, .{ .cast = .{ .e = try mkExpr(a, .{ .str_lit = "2024-01-01" }), .ty = .{ .kind = .date } } }));
     try std.testing.expect(!mayRaise(lit));
 }
