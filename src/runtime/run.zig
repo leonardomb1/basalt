@@ -98,7 +98,6 @@ const SinkGuard = @import("../exec/guard.zig").SinkGuard;
 const env_mod = @import("env.zig");
 
 const buildPipeline = @import("plan.zig").buildPipeline;
-const ownClock = @import("plan.zig").ownClock;
 
 const buildScriptScope = @import("script.zig").buildScriptScope;
 const bindConnection = @import("script.zig").bindConnection;
@@ -276,7 +275,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
                 env.noteResult(if (e.mode == .describe) "describe" else "explain", e.pos);
                 try runExplain(&env, .{ .mode = e.mode, .pipeline = try renderScriptScope(&env, e.pipeline), .pos = e.pos }, opts, &stats, &lanes_used, &batch_arena);
             },
-            .for_each => |fe| try runForEach(&env, fe, opts, &stats, &lanes_used, &batch_arena, runForBody, &env.script_scope),
+            .for_each => |fe| try runForEach(&env, try renderForSource(arena, fe, env.script_scope), opts, &stats, &lanes_used, &batch_arena, runForBody, &env.script_scope),
             .match => |m| try runStmtMatch(&env, m, opts, &stats, &lanes_used, &batch_arena),
             .print => |p| try runPrint(&env, p, no_loop_vars),
             .call => |c| try runCall(&env, c, no_loop_vars, opts, &stats, &lanes_used, &batch_arena, runForBody),
@@ -407,7 +406,7 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
             env.noteResult(if (e.mode == .describe) "describe" else "explain", e.pos);
             try runExplain(env, .{ .mode = e.mode, .pipeline = try renderScriptScope(env, e.pipeline), .pos = e.pos }, opts, stats, lanes_used, batch_arena);
         },
-        .for_each => |fe| try runForEach(env, fe, opts, stats, lanes_used, batch_arena, runForBody, &env.script_scope),
+        .for_each => |fe| try runForEach(env, try renderForSource(env.arena, fe, env.script_scope), opts, stats, lanes_used, batch_arena, runForBody, &env.script_scope),
         .match => |mm| try runStmtMatch(env, mm, opts, stats, lanes_used, batch_arena),
         .print => |p| try runPrint(env, p, no_loop_vars),
         .call => |c| try runCall(env, c, no_loop_vars, opts, stats, lanes_used, batch_arena, runForBody),
@@ -427,6 +426,8 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
 /// `LET x = (SELECT ...);`: run the query now and keep its single cell as `$x`. Also
 /// the desugared form of a WHERE scalar subquery, which becomes a literal that rides
 /// filter pushdown. One column required, zero rows is NULL, more than one an error.
+/// The query is rendered in the script's scope as every statement's is, so a
+/// `'${param}'` path in it names the file it names in a FROM.
 fn runScalarLet(env: *Env, l: ast.LetConst, of_explain: bool) !void {
     defer env.endStatement(false);
     if (heldValue(env.held, l.name)) |v| {
@@ -437,7 +438,7 @@ fn runScalarLet(env: *Env, l: ast.LetConst, of_explain: bool) !void {
     const what = try analyze.queryLetLabel(env.arena, l.name);
     const step = try explainStep.openStep(env, env.explain or of_explain, what);
     defer explainStep.closeStep(env, step);
-    const stages = try ownClock(env, l.query.?.stages);
+    const stages = (try renderScriptScope(env, l.query.?)).stages;
     if (step) |p| try explainStep.noteStep(env, p, stages);
     const pipe = try buildPipeline(env, stages);
     defer pipe.op.release();

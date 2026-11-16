@@ -2233,3 +2233,25 @@ test "a one-key join indexed in slots gives the rows, in the order, a two-key jo
         try std.testing.expectEqualStrings(outs[1], outs[0]);
     };
 }
+
+test "a '${param}' path names its file in a LET query, a scalar subquery and a FOR EACH discovery, as in a FROM" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("d");
+    try tmp.dir.writeFile(.{ .sub_path = "d/t.csv", .data = "x\n1\n2\n3\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.fmt.allocPrint(alloc,
+        \\PARAM dir STRING DEFAULT '{s}/d';
+        \\LET n = (SELECT count(*) AS n FROM '${{dir}}/t.csv');
+        \\SELECT $n AS let_n, (SELECT max(x) FROM '${{dir}}/t.csv') AS sub_max;
+        \\FOR EACH ROW OF (SELECT sum(x) AS s FROM '${{dir}}/t.csv') AS (s)
+        \\  SELECT $s AS loop_s;
+        \\END FOR;
+    , .{base});
+    defer alloc.free(script);
+    const printed = try runToStdout(alloc, tmp.dir, script, .{ .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } });
+    defer alloc.free(printed);
+    try std.testing.expectEqualStrings("let_n,sub_max\n3,3\nloop_s\n6\n", printed);
+}
