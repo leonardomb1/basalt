@@ -298,11 +298,12 @@ pub const TypeCtx = struct {
             if (arm.is_default) {
                 has_default = true;
             } else if (arm.guard) |g| {
-                if (!boolish(try self.typeOf(g))) return self.err("match guard must be bool", .{});
+                const gt = try self.typeOf(g);
+                if (!boolish(gt)) return self.err("CASE WHEN takes a condition, and this one is {s}: compare it (`x = 'S'`) or CAST it to BOOL", .{try self.typeName(gt)});
             } else {
                 for (arm.pats) |p| {
                     const pt = try self.typeOf(p);
-                    if (subj) |st| if (!comparable(st, pt)) return self.err("match pattern type does not match subject", .{});
+                    if (subj) |st| if (!comparable(st, pt)) return self.err("CASE compares its value, {s}, with each WHEN, and this one is {s}: CAST one to the other's type", .{ try self.typeName(st), try self.typeName(pt) });
                 }
             }
             const vt = try self.typeOf(arm.value);
@@ -344,6 +345,12 @@ pub const TypeCtx = struct {
             try out.appendSlice(f.name);
         }
         return out.items;
+    }
+
+    /// `t`'s name as an error message spells it, upper case as SQL writes a type.
+    fn typeName(self: *TypeCtx, t: Type) TypeError![]const u8 {
+        const n = t.name(self.arena) catch return error.OutOfMemory;
+        return std.ascii.allocUpperString(self.arena, n) catch return error.OutOfMemory;
     }
 
     pub fn err(self: *TypeCtx, comptime fmt: []const u8, args: anytype) TypeError {

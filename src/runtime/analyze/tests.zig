@@ -292,6 +292,27 @@ test "type flow catches a type error in an expression" {
     try std.testing.expectEqualStrings("`not` needs a bool operand", diag.msg);
 }
 
+test "a CASE WHEN over a non-condition, and a CASE value against a WHEN of another type, name the CASE and both types" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,name\n1,x\n" });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const in = try std.fs.path.join(a, &.{ base, "in.csv" });
+    const Case = struct { sel: []const u8, msg: []const u8 };
+    for ([_]Case{
+        .{ .sel = "CASE WHEN name THEN 1 ELSE 0 END", .msg = "CASE WHEN takes a condition, and this one is STRING: compare it (`x = 'S'`) or CAST it to BOOL" },
+        .{ .sel = "CASE name WHEN 1 THEN 'one' END", .msg = "CASE compares its value, STRING, with each WHEN, and this one is INT: CAST one to the other's type" },
+    }) |c| {
+        const src = try msgfmt.allocPrint(a, "LOAD INTO '/tmp/x.csv' AS SELECT {s} AS v FROM '{s}';", .{ c.sel, in });
+        var diag = Diag{};
+        try std.testing.expectError(error.AnalyzeFailed, analyze(a, try parse(a, src), &diag));
+        try std.testing.expectEqualStrings(c.msg, diag.msg);
+    }
+}
+
 test "an S3 target whose bucket a loop variable names is judged once rendered, not as its template" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();

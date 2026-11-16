@@ -58,7 +58,7 @@ pub fn exactSumText(text: []const u8, ty: types.Type) EvalError!Value {
     };
     if (decimal.dropsDigits(d, want)) {
         if (want == 0)
-            return failWith(error.CastFailed, "SUM: '{s}' has decimal places, but the sum is an INT, as no value sampled at plan time had any; sum CAST(x AS DECIMAL(38, {d})) instead", .{ clip(s), d.scale });
+            return failWith(error.CastFailed, "SUM: '{s}' has decimal places, but this text column sums as an INT, as nothing seen at plan time showed it has any (only a CSV column's sampled values do); sum CAST(x AS DECIMAL(38, {d})) instead", .{ clip(s), d.scale });
         return failWith(error.CastFailed, "SUM: '{s}' has {d} decimal places, more than the {d} of the column's sampled values the sum is typed by; sum CAST(x AS DECIMAL(38, {d})) instead", .{ clip(s), d.scale, want, d.scale });
     }
     const r = rescaleTo(d, want) orelse return decimalOverflow();
@@ -238,7 +238,8 @@ test "exactSumText adds text exactly or fails, never rounding" {
     try std.testing.expectEqual(@as(i128, 150), (try exactSumText("1.500", d2)).decimal.unscaled);
     try std.testing.expectEqual(@as(i64, 9007199254740993), (try exactSumText("9007199254740993", types.Type.init(.int))).int);
     try std.testing.expectError(error.CastFailed, exactSumText("1.255", d2));
-    try std.testing.expectError(error.CastFailed, exactSumText("1.5", types.Type.init(.int)));
+    try std.testing.expectError(error.CastFailed, exactSumText("33.8000", types.Type.init(.int)));
+    try std.testing.expectEqualStrings("SUM: '33.8000' has decimal places, but this text column sums as an INT, as nothing seen at plan time showed it has any (only a CSV column's sampled values do); sum CAST(x AS DECIMAL(38, 4)) instead", @import("support.zig").takeFailure(error.CastFailed).?);
     try std.testing.expectError(error.CastFailed, exactSumText("1e3", d2));
     try std.testing.expectError(error.CastFailed, exactSumText("nan", d2));
     try std.testing.expectError(error.IntOverflow, exactSumText("99999999999999999999", types.Type.init(.int)));
