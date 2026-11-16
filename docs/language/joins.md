@@ -118,7 +118,9 @@ An inner join holds its right side in memory and streams the left side through
 it, unless the left side is estimated at least four times smaller: then the left
 side is indexed and the right side streams. A chain of inner joins that all key
 on the columns of the table they start from (a fact table and its dimensions,
-`f JOIN a ON f.x = a.x JOIN b ON f.y = b.y`) runs its smallest side first. The
+`f JOIN a ON f.x = a.x JOIN b ON f.y = b.y`) runs its smallest side first; any
+other chain runs in the written order, each join choosing its held side as a lone
+join does (TPC-H Q21: its 10K suppliers indexed, lineitem streamed through them). The
 result is the written query's — same columns in the same order, same names
 (`_r` suffixes included), same rows — and only the order of the rows can differ.
 So neither choice is made unless the rows are reordered anyway: a `GROUP BY`,

@@ -24,8 +24,9 @@
 //! each keyed only on the columns of what precedes the run (the head), is run
 //! smallest right side first when every side's row count is estimated. Each join's
 //! keys are resolved against the head alone, in the written order and in the new
-//! one, and must name the same columns all three ways; else the chain runs as
-//! written. A `Project` restores the written column order and names.
+//! one, and must name the same columns all three ways; else the chain runs in the
+//! written order, each join's build side chosen as a lone join's (q21's supplier
+//! held against its lineitem). A `Project` restores the written column order and names.
 //!
 //! Row order. A join emits rows in its probe side's order, which `queries.md`
 //! promises for a pipeline that only filters, projects and joins. So neither
@@ -205,13 +206,20 @@ pub fn buildAt(env: *Env, stages: []const ast.Stage, si: usize, probe: op.Op, sc
     if (take == null) {
         const end = chainEnd(stages, si);
         if (end - si >= 2 and orderFreeIn(env, stages[end..]))
-            return .{ .res = try buildChain(env, stages[si..end], stages[end..], probe, schema), .next = end };
+            return .{ .res = try buildChain(env, stages, si, end, probe, schema), .next = end };
     }
+    const side = try plan.joinSide(env, st.node.join, st.hints, stages[si + 1 ..]);
+    return .{ .res = try buildOne(env, stages, si, side, probe, schema, take), .next = si + 1 };
+}
+
+/// The join at `stages[si]` over `probe`, its right side planned as `side`, held on
+/// the side `choose` picks.
+fn buildOne(env: *Env, stages: []const ast.Stage, si: usize, side: plan.JoinSide, probe: op.Op, schema: types.Schema, take: ?plan.ProbeTake) anyerror!PipeRes {
+    const st = stages[si];
     const j = st.node.join;
-    const side = try plan.joinSide(env, j, st.hints, stages[si + 1 ..]);
     const a = try plan.assembleJoin(env, j, st.hints, side, schema, probe, take);
-    if (a.nl) |r| return .{ .res = r, .next = si + 1 };
-    const plain: Built = .{ .res = .{ .op = .{ .join = a.o }, .schema = a.schema }, .next = si + 1 };
+    if (a.nl) |r| return r;
+    const plain: PipeRes = .{ .op = .{ .join = a.o }, .schema = a.schema };
     if (a.o.residual != null) return plain;
     const c = (try choose(env, stages[0..si], st, side.rstages, stages[si + 1 ..], try plan.joinSpillAt(env, st.hints), null)) orelse return plain;
     if (!c.held_left) {
@@ -219,7 +227,7 @@ pub fn buildAt(env: *Env, stages: []const ast.Stage, si: usize, probe: op.Op, sc
         return plain;
     }
     env.log.log(.info, "join with `{s}`: the left side is held in memory, {s}", .{ j.alias, c.note["build: left ".len..] });
-    return .{ .res = try flipped(env.arena, a.o, a.schema, c.note, env.errctx), .next = si + 1 };
+    return flipped(env.arena, a.o, a.schema, c.note, env.errctx);
 }
 
 /// `o` turned around, its right side probing an index of its left side, under a
@@ -254,23 +262,22 @@ pub fn flipped(arena: std.mem.Allocator, o: *const op.Join, schema: types.Schema
     return .{ .op = .{ .project = p }, .schema = schema };
 }
 
-/// A star chain run smallest side first, else as written; either way its output
-/// is the written chain's. `after` is what follows the chain.
-fn buildChain(env: *Env, chain: []const ast.Stage, after: []const ast.Stage, probe: op.Op, head: types.Schema) anyerror!PipeRes {
+/// The chain `stages[si..end]` run smallest side first when it is a star, else each
+/// join as written but for its build side (`buildOne`); either way its output is the
+/// written chain's.
+fn buildChain(env: *Env, stages: []const ast.Stage, si: usize, end: usize, probe: op.Op, head: types.Schema) anyerror!PipeRes {
     const arena = env.arena;
+    const chain = stages[si..end];
     const sides = try arena.alloc(plan.JoinSide, chain.len);
-    for (chain, sides, 0..) |st, *s, k| s.* = try plan.joinSide(env, st.node.join, st.hints, try std.mem.concat(arena, ast.Stage, &.{ chain[k + 1 ..], after }));
+    for (chain, sides, si + 1..) |st, *s, k| s.* = try plan.joinSide(env, st.node.join, st.hints, stages[k..]);
 
     const order = (try starOrder(env, chain, sides, head)) orelse {
-        var cur = probe;
-        var sch = head;
-        for (chain, sides) |st, s| {
-            const a = try plan.assembleJoin(env, st.node.join, st.hints, s, sch, cur, null);
-            cur = .{ .join = a.o };
-            cur.stampNew(profile.keyOf(st.pos));
-            sch = a.schema;
+        var cur: PipeRes = .{ .op = probe, .schema = head };
+        for (sides, si..) |s, k| {
+            cur = try buildOne(env, stages, k, s, cur.op, cur.schema, null);
+            cur.op.stampNew(profile.keyOf(stages[k].pos));
         }
-        return .{ .op = cur, .schema = sch };
+        return cur;
     };
 
     var cur = probe;

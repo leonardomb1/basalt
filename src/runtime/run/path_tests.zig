@@ -278,6 +278,7 @@ const report_cases = [_]ReportCase{
     .{ .script = "FOR EACH ROW OF (SELECT tname, tag FROM pg.public.catalog) AS (a, b)\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND FOR;", .explain = true, .says = &.{"FOR EACH discovery (actuals)"} },
     .{ .script = "FOR EACH ROW OF (pg.QUERY($$SELECT \"tname\", \"tag\" FROM catalog$$)) AS (a, b)\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND FOR;", .explain = true, .says = &.{ "FOR EACH discovery (actuals)", "postgres query, discovery", "FOR EACH 2 rows of 2 share this plan, its figures summed over them: a=t, b=a; a=t2, b=b" } },
     .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.xlsx' AS SELECT a.id FROM '$B/in.csv' a JOIN '$B/twice.csv' b ON a.g = b.g;", .says = &.{ "Sink: xlsx ", "(2.0x)", "project (#1)  id\n" } },
+    .{ .script = "EXPLAIN ANALYZE SELECT s.g, COUNT(*) AS n FROM '$B/p1.parquet' s JOIN '$B/p.parquet' l ON l.id = s.id JOIN '$B/p.parquet' m ON m.id = l.v GROUP BY s.g;", .says = &.{"build: left (est."} },
     .{ .script = "EXPLAIN ANALYZE SELECT g, string_agg(id, ',') AS s FROM pg.public.t GROUP BY g;", .threads = 4 },
     .{ .script = "EXPLAIN ANALYZE SELECT * FROM pg.public.t PIVOT (SUM(v) FOR g IN ('a'));", .threads = 4, .says = &.{"by the other columns"} },
     .{ .script = "EXPLAIN ANALYZE SELECT g, COUNT(*) AS n FROM pg.public.t GROUP BY ROLLUP(g);", .threads = 4 },
@@ -334,6 +335,7 @@ test "the report shows every query the server got, once, on its scan or in a tre
     try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = "id,g,v\n1,a,1\n2,b,2\n3,c,3\n" });
     try tmp.dir.writeFile(.{ .sub_path = "twice.csv", .data = "g\na\na\nb\nb\nc\nc\n" });
     try writeParquet(a, try std.fs.path.join(a, &.{ base, "p.parquet" }), 1000, 100);
+    try writeParquet(a, try std.fs.path.join(a, &.{ base, "p1.parquet" }), 100, 1000);
     try tmp.dir.makeDir("pf");
     try writeParquet(a, try std.fs.path.join(a, &.{ base, "pf", "a.parquet" }), 100, 50);
     try writeParquet(a, try std.fs.path.join(a, &.{ base, "pf", "b.parquet" }), 100, 50);
