@@ -147,7 +147,9 @@ right side. Where a pipeline's joins run in parallel lanes (see above), the firs
 join of a `GROUP BY` pipeline whose right side is a local Parquet or CSV read is
 turned around the same way: its left side is indexed once and the lanes read the
 right side, the unmatched left rows folded in last, so the result is the same at
-every `-j`. The last join of such a pipeline, past the first, is decided on what
+every `-j`. A head the lanes cannot cut (a Parquet file of one row group, a CSV
+that quotes a newline) runs in parallel this way too, when its first join turns:
+Q21's one-row-group supplier is held, its lineitem read on the lanes. The last join of such a pipeline, past the first, is decided on what
 the run meets instead: the joins before it run on the lanes first, into memory and
 narrowed to the columns the rest reads, and if they leave fewer rows than a
 quarter of its right side's estimate they are indexed and the lanes read that

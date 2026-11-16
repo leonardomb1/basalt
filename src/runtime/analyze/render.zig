@@ -138,6 +138,7 @@ fn physical(w: anytype, ph: Physical) !void {
                 .distinct => "distinct",
                 .sort => |x| if (x.srt.node == .window) "window" else "sort",
             }, if (ph.veto.len > 0) ph.veto else "the file cannot be mapped" });
+            if (l.shape == .map_join or (l.shape == .sink and l.shape.sink.joins.len > 0)) try w.writeAll(" and its first join does not turn around to hold it");
             if (ph.keys_serial) try w.print(" or the file is under {d} MB, so the join's SQL side takes its keys", .{op.default_prefetch_bytes >> 20});
             if (l.shape == .map_join or (l.shape == .sink and l.shape.sink.joins.len > 0)) try w.writeAll(" or the join's build side is past --op-memory");
             if (l.shape == .sink) try w.writeAll(" or its partials pass --op-memory");

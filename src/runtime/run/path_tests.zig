@@ -68,6 +68,7 @@ const cases = [_]Case{
     .{ .q = "SELECT COUNT(*) AS n FROM '$B/p.parquet'", .want = "serial" },
     .{ .q = "SELECT COUNT(*) AS n FROM '$B/p.parquet' WHERE v > 0", .want = "parquet parallel aggregate" },
     .{ .q = "SELECT id, v FROM '$B/p1.parquet'", .want = "serial", .static = "parquet parallel map" },
+    .{ .q = "SELECT s.g, COUNT(*) AS n FROM '$B/p1.parquet' s JOIN '$B/p.parquet' l ON l.id = s.id GROUP BY s.g", .want = "parquet parallel aggregate over joins" },
     .{ .q = "SELECT v, id AS key FROM '$B/p.parquet'", .into = "never.parquet", .want = "parquet chunk copy" },
     .{ .q = "SELECT * FROM '$B/p.parquet'", .into = "never.parquet", .want = "parquet chunk copy" },
     .{ .q = "SELECT id, v FROM '$B/p.parquet' WHERE v > 2", .into = "never.parquet", .want = "parquet parallel map" },

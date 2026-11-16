@@ -73,16 +73,30 @@ const dupeSchema = @import("connect.zig").dupeSchema;
 const projectedColumns = @import("plan.zig").projectedColumns;
 
 pub fn runParquetLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
-    const split = (try parquetSplit(env, stages[0].node.read, stages[0].hints, pushStages(stages, shape), w, opts)) orelse return false;
+    const split = (try parquetSplit(env, stages[0].node.read, stages[0].hints, pushStages(stages, shape), w, opts)) orelse
+        return runHeld(env, stages[0], shape, w, opts, stats, lanes_used);
     return runShape(env, split, stages[0], shape, w, opts, stats, lanes_used);
 }
 
 pub fn runCsvLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     var rd = stages[0].node.read;
     if (try projectedColumns(env, pushStages(stages, shape))) |cols| rd.cols = cols;
-    const mapped = (try csvSplitFile(env, rd, stages[0].hints, w)) orelse return false;
+    const mapped = (try csvSplitFile(env, rd, stages[0].hints, w)) orelse
+        return runHeld(env, stages[0], shape, w, opts, stats, lanes_used);
     defer mapped.close();
     return runShape(env, .ofCsv(mapped, &mapped.schema, opts.morsel_bytes), stages[0], shape, w, opts, stats, lanes_used);
+}
+
+/// A head the lanes cannot cut (one row group, a quoted newline) under a first join
+/// that turns around: the head held in memory and the joined file read on the lanes
+/// (`lanes/join.zig` `flipFirstJoin`), as q21's one-row-group supplier against its
+/// lineitem. False where the join does not turn: the run goes serial.
+fn runHeld(env: *Env, head: ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    return switch (shape) {
+        .sink => |x| x.joins.len > 0 and try runParallelAgg(env, null, head, x, w, opts, stats, lanes_used),
+        .map_join => |x| runParallelMap(env, null, head, x.prefix, x, w, opts, stats, lanes_used),
+        else => false,
+    };
 }
 
 /// The stages a read may push down: a map path's own, or every stage, joins included,

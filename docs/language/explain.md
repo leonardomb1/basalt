@@ -78,8 +78,9 @@ serial` is an aggregating CTE read on its own path ahead of a
 serial rest; `serial` is everything else (a CSV over HTTP is fetched whole, so it
 parses serially; an `UNNEST` or a `LIMIT` without `ORDER BY` over a file streams
 on one lane). A parallel path names what only the source can settle — a table's
-key and size, a CSV that quotes a newline, a Parquet with one row group, a join
-build past `--op-memory` — as the condition that would keep it serial, since
+key and size, a CSV that quotes a newline, a Parquet with one row group (over
+joins: unless its first join turns around to hold it), a join build past
+`--op-memory` — as the condition that would keep it serial, since
 neither `EXPLAIN` nor `check` reads that far. At `-j 1` every path is `serial`.
 
 A source whose schema only the source itself can describe — a database table, a
