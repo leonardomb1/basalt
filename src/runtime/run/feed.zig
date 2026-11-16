@@ -56,16 +56,14 @@ fn columnsOf(env: *Env, w: ast.Write) !?[]const []const u8 {
     const a = env.arena;
     if (env.connections.get(w.connector)) |conn| {
         const info = sqlConnInfo(conn) orelse return null;
-        var parts = std.mem.splitScalar(u8, w.target, '.');
-        var list = std.array_list.Managed([]const u8).init(a);
-        while (parts.next()) |p| try list.append(p);
-        const table = list.items[list.items.len - 1];
+        const parts = try sql.nameParts(a, w.target);
+        const table = parts[parts.len - 1];
         var q = std.Io.Writer.Allocating.init(a);
         try q.writer.writeAll("SELECT column_name FROM information_schema.columns WHERE table_name = ");
         try info.dialect.writeStrLit(&q.writer, table, .catalog_name);
         try q.writer.writeAll(" AND table_schema = ");
-        if (list.items.len > 1) {
-            try info.dialect.writeStrLit(&q.writer, list.items[list.items.len - 2], .catalog_name);
+        if (parts.len > 1) {
+            try info.dialect.writeStrLit(&q.writer, parts[parts.len - 2], .catalog_name);
         } else try q.writer.writeAll(switch (info.dialect) {
             .postgres => "current_schema()",
             .sqlserver => "SCHEMA_NAME()",
@@ -96,10 +94,7 @@ fn columnsOf(env: *Env, w: ast.Write) !?[]const []const u8 {
 /// The target as a read: its connection's table, or its Delta folder.
 fn targetRead(w: ast.Write, a: std.mem.Allocator) !ast.Read {
     if (std.mem.eql(u8, w.connector, "csv")) return .{ .connector = "csv", .form = .{ .path = w.target } };
-    var parts = std.array_list.Managed([]const u8).init(a);
-    var it = std.mem.splitScalar(u8, w.target, '.');
-    while (it.next()) |p| try parts.append(p);
-    return .{ .connector = w.connector, .form = .{ .table = .{ .parts = parts.items } } };
+    return .{ .connector = w.connector, .form = .{ .table = .{ .parts = try sql.nameParts(a, w.target) } } };
 }
 
 fn targetHints(a: std.mem.Allocator, w: ast.Write, pos: ast.Pos) ![]const ast.Hint {

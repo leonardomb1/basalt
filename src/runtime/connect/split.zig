@@ -417,6 +417,74 @@ pub fn catalogObjectLit(arena: std.mem.Allocator, dialect: Dialect, parts: []con
 
 /// What a catalog probe matches the table by: its quoted name as a literal on
 /// postgres and SQL Server, its schema and name columns on the MySQL family.
+/// A table's unique key, primary or not: its columns, and whether it holds whole
+/// column values (not partial, on no expression or column prefix, not deferred), as
+/// an upsert's match needs.
+pub const UniqueKey = struct { cols: []const []const u8, whole: bool };
+
+/// The unique keys of table `parts`, read on a connection of the prober's own (a
+/// cursor owns the connection it reads); null when no such table exists, or on SQL
+/// Server, whose MERGE matches by the keys it names. A StarRocks or Doris table has
+/// one, the PRIMARY KEY or UNIQUE KEY its upserts merge by, and none in a duplicate
+/// or aggregate model. A column of an expression key part reads as "".
+pub fn uniqueKeys(arena: std.mem.Allocator, prober: Prober, dialect: Dialect, parts: []const []const u8) !?[]const UniqueKey {
+    const lit = try catalogLit(arena, dialect, parts);
+    const query = switch (dialect) {
+        .postgres => try msgfmt.allocPrint(arena,
+            \\SELECT '' AS i, '' AS c, 1 AS w WHERE to_regclass({s}) IS NOT NULL
+            \\UNION ALL
+            \\SELECT i.indexrelid::text, a.attname,
+            \\ CASE WHEN i.indpred IS NULL AND i.indexprs IS NULL AND i.indimmediate THEN 1 ELSE 0 END
+            \\FROM pg_index i JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+            \\WHERE i.indrelid = to_regclass({s}) AND i.indisunique
+        , .{ lit, lit }),
+        .mysql => try msgfmt.allocPrint(arena,
+            \\SELECT '' AS i, '' AS c, 1 AS w FROM information_schema.TABLES k WHERE {s}
+            \\UNION ALL
+            \\SELECT k.INDEX_NAME, COALESCE(k.COLUMN_NAME, ''),
+            \\ CASE WHEN k.SUB_PART IS NULL AND k.COLUMN_NAME IS NOT NULL THEN 1 ELSE 0 END
+            \\FROM information_schema.STATISTICS k WHERE k.NON_UNIQUE = 0 AND {s}
+        , .{ lit, lit }),
+        .starrocks, .doris => try msgfmt.allocPrint(arena,
+            \\SELECT '' AS i, '' AS c, 1 AS w FROM information_schema.TABLES k WHERE {s}
+            \\UNION ALL
+            \\SELECT 'key', k.COLUMN_NAME, 1 FROM information_schema.COLUMNS k WHERE k.COLUMN_KEY IN ('PRI', 'UNI') AND {s}
+        , .{ lit, lit }),
+        .sqlserver => return null,
+    };
+    const conn = try prober.open();
+    var cur = conn.queryCursor(query) catch |e| {
+        conn.close();
+        return e;
+    };
+    defer cur.close();
+    var exists = false;
+    var names = std.array_list.Managed([]const u8).init(arena);
+    var keys = std.array_list.Managed(struct { cols: std.array_list.Managed([]const u8), whole: bool }).init(arena);
+    while (try cur.nextBatch(arena)) |b| for (0..b.len) |r| {
+        const name = b.columns[0].getValue(r).string;
+        if (name.len == 0) {
+            exists = true;
+            continue;
+        }
+        const col = try arena.dupe(u8, b.columns[1].getValue(r).string);
+        const whole = b.columns[2].getValue(r).int == 1;
+        const at = for (names.items, 0..) |n, i| {
+            if (std.mem.eql(u8, n, name)) break i;
+        } else blk: {
+            try names.append(try arena.dupe(u8, name));
+            try keys.append(.{ .cols = std.array_list.Managed([]const u8).init(arena), .whole = true });
+            break :blk keys.items.len - 1;
+        };
+        try keys.items[at].cols.append(col);
+        keys.items[at].whole = keys.items[at].whole and whole;
+    };
+    if (!exists) return null;
+    const out = try arena.alloc(UniqueKey, keys.items.len);
+    for (keys.items, out) |k, *o| o.* = .{ .cols = k.cols.items, .whole = k.whole };
+    return out;
+}
+
 fn catalogLit(arena: std.mem.Allocator, dialect: Dialect, parts: []const []const u8) ![]const u8 {
     return switch (dialect) {
         .postgres, .sqlserver => catalogObjectLit(arena, dialect, parts),

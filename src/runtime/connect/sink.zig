@@ -229,6 +229,76 @@ fn openStdoutSink(env: *Env, schema: types.Schema, info: arrow.ResultInfo) !driv
     }
 }
 
+/// Why an UPSERT into table `table`, whose unique keys are `keys`, cannot merge by
+/// the keys it names, or null. Each of these matches rows by the table's own keys,
+/// not by the keys an upsert names: PostgreSQL's ON CONFLICT needs a whole key on
+/// exactly them; a StarRocks or Doris load merges only into a PRIMARY KEY or UNIQUE
+/// KEY table, by its key, and appends to any other; MySQL's ON DUPLICATE KEY fires
+/// on every unique key, so it needs one on exactly them and no other whose columns
+/// the load writes (one on a column it does not write, as an auto-increment id,
+/// never collides). Without that MySQL, StarRocks and Doris added each row again,
+/// or MySQL updated another row in its place.
+pub fn upsertKeyProblem(arena: std.mem.Allocator, dialect: sql.Dialect, table: []const u8, keys: []const split.UniqueKey, named: []const []const u8, written: types.Schema) !?[]const u8 {
+    const ci = dialect != .postgres;
+    const list = try std.mem.join(arena, ", ", named);
+    const exact = for (keys) |k| {
+        if (k.whole and sameNames(k.cols, named, ci)) break true;
+    } else false;
+    if (!exact) return switch (dialect) {
+        .starrocks, .doris => try msgfmt.allocPrint(arena, "UPSERT ON ({s}) into `{s}` needs a {s} KEY table keyed on exactly ({s}), which `{s}` is not: {s} merges a load's rows only into one, by its key, and appends them to any other, so every row would be added again; recreate it keyed on ({s}) or load with REPLACE", .{
+            list, table, if (dialect == .starrocks) "PRIMARY" else "UNIQUE", list, table, if (dialect == .starrocks) "StarRocks" else "Doris", list,
+        }),
+        else => try msgfmt.allocPrint(arena, "UPSERT ON ({s}) into `{s}` needs a primary key or unique index on exactly ({s}), which the table lacks: {s}; add one (ALTER TABLE {s} ADD PRIMARY KEY ({s})) or load with REPLACE", .{
+            list, table, list, if (dialect == .mysql) "MySQL matches an upsert's rows only by the table's unique keys, so every row would be added again" else "PostgreSQL's ON CONFLICT matches rows by one", table, list,
+        }),
+    };
+    if (dialect != .mysql) return null;
+    for (keys) |k| {
+        if (k.whole and sameNames(k.cols, named, ci)) continue;
+        const writes = for (k.cols) |c| {
+            if (c.len > 0 and !nameOf(written, c, ci)) break false;
+        } else true;
+        if (writes) return try msgfmt.allocPrint(arena, "UPSERT ON ({s}) into `{s}`: MySQL also matches an upsert's rows by the table's unique key ({s}), which this load writes, so a row new by ({s}) could overwrite another row; leave those columns out of the load, or name that key in UPSERT ON", .{
+            list, table, try std.mem.join(arena, ", ", k.cols), list,
+        });
+    }
+    return null;
+}
+
+/// Refuses an UPSERT whose table, if it exists, would not merge rows by the keys it
+/// names (`upsertKeyProblem`), before a row is written; the catalog is read on a
+/// connection of its own.
+fn checkUpsertTarget(env: *Env, conn: ast.Connection, w: ast.Write, schema: types.Schema) !void {
+    if (w.mode != .upsert) return;
+    const info = sqlConnInfo(conn) orelse return;
+    if (info.dialect == .sqlserver) return;
+    var pctx = SplitCtx{ .gpa = env.gpa, .kind = info.kind, .cfg = try resolveDbConfig(env, conn, info.port), .base_sql = "", .report = try readReport(env, conn.connector), .prof = env.profile };
+    const keys = split.uniqueKeys(env.arena, .{ .ctx = &pctx, .openFn = proberOpen }, info.dialect, try sql.nameParts(env.arena, w.target)) catch |e|
+        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read the unique keys of `{s}`: {s}", .{ w.target, @errorName(e) }));
+    const ks = keys orelse return;
+    if (try upsertKeyProblem(env.arena, info.dialect, w.target, ks, w.mode.upsert.keys, schema)) |msg| return planErr(env.diag, msg);
+}
+
+fn sameNames(a: []const []const u8, b: []const []const u8, ci: bool) bool {
+    if (a.len != b.len) return false;
+    for (a) |x| {
+        const found = for (b) |y| {
+            if (sameName(x, y, ci)) break true;
+        } else false;
+        if (!found) return false;
+    }
+    return true;
+}
+
+fn nameOf(schema: types.Schema, name: []const u8, ci: bool) bool {
+    for (schema.fields) |f| if (sameName(f.name, name, ci)) return true;
+    return false;
+}
+
+fn sameName(a: []const u8, b: []const u8, ci: bool) bool {
+    return if (ci) std.ascii.eqlIgnoreCase(a, b) else std.mem.eql(u8, a, b);
+}
+
 fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, w.connector, "csv")) {
         const fmode = try fileWriteMode(env, w);
@@ -236,6 +306,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     }
     const conn = env.connections.get(w.connector) orelse
         return planErr(env.diag, try options.unknownConnectionMsg(env.arena, w.connector, "write"));
+    try checkUpsertTarget(env, conn, w, schema);
     if (streamload.Flavor.of(conn.connector)) |flavor| {
         const cfg = try resolveStreamLoadConfig(env, conn, flavor);
         if (streamload.unquotableName(flavor, cfg.database, w.target, schema)) |name|
@@ -375,5 +446,48 @@ test "a connection's int options outside their type and a non-bool auto_create a
         diag = .{};
         try std.testing.expectError(error.PlanFailed, resolveDbConfig(&env, conn, 5432));
         try std.testing.expectEqualStrings("postgres connection `port` is out of range", diag.msg);
+    }
+}
+
+test "upsertKeyProblem: an upsert merges only by a whole unique key on exactly its keys, and on MySQL by no other key the load writes" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const written = types.Schema{ .fields = &.{
+        .{ .name = "id", .ty = types.Type.init(.int) },
+        .{ .name = "k", .ty = types.Type.init(.int) },
+        .{ .name = "v", .ty = types.Type.init(.string) },
+    } };
+    const k: []const []const u8 = &.{"k"};
+    const pk_k = split.UniqueKey{ .cols = &.{"k"}, .whole = true };
+    const pk_id = split.UniqueKey{ .cols = &.{"id"}, .whole = true };
+    const uq_auto = split.UniqueKey{ .cols = &.{"auto_id"}, .whole = true };
+    const prefix_k = split.UniqueKey{ .cols = &.{"k"}, .whole = false };
+
+    const Case = struct { d: sql.Dialect, keys: []const split.UniqueKey, named: []const []const u8 = &.{"k"}, says: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .d = .mysql, .keys = &.{}, .says = "every row would be added again" },
+        .{ .d = .mysql, .keys = &.{pk_k}, .says = null },
+        .{ .d = .mysql, .keys = &.{ pk_k, uq_auto }, .says = null },
+        .{ .d = .mysql, .keys = &.{ pk_id, pk_k }, .says = "unique key (id), which this load writes" },
+        .{ .d = .mysql, .keys = &.{prefix_k}, .says = "needs a primary key or unique index on exactly (k)" },
+        .{ .d = .mysql, .keys = &.{.{ .cols = &.{"K"}, .whole = true }}, .says = null },
+        .{ .d = .mysql, .keys = &.{.{ .cols = &.{ "v", "k" }, .whole = true }}, .named = &.{ "k", "v" }, .says = null },
+        .{ .d = .postgres, .keys = &.{}, .says = "ON CONFLICT matches rows by one" },
+        .{ .d = .postgres, .keys = &.{ pk_id, pk_k }, .says = null },
+        .{ .d = .postgres, .keys = &.{.{ .cols = &.{"K"}, .whole = true }}, .says = "needs a primary key" },
+        .{ .d = .postgres, .keys = &.{pk_id}, .named = k, .says = "ALTER TABLE t ADD PRIMARY KEY (k)" },
+        .{ .d = .starrocks, .keys = &.{}, .says = "needs a PRIMARY KEY table keyed on exactly (k)" },
+        .{ .d = .starrocks, .keys = &.{.{ .cols = &.{"K"}, .whole = true }}, .says = null },
+        .{ .d = .doris, .keys = &.{.{ .cols = &.{ "id", "k" }, .whole = true }}, .says = "needs a UNIQUE KEY table" },
+        .{ .d = .doris, .keys = &.{pk_k}, .says = null },
+    };
+    for (cases) |c| {
+        const got = try upsertKeyProblem(a, c.d, "t", c.keys, c.named, written);
+        const ok = if (c.says) |s| got != null and std.mem.indexOf(u8, got.?, s) != null else got == null;
+        std.testing.expect(ok) catch |e| {
+            std.debug.print("{s} {any}: want {?s}, got {?s}\n", .{ @tagName(c.d), c.keys.len, c.says, got });
+            return e;
+        };
     }
 }

@@ -54,7 +54,12 @@ AS
   `PARTIAL COLUMNS`) ·
   bare `UPSERT` (infer the PK from the source table's metadata at plan time —
   needs a table read on a SQL source that exposes it). An empty/unresolved
-  upsert key is an error, never a silent no-op.
+  upsert key is an error, never a silent no-op. A table the UPSERT creates gets
+  its keys as its primary key. An existing PostgreSQL or MySQL table must have a
+  primary key or unique index on exactly those keys, as both match an upsert's
+  rows by the table's unique keys rather than by the keys named — and on MySQL
+  no other unique key whose columns the load writes, as it would match rows too;
+  otherwise the load is refused before a row is written.
 - `REPLACE` into PostgreSQL, MySQL or SQL Server loads a staging table
   (`_basalt_stage_<table>_<run tag>`, in the target's schema) from every lane, then in one
   transaction clears the target and copies the staged rows in, and drops the

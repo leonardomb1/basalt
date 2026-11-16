@@ -354,6 +354,49 @@ CONTRACT
   if [ $bad = 0 ]; then report "$1-pushdown-contract" ok; else report "$1-pushdown-contract" bad; fi
 }
 
+# An UPSERT matches rows by the target's own keys, not by the keys it names: into a
+# table without one on exactly them MySQL, StarRocks and Doris added every row
+# again (503 rows for 375 keys) and PostgreSQL failed in its own words. It must be
+# refused before a row is written, saying so, and merge by the key once the table
+# has it (StarRocks and Doris: a PRIMARY or UNIQUE KEY table, as an UPSERT creates
+# it); on MySQL another unique key the load writes is refused too, as it would
+# match rows as well.
+upsertkeyrt() { # $1 mysql|postgres|starrocks|doris, $2 CREATE CONNECTION db ...
+  local decl=$2 bad=0 got
+  ddl() {
+    case $1 in
+      mysql) docker compose -f tests/integration/compose.yaml exec -T mysql mysql -uroot -pit it -e "$2" >/dev/null 2>&1 ;;
+      postgres) docker compose -f tests/integration/compose.yaml exec -T postgres psql -U postgres -d it -c "$2" >/dev/null 2>&1 ;;
+      *) docker compose -f tests/integration/compose.yaml exec -T "$1" mysql -h127.0.0.1 -P9030 -uroot it -e "$2" >/dev/null 2>&1 ;;
+    esac
+  }
+  ddl "$1" "DROP TABLE IF EXISTS it_upkey"
+  brun run -c "$decl LOAD INTO db.it_upkey REPLACE AS SELECT CAST(range AS INT) AS k, CAST(range AS INT) AS id, 'a' AS v FROM RANGE(10);" || bad=1
+  if $B run -q -c "$decl LOAD INTO db.it_upkey UPSERT ON (k) AS SELECT CAST(5 + range AS INT) AS k, CAST(100 + range AS INT) AS id, 'b' AS v FROM RANGE(10);" >"$out/upkey.log" 2>&1 ||
+     ! grep -q "on exactly (k)" "$out/upkey.log"; then
+    bad=1; echo "  $1: an upsert into a table not keyed on (k) was not refused"; head -2 "$out/upkey.log"
+  fi
+  got=$($B run -q --format csv -c "$decl SELECT count(*) AS n FROM db.it_upkey;" | tail -1)
+  [ "$got" = 10 ] || { bad=1; echo "  $1: the refused upsert left $got rows, want 10"; }
+  case $1 in
+    mysql|postgres) ddl "$1" "ALTER TABLE it_upkey ADD PRIMARY KEY (k)" ;;
+    *) ddl "$1" "DROP TABLE it_upkey"
+       brun run -c "$decl LOAD INTO db.it_upkey UPSERT ON (k) AS SELECT CAST(range AS INT) AS k, CAST(range AS INT) AS id, 'a' AS v FROM RANGE(10);" || bad=1 ;;
+  esac
+  brun run -c "$decl LOAD INTO db.it_upkey UPSERT ON (k) AS SELECT CAST(5 + range AS INT) AS k, CAST(100 + range AS INT) AS id, 'b' AS v FROM RANGE(10);" || bad=1
+  got=$($B run -q --format csv -c "$decl SELECT count(*) AS n, count(DISTINCT k) AS d, sum(CASE WHEN v = 'b' THEN 1 ELSE 0 END) AS b FROM db.it_upkey;" | tail -1)
+  [ "$got" = "15,15,10" ] || { bad=1; echo "  $1: after the upsert got $got, want 15,15,10"; }
+  if [ "$1" = mysql ]; then
+    ddl "$1" "ALTER TABLE it_upkey ADD UNIQUE KEY uq_id (id)"
+    if $B run -q -c "$decl LOAD INTO db.it_upkey UPSERT ON (k) AS SELECT CAST(1 AS INT) AS k, CAST(101 AS INT) AS id, 'c' AS v;" >"$out/upkey.log" 2>&1 ||
+       ! grep -q "unique key (id), which this load writes" "$out/upkey.log"; then
+      bad=1; echo "  $1: another unique key the load writes was not refused"; head -2 "$out/upkey.log"
+    fi
+    brun run -c "$decl LOAD INTO db.it_upkey UPSERT ON (k) AS SELECT CAST(1 AS INT) AS k, 'd' AS v;" || { bad=1; echo "  $1: an upsert leaving the other key's column out was refused"; }
+  fi
+  if [ $bad = 0 ]; then report "$1-upsert-key" ok; else report "$1-upsert-key" bad; fi
+}
+
 # A boolean column used as a condition on its own (`WHERE b`, `NOT b`, inside AND
 # and OR): every dialect must take it as its SQL spells a condition — T-SQL has no
 # boolean values, so a bare `[b]` there is refused ("an expression of non-boolean
@@ -388,6 +431,7 @@ LOAD INTO '$pq' AS SELECT n, b FROM db.it_bool;"; then
 
 runs mysql     && collrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"      db.it_coll
 runs mysql     && pushrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"      db.it_push
+runs mysql     && upsertkeyrt mysql "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"
 runs mysql     && boolrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"      db.it_bool lossy
 
 # Four-byte UTF-8 (an emoji) survives a write and a read: the session speaks
@@ -438,6 +482,7 @@ fi
 runs postgres  && collrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      db.it_coll descends  # 16-alpine: musl, byte order
 runs sqlserver && collrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" db.it_coll
 runs postgres  && pushrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      db.it_push
+runs postgres  && upsertkeyrt postgres "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"
 runs sqlserver && pushrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" db.it_push
 runs postgres  && boolrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      db.it_bool
 runs sqlserver && boolrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" db.it_bool
@@ -1015,6 +1060,7 @@ LOAD INTO sr.it_replace_nc REPLACE AS SELECT 7 AS range;"; then
   paramrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');"
   collrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_coll"
   pushrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_push"
+  upsertkeyrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');"
   boolrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_bool" lossy
   catalogrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" it
 fi
@@ -1235,6 +1281,7 @@ LOAD INTO '$out/dr_up_out.csv' AS SELECT k, v FROM dr.it_upsert ORDER BY k;"; th
   paramrt doris "$DB"
   collrt doris "$DB" "db.it_coll"
   pushrt doris "$DB" "db.it_push"
+  upsertkeyrt doris "$DB"
   boolrt doris "$DB" "db.it_bool" lossy
   catalogrt doris "$DB" it
 fi

@@ -1204,6 +1204,14 @@ pub fn quoteIdent(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) 
     return buf.toOwnedSlice();
 }
 
+/// A dotted table name's parts, as `quoteIdent` quotes them one by one.
+pub fn nameParts(arena: std.mem.Allocator, name: []const u8) ![]const []const u8 {
+    var parts = std.array_list.Managed([]const u8).init(arena);
+    var it = std.mem.splitScalar(u8, name, '.');
+    while (it.next()) |p| try parts.append(p);
+    return parts.items;
+}
+
 /// One identifier, dots and all, as a single quoted name: a column, or one part of
 /// a qualified table name.
 pub fn quoteName(arena: std.mem.Allocator, dialect: Dialect, name: []const u8) ![]const u8 {
