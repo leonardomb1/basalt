@@ -280,6 +280,8 @@ pub const Decoder = struct {
     relid: ?u32 = null,
     /// For the table's relation, each of its columns' place among `cols`.
     map: []?usize = &.{},
+    /// For the table's relation, which of its columns are its replica identity.
+    ident: []bool = &.{},
     lsn: u64 = 0,
     ts: i64 = 0,
     seq: i64 = 0,
@@ -318,13 +320,17 @@ pub const Decoder = struct {
             'U' => {
                 if (!try self.ours(&r)) return;
                 var old: ?[]const ?[]const u8 = null;
+                var whole = false;
                 var tag = try r.int(u8);
                 if (tag == 'K' or tag == 'O') {
                     old = try self.tuple(&r, null);
+                    whole = tag == 'O';
                     tag = try r.int(u8);
                 }
                 if (tag != 'N') return error.CorruptChangeStream;
-                try self.row(&r, old, "update_postimage");
+                const new = try self.tuple(&r, if (whole) old else null);
+                if (old) |o| if (!whole or self.identityMoved(o, new)) try self.emit(o, "delete");
+                try self.emit(new, "update_postimage");
             },
             'D' => {
                 if (!try self.ours(&r)) return;
@@ -358,8 +364,9 @@ pub const Decoder = struct {
         const n = try r.int(u16);
         const mine = std.mem.eql(u8, ns, self.schema_name) and std.mem.eql(u8, name, self.table);
         const map = try self.arena.alloc(?usize, n);
-        for (map) |*m| {
-            _ = try r.int(u8);
+        const ident = try self.arena.alloc(bool, n);
+        for (map, ident) |*m, *key| {
+            key.* = try r.int(u8) & 1 != 0;
             const col = try r.cstr();
             _ = try r.int(u32);
             _ = try r.int(u32);
@@ -371,6 +378,7 @@ pub const Decoder = struct {
         if (mine) {
             self.relid = id;
             self.map = map;
+            self.ident = ident;
         }
     }
 
@@ -396,7 +404,24 @@ pub const Decoder = struct {
     }
 
     fn row(self: *Decoder, r: *Reader, old: ?[]const ?[]const u8, kind: []const u8) !void {
-        const vals = try self.tuple(r, old);
+        return self.emit(try self.tuple(r, old), kind);
+    }
+
+    /// Whether an UPDATE moved the row's replica identity, its key: then the row
+    /// under the old key is gone, and the change feed says so before the new one.
+    /// An old key alone (`K`) is sent only when it moved; a whole old row (`O`, under
+    /// REPLICA IDENTITY FULL) with every update, so it is compared.
+    fn identityMoved(self: *const Decoder, old: []const ?[]const u8, new: []const ?[]const u8) bool {
+        for (self.ident, old, new) |key, o, n| {
+            if (!key) continue;
+            if ((o == null) != (n == null)) return true;
+            if (o) |ov| if (!std.mem.eql(u8, ov, n.?)) return true;
+        }
+        return false;
+    }
+
+    /// One change row of the relation's values `vals`, of kind `kind`.
+    fn emit(self: *Decoder, vals: []const ?[]const u8, kind: []const u8) !void {
         const filled = try self.arena.alloc(bool, self.cols.len);
         @memset(filled, false);
         for (vals, self.map) |v, m| {
@@ -478,8 +503,8 @@ fn relationMsg(a: std.mem.Allocator, id: u32, ns: []const u8, name: []const u8, 
     try m.str(name);
     try m.buf.append('d');
     try m.int(u16, @intCast(cols.len));
-    for (cols) |c| {
-        try m.buf.append(0);
+    for (cols, 0..) |c, i| {
+        try m.buf.append(if (i == 0) 1 else 0);
         try m.str(c);
         try m.int(u32, 25);
         try m.int(u32, 0xffff_ffff);
@@ -542,6 +567,32 @@ test "pgoutput: the read table's inserts, updates and deletes after the position
     };
     try std.testing.expect(!f.truncated and !f.unsent);
     try std.testing.expectEqualStrings("_commit_timestamp", f.schema.fields[5].name);
+}
+
+test "pgoutput: an UPDATE that moves the key deletes the old key first, under an old key alone or a whole old row; one that keeps it deletes nothing" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const cols = &[_][]const u8{ "id", "status", "note" };
+    var d = try Decoder.init(a, testCols(), "public", "orders", 0);
+    try d.message(try begin(a, 0x10));
+    try d.message(try relationMsg(a, 16, "public", "orders", cols));
+    try d.message(try change(a, 'U', 16, .{ 'K', &.{ "8", null, null } }, &.{ "8888", "paid", "\x00u" }));
+    try d.message(try change(a, 'U', 16, .{ 'O', &.{ "5", "new", "n" } }, &.{ "6", "new", "n" }));
+    try d.message(try change(a, 'U', 16, .{ 'O', &.{ "6", "new", "n" } }, &.{ "6", "paid", "n" }));
+    const f = try d.finish();
+    const want = [_][3][]const u8{
+        .{ "8", "delete", "1" },
+        .{ "8888", "update_postimage", "2" },
+        .{ "5", "delete", "3" },
+        .{ "6", "update_postimage", "4" },
+        .{ "6", "update_postimage", "5" },
+    };
+    try std.testing.expectEqual(want.len, f.batch.len);
+    for (want, 0..) |w, r| for ([_]usize{ 0, 3, 6 }, w) |c, text| {
+        try std.testing.expectEqualStrings(text, try fmtnum.valueToString(a, f.batch.columns[c].getValue(r)));
+    };
+    try std.testing.expect(f.unsent);
 }
 
 test "pgoutput: an unchanged TOASTed value comes from the old row when the table logs it, else marks the range unsent; a TRUNCATE of the table marks it truncated" {

@@ -229,6 +229,9 @@ AS SELECT * FROM shop.public.orders WITH (changes_from = $since, slot = 'basalt_
   `ALTER TABLE orders REPLICA IDENTITY FULL;` avoids that, and also makes a delete
   carry the whole row; without it a deleted row arrives with its key alone, the
   other columns NULL.
+- An update that changes the key (`UPDATE orders SET id = 8888 WHERE id = 8`)
+  arrives as a delete of the old key, its key alone, then the new row, so under
+  `USING changes` the target no longer holds key 8.
 - The change feed is read as a statement's FROM, or the CTE it starts with, not
   as a joined table.
 
