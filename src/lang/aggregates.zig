@@ -142,6 +142,18 @@ pub fn spec(func: AggFunc) Spec {
     return specs[@intFromEnum(func)];
 }
 
+/// An aggregate call's argument as its item holds it: `COUNT(1)`, `COUNT('x')` and
+/// any COUNT of a literal that is never NULL count every row, so they are `COUNT(*)`,
+/// no argument, which a source counts itself and a file answers from its footer.
+pub fn itemArg(func: AggFunc, distinct: bool, args: []const *ast.Expr) ?*ast.Expr {
+    const arg = if (args.len > 0) args[0] else return null;
+    if (func == .count and !distinct) switch (arg.*) {
+        .int_lit, .float_lit, .dec_lit, .str_lit, .bool_lit => return null,
+        else => {},
+    };
+    return arg;
+}
+
 pub fn lookup(name: []const u8) ?AggFunc {
     for (specs) |s| for (s.names) |n| {
         if (std.ascii.eqlIgnoreCase(n, name)) return s.func;

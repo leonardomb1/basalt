@@ -165,8 +165,7 @@ pub fn liftAggs(
                         if (std.mem.eql(u8, it.name, key)) break true;
                     } else false;
                     if (!seen) {
-                        const arg: ?*ast.Expr = if (node.call.args.len > 0) node.call.args[0] else null;
-                        try cx.a.append(.{ .name = key, .func = f, .arg = arg, .distinct = node.call.distinct });
+                        try cx.a.append(.{ .name = key, .func = f, .arg = aggregates.itemArg(f, node.call.distinct, node.call.args), .distinct = node.call.distinct });
                     }
                     return cx.p.mk(.{ .field = try cx.p.singleName(key) });
                 }

@@ -1730,8 +1730,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     }
                     if (stripped.* == .call) {
                         if (aggregates.lookup(stripped.call.name)) |f| {
-                            const arg: ?*ast.Expr = if (stripped.call.args.len > 0) stripped.call.args[0] else null;
-                            try aggs.append(.{ .name = c.name, .func = f, .arg = arg, .distinct = stripped.call.distinct });
+                            try aggs.append(.{ .name = c.name, .func = f, .arg = aggregates.itemArg(f, stripped.call.distinct, stripped.call.args), .distinct = stripped.call.distinct });
                             try post.append(.{ .field = try self.singleName(c.name) });
                             continue;
                         }
@@ -2084,7 +2083,8 @@ fn parsePivot(self: *Parser, stages: *std.array_list.Managed(ast.Stage), aliases
                 try std.fmt.allocPrint(self.arena, "{s}_{s}", .{ value_name, a.call.name })
             else
                 value_name;
-            try items.append(.{ .name = name, .func = aggregates.lookup(f.name).?, .arg = if (f.args.len > 0) f.args[0] else null, .distinct = a.call.distinct });
+            const func = aggregates.lookup(f.name).?;
+            try items.append(.{ .name = name, .func = func, .arg = aggregates.itemArg(func, a.call.distinct, f.args), .distinct = a.call.distinct });
         }
         if (!self.eat(.comma)) break;
     }

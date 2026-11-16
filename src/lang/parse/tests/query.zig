@@ -870,6 +870,20 @@ test "sql: scalar subquery desugars to a query LET ahead of the statement" {
     try testing.expectEqualStrings("hi", prog2.stmts[1].let_const.name);
 }
 
+test "sql: COUNT of a literal that is never NULL is COUNT(*); COUNT(DISTINCT 1) and COUNT(NULL) keep their argument" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a, "SELECT count(1) AS a, count('x') AS b, count(DISTINCT 1) AS c, count(NULL) AS d, count(id) AS e FROM 'in.csv';");
+    const st = prog.stmts[prog.stmts.len - 1].output.stages;
+    const aggs = for (st) |s| {
+        if (s.node == .aggregate) break s.node.aggregate.aggs;
+    } else return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(usize, 5), aggs.len);
+    try testing.expect(aggs[0].arg == null and aggs[1].arg == null);
+    try testing.expect(aggs[2].arg != null and aggs[3].arg != null and aggs[4].arg != null);
+}
+
 test "sql: anchor and pushdown, no longer keywords, name a source without AS" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
