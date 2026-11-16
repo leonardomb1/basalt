@@ -412,6 +412,9 @@ pub const Env = struct {
     /// The one sink a split-parallel union's branches all write to, so the union is
     /// one result: `openSink` hands it to each branch, and the union closes it.
     union_sink: ?driver.Sink = null,
+    /// Set while a split-parallel union's branches run, each into the union's one
+    /// target, which the union statement notes as one load.
+    union_branch: bool = false,
     script_scope: LoopRow = no_loop_vars,
     call_depth: usize = 0,
     sink_label_prefix: ?[]const u8 = null,

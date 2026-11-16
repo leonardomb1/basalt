@@ -146,12 +146,12 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     const lanes0 = lanes_used.*;
     lanes_used.* = 1;
     var load_err: ?anyerror = null;
-    var delegated = false;
+    const branch = env.union_branch;
     defer {
         if (moving) env.progress.?.end();
         const lanes = lanes_used.*;
         lanes_used.* = @max(lanes0, lanes);
-        if (is_load and !delegated) noteLoad(env, out.pos, load_err, .{
+        if (is_load and !branch) noteLoad(env, out.pos, load_err, .{
             .rows = stats.rows_out - load_rows0,
             .rows_read = env.rows_read.load(.monotonic) - read0,
             .elapsed_ms = @intCast(@max(0, std.time.milliTimestamp() - load_t0)),
@@ -160,7 +160,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     }
     const scan0 = scanCounts(env);
     const held0: u64 = if (own_profile) if (env.space) |sp| sp.restartPeak() else 0 else 0;
-    runOutputBody(env, opts_in, stages, last, stats, lanes_used, batch_arena, &delegated) catch |e| {
+    runOutputBody(env, opts_in, stages, last, stats, lanes_used, batch_arena) catch |e| {
         load_err = e;
         return e;
     };
@@ -245,10 +245,9 @@ pub fn runToMemory(env: *Env, opts: RunOptions, stages: []const ast.Stage, what:
     env.out_order_free = false;
     defer env.out_order_free = outer_free;
     var scratch: Stats = .{};
-    var delegated = false;
     const outer_scope = enterScope(env, what);
     defer leaveScope(env, outer_scope);
-    try runOutputBody(env, opts, inner, inner[stages.len].node, &scratch, lanes_used, batch_arena, &delegated);
+    try runOutputBody(env, opts, inner, inner[stages.len].node, &scratch, lanes_used, batch_arena);
     return ms;
 }
 
@@ -273,11 +272,10 @@ fn materializeNamed(env: *Env, opts: RunOptions, name: []const u8, lanes_used: *
     env.out_order_free = false;
     defer env.out_order_free = outer_free;
     var scratch: Stats = .{};
-    var delegated = false;
     {
         const outer_scope = enterScope(env, name);
         defer leaveScope(env, outer_scope);
-        try runOutputBody(env, opts, inner, inner[b.stages.len].node, &scratch, lanes_used, batch_arena, &delegated);
+        try runOutputBody(env, opts, inner, inner[b.stages.len].node, &scratch, lanes_used, batch_arena);
     }
     try env.materialized.put(env.arena, name, .{ .schema = ms.schema, .batches = ms.batches.items });
     return true;
@@ -533,10 +531,9 @@ fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: Turn, w: ast.Write
         defer env.out_order_free = outer_free;
         defer env.sink_name = outer_name;
         var scratch: Stats = .{};
-        var delegated = false;
         const outer_scope = enterScope(env, held_name);
         defer leaveScope(env, outer_scope);
-        runOutputBody(env, opts, inner, inner[pre_len + 1].node, &scratch, lanes_used, batch_arena, &delegated) catch |e| {
+        runOutputBody(env, opts, inner, inner[pre_len + 1].node, &scratch, lanes_used, batch_arena) catch |e| {
             if (e != error.PastMemCap) return e;
             env.log.log(.debug, "{s} `{s}` leave over {d} rows; it is held in memory as written", .{ before, side, cap });
             return false;
@@ -651,7 +648,7 @@ fn sideOf(schemas: []const ?types.Schema, name: []const u8) enum { yes, no, unkn
     return if (all_known) .no else .unknown;
 }
 
-fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, last: @FieldType(ast.Stage, "node"), stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, delegated: *bool) anyerror!void {
+fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, last: @FieldType(ast.Stage, "node"), stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     var opts = opts_in;
     const api = callsApi(env, stages_in, 0);
     if (api) opts.threads = 1;
@@ -774,7 +771,6 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         if (try chunk_copy.run(env, stages, last.write, stats)) return;
     const chosen = try path.choose(arena, stages, head_stages, path_facts);
     if (chosen == .union_split) {
-        delegated.* = true;
         return runUnionSplit(env, stages[0].node.union_, stages[0].hints, stages[1 .. stages.len - 1], stages[stages.len - 1], opts, stats, lanes_used, batch_arena);
     }
     if (env.profile) |p| {
@@ -1033,6 +1029,9 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
     defer if (env.profile) |p| {
         p.scope = outer_scope;
     };
+    const outer_branch = env.union_branch;
+    env.union_branch = true;
+    defer env.union_branch = outer_branch;
     for (specs, schemas, 0..) |s, sch, i| {
         if (env.stop) |f| if (f.load(.monotonic)) break;
         if (env.profile) |p| p.scope = std.hash.Wyhash.hash(outer_scope, std.mem.asBytes(&i));

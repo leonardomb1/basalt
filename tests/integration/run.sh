@@ -855,6 +855,18 @@ WITH (schema_from = 'it_sc5010') WHERE S_T_A_M_P_ >= '2026-11-16 00:00:00' ORDER
     report "sqlserver-union-filter-every-branch ($(grep -o 'Read [0-9,]* rows' "$out/ms_union_stamp.log" | head -1))" bad
     head -3 "$out/ms_union_stamp.log"
   fi
+  # A split-parallel union into a table is one load: the summary called each branch
+  # a target of its own ("Loaded 3 targets").
+  if $B run -j 4 -c "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);
+LOAD INTO db.it_union_sum REPLACE AS
+SELECT * FROM EACH TABLE OF (db.QUERY(\$\$SELECT 'it_sc5010', '01' UNION ALL SELECT 'it_sc5020', '02' UNION ALL SELECT 'it_sc5030', '03'\$\$)) AS (table_name, emp)
+WITH (schema_from = 'it_sc5010');" >"$out/ms_union_sum.log" 2>&1 &&
+     grep -qE "^(Loaded 1,503 rows|Read 1,503 rows, loaded 1,503) into db.it_union_sum" "$out/ms_union_sum.log"; then
+    report sqlserver-union-one-load ok
+  else
+    report sqlserver-union-one-load bad
+    tail -2 "$out/ms_union_sum.log"
+  fi
 fi
 
 # SQL Server money and time. `money` is a scaled integer of ten-thousandths sent
