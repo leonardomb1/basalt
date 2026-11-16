@@ -253,6 +253,15 @@ LOAD INTO '$pq' AS SELECT n, code FROM db.it_coll;"; then
   $B run --format csv -q -c "$decl SELECT code, count(*) AS c FROM db.it_coll GROUP BY code ORDER BY code;" >"$out/coll_got.csv" 2>&1
   $B run --format csv -q -c "SELECT code, count(*) AS c FROM '$pq' GROUP BY code ORDER BY code;" >"$out/coll_want.csv" 2>&1
   cmp -s "$out/coll_got.csv" "$out/coll_want.csv" || { bad=1; echo "  $1: group by code"; diff "$out/coll_want.csv" "$out/coll_got.csv" | head -4 || true; }
+  $B run --format csv -q -c "$decl SELECT count(DISTINCT code) AS d FROM db.it_coll;" >"$out/coll_got.csv" 2>&1
+  $B run --format csv -q -c "SELECT count(DISTINCT code) AS d FROM '$pq';" >"$out/coll_want.csv" 2>&1
+  cmp -s "$out/coll_got.csv" "$out/coll_want.csv" || { bad=1; echo "  $1: count(DISTINCT code)"; diff "$out/coll_want.csv" "$out/coll_got.csv" | head -4 || true; }
+  # a text group key and COUNT(DISTINCT text) descend everywhere: as they are where
+  # the collation compares bytes, else grouped by the bytes
+  $B run --format csv --log-level debug -c "$decl SELECT code, count(*) AS c FROM db.it_coll GROUP BY code;" >"$out/coll_log.txt" 2>&1 || true
+  grep "sql read" "$out/coll_log.txt" | grep -q "GROUP BY" || { bad=1; echo "  $1: the text group key did not descend"; }
+  $B run --format csv --log-level debug -c "$decl SELECT count(DISTINCT code) AS d FROM db.it_coll;" >"$out/coll_log.txt" 2>&1 || true
+  grep "sql read" "$out/coll_log.txt" | grep -qi "COUNT[_A-Z]*(DISTINCT" || { bad=1; echo "  $1: COUNT(DISTINCT code) did not descend"; }
   # SELECT * EXCEPT behind a WHERE that stays in the engine (arithmetic) still
   # leaves the excepted column on the server
   $B run --format csv --log-level debug -c "$decl SELECT * EXCEPT (code) FROM db.it_coll WHERE n * 2 > 10 ORDER BY n;" >"$out/coll_got.csv" 2>"$out/coll_log.txt" || true
@@ -275,8 +284,6 @@ LOAD INTO '$pq' AS SELECT n, code FROM db.it_coll;"; then
   if [ -n "${4:-}" ]; then
     $B run --format csv --log-level debug -c "$decl SELECT n FROM db.it_coll WHERE code >= 'B';" >"$out/coll_log.txt" 2>&1 || true
     grep "sql read" "$out/coll_log.txt" | grep -q ">= 'B'" || { bad=1; echo "  $1: the text range did not descend"; }
-    $B run --format csv --log-level debug -c "$decl SELECT code, count(*) AS c FROM db.it_coll GROUP BY code;" >"$out/coll_log.txt" 2>&1 || true
-    grep "sql read" "$out/coll_log.txt" | grep -q "GROUP BY" || { bad=1; echo "  $1: the text group key did not descend"; }
   fi
   if [ $bad = 0 ]; then report "$1-collation" ok; else report "$1-collation" bad; fi
 }

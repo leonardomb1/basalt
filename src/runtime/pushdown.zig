@@ -30,8 +30,9 @@
 //! `planWholeAggWhy` is the exception to advisory pushdown: the source's GROUP BY
 //! result is what the pipeline emits, computed with the source's own semantics.
 //! Its WHERE translates exactly (`Need.exact`): a text comparison the column's
-//! collation could decide otherwise keeps the aggregate here, as do text MIN/MAX
-//! and COUNT DISTINCT over text, which the collation orders and folds; AVG, SUM and
+//! collation could decide otherwise keeps the aggregate here, as does text MIN/MAX,
+//! which the collation orders; a text group key or COUNT DISTINCT over text goes
+//! by the column's bytes where its collation folds (`byteKey`); AVG, SUM and
 //! numeric MIN/MAX round and fold as the source does; each aggregate is CAST to the engine's planned output type. Null semantics
 //! match by construction: NULL keys form one group, COUNT(col)/SUM/AVG/MIN/MAX
 //! skip nulls, and an ungrouped aggregate over no rows yields one row. A top-N (`TopN`) is never authoritative: the
@@ -155,21 +156,26 @@ pub fn planWholeAggWhy(
         if (!std.mem.eql(u8, out.name, col)) return refuse(why, try msgfmt.allocPrint(arena, "group key `{s}` is renamed by the aggregate", .{col}));
         const kind = src_schema.fields[idx].ty.kind;
         if (out.ty.kind != kind) return refuse(why, try msgfmt.allocPrint(arena, "group key `{s}` changes type through the aggregate", .{col}));
+        const qc = try sql.quoteName(arena, dialect, col);
+        var key = qc;
+        var shown = qc;
         if (kind == .string or kind == .bytes) {
             const f = if (facts) |fs| fs.get(col) else null;
-            if (f == null or !f.?.eq_bytes)
-                return refuse(why, try msgfmt.allocPrint(arena, "text group key `{s}` has a collation that may group values the engine keeps apart (case, accents or trailing spaces)", .{col}));
+            if (f == null or !f.?.eq_bytes) {
+                key = (try byteKey(arena, dialect, qc, f, .group)) orelse
+                    return refuse(why, try msgfmt.allocPrint(arena, "text group key `{s}` has a collation that may group values the engine keeps apart (case, accents or trailing spaces)", .{col}));
+                shown = try msgfmt.allocPrint(arena, "MIN({s})", .{qc});
+            }
         }
-        const qc = try sql.quoteName(arena, dialect, col);
         if (keys.items.len > 0) try keys.appendSlice(", ");
-        try keys.appendSlice(qc);
+        try keys.appendSlice(key);
         if (sel.items.len > 0) try sel.appendSlice(", ");
-        try sel.appendSlice(try msgfmt.allocPrint(arena, "{s} AS {s}", .{ qc, qc }));
+        try sel.appendSlice(try msgfmt.allocPrint(arena, "{s} AS {s}", .{ shown, qc }));
     }
 
     for (ag.aggs, 0..) |item, i| {
         const out = plan_schema.fields[ag.by.len + i];
-        const inner = (try aggExpr(arena, dialect, src_schema, item, out.ty)) orelse
+        const inner = (try aggExpr(arena, dialect, src_schema, item, out.ty, facts)) orelse
             return refuse(why, try msgfmt.allocPrint(arena, "`{s}` is not pushed down for this argument and result type (see the pushdown rules in docs/language/pushdown.md)", .{out.name}));
         const cast_to = (try dialect.castType(arena, out.ty)) orelse
             return refuse(why, try msgfmt.allocPrint(arena, "{s} has no cast for the result type of `{s}`", .{ @tagName(dialect), out.name }));
@@ -216,7 +222,7 @@ fn refuse(why: *[]const u8, reason: []const u8) ?WholeAgg {
 /// One aggregate's SQL before the outer CAST. SQL Server takes COUNT_BIG and a
 /// bigint SUM addend, as its 32-bit COUNT and int SUM raise on overflow; AVG
 /// averages a float, as SQL Server's AVG of an int truncates.
-fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, item: ast.AggItem, out_ty: types.Type) !?[]const u8 {
+fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, item: ast.AggItem, out_ty: types.Type, facts: ?*const Facts) !?[]const u8 {
     const count_fn = dialect.countFn();
 
     if (item.func == .count and item.arg == null) {
@@ -233,7 +239,11 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
 
     switch (item.func) {
         .count => {
-            if (item.distinct and (src_kind == .string or src_kind == .bytes)) return null;
+            if (item.distinct and (src_kind == .string or src_kind == .bytes)) {
+                const f = if (facts) |fs| fs.get(name) else null;
+                const v = if (f != null and f.?.eq_bytes) col else (try byteKey(arena, dialect, col, f, .one)) orelse return null;
+                return try msgfmt.allocPrint(arena, "{s}(DISTINCT {s})", .{ count_fn, v });
+            }
             if (item.distinct) return try msgfmt.allocPrint(arena, "{s}(DISTINCT {s})", .{ count_fn, col });
             return try msgfmt.allocPrint(arena, "{s}({s})", .{ count_fn, col });
         },
@@ -265,6 +275,33 @@ fn aggExpr(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema,
         },
         .median, .count_if, .bool_and, .bool_or, .bit_and, .bit_or, .bit_xor, .var_samp, .var_pop, .stddev_samp, .stddev_pop, .any_value, .arg_max, .arg_min, .array_agg, .string_agg, .percentile_cont, .percentile_disc, .skewness, .kurtosis, .product, .mode, .entropy => return null,
     }
+}
+
+/// Text or bytes column `qc` as SQL whose equality is byte equality, for a column
+/// whose own equality its collation decides (case, accents, trailing spaces): as
+/// group keys, or as `one` value for `COUNT(DISTINCT ...)`. SQL Server pads binary
+/// values with zeros to compare them, so the length goes with the bytes. Null
+/// without the catalog's declared type, or for one whose values the dialect cannot
+/// group whole (MySQL TEXT and BLOB compare a prefix, SQL Server's legacy types
+/// take no MIN).
+fn byteKey(arena: std.mem.Allocator, dialect: Dialect, qc: []const u8, f: ?ColFacts, form: enum { group, one }) !?[]const u8 {
+    const fs = f orelse return null;
+    const held: []const []const u8 = switch (dialect) {
+        .mysql => &.{ "char(", "varchar(", "binary(", "varbinary(", "enum(", "set(" },
+        .sqlserver => &.{ "char(", "varchar(", "nchar(", "nvarchar(", "binary(", "varbinary(" },
+        else => return null,
+    };
+    for (held) |p| {
+        if (!std.ascii.startsWithIgnoreCase(fs.declared, p)) continue;
+        return switch (dialect) {
+            .mysql => try msgfmt.allocPrint(arena, "CAST({s} AS BINARY)", .{qc}),
+            else => switch (form) {
+                .group => try msgfmt.allocPrint(arena, "CONVERT(VARBINARY(MAX), {s}), DATALENGTH({s})", .{ qc, qc }),
+                .one => try msgfmt.allocPrint(arena, "CAST(DATALENGTH({s}) AS BINARY(8)) + CONVERT(VARBINARY(MAX), {s})", .{ qc, qc }),
+            },
+        };
+    }
+    return null;
 }
 
 pub const MapPlan = struct {
@@ -660,6 +697,57 @@ test "planWholeAgg: a text group key stays in the engine unless the catalog says
     };
 }
 
+test "planWholeAgg: a text key or COUNT DISTINCT under a folding collation groups by the bytes where the declared type allows" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const keyed = try a.alloc(ast.AggItem, 1);
+    keyed[0] = .{ .name = "n", .func = .count, .arg = null };
+    const by_b = ast.Aggregate{ .aggs = keyed, .by = try byList(a, &.{"b"}) };
+    const by_schema = types.Schema{ .fields = &.{
+        .{ .name = "b", .ty = types.Type.init(.string) },
+        .{ .name = "n", .ty = types.Type.init(.int) },
+    } };
+    const counted = try a.alloc(ast.AggItem, 1);
+    counted[0] = .{ .name = "u", .func = .count, .arg = try fld(a, "b"), .distinct = true };
+    const distinct_b = ast.Aggregate{ .aggs = counted, .by = &.{} };
+    const distinct_schema = types.Schema{ .fields = &.{.{ .name = "u", .ty = types.Type.init(.int) }} };
+
+    const cases = [_]struct { d: Dialect, declared: []const u8, group: ?[]const u8, distinct: ?[]const u8 }{
+        .{ .d = .mysql, .declared = "varchar(20)", .group = "SELECT MIN(`b`) AS `b`, CAST(COUNT(*) AS SIGNED) AS `n` FROM (SELECT * FROM t) _g GROUP BY CAST(`b` AS BINARY)", .distinct = "COUNT(DISTINCT CAST(`b` AS BINARY))" },
+        .{ .d = .mysql, .declared = "CHAR(3)", .group = "GROUP BY CAST(`b` AS BINARY)", .distinct = "COUNT(DISTINCT CAST(`b` AS BINARY))" },
+        .{ .d = .mysql, .declared = "enum('a','b')", .group = "GROUP BY CAST(`b` AS BINARY)", .distinct = "COUNT(DISTINCT CAST(`b` AS BINARY))" },
+        .{ .d = .mysql, .declared = "text", .group = null, .distinct = null },
+        .{ .d = .mysql, .declared = "", .group = null, .distinct = null },
+        .{ .d = .sqlserver, .declared = "varchar(20,0,0)", .group = "SELECT MIN([b]) AS [b], CAST(COUNT_BIG(*) AS BIGINT) AS [n] FROM (SELECT * FROM t) _g GROUP BY CONVERT(VARBINARY(MAX), [b]), DATALENGTH([b])", .distinct = "COUNT_BIG(DISTINCT CAST(DATALENGTH([b]) AS BINARY(8)) + CONVERT(VARBINARY(MAX), [b]))" },
+        .{ .d = .sqlserver, .declared = "nvarchar(-1,0,0)", .group = "GROUP BY CONVERT(VARBINARY(MAX), [b]), DATALENGTH([b])", .distinct = "COUNT_BIG(DISTINCT CAST(DATALENGTH([b]) AS BINARY(8))" },
+        .{ .d = .sqlserver, .declared = "ntext(16,0,0)", .group = null, .distinct = null },
+        .{ .d = .sqlserver, .declared = "text(16,0,0)", .group = null, .distinct = null },
+        .{ .d = .sqlserver, .declared = "sysname(256,0,0)", .group = null, .distinct = null },
+        .{ .d = .postgres, .declared = "character varying(20)", .group = null, .distinct = null },
+    };
+    for (cases) |tc| {
+        var f = Facts.init(a);
+        try f.put("b", .{ .text = true, .byte_order = false, .pads = true, .eq_bytes = false, .declared = tc.declared });
+        var why: []const u8 = "";
+        const g = try planWholeAggWhy(a, tc.d, base_t, wholeSchema(), &.{}, by_b, by_schema, &f, &why);
+        const u = try planWholeAggWhy(a, tc.d, base_t, wholeSchema(), &.{}, distinct_b, distinct_schema, &f, &why);
+        for ([_]?WholeAgg{ g, u }, [_]?[]const u8{ tc.group, tc.distinct }) |got, want| {
+            const ok = if (want) |w| got != null and std.mem.indexOf(u8, got.?.sql, w) != null else got == null;
+            testing.expect(ok) catch |e| {
+                std.debug.print("{s} {s}: want {?s}, got {?s}\n", .{ @tagName(tc.d), tc.declared, want, if (got) |x| x.sql else null });
+                return e;
+            };
+        }
+    }
+
+    var exact = Facts.init(a);
+    try exact.put("b", .{ .text = true, .eq_bytes = true, .declared = "text" });
+    var why: []const u8 = "";
+    const plain = (try planWholeAggWhy(a, .postgres, base_t, wholeSchema(), &.{}, distinct_b, distinct_schema, &exact, &why)).?;
+    try testing.expectEqualStrings("SELECT CAST(COUNT(DISTINCT \"b\") AS BIGINT) AS \"u\" FROM (SELECT * FROM t) _g", plain.sql);
+}
+
 test "planWholeAgg: ungrouped COUNT DISTINCT has no GROUP BY and no WHERE" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
@@ -684,7 +772,11 @@ test "planWholeAgg: ungrouped COUNT DISTINCT has no GROUP BY and no WHERE" {
     );
 
     aggs[0].arg = try fld(a, "b");
-    try expectWholeAggRefused(a, .mysql, ag, plan_schema, "`u` is not pushed down");
+    const my = (try planWholeAgg(a, .mysql, base_t, wholeSchema(), &.{}, ag, plan_schema)).?;
+    try testing.expectEqualStrings("SELECT CAST(COUNT(DISTINCT `b`) AS SIGNED) AS `u` FROM (SELECT * FROM t) _g", my.sql);
+    var why: []const u8 = "";
+    try testing.expect((try planWholeAggWhy(a, .mysql, base_t, wholeSchema(), &.{}, ag, plan_schema, null, &why)) == null);
+    try testing.expect(std.mem.startsWith(u8, why, "`u` is not pushed down"));
 }
 
 test "planWholeAgg: a QUERY-form read is wrapped as the subquery, its own WHERE intact" {

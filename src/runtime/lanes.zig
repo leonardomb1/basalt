@@ -173,17 +173,24 @@ pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: SinkShape, de
     return out;
 }
 
-/// Whether a group key is a text or bytes source column, whose grouping the
-/// source's collation decides.
-fn textKey(ag: ast.Aggregate, schema: @import("../lang/types.zig").Schema) bool {
-    for (ag.by) |q| {
-        const i = schema.indexOf(q.parts[q.parts.len - 1]) orelse continue;
-        switch (schema.fields[i].ty.kind) {
-            .string, .bytes => return true,
-            else => {},
-        }
+/// Whether a group key, or a `COUNT(DISTINCT ...)` argument, is a text or bytes
+/// source column, whose grouping the source's collation decides.
+fn textKey(ag: ast.Aggregate, schema: types.Schema) bool {
+    for (ag.by) |q| if (textCol(schema, q.parts[q.parts.len - 1])) return true;
+    for (ag.aggs) |it| {
+        if (it.func != .count or !it.distinct) continue;
+        const arg = it.arg orelse continue;
+        if (arg.* == .field and textCol(schema, arg.field.parts[arg.field.parts.len - 1])) return true;
     }
     return false;
+}
+
+fn textCol(schema: types.Schema, name: []const u8) bool {
+    const i = schema.indexOf(name) orelse return false;
+    return switch (schema.fields[i].ty.kind) {
+        .string, .bytes => true,
+        else => false,
+    };
 }
 
 /// Descend a `LIMIT` (with its `ORDER BY`) into the SQL read when `pushdown.planTopN`

@@ -117,8 +117,18 @@ crosses the wire. The answer never changes, only where the work happens;
   The answer is the one the engine would give: every filter must translate
   exactly (the rules above), so a text comparison or `LIKE` the column's
   collation could decide otherwise (`'a' = 'A'` under a case-insensitive one,
-  `'01 ' = '01'` under padding) keeps the aggregate in the engine, as do text
-  `MIN`/`MAX` and `COUNT(DISTINCT text)`, which a collation orders and folds.
+  `'01 ' = '01'` under padding) keeps the aggregate in the engine, as does text
+  `MIN`/`MAX`, which a collation orders. A text group key or
+  `COUNT(DISTINCT text)` groups by the column's bytes where its collation would
+  fold values the engine keeps apart: `GROUP BY CAST(k AS BINARY)` on MySQL,
+  `GROUP BY CONVERT(VARBINARY(MAX), k), DATALENGTH(k)` on SQL Server (which pads
+  binary values with zeros to compare them), the key itself sent back as
+  `MIN(k)`. That takes the declared type from the catalog: `char`, `varchar`,
+  `binary`, `varbinary` (and `nchar`/`nvarchar` on SQL Server, `enum`/`set` on
+  MySQL); MySQL `TEXT`/`BLOB`, which group by a prefix, SQL Server's legacy
+  `text`/`ntext`/`image`, and a query read without a catalog stay in the engine,
+  as does a PostgreSQL column under a nondeterministic collation. Where the
+  collation already compares bytes, the key goes as is.
   Then every matching row is streamed to be grouped, and the run log says so in
   a `warn` line naming the rule (`the WHERE predicate does not translate exactly
   to mysql SQL …`, ``group key `x` is renamed by the aggregate``, …).
