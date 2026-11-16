@@ -26,6 +26,7 @@ const columnFacts = @import("facts.zig").columnFacts;
 const dupeSchema = @import("../connect.zig").dupeSchema;
 const types = @import("../../lang/types.zig");
 const collectFields = @import("../pushdown.zig").collectFields;
+const translatePred = @import("../pushdown.zig").translatePred;
 
 pub fn readSql(env: *Env, rd: ast.Read) ![]const u8 {
     const base = switch (rd.form) {
@@ -127,8 +128,9 @@ pub fn selectListFor(arena: std.mem.Allocator, dialect: sql.Dialect, cols: []con
 
 /// After a join an unqualified name may be the other side's, so only the table's
 /// own columns are kept, learnt from a zero-row probe; a failed probe reads all.
-pub fn projectSqlRead(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
-    if (stages.len == 0 or stages[0].node != .read) return stages;
+pub fn projectSqlRead(env: *Env, stages_in: []const ast.Stage) ![]const ast.Stage {
+    if (stages_in.len == 0 or stages_in[0].node != .read) return stages_in;
+    const stages = try exceptedFiltersDown(env, stages_in);
     const rd = stages[0].node.read;
     if (rd.form != .table or rd.cols.len > 0) return stages;
     const conn = env.connections.get(rd.connector) orelse return stages;
@@ -241,6 +243,67 @@ pub fn probedSchema(env: *Env, probe: ast.Read, hints: []const ast.Hint) !types.
     return schema;
 }
 
+/// Under a `SELECT * EXCEPT (...)` past the read's filters, each condition of those
+/// filters that reads an excepted column and that the source applies exactly is
+/// moved into the read's own WHERE and out of the engine's filter, so the column it
+/// reads is not fetched to evaluate it again (`IS NOT NULL` on a blob). A condition
+/// the source cannot apply exactly stays, and keeps its column in the read.
+fn exceptedFiltersDown(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
+    const arena = env.arena;
+    const rd = stages[0].node.read;
+    if (rd.form != .table) return stages;
+    const conn = env.connections.get(rd.connector) orelse return stages;
+    const d = (sqlConnInfo(conn) orelse return stages).dialect;
+    if (!pushableRead(d, rd)) return stages;
+    var k: usize = 1;
+    while (k < stages.len and stages[k].node == .filter) k += 1;
+    if (k == 1 or k == stages.len or stages[k].node != .select) return stages;
+    const names = for (stages[k].node.select) |it| {
+        if (it == .star_except) break it.star_except;
+    } else return stages;
+    const facts = try columnFacts(env, rd);
+    var moved = std.array_list.Managed([]const u8).init(arena);
+    const out = try arena.dupe(ast.Stage, stages);
+    var kept = std.array_list.Managed(ast.Stage).init(arena);
+    try kept.append(out[0]);
+    for (out[1..k]) |st| {
+        var conj = std.array_list.Managed(*ast.Expr).init(arena);
+        try ast.splitAnd(*ast.Expr, st.node.filter, &conj);
+        var rest: ?*ast.Expr = null;
+        for (conj.items) |c| {
+            var read = std.StringHashMap(void).init(arena);
+            try collectFields(c, &read);
+            if (readsAny(read, names)) if (try translatePred(arena, c, d, .{ .facts = facts, .need = .exact })) |sql_text| {
+                try moved.append(sql_text);
+                continue;
+            };
+            rest = if (rest) |r| try ast.mk(arena, .{ .binary = .{ .op = .@"and", .l = r, .r = c } }) else c;
+        }
+        if (rest) |r| {
+            var nst = st;
+            nst.node = .{ .filter = r };
+            try kept.append(nst);
+        }
+    }
+    if (moved.items.len == 0) return stages;
+    var nrd = rd;
+    const joined = try std.mem.join(arena, ") AND (", moved.items);
+    nrd.where = if (rd.where.len > 0) try msgfmt.allocPrint(arena, "({s}) AND ({s})", .{ rd.where, joined }) else try msgfmt.allocPrint(arena, "({s})", .{joined});
+    kept.items[0].node = .{ .read = nrd };
+    try kept.appendSlice(out[k..]);
+    return kept.items;
+}
+
+/// Whether any of `names` is among the columns `read`, matched as a catalog does,
+/// in any case.
+fn readsAny(read: std.StringHashMap(void), names: []const []const u8) bool {
+    var it = read.keyIterator();
+    while (it.next()) |k| for (names) |n| {
+        if (std.ascii.eqlIgnoreCase(k.*, n)) return true;
+    };
+    return false;
+}
+
 /// The names a `SELECT * EXCEPT (...)` leaves out of the read, past the filters
 /// before it (a WHERE stands between a read and its select): those of them a filter
 /// reads are kept, as a filter the source does not take reads them here. Null when
@@ -258,14 +321,7 @@ pub fn exceptPastFilters(arena: std.mem.Allocator, after: []const ast.Stage, sol
     };
     const names = found orelse return null;
     var out = std.array_list.Managed([]const u8).init(arena);
-    for (names) |n| {
-        var kept = false;
-        var it = read.keyIterator();
-        while (it.next()) |k| if (std.ascii.eqlIgnoreCase(k.*, n)) {
-            kept = true;
-        };
-        if (!kept) try out.append(n);
-    }
+    for (names) |n| if (!readsAny(read, &.{n})) try out.append(n);
     return out.items;
 }
 

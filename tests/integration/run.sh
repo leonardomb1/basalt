@@ -262,6 +262,15 @@ LOAD INTO '$pq' AS SELECT n, code FROM db.it_coll;"; then
   if ! grep -q "it_coll" "$out/coll_reads.txt" || grep -qiE 'SELECT \*|code' "$out/coll_reads.txt"; then
     bad=1; echo "  $1: SELECT * EXCEPT (code) behind a WHERE still asked for code"; head -1 "$out/coll_reads.txt"
   fi
+  # an exact condition on the excepted column is the source's alone, so the column
+  # itself is not asked for to evaluate it again
+  $B run --format csv --log-level debug -c "$decl SELECT * EXCEPT (code) FROM db.it_coll WHERE n > 1 AND code IS NOT NULL ORDER BY n;" >"$out/coll_got.csv" 2>"$out/coll_log.txt" || true
+  $B run --format csv -q -c "SELECT * EXCEPT (code) FROM '$pq' WHERE n > 1 AND code IS NOT NULL ORDER BY n;" >"$out/coll_want.csv" 2>&1 || true
+  cmp -s "$out/coll_got.csv" "$out/coll_want.csv" || { bad=1; echo "  $1: SELECT * EXCEPT (code) ... WHERE code IS NOT NULL"; diff "$out/coll_want.csv" "$out/coll_got.csv" | head -4 || true; }
+  grep "sql read" "$out/coll_log.txt" | grep -v "1 = 0" >"$out/coll_reads.txt" || true
+  if ! sed 's/ FROM .*//' "$out/coll_reads.txt" | grep -q "SELECT" || sed 's/ FROM .*//' "$out/coll_reads.txt" | grep -qiE '\*|code' || ! grep -qi "code.* IS NOT NULL" "$out/coll_reads.txt"; then
+    bad=1; echo "  $1: an exact condition on the excepted code still fetched it"; head -1 "$out/coll_reads.txt"
+  fi
   # where the catalog proves byte order, the text range reaches the source
   if [ -n "${4:-}" ]; then
     $B run --format csv --log-level debug -c "$decl SELECT n FROM db.it_coll WHERE code >= 'B';" >"$out/coll_log.txt" 2>&1 || true
