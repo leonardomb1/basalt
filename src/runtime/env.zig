@@ -203,14 +203,38 @@ pub const FactsCache = struct {
     }
 };
 
-/// Copies facts built in a private arena into the cache's.
+/// Copies facts built in a private arena into the cache's: each column's name and
+/// its declared type, the text a union's `schema_from` compares, which pointed into
+/// the freed arena when only the name was copied.
 fn adoptFacts(f: *const pushdown.Facts, ca: std.mem.Allocator) error{OutOfMemory}!*const pushdown.Facts {
     const out = try ca.create(pushdown.Facts);
     out.* = pushdown.Facts.init(ca);
     try out.ensureTotalCapacity(f.count());
     var it = f.iterator();
-    while (it.next()) |e| out.putAssumeCapacity(try ca.dupe(u8, e.key_ptr.*), e.value_ptr.*);
+    while (it.next()) |e| {
+        var v = e.value_ptr.*;
+        v.declared = try ca.dupe(u8, v.declared);
+        out.putAssumeCapacity(try ca.dupe(u8, e.key_ptr.*), v);
+    }
     return out;
+}
+
+test "cached facts keep each column's declared type once the arena they were built in is gone" {
+    var cache = FactsCache.init(std.testing.allocator);
+    defer cache.deinit();
+    const Build = struct {
+        fn compute(_: void, scratch: std.mem.Allocator) !*const pushdown.Facts {
+            const f = try scratch.create(pushdown.Facts);
+            f.* = pushdown.Facts.init(scratch);
+            for ([_][]const u8{ "S_T_A_M_P_", "C5_NUM" }, [_][]const u8{ "datetime(8,23,3)", "varchar(6,0,0)" }) |name, ty| {
+                try f.put(try scratch.dupe(u8, name), .{ .text = false, .declared = try scratch.dupe(u8, ty) });
+            }
+            return f;
+        }
+    };
+    const got = try cache.facts.get(&cache, "erp\x00SC5030", {}, Build.compute);
+    try std.testing.expectEqualStrings("datetime(8,23,3)", got.get("S_T_A_M_P_").?.declared);
+    try std.testing.expectEqualStrings("varchar(6,0,0)", got.get("C5_NUM").?.declared);
 }
 
 /// Answers computed at most once per key across threads: the first asker claims the

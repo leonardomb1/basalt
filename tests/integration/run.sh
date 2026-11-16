@@ -660,6 +660,29 @@ SELECT length(t) AS n FROM (SELECT * FROM db.QUERY(\$\$SELECT N'$long' AS t\$\$)
   else report sqlserver-long-batch-tls bad; fi
 fi
 
+# A union under schema_from sends its filter into every branch that declares the
+# column as the named branch does. The cached catalog facts held each column's
+# declared type in a freed arena, so a branch read after another's facts were
+# computed compared garbage and was read whole (2,882 rows read to keep 1).
+if runs sqlserver; then
+  msq() { docker compose -f tests/integration/compose.yaml exec -T mssql /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P It_Passw0rd1 -C -h -1 -W -s, "$@"; }
+  for t in 10 20 30; do
+    msq -Q "USE master; DROP TABLE IF EXISTS dbo.it_sc50$t; CREATE TABLE dbo.it_sc50$t (C5_NUM varchar(6), S_T_A_M_P_ datetime2(3) NULL);
+            INSERT INTO dbo.it_sc50$t SELECT TOP 500 RIGHT('00000' + CAST(ROW_NUMBER() OVER (ORDER BY (SELECT 1)) AS varchar(6)), 6), '2024-01-01' FROM sys.all_objects;
+            INSERT INTO dbo.it_sc50$t VALUES ('NEW$t', '2026-11-16 06:48:00');" >/dev/null 2>&1
+  done
+  if $B run -c "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);
+LOAD INTO '$out/ms_union_stamp.csv' AS
+SELECT * FROM EACH TABLE OF (db.QUERY(\$\$SELECT 'it_sc5010', '01' UNION ALL SELECT 'it_sc5020', '02' UNION ALL SELECT 'it_sc5030', '03'\$\$)) AS (table_name, emp)
+WITH (schema_from = 'it_sc5010') WHERE S_T_A_M_P_ >= '2026-11-16 00:00:00' ORDER BY emp;" >"$out/ms_union_stamp.log" 2>&1 &&
+     grep -qE "^Loaded 3 rows|Read 3 rows" "$out/ms_union_stamp.log"; then
+    report sqlserver-union-filter-every-branch ok
+  else
+    report "sqlserver-union-filter-every-branch ($(grep -o 'Read [0-9,]* rows' "$out/ms_union_stamp.log" | head -1))" bad
+    head -3 "$out/ms_union_stamp.log"
+  fi
+fi
+
 # SQL Server money and time. `money` is a scaled integer of ten-thousandths sent
 # high word first, not a float — decoding it as one turned -0.0001 into NaN — and
 # the fixed-length forms (money NOT NULL) were missing from the type switch
