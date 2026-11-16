@@ -89,6 +89,10 @@ pub const Window = struct {
     held: ?*Held = null,
     /// The child's batches are a materialized binding's, held uncopied (`Held.adopt`).
     adopt_input: bool = false,
+    /// The child hands out this window's rows already computed, its partitions by
+    /// bucket on lanes (`runtime/lanes/window.zig`): they pass through, and the window
+    /// stands in a profile where it ran.
+    passthrough: bool = false,
     fcols: []column.Column = &.{},
     /// With a `space`, input past `spill_at` bytes is sorted to disk (`Sort.fill`) and
     /// read back in order from `src` a segment at a time (`nextSorted`).
@@ -997,6 +1001,7 @@ pub const Window = struct {
     }
 
     pub fn next(self: *Window, arena: std.mem.Allocator) anyerror!?Batch {
+        if (self.passthrough) return self.child.next(arena);
         errdefer self.release();
         if (self.held) |h| return self.emit(arena, h, h.refs.len);
         if (self.src != null) return self.nextSorted(arena);

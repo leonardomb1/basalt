@@ -18,6 +18,7 @@ const LaneMem = @import("../parallel.zig").LaneMem;
 const MemSource = @import("../env.zig").MemSource;
 const buildOp = @import("../plan.zig").buildOp;
 const analyze = @import("../analyze.zig");
+const obs = @import("../../exec/obs.zig");
 const ast = @import("../../lang/ast.zig");
 const chainAt = @import("../plan.zig").chainAt;
 const op = @import("../../exec/op.zig");
@@ -29,6 +30,7 @@ const sinkLabel = @import("../connect.zig").sinkLabel;
 const std = @import("std");
 const msgfmt = @import("../../base/msgfmt.zig");
 const writeTailOver = @import("agg.zig").writeTailOver;
+const runWindowBuckets = @import("window.zig").runWindowBuckets;
 
 const SortShape = @import("shape.zig").SortShape;
 
@@ -110,15 +112,44 @@ pub fn runParallelSort(env: *Env, m: *const Morsels, shape: SortShape, w: ast.Wr
         .window => |wo| .{ .child = .{ .scan = &scan }, .in_schema = row_schema, .keys = try std.mem.concat(arena, op.Sort.Key, &.{ wo.part, wo.ord }), .threads = opts.lanes(), .space = env.space, .gpa = env.gpa },
         else => unreachable,
     };
+    const after = try chainAt(env, built.schema, shape.tail);
+    var first: ?u64 = null;
+    var again = obs.RowCounter{};
+    if (built.op == .window and built.op.window.part.len > 0) {
+        const read0 = env.rows_read.load(.monotonic);
+        const wo = built.op.window;
+        if (runWindowBuckets(env, m, pre.recs, wo, opts, lanes_used)) |rows_in| {
+            var rows = rows_in;
+            defer rows.deinit();
+            var held = MemSource{ .m = .{ .schema = built.schema, .batches = rows.batches } };
+            var rows_scan = op.Scan{ .src = held.source() };
+            rows_scan.stats.at = profile.merged_at;
+            wo.child = .{ .scan = &rows_scan };
+            wo.passthrough = true;
+            wo.stats.ns += rows.ns;
+            const start: op.Op = .{ .window = wo };
+            start.stampNew(profile.keyOf(shape.srt.pos));
+            const snk = try openTailSink(env, w, after.out.*);
+            var guard = SinkGuard.init(snk);
+            defer guard.abort();
+            try writeTailOver(env, snk, start, after.recs, stats, rows.feeds);
+            try guard.close();
+            return true;
+        } else |e| {
+            if (e != error.WindowPastMemory) return e;
+            first = env.rows_read.load(.monotonic) - read0;
+            env.log.log(.info, "the window's rows are past {d} bytes (--op-memory); it sorts them on lanes, spilling, and computes it on one thread", .{env.op_memory});
+        }
+    }
     base.spill_at = env.op_memory / @max(m.workers(opts.lanes()), 1);
     const shared = try arena.create(op.SortShared);
     shared.* = try .init(arena, base);
     defer shared.sort.release();
-    const after = try chainAt(env, built.schema, shape.tail);
     var g = SortSink{ .env = env, .shared = shared, .order = built.op == .sort };
     defer g.deinit();
-    const p: Pipeline = .{ .m = m, .recs = pre.recs, .errctx = env.errctx, .rows_read = env.rows_read };
+    const p: Pipeline = .{ .m = m, .recs = pre.recs, .errctx = env.errctx, .rows_read = if (first != null) &again else env.rows_read };
     const lanes = try drive(arena, p, g.parallelSink(), opts.lanes());
+    if (first) |f| _ = env.rows_read.fetchAdd(again.load(.monotonic) -| f, .monotonic);
     lanes_used.* = @max(lanes_used.*, lanes);
     const what = if (built.op == .sort) "sort" else "window";
     env.log.log(.debug, "parallel {s} {s}: {d} {s} over {d} lanes, {d} runs", .{ m.label(), what, m.count(), m.unitName(), lanes, shared.sort.runs });

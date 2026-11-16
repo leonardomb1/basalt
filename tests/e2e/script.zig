@@ -370,7 +370,7 @@ test "EXPLAIN ANALYZE on lanes names the path, the in-memory or build-side scan,
         .{
             .q = "SELECT id, SUM(v) OVER (PARTITION BY g) AS s FROM '$B/in.csv'",
             .rows = "Rows read: 6.0K (6000)   Rows out: 6.0K (6000)   Path: csv parallel window, ",
-            .path = " chunks\n",
+            .path = " buckets\n",
             .scan = "  the lanes' partial results, merged\n",
         },
         .{
