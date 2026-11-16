@@ -16,6 +16,7 @@ const buildProject = @import("../plan.zig").buildProject;
 const buildStage = @import("../plan.zig").buildStage;
 const driver = @import("../../exec/driver.zig");
 const descendLeadingWhere = @import("../plan.zig").descendLeadingWhere;
+const buildPipelineLateLead = @import("../plan.zig").buildPipelineLateLead;
 const dupeSchema = @import("../connect.zig").dupeSchema;
 const env_mod = @import("../env.zig");
 const exceptColumns = @import("../connect.zig").exceptColumns;
@@ -88,6 +89,7 @@ const synthReconcile = @import("../plan.zig").synthReconcile;
 const targetLabel = @import("../run.zig").targetLabel;
 const topNStages = @import("../lanes.zig").topNStages;
 const types = @import("../../lang/types.zig");
+const sql_read = @import("../connect/sql_read.zig");
 const lake = @import("../../format/lake/table.zig");
 const feed = @import("feed.zig");
 const changes_pg = @import("../connect/changes_pg.zig");
@@ -791,47 +793,44 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     env.src_name = "";
     const src_base = env.sources.items.len;
     const t_open = std.time.Instant.now() catch null;
-    var res = try buildPipeline(env, stages[0 .. stages.len - 1]);
+
+    var whole_agg = false;
+    var top_n = false;
+    const lead_desc = try sql_read.sqlDescForStage(env, stages[0]);
+    if (lead_desc) |desc| {
+        const agg_shape: ?SinkShape = if (sql) |s| s.whole_agg else null;
+        var cwhy: []const u8 = "";
+        const topn_shaped = (try pushdown.classifyTopN(arena, stages[0 .. stages.len - 1], &cwhy)) != null;
+        const schema: ?types.Schema = if (agg_shape != null or topn_shaped or hasSort(stages)) blk: {
+            var probe = stages[0].node.read;
+            probe.where = "1 = 0";
+            break :blk sql_read.probedSchema(env, probe, stages[0].hints) catch null;
+        } else null;
+        var why: []const u8 = "the pipeline is not read -> filter* -> aggregate";
+        if (agg_shape) |shape| if (schema) |sch| if (try wholeAggStages(env, stages, shape, desc, sch, &why)) |ns| {
+            stages = ns;
+            whole_agg = true;
+            if (env.profile) |p| p.path = "serial; the aggregate runs in the source";
+        };
+        if (!whole_agg and hasAggregate(stages))
+            env.log.log(.warn, "aggregate over {s} runs engine-side, not in the source ({s}); every matching row is streamed here to be grouped", .{ @tagName(desc.dialect), why });
+        if (!whole_agg) if (schema) |sch| {
+            var twhy: []const u8 = "";
+            if (try topNStages(env, stages, desc, sch, &twhy)) |ns| {
+                stages = ns;
+                top_n = true;
+                if (env.profile) |p| p.path = "serial; ORDER BY ... LIMIT runs in the source";
+            } else if (twhy.len > 0 and hasSort(stages))
+                env.log.log(.warn, "ORDER BY ... LIMIT over {s} sorts engine-side, not in the source ({s}); every matching row is streamed here to be sorted", .{ @tagName(desc.dialect), twhy });
+        };
+    }
+
+    const may_split = !whole_agg and !top_n and opts.lanes() > 1 and lead_desc != null and sql_read.splitMayCutInto(env, stages[0], last.write);
+    var res = if (may_split) try buildPipelineLateLead(env, stages[0 .. stages.len - 1]) else try buildPipeline(env, stages[0 .. stages.len - 1]);
     defer res.op.release();
     if (env.profile) |p| if (t_open) |t| try p.phase("plan and open the sources", (std.time.Instant.now() catch t).since(t));
 
     const wr = try resolveUpsertKeys(env, last.write);
-
-    var whole_agg = false;
-    if (pipe.sql_desc != null and src_base < env.sources.items.len) {
-        var why: []const u8 = "the pipeline is not read -> filter* -> aggregate";
-        if (sql) |s| if (s.whole_agg) |shape| {
-            if (try wholeAggStages(env, stages, shape, src_base, &why)) |ns| {
-                for (env.sources.items[src_base..]) |sc| sc.close();
-                env.sources.shrinkRetainingCapacity(src_base);
-                pipe.sql_desc = null;
-                stages = ns;
-                res.op.release();
-                res = try buildPipeline(env, ns[0 .. ns.len - 1]);
-                whole_agg = true;
-                if (env.profile) |p| p.path = "serial; the aggregate runs in the source";
-            }
-        };
-        if (!whole_agg and hasAggregate(stages))
-            env.log.log(.warn, "aggregate over {s} runs engine-side, not in the source ({s}); every matching row is streamed here to be grouped", .{ @tagName(pipe.sql_desc.?.dialect), why });
-    }
-
-    var top_n = false;
-    if (!whole_agg and pipe.sql_desc != null and src_base < env.sources.items.len) {
-        var why: []const u8 = "";
-        const dialect = pipe.sql_desc.?.dialect;
-        if (try topNStages(env, stages, src_base, &why)) |ns| {
-            for (env.sources.items[src_base..]) |sc| sc.close();
-            env.sources.shrinkRetainingCapacity(src_base);
-            pipe.sql_desc = null;
-            stages = ns;
-            res.op.release();
-            res = try buildPipeline(env, ns[0 .. ns.len - 1]);
-            top_n = true;
-            if (env.profile) |p| p.path = "serial; ORDER BY ... LIMIT runs in the source";
-        } else if (why.len > 0 and hasSort(stages))
-            env.log.log(.warn, "ORDER BY ... LIMIT over {s} sorts engine-side, not in the source ({s}); every matching row is streamed here to be sorted", .{ @tagName(dialect), why });
-    }
 
     if (!whole_agg and !top_n and opts.lanes() > 1 and pipe.sql_desc != null) {
         if (sql) |s| {

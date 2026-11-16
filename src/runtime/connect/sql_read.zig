@@ -401,6 +401,11 @@ pub fn splitMayCut(lead: ast.Stage, pg_copy: bool) bool {
     return h.col != null or (lead.node == .read and lead.node.read.form == .table);
 }
 
+/// `splitMayCut` for a read written by `w`.
+pub fn splitMayCutInto(env: *Env, lead: ast.Stage, w: ast.Write) bool {
+    return splitMayCut(lead, isPostgresCopySink(env, w));
+}
+
 fn isPostgresCopySink(env: *Env, w: ast.Write) bool {
     return w.mode != .upsert and std.mem.eql(u8, connectorType(env, w.connector), "postgres");
 }

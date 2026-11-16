@@ -40,6 +40,7 @@ const pqdecode = @import("../format/parquet/read.zig");
 const analyze = @import("analyze.zig");
 const pushdown = @import("pushdown.zig");
 const keypush = @import("plan/keypush.zig");
+const changes = @import("connect/changes.zig");
 const runtime_filters = @import("plan/runtime_filters.zig");
 const joinorder = @import("plan/joinorder.zig");
 const obs = @import("../exec/obs.zig");
@@ -585,7 +586,15 @@ fn metaShortcut(env: *Env, stages: []const ast.Stage) anyerror!?PipeRes {
 }
 
 pub fn buildPipeline(env: *Env, stages_in: []const ast.Stage) anyerror!PipeRes {
-    return buildPipelineWith(env, stages_in, null);
+    return buildPipelineWith(env, stages_in, null, false);
+}
+
+/// `buildPipeline` whose leading SQL read sends its query only on its first pull,
+/// its schema taken from a `WHERE 1 = 0` probe (one per table and statement): for a
+/// plan that may still read the table cut into key ranges and close this read
+/// unread. A change-feed read opens as usual, as its query is the feed's.
+pub fn buildPipelineLateLead(env: *Env, stages_in: []const ast.Stage) anyerror!PipeRes {
+    return buildPipelineWith(env, stages_in, null, true);
 }
 
 /// A join's request that the pipeline's read take its keys: a SQL read opens late,
@@ -654,7 +663,7 @@ fn openTaker(env: *Env, stages: []const ast.Stage, want: keypush.Want) !Taken {
     }
 }
 
-fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq) anyerror!PipeRes {
+fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq, late_lead: bool) anyerror!PipeRes {
     var ld = analyze.Diag{};
     const bound = analyze.bindLimits(env.arena, stages_in, env.params_expr, &ld) catch |e| return aErr(env, &ld, e);
     const stages = try projectSqlRead(env, bound);
@@ -679,7 +688,9 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
                     take_at = pt.idx;
                 }
                 break :blk t.src;
-            } else blk: {
+            } else if (if (late_lead and !changes.asked(stages[0].hints)) keypush.sqlDialect(env, stages[0..1]) else null) |d|
+                (try keypush.LateSql.open(env, rd, stages[0].hints, d)).source()
+            else blk: {
                 const before = env.pipe.pq_reader;
                 const s = try openSourceProjected(env, rd, stages[0].hints, try projectedColumns(env, stages[1..]), try filterBounds(env, stages[1..]));
                 if (env.pipe.pq_reader) |pr| if (pr != before) {
@@ -1047,7 +1058,7 @@ pub fn joinSide(env: *Env, j: ast.Join, hints: []const ast.Hint, after: ?[]const
     else
         try keypush.takerFor(env, rstages);
     const build = if (a_want) |w|
-        try buildPipelineWith(env, rstages, .{ .want = w, .out = &right_late })
+        try buildPipelineWith(env, rstages, .{ .want = w, .out = &right_late }, false)
     else
         try buildPipeline(env, rstages);
     return .{ .rstages = rstages, .build = build, .right_late = right_late };

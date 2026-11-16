@@ -247,18 +247,23 @@ const ReportCase = struct {
     threads: usize = 1,
     explain: bool = false,
     says: []const []const u8 = &.{},
+    never: []const []const u8 = &.{},
 };
+
+const unread: []const []const u8 = &.{"opened and not read"};
 
 const report_cases = [_]ReportCase{
     .{ .script = "EXPLAIN ANALYZE SELECT id, v FROM pg.public.t WHERE v > 1;", .says = &.{"scan (#3)  postgres table public.t\n            sent: SELECT \"v\", \"id\" FROM \"public\".\"t\" WHERE (\"v\" > 1)\n"} },
-    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.csv' AS SELECT id, v FROM pg.public.t WHERE v > 1;", .threads = 4, .says = &.{ "outside the plan (actuals)", "postgres lookup", "opened and not read", "sent: once per key range: SELECT" } },
-    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.csv' SPLIT BY (id) AS SELECT g, COUNT(*) AS n FROM pg.public.t GROUP BY g;", .threads = 4, .says = &.{ "outside the plan (actuals)", "sent: once per key range: SELECT" } },
-    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.csv' SPLIT BY (id) AS SELECT t.id, k.g FROM pg.public.t t JOIN '$B/in.csv' k ON t.g = k.g;", .threads = 4, .says = &.{"sent: once per key range: SELECT"} },
-    .{ .script = "EXPLAIN ANALYZE SELECT id FROM pg.public.t ORDER BY id LIMIT 3;", .threads = 4, .says = &.{"opened and not read"} },
+    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.csv' AS SELECT id, v FROM pg.public.t WHERE v > 1;", .threads = 4, .says = &.{ "outside the plan (actuals)", "postgres lookup", "schema probe", "sent: once per key range: SELECT" }, .never = unread },
+    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.csv' SPLIT BY (id) AS SELECT g, COUNT(*) AS n FROM pg.public.t GROUP BY g;", .threads = 4, .says = &.{ "outside the plan (actuals)", "sent: once per key range: SELECT" }, .never = unread },
+    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.csv' SPLIT BY (id) AS SELECT t.id, k.g FROM pg.public.t t JOIN '$B/in.csv' k ON t.g = k.g;", .threads = 4, .says = &.{"sent: once per key range: SELECT"}, .never = unread },
+    .{ .script = "EXPLAIN ANALYZE SELECT id FROM pg.public.t ORDER BY id LIMIT 3;", .threads = 4, .says = &.{"schema probe"}, .never = unread },
+    .{ .script = "EXPLAIN ANALYZE SELECT * FROM pg.public.t LIMIT 3;", .threads = 4, .says = &.{"LIMIT 3"}, .never = unread },
     .{ .script = "EXPLAIN ANALYZE SELECT s.v, c.g FROM '$B/in.csv' s JOIN pg.public.t c ON c.id = s.id;", .says = &.{"schema probe"} },
     .{ .script = "EXPLAIN ANALYZE SELECT s.v, c.g FROM '$B/in.csv' s JOIN pg.public.t c ON c.id = s.id;", .threads = 4 },
     .{ .script = "EXPLAIN ANALYZE SELECT * FROM EACH TABLE OF (pg.QUERY($$SELECT \"tname\", \"tag\" FROM catalog$$));", .says = &.{ "postgres query, discovery", "union (#", "2 branches, from discovery", "postgres table t\n", "postgres table t2\n" } },
-    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.csv' AS SELECT * FROM EACH TABLE OF (pg.QUERY($$SELECT \"tname\", \"tag\" FROM catalog$$));", .threads = 4, .says = &.{"postgres query, discovery"} },
+    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.csv' AS SELECT * FROM EACH TABLE OF (pg.QUERY($$SELECT \"tname\", \"tag\" FROM catalog$$));", .threads = 4, .says = &.{"postgres query, discovery"}, .never = unread },
+    .{ .script = "EXPLAIN ANALYZE SELECT 'a' AS tag, t.* FROM pg.public.t t UNION ALL BY NAME SELECT 'b' AS tag, t.* FROM pg.public.t2 t;", .threads = 4, .says = &.{"sent: once per key range: SELECT"}, .never = unread },
     .{ .script = "EXPLAIN ANALYZE SELECT * FROM EACH TABLE OF (SELECT tname, tag FROM pg.public.catalog);", .says = &.{"2 branches, from discovery"} },
     .{ .script = "EXPLAIN ANALYZE SELECT id FROM '$B/in.csv' WHERE v = (SELECT MAX(v) AS m FROM pg.public.t);", .says = &.{"scalar subquery (actuals)"} },
     .{ .script = "LET top = (SELECT MAX(v) AS m FROM pg.public.t);\nLOAD INTO '$B/never.csv' AS SELECT id FROM '$B/in.csv' WHERE v = $top;", .explain = true, .says = &.{"LET `top` (actuals)"} },
@@ -348,6 +353,10 @@ test "the report shows every query the server got, once, on its scan or in a tre
         var ok = try reportShowsAll(a, printed, got);
         for (c.says) |s| if (std.mem.indexOf(u8, printed, s) == null) {
             std.debug.print("missing: {s}\n", .{s});
+            ok = false;
+        };
+        for (c.never) |s| if (std.mem.indexOf(u8, printed, s) != null) {
+            std.debug.print("unwanted: {s}\n", .{s});
             ok = false;
         };
         if (!ok) std.debug.print("{s}\n{s}\n", .{ c.script, printed });

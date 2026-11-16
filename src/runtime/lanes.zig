@@ -62,6 +62,8 @@ const pushdown = @import("pushdown.zig");
 const sql_read = @import("connect/sql_read.zig");
 
 const Env = @import("env.zig").Env;
+const SqlDesc = @import("env.zig").SqlDesc;
+const types = @import("../lang/types.zig");
 const RunOptions = @import("env.zig").RunOptions;
 const Stats = @import("env.zig").Stats;
 
@@ -131,10 +133,10 @@ pub fn classifyWholeAgg(stages: []const ast.Stage) ?SinkShape {
 
 /// Descend the whole aggregate into the source: a QUERY-form read of the grouped SQL
 /// (cast to the engine's own output schema), the untouched tail, then the write. Null
-/// means not eligible, and the caller keeps the pipeline it built.
-pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: SinkShape, src_base: usize, why: *[]const u8) !?[]const ast.Stage {
+/// means not eligible. Decided before the read opens, from `desc` and the read's
+/// `src_schema`, so a table the source counts is never opened for its rows first.
+pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: SinkShape, desc: SqlDesc, src_schema: types.Schema, why: *[]const u8) !?[]const ast.Stage {
     const arena = env.arena;
-    const desc = env.pipe.sql_desc orelse return null;
     if (stages[0].node != .read) return null;
     const rd = stages[0].node.read;
     if (!sql_read.pushableRead(desc.dialect, rd)) {
@@ -145,8 +147,6 @@ pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: SinkShape, sr
         why.* = "a stage other than WHERE sits between the read and the aggregate";
         return null;
     };
-
-    const src_schema = try dupeSchema(arena, env.sources.items[src_base].schema());
 
     var ad = analyze.Diag{};
     const apl = analyze.resolve(arena, src_schema, shape.agg, env.params_expr, &ad) catch {
@@ -173,9 +173,6 @@ pub fn wholeAggStages(env: *Env, stages: []const ast.Stage, shape: SinkShape, sr
     return out;
 }
 
-/// Descend a `LIMIT` (with its `ORDER BY`) into the SQL read when `pushdown.planTopN`
-/// allows; the engine still sorts and cuts what arrives. Null leaves the pipeline as
-/// built, with `why` set when there was a limit to push.
 /// Whether a group key is a text or bytes source column, whose grouping the
 /// source's collation decides.
 fn textKey(ag: ast.Aggregate, schema: @import("../lang/types.zig").Schema) bool {
@@ -189,14 +186,16 @@ fn textKey(ag: ast.Aggregate, schema: @import("../lang/types.zig").Schema) bool 
     return false;
 }
 
-pub fn topNStages(env: *Env, stages: []const ast.Stage, src_base: usize, why: *[]const u8) !?[]const ast.Stage {
+/// Descend a `LIMIT` (with its `ORDER BY`) into the SQL read when `pushdown.planTopN`
+/// allows; the engine still sorts and cuts what arrives. Null leaves the pipeline as
+/// built, with `why` set when there was a limit to push. Decided before the read
+/// opens, as `wholeAggStages` is.
+pub fn topNStages(env: *Env, stages: []const ast.Stage, desc: SqlDesc, src_schema: types.Schema, why: *[]const u8) !?[]const ast.Stage {
     const arena = env.arena;
-    const desc = env.pipe.sql_desc orelse return null;
     if (stages[0].node != .read) return null;
     const rd = stages[0].node.read;
     if (!sql_read.pushableRead(desc.dialect, rd)) return null;
     const t = (try pushdown.classifyTopN(arena, stages[0 .. stages.len - 1], why)) orelse return null;
-    const src_schema = try dupeSchema(arena, env.sources.items[src_base].schema());
     const facts = try connect_mod.factsIfWanted(env, rd, desc.dialect, stages[1 .. stages.len - 1], src_schema, true, .exact);
     const q = (try pushdown.planTopN(arena, desc.dialect, desc.base_sql, src_schema, stages[0 .. stages.len - 1], t, facts, why)) orelse return null;
 
