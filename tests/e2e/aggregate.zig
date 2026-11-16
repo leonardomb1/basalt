@@ -783,3 +783,20 @@ test "the new statistics over many morsels: the same bits at every -j of 2 or mo
     try std.testing.expectEqual(@as(usize, 41), std.mem.count(u8, one, "\n"));
     try std.testing.expectEqualStrings(one, many);
 }
+
+test "aggregate: COUNT(DISTINCT) of a constant counts its one value, whole and grouped" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const out = try runToString(
+        alloc,
+        &tmp,
+        "id,g\n1,a\n2,b\n3,a\n4,a\n",
+        "SELECT g, COUNT(DISTINCT 1) AS one, COUNT(DISTINCT CAST(7 AS INT)) AS seven, COUNT(DISTINCT id % 2) AS par, COUNT(1) AS n FROM '$IN' GROUP BY g ORDER BY g",
+    );
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("g,one,seven,par,n\na,1,1,2,3\nb,1,1,1,1\n", out);
+    const whole = try runToString(alloc, &tmp, "id\n1\n2\n", "SELECT COUNT(DISTINCT 1) AS one, COUNT(DISTINCT 'x') AS x FROM '$IN'");
+    defer alloc.free(whole);
+    try std.testing.expectEqualStrings("one,x\n1,1\n", whole);
+}

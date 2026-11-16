@@ -44,10 +44,15 @@ pub fn argCast(agg: Agg) ?types.Type {
 /// One agg's argument across a batch, a text column cast per `argCast`. A stored
 /// column is handed over uncopied when its type feeds the accumulator, or always
 /// for COUNT, which reads only presence and values as they are; others are built as
-/// the type they read (`count_if` folds BOOLs into an INT).
+/// the type they read (`count_if` folds BOOLs into an INT). A computed COUNT
+/// argument is built as no type in particular, which keeps presence only, unless
+/// DISTINCT reads its values: then as the argument's type, or a constant `1` came
+/// out as an empty text and failed its cast to the INT it is.
 pub fn argColumn(self: *Aggregate, arena: std.mem.Allocator, agg: Agg, e: *const ast.Expr, b: Batch) anyerror!column.Column {
     var want = argCast(agg) orelse agg.ty;
-    if (agg.func == .count) want.unknown = true;
+    if (agg.func == .count) {
+        if (agg.distinct and agg.arg_ty != null) want = agg.arg_ty.? else want.unknown = true;
+    }
     if (e.* == .field) {
         if (b.schema.resolve(e.field.parts)) |ci| {
             const ck = b.columns[ci].ty.kind;
