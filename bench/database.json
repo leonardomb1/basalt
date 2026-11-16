@@ -1,0 +1,66 @@
+{
+  "pg_to_parquet": {
+    "expect": "orders",
+    "engines": {
+      "basalt": "{basalt_conns} LOAD INTO '{out}/out.parquet' AS SELECT * FROM pg.bench_orders;",
+      "duckdb": "ATTACH 'host={pg_host} port={pg_port} user={pg_user} password={pg_password} dbname={pg_db}' AS pg (TYPE postgres); COPY (SELECT * FROM pg.public.bench_orders) TO '{out}/out.parquet' (FORMAT parquet);",
+      "clickhouse": "INSERT INTO FUNCTION file('{out}/out.parquet', Parquet) SELECT * FROM postgresql('{pg_host}:{pg_port}', '{pg_db}', 'bench_orders', '{pg_user}', '{pg_password}')",
+      "polars": "py:pl.read_database_uri('SELECT * FROM bench_orders', 'postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_db}').write_parquet(f'{out}/out.parquet')"
+    }
+  },
+  "parquet_to_pg": {
+    "expect": "orders",
+    "setup": "{basalt_conns} LOAD INTO pg.bench_load REPLACE AS SELECT * FROM '{data}/parquet/orders.parquet' WHERE o_orderkey < 0;",
+    "count": "{basalt_conns} SELECT count(*) AS n FROM pg.bench_load;",
+    "engines": {
+      "basalt": "{basalt_conns} LOAD INTO pg.bench_load AS SELECT * FROM '{data}/parquet/orders.parquet';",
+      "duckdb": "ATTACH 'host={pg_host} port={pg_port} user={pg_user} password={pg_password} dbname={pg_db}' AS pg (TYPE postgres); INSERT INTO pg.public.bench_load SELECT * FROM read_parquet('{data}/parquet/orders.parquet');",
+      "clickhouse": "INSERT INTO FUNCTION postgresql('{pg_host}:{pg_port}', '{pg_db}', 'bench_load', '{pg_user}', '{pg_password}') SELECT * FROM file('{data}/parquet/orders.parquet', Parquet)",
+      "polars": "py:pl.read_parquet(f'{data}/parquet/orders.parquet').with_columns(pl.col('o_shippriority').cast(pl.Int64)).write_database('bench_load', 'postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_db}', engine='adbc', if_table_exists='append')"
+    }
+  },
+  "mysql_to_parquet": {
+    "expect": "orders",
+    "engines": {
+      "basalt": "{basalt_conns} LOAD INTO '{out}/out.parquet' AS SELECT * FROM my.bench_orders;",
+      "duckdb": "ATTACH 'host={my_host} port={my_port} user={my_user} password={my_password} database={my_db}' AS my (TYPE mysql); COPY (SELECT * FROM my.bench_orders) TO '{out}/out.parquet' (FORMAT parquet);",
+      "clickhouse": "INSERT INTO FUNCTION file('{out}/out.parquet', Parquet) SELECT * FROM mysql('{my_host}:{my_port}', '{my_db}', 'bench_orders', '{my_user}', '{my_password}')",
+      "polars": "py:pl.read_database_uri('SELECT * FROM bench_orders', 'mysql://{my_user}:{my_password}@{my_host}:{my_port}/{my_db}').write_parquet(f'{out}/out.parquet')"
+    }
+  },
+  "parquet_to_mysql": {
+    "expect": "orders",
+    "setup": "{basalt_conns} LOAD INTO my.bench_load REPLACE AS SELECT * FROM '{data}/parquet/orders.parquet' WHERE o_orderkey < 0;",
+    "count": "{basalt_conns} SELECT count(*) AS n FROM my.bench_load;",
+    "engines": {
+      "basalt": "{basalt_conns} LOAD INTO my.bench_load AS SELECT * FROM '{data}/parquet/orders.parquet';",
+      "duckdb": "ATTACH 'host={my_host} port={my_port} user={my_user} password={my_password} database={my_db}' AS my (TYPE mysql); INSERT INTO my.bench_load SELECT * FROM read_parquet('{data}/parquet/orders.parquet');",
+      "clickhouse": "INSERT INTO FUNCTION mysql('{my_host}:{my_port}', '{my_db}', 'bench_load', '{my_user}', '{my_password}') SELECT * FROM file('{data}/parquet/orders.parquet', Parquet)"
+    }
+  },
+  "mssql_to_parquet": {
+    "expect": "orders",
+    "engines": {
+      "basalt": "{basalt_conns} LOAD INTO '{out}/out.parquet' AS SELECT * FROM ms.bench_orders;",
+      "polars": "py:pl.read_database_uri('SELECT * FROM bench_orders', 'mssql://{ms_user}:{ms_password}@{ms_host}:{ms_port}/{ms_db}?trust_server_certificate=true&encrypt=true').write_parquet(f'{out}/out.parquet')"
+    }
+  },
+  "parquet_to_mssql": {
+    "expect": "orders",
+    "setup": "{basalt_conns} LOAD INTO ms.bench_load REPLACE AS SELECT * FROM '{data}/parquet/orders.parquet' WHERE o_orderkey < 0;",
+    "count": "{basalt_conns} SELECT count(*) AS n FROM ms.bench_load;",
+    "engines": {
+      "basalt": "{basalt_conns} LOAD INTO ms.bench_load AS SELECT * FROM '{data}/parquet/orders.parquet';"
+    }
+  },
+  "pg_to_mysql": {
+    "expect": "orders",
+    "setup": "{basalt_conns} LOAD INTO my.bench_load REPLACE AS SELECT * FROM '{data}/parquet/orders.parquet' WHERE o_orderkey < 0;",
+    "count": "{basalt_conns} SELECT count(*) AS n FROM my.bench_load;",
+    "engines": {
+      "basalt": "{basalt_conns} LOAD INTO my.bench_load AS SELECT * FROM pg.bench_orders;",
+      "duckdb": "ATTACH 'host={pg_host} port={pg_port} user={pg_user} password={pg_password} dbname={pg_db}' AS pg (TYPE postgres); ATTACH 'host={my_host} port={my_port} user={my_user} password={my_password} database={my_db}' AS my (TYPE mysql); INSERT INTO my.bench_load SELECT * FROM pg.public.bench_orders;",
+      "clickhouse": "INSERT INTO FUNCTION mysql('{my_host}:{my_port}', '{my_db}', 'bench_load', '{my_user}', '{my_password}') SELECT * FROM postgresql('{pg_host}:{pg_port}', '{pg_db}', 'bench_orders', '{pg_user}', '{pg_password}')"
+    }
+  }
+}

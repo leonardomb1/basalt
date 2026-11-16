@@ -38,6 +38,30 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 HOME = os.path.expanduser("~/.local/share/basalt-bench")
 TABLES = ["lineitem", "orders", "customer", "part", "partsupp", "supplier", "nation", "region"]
 ENGINES = ["basalt", "duckdb", "clickhouse", "polars", "datafusion"]
+
+# The database suite's servers, by default the integration tests' containers
+# (`tests/integration/docker-compose.yml`); each setting from BENCH_<DB>_<KEY>,
+# e.g. BENCH_PG_HOST.
+DB_DEFAULTS = {
+    "pg": {"host": "127.0.0.1", "port": "35432", "user": "postgres", "password": "it", "db": "it"},
+    "my": {"host": "127.0.0.1", "port": "33306", "user": "root", "password": "it", "db": "it"},
+    "ms": {"host": "127.0.0.1", "port": "31433", "user": "sa", "password": "It_Passw0rd1", "db": "master"},
+}
+
+
+def db_settings():
+    """`{pg_host}`-style placeholders for the database suite, and `{basalt_conns}`,
+    the CREATE CONNECTIONs a basalt statement names them by."""
+    out = {}
+    for db, keys in DB_DEFAULTS.items():
+        for k, v in keys.items():
+            out[f"{db}_{k}"] = os.environ.get(f"BENCH_{db.upper()}_{k.upper()}", v)
+    out["basalt_conns"] = (
+        "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '{pg_host}', port = {pg_port}, user = '{pg_user}', password = '{pg_password}', database = '{pg_db}'); "
+        "CREATE CONNECTION my TYPE mysql OPTIONS (host = '{my_host}', port = {my_port}, user = '{my_user}', password = '{my_password}', database = '{my_db}'); "
+        "CREATE CONNECTION ms TYPE sqlserver OPTIONS (host = '{ms_host}', port = {ms_port}, user = '{ms_user}', password = '{ms_password}', database = '{ms_db}', tls = 'insecure'); "
+    ).format(**out)
+    return out
 PAGE_KB = os.sysconf("SC_PAGE_SIZE") // 1024
 
 
@@ -59,6 +83,8 @@ def tasks():
         out.append({"suite": "analytics", "name": name, "per": per})
     for name, per in json.load(open(os.path.join(ROOT, "movement.json"))).items():
         out.append({"suite": "movement", "name": name, "per": per})
+    for name, t in json.load(open(os.path.join(ROOT, "database.json"))).items():
+        out.append({"suite": "database", "name": name, "per": t["engines"], "setup": t.get("setup", ""), "count": t.get("count", ""), "expect": t["expect"]})
     return out
 
 
@@ -73,7 +99,8 @@ def table_ref(engine, table, data):
 
 
 def render(engine, text, data, out):
-    """`text` with its `{table}`, `{data}` and `{out}` placeholders filled in."""
+    """`text` with its `{table}`, `{data}`, `{out}` and database placeholders filled in."""
+    dbs = db_settings()
     def sub(m):
         key = m.group(1)
         if key == "data":
@@ -82,8 +109,38 @@ def render(engine, text, data, out):
             return out
         if key in TABLES:
             return table_ref(engine, key, data)
-        return m.group(0)
-    return re.sub(r"\{([a-z]+)\}", sub, text)
+        return dbs.get(key, m.group(0))
+    return re.sub(r"\{([a-z_]+)\}", sub, text)
+
+
+def basalt_sql(tools, text, data, out):
+    """`text` run by basalt with its placeholders filled in, untimed: a database task's
+    setup or count. Its printed CSV, or the run's error."""
+    p = subprocess.run([tools["basalt"], "run", "-q", "--format", "csv", "-c", render("basalt", text, data, out)], capture_output=True, text=True)
+    if p.returncode != 0:
+        sys.exit(f"basalt failed: {p.stderr.strip()[-400:]}")
+    return p.stdout
+
+
+def prepare(t, tools, data, out):
+    """A database task's setup, its target table emptied, before each timed run."""
+    if t.get("setup"):
+        basalt_sql(tools, t["setup"], data, out)
+
+
+def moved_rows(t, tools, data, out):
+    """The rows a movement or database task wrote: its target table's count, else
+    its output file's."""
+    if t.get("count"):
+        return int(basalt_sql(tools, t["count"], data, out).strip().splitlines()[-1])
+    import duckdb
+    files = [os.path.join(out, f) for f in os.listdir(out)]
+    return duckdb.connect().execute(f"SELECT count(*) FROM '{files[0]}'").fetchall()[0][0] if files else -1
+
+
+def wanted(args, t):
+    """Whether a run or check takes task `t`: a database task only with --db."""
+    return (not args.filter or args.filter in t["name"]) and (t["suite"] != "database" or args.db)
 
 
 def command(engine, text, data, out, threads, tools, check):
@@ -220,7 +277,8 @@ def data_dir(args, sf):
 def gen(args):
     """TPC-H at `--sf` from DuckDB's generator, laid out as `parquet/` (every
     table), `csv/` (`lineitem` as CSV and gzipped CSV) and `ndjson/` (`lineitem`),
-    the movement tasks' sources. What is already there is kept."""
+    the movement tasks' sources. What is already there is kept. With `--db`, the
+    database suite's source table `bench_orders` is loaded into each server by basalt."""
     if args.sf >= 10 and not args.big:
         sys.exit(f"SF{args.sf:g} writes about {args.sf:g} GB per copy of lineitem; pass --big to go ahead")
     import duckdb
@@ -244,17 +302,23 @@ def gen(args):
         path = os.path.join(d, rel)
         if not os.path.exists(path):
             con.execute(f"COPY (SELECT * FROM {src}) TO '{path}' {opts}")
+    if args.db:
+        orders = f"'{pq}/orders.parquet'"
+        basalt_sql(find_tools(args), "{basalt_conns} " + " ".join(f"LOAD INTO {db}.bench_orders REPLACE AS SELECT * FROM {orders};" for db in DB_DEFAULTS), d, d)
     print(f"ready: {d}")
 
 
 def canon(text):
     """CSV text as rows of cells, the header row dropped: a number as a float,
-    the rest trimmed text."""
+    a NULL as each engine spells it (`NULL`, `\\N` or nothing) as nothing, the rest
+    trimmed text."""
     out = []
     for r in list(csv.reader(io.StringIO(text)))[1:]:
         cells = []
         for c in r:
             c = c.strip()
+            if c in ("NULL", "\\N"):
+                c = ""
             try:
                 cells.append(float(c))
             except ValueError:
@@ -297,15 +361,18 @@ def check(args):
     out = tempfile.mkdtemp(prefix="basalt-bench-")
     import duckdb
     for t in tasks():
-        if args.filter and args.filter not in t["name"]:
+        if not wanted(args, t):
             continue
         want = None
+        if t["suite"] == "database":
+            want = duckdb.connect().execute(f"SELECT count(*) FROM '{d}/parquet/{t['expect']}.parquet'").fetchall()[0][0]
         for e in ["duckdb"] + [x for x in engines if x != "duckdb"]:
             shutil.rmtree(out, ignore_errors=True)
             os.makedirs(out)
             text = render(e, t["per"].get(e, ""), d, out)
             if not text:
                 continue
+            prepare(t, tools, d, out)
             cmd, env = command(e, text, d, out, 4, tools, t["suite"] == "analytics")
             env["BENCH_OUT"] = out
             r = measure(cmd, env, True)
@@ -313,12 +380,11 @@ def check(args):
                 print(f"{t['name']} {e}: failed: {r.err.strip().splitlines()[-1] if r.err.strip() else r.code}")
                 bad += 1
                 continue
-            if t["suite"] == "movement":
-                files = [os.path.join(out, f) for f in os.listdir(out)]
-                got = duckdb.connect().execute(f"SELECT count(*) FROM '{files[0]}'").fetchall()[0][0] if files else -1
+            if t["suite"] != "analytics":
+                got = moved_rows(t, tools, d, out)
             else:
                 got = canon(r.out.decode(errors="replace"))
-            if e == "duckdb":
+            if e == "duckdb" and t["suite"] != "database":
                 want = got
                 continue
             ok = same(got, want)
@@ -333,7 +399,8 @@ def check(args):
 
 def run(args):
     """Startup, then every task on every engine, `-n` times each, engines taking
-    turns; the best wall time, its memory, and a table in bench/results/."""
+    turns; the best wall time, its memory, and a table in bench/results/ unless
+    the run was narrowed, so a probe of one task never overwrites the day's run."""
     d = data_dir(args, args.sf)
     if not os.path.exists(os.path.join(d, "parquet", "lineitem.parquet")):
         sys.exit(f"no data in {d}: run `gen --sf {args.sf:g}` first")
@@ -353,7 +420,7 @@ def run(args):
         print(f"startup {e}: {best.wall * 1000:.0f} ms, {best.peak:.0f} MB peak", flush=True)
     results = []
     for t in tasks():
-        if args.filter and args.filter not in t["name"]:
+        if not wanted(args, t):
             continue
         best = {}
         for _ in range(args.n):
@@ -363,6 +430,7 @@ def run(args):
                     continue
                 shutil.rmtree(out, ignore_errors=True)
                 os.makedirs(out)
+                prepare(t, tools, d, out)
                 cmd, env = command(e, render(e, text, d, out), d, out, threads, tools, False)
                 env["BENCH_OUT"] = out
                 r = measure(cmd, env, False)
@@ -375,6 +443,9 @@ def run(args):
         line = "  ".join(f"{e} {fmt_time(best[e], startup[e])}" for e in engines if e in best)
         print(f"{t['suite']}/{t['name']}: {line}", flush=True)
     shutil.rmtree(out, ignore_errors=True)
+    if args.filter or args.engine:
+        print("a narrowed run (--filter, --engine) writes no results file")
+        return
     write_results(args, d, threads, tools, engines, startup, results)
 
 
@@ -421,7 +492,7 @@ def write_results(args, d, threads, tools, engines, startup, results):
     ]
     for e in engines:
         lines.append(f"| {e} | {startup[e].wall * 1000:.0f} ms | {startup[e].peak:.0f} |")
-    for suite in ["analytics", "movement"]:
+    for suite in ["analytics", "movement", "database"]:
         rows = [(t, b) for t, b in results if t["suite"] == suite]
         if not rows:
             continue
@@ -458,7 +529,10 @@ def ratio_ci(a, b, rounds=2000):
 
 
 def basalt_tasks(args):
-    return [t for t in tasks() if (not args.filter or args.filter in t["name"]) and (args.suite == "all" or t["suite"] == args.suite)]
+    """The tasks ab and scale run: `--suite` all is analytics and movement, as the
+    database suite needs its servers up and is named alone."""
+    picked = ["analytics", "movement"] if args.suite == "all" else [args.suite]
+    return [t for t in tasks() if (not args.filter or args.filter in t["name"]) and t["suite"] in picked]
 
 
 def ab(args):
@@ -480,6 +554,7 @@ def ab(args):
             text = render("basalt", t["per"]["basalt"], d, out)
             shutil.rmtree(out, ignore_errors=True)
             os.makedirs(out)
+            prepare(t, {"basalt": bins[who]}, d, out)
             cmd, env = command("basalt", text, d, out, threads, {"basalt": bins[who]}, False)
             r = measure(cmd, env, False, sample=False)
             if r.code != 0:
@@ -512,6 +587,7 @@ def scale(args):
                 text = render("basalt", t["per"]["basalt"], d, out)
                 shutil.rmtree(out, ignore_errors=True)
                 os.makedirs(out)
+                prepare(t, tools, d, out)
                 cmd, env = command("basalt", text, d, out, j, tools, False)
                 r = measure(cmd, env, False, sample=False)
                 if r.code != 0:
@@ -546,7 +622,8 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--a", default="", help="ab: the baseline basalt")
     ap.add_argument("--b", default="", help="ab: the candidate (default: --a, the noise floor)")
-    ap.add_argument("--suite", default="analytics", choices=["analytics", "movement", "all"], help="ab and scale: which tasks")
+    ap.add_argument("--suite", default="analytics", choices=["analytics", "movement", "database", "all"], help="ab and scale: which tasks (all: analytics and movement)")
+    ap.add_argument("--db", action="store_true", help="gen: load the database suite's source into its servers; check and run: take the database suite too")
     ap.add_argument("--threads-list", default="1,2,4,8,16", help="scale: the thread counts")
     args = ap.parse_args()
     {"gen": gen, "check": check, "run": run, "ab": ab, "scale": scale}[args.cmd](args)
