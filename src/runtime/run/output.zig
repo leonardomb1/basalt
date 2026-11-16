@@ -368,6 +368,26 @@ fn callsApi(env: *Env, stages: []const ast.Stage, depth: usize) bool {
     return false;
 }
 
+/// Whether `stages`, or a binding they read (a CTE, a joined one, a union's branch),
+/// reads the connection `name`. A bulk load into a SQL Server table it reads takes no
+/// table lock: the read holds its own lock on the table until its last row, the load
+/// would wait for it while the read waits for the load to take its rows, and the
+/// server sees no deadlock in that, the cycle closing through the run.
+fn readsConnection(env: *Env, stages: []const ast.Stage, name: []const u8, depth: usize) bool {
+    if (depth > 16) return true;
+    for (stages) |st| switch (st.node) {
+        .read => |rd| if (std.mem.eql(u8, rd.connector, name)) return true,
+        .ref => |n| if (env.bindings.get(n)) |b| if (readsConnection(env, b.stages, name, depth + 1)) return true,
+        .join => |j| if (env.bindings.get(j.binding)) |b| if (readsConnection(env, b.stages, name, depth + 1)) return true,
+        .union_ => |u| for (u.branches) |br| {
+            if (std.mem.eql(u8, br.read.connector, name)) return true;
+            if (br.pipeline) |pl| if (readsConnection(env, pl.stages, name, depth + 1)) return true;
+        },
+        else => {},
+    };
+    return false;
+}
+
 /// How often `stages`, and the bindings they read, read each binding, a binding's
 /// own reads walked the first time it is met, so `counts` lists the ones it reads
 /// before it.
@@ -713,6 +733,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     const sink_connector = if (is_file_sink) last.write.connector else if (env.connections.get(last.write.connector)) |c| c.connector else last.write.connector;
     analyze.checkSinkForm(last.write, stages[stages.len - 1].hints, sink_connector, &ddiag) catch |e| return aErr(env, &ddiag, e);
     env.table_lock = analyze.tableLockProblem(last.write, stages[stages.len - 1].hints, sink_connector, &ddiag) catch |e| return aErr(env, &ddiag, e);
+    if (env.table_lock and readsConnection(env, stages, last.write.connector, 0)) env.table_lock = false;
     if (!is_file_sink) if (env.connections.get(last.write.connector)) |c|
         analyze.checkSinkConnection(arena, c, &ddiag) catch |e| return aErr(env, &ddiag, e);
     analyze.checkBareUpsert(stages, env.connections, &ddiag) catch |e| return aErr(env, &ddiag, e);

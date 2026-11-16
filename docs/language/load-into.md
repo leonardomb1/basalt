@@ -77,7 +77,9 @@ AS
   sessions from reading or writing the table until each load's statement ends;
   `WITH (table_lock = false)` on an APPEND loads without it, for a table that must
   stay in use meanwhile. A table with an index never takes it, as there the lock
-  is exclusive and the lanes would load one at a time. A REPLACE always loads its
+  is exclusive and the lanes would load one at a time; nor does a load whose query
+  reads from the same connection, as that read's own lock on its table would have
+  the load and the read wait on each other for good. A REPLACE always loads its
   staging table, its run's own, under the lock, and its cutover after a
   `TRUNCATE` copies under the lock the `TRUNCATE` already holds.
 - Dispositions on a **file target** — the omissible default is *not* `APPEND`:
