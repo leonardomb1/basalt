@@ -113,12 +113,15 @@ pub fn chunkCopy(stages: []const ast.Stage, f: Facts) bool {
 
 /// Whether an aggregate of `stages` answers by the order its rows arrive in
 /// (`string_agg`, `array_agg`, `any_value`, `arg_max`, their ties). One lane reads the
-/// input as it stands, spilling included, so the answer does not depend on `-j`. A
-/// PIVOT's keys are known only from the schema, past what the lane paths plan from, and
-/// the lanes' merge knows nothing of a grand total owed over no rows.
+/// input as it stands, spilling included, so the answer does not depend on `-j`. The
+/// lanes' merge knows nothing of a grand total owed over no rows, so the first
+/// aggregate, the one the lanes fold, may not owe one; a later one runs serially over
+/// the merged groups, as a ROLLUP's sets over its pre-aggregate do.
 fn foldsInInputOrder(stages: []const ast.Stage) bool {
+    var first = true;
     for (stages) |st| if (st.node == .aggregate) {
-        if (st.node.aggregate.by_rest != null or st.node.aggregate.on_empty.len > 0) return true;
+        if (first and st.node.aggregate.on_empty.len > 0) return true;
+        first = false;
         for (st.node.aggregate.aggs) |a| if (aggregates.spec(a.func).input_ordered) return true;
     };
     return false;

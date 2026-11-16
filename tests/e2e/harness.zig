@@ -32,7 +32,7 @@ pub fn runCsvThreaded(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input:
     return runCsvOpts(alloc, tmp, input, query, .{ .threads = threads });
 }
 
-fn runCsvOpts(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, query: []const u8, opts: basalt.env.RunOptions) ![]u8 {
+pub fn runCsvOpts(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, input: []const u8, query: []const u8, opts: basalt.env.RunOptions) ![]u8 {
     try tmp.dir.writeFile(.{ .sub_path = "in.csv", .data = input });
     const base = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(base);

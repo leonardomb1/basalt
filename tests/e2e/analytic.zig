@@ -1,8 +1,10 @@
 //! End-to-end QUALIFY, the collecting and ordered aggregates, grouping sets, PIVOT and
-//! UNPIVOT, each answer checked at one lane and at four, as `-j` must not change it.
+//! UNPIVOT, each answer checked at one lane and at four, the input whole and cut into
+//! small chunks so the lanes fold it, as `-j` must not change it.
 
 const std = @import("std");
-const runCsvThreaded = @import("harness.zig").runCsvThreaded;
+const harness = @import("harness.zig");
+const runCsvThreaded = harness.runCsvThreaded;
 const basalt = @import("basalt");
 
 const Case = struct { q: []const u8, want: []const u8 };
@@ -21,17 +23,17 @@ const sales =
 fn expectCases(input: []const u8, cases: []const Case) !void {
     const alloc = std.testing.allocator;
     var failed = false;
-    for (cases) |c| for ([_]usize{ 1, 4 }) |threads| {
+    for (cases) |c| for ([_]basalt.env.RunOptions{ .{ .threads = 1 }, .{ .threads = 4 }, .{ .threads = 4, .morsel_bytes = 16 } }) |o| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
-        const out = runCsvThreaded(alloc, &tmp, input, c.q, threads) catch |e| {
-            std.debug.print("-j {d}: {s}\n  failed: {s}\n", .{ threads, c.q, @errorName(e) });
+        const out = harness.runCsvOpts(alloc, &tmp, input, c.q, o) catch |e| {
+            std.debug.print("-j {?d} ({d} B morsels): {s}\n  failed: {s}\n", .{ o.threads, o.morsel_bytes, c.q, @errorName(e) });
             failed = true;
             continue;
         };
         defer alloc.free(out);
         if (!std.mem.eql(u8, c.want, out)) {
-            std.debug.print("-j {d}: {s}\n  want:\n{s}\n  got:\n{s}\n", .{ threads, c.q, c.want, out });
+            std.debug.print("-j {?d} ({d} B morsels): {s}\n  want:\n{s}\n  got:\n{s}\n", .{ o.threads, o.morsel_bytes, c.q, c.want, out });
             failed = true;
         }
     };

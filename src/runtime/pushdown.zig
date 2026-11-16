@@ -79,14 +79,15 @@ pub fn inSchema(schema: types.Schema, name: []const u8) bool {
 }
 
 /// Projection and predicate pushdown for `read … | prefix | aggregate ag`. A
-/// `select` in the prefix disables projection (renames blur attribution); filters still go.
+/// `select` in the prefix disables projection (renames blur attribution), as do a
+/// PIVOT's keys, every column it does not pivot; filters still go.
 pub fn planAgg(arena: std.mem.Allocator, dialect: Dialect, src_schema: types.Schema, prefix: []const ast.Stage, ag: ast.Aggregate, facts: ?*const Facts) !Plan {
     var plan = Plan{};
 
     const has_select = for (prefix) |st| {
         if (st.node == .select) break true;
     } else false;
-    if (!has_select) {
+    if (!has_select and ag.by_rest == null) {
         var need = std.StringHashMap(void).init(arena);
         defer need.deinit();
         for (prefix) |st| if (st.node == .filter) try collectFields(st.node.filter, &need);
