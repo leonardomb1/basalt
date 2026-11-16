@@ -253,6 +253,15 @@ LOAD INTO '$pq' AS SELECT n, code FROM db.it_coll;"; then
   $B run --format csv -q -c "$decl SELECT code, count(*) AS c FROM db.it_coll GROUP BY code ORDER BY code;" >"$out/coll_got.csv" 2>&1
   $B run --format csv -q -c "SELECT code, count(*) AS c FROM '$pq' GROUP BY code ORDER BY code;" >"$out/coll_want.csv" 2>&1
   cmp -s "$out/coll_got.csv" "$out/coll_want.csv" || { bad=1; echo "  $1: group by code"; diff "$out/coll_want.csv" "$out/coll_got.csv" | head -4 || true; }
+  # SELECT * EXCEPT behind a WHERE that stays in the engine (arithmetic) still
+  # leaves the excepted column on the server
+  $B run --format csv --log-level debug -c "$decl SELECT * EXCEPT (code) FROM db.it_coll WHERE n * 2 > 10 ORDER BY n;" >"$out/coll_got.csv" 2>"$out/coll_log.txt" || true
+  $B run --format csv -q -c "SELECT * EXCEPT (code) FROM '$pq' WHERE n * 2 > 10 ORDER BY n;" >"$out/coll_want.csv" 2>&1 || true
+  cmp -s "$out/coll_got.csv" "$out/coll_want.csv" || { bad=1; echo "  $1: SELECT * EXCEPT (code) ... WHERE n * 2 > 10"; diff "$out/coll_want.csv" "$out/coll_got.csv" | head -4 || true; }
+  grep "sql read" "$out/coll_log.txt" | grep -v "1 = 0" >"$out/coll_reads.txt" || true
+  if ! grep -q "it_coll" "$out/coll_reads.txt" || grep -qiE 'SELECT \*|code' "$out/coll_reads.txt"; then
+    bad=1; echo "  $1: SELECT * EXCEPT (code) behind a WHERE still asked for code"; head -1 "$out/coll_reads.txt"
+  fi
   # where the catalog proves byte order, the text range reaches the source
   if [ -n "${4:-}" ]; then
     $B run --format csv --log-level debug -c "$decl SELECT n FROM db.it_coll WHERE code >= 'B';" >"$out/coll_log.txt" 2>&1 || true

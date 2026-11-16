@@ -977,7 +977,7 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
         s.read.where = try branchWhere(env, s.read, downstream, tag_col, canon_types);
     };
 
-    const except = unionExceptNames(downstream);
+    const except = try unionExceptNames(env.arena, downstream);
     const schemas = try arena.alloc(types.Schema, specs.len);
     const probes = try arena.alloc(driver.Source, specs.len);
     var opened: usize = 0;

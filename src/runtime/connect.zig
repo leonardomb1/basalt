@@ -194,6 +194,7 @@ const tdsConnect = @import("connect/dbconfig.zig").tdsConnect;
 pub const selectListFor = @import("connect/sql_read.zig").selectListFor;
 pub const projectSqlRead = @import("connect/sql_read.zig").projectSqlRead;
 pub const exceptColumns = @import("connect/sql_read.zig").exceptColumns;
+pub const exceptPastFilters = @import("connect/sql_read.zig").exceptPastFilters;
 pub const probedSchema = @import("connect/sql_read.zig").probedSchema;
 pub const sqlWithWhere = @import("connect/sql_read.zig").sqlWithWhere;
 pub const sqlDescForStage = @import("connect/sql_read.zig").sqlDescForStage;

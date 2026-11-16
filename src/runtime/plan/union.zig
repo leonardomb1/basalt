@@ -14,6 +14,7 @@ const discoverRows = @import("discover.zig").discoverRows;
 const discoverRowsPipeline = @import("discover.zig").discoverRowsPipeline;
 const dupeSchema = @import("../connect.zig").dupeSchema;
 const exceptColumns = @import("../connect.zig").exceptColumns;
+const exceptPastFilters = @import("../connect.zig").exceptPastFilters;
 const forHintIdent = @import("../env.zig").forHintIdent;
 const forHintName = @import("../env.zig").forHintName;
 const mk = @import("../env.zig").mk;
@@ -312,12 +313,10 @@ fn rankBound(e: *const ast.Expr, rn: []const u8) ?u64 {
     };
 }
 
-pub fn unionExceptNames(after: []const ast.Stage) []const []const u8 {
-    if (after.len == 0 or after[0].node != .select) return &.{};
-    for (after[0].node.select) |it| {
-        if (it == .star_except) return it.star_except;
-    }
-    return &.{};
+/// The names a `SELECT * EXCEPT (...)` after a union drops before its branches are
+/// reconciled, past the filters before it (`sql_read.exceptPastFilters`).
+pub fn unionExceptNames(arena: std.mem.Allocator, after: []const ast.Stage) ![]const []const u8 {
+    return (try exceptPastFilters(arena, after, false)) orelse &.{};
 }
 
 /// Each branch of a union by name asks only for the columns `after` takes that it
@@ -357,7 +356,7 @@ fn fileColumnsAmong(env: *Env, rd: ast.Read, hints: []const ast.Hint, names: []c
 /// The serial union: every branch opened, reconciled to the canon and drained in
 /// order; used when splitting does not apply. Positional unions leave EXCEPT downstream.
 pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, after: []const ast.Stage) anyerror!PipeRes {
-    const except_names = unionExceptNames(after);
+    const except_names = try unionExceptNames(env.arena, after);
     const arena = env.arena;
     const except: []const []const u8 = if (u.positional) &.{} else except_names;
     const tag_col = forHintIdent(hints, "tag");

@@ -25,6 +25,7 @@ const observe = @import("observe.zig");
 const columnFacts = @import("facts.zig").columnFacts;
 const dupeSchema = @import("../connect.zig").dupeSchema;
 const types = @import("../../lang/types.zig");
+const collectFields = @import("../pushdown.zig").collectFields;
 
 pub fn readSql(env: *Env, rd: ast.Read) ![]const u8 {
     const base = switch (rd.form) {
@@ -133,7 +134,7 @@ pub fn projectSqlRead(env: *Env, stages: []const ast.Stage) ![]const ast.Stage {
     const conn = env.connections.get(rd.connector) orelse return stages;
     if (sqlConnInfo(conn) == null) return stages;
     const cols = (try projectedColumns(env, stages[1..])) orelse blk: {
-        const except = starExcept(stages[1..]) orelse return stages;
+        const except = (try exceptPastFilters(env.arena, stages[1..], true)) orelse return stages;
         break :blk (try exceptColumns(env, rd, stages[0].hints, except)) orelse return stages;
     };
     if (cols.len == 0) return stages;
@@ -240,17 +241,32 @@ pub fn probedSchema(env: *Env, probe: ast.Read, hints: []const ast.Hint) !types.
     return schema;
 }
 
-/// The names a `SELECT * EXCEPT (...)` right after the read leaves out, when that
-/// select has no other star.
-fn starExcept(after: []const ast.Stage) ?[]const []const u8 {
-    if (after.len == 0 or after[0].node != .select) return null;
+/// The names a `SELECT * EXCEPT (...)` leaves out of the read, past the filters
+/// before it (a WHERE stands between a read and its select): those of them a filter
+/// reads are kept, as a filter the source does not take reads them here. Null when
+/// no such select follows, or, `sole`, when it holds another star.
+pub fn exceptPastFilters(arena: std.mem.Allocator, after: []const ast.Stage, sole: bool) !?[]const []const u8 {
+    var read = std.StringHashMap(void).init(arena);
+    var i: usize = 0;
+    while (i < after.len and after[i].node == .filter) : (i += 1) try collectFields(after[i].node.filter, &read);
+    if (i == after.len or after[i].node != .select) return null;
     var found: ?[]const []const u8 = null;
-    for (after[0].node.select) |it| switch (it) {
+    for (after[i].node.select) |it| switch (it) {
         .star_except => |names| found = names,
-        .star, .star_rename, .star_of => return null,
+        .star, .star_rename, .star_of => if (sole) return null,
         else => {},
     };
-    return found;
+    const names = found orelse return null;
+    var out = std.array_list.Managed([]const u8).init(arena);
+    for (names) |n| {
+        var kept = false;
+        var it = read.keyIterator();
+        while (it.next()) |k| if (std.ascii.eqlIgnoreCase(k.*, n)) {
+            kept = true;
+        };
+        if (!kept) try out.append(n);
+    }
+    return out.items;
 }
 
 pub fn exceptColumns(env: *Env, rd: ast.Read, hints: []const ast.Hint, except: []const []const u8) !?[]const []const u8 {
@@ -441,4 +457,29 @@ test "a SQL Server query with a leading WITH or a top-level ORDER BY is never wr
     try std.testing.expect(pushableRead(.sqlserver, q("SELECT id FROM (SELECT TOP 5 id FROM t ORDER BY id) s")));
     try std.testing.expect(pushableRead(.sqlserver, q("SELECT 'ORDER BY x' AS s, [order by] FROM t")));
     try std.testing.expect(pushableRead(.postgres, q("WITH c AS (SELECT 1) SELECT * FROM c ORDER BY 1")));
+}
+
+test "SELECT * EXCEPT narrows a read past the WHERE before it, keeping an excepted column a filter reads" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const parser = @import("../../lang/sql_parser.zig");
+    var diag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const Case = struct { src: []const u8, sole: bool, want: ?[]const []const u8 };
+    const cases = [_]Case{
+        .{ .src = "SELECT * EXCEPT (pdf, note) FROM 't.csv';", .sole = true, .want = &.{ "pdf", "note" } },
+        .{ .src = "SELECT * EXCEPT (pdf, note) FROM 't.csv' WHERE n > 1;", .sole = true, .want = &.{ "pdf", "note" } },
+        .{ .src = "SELECT * EXCEPT (pdf, note) FROM 't.csv' WHERE n > 1 AND NOTE IS NULL;", .sole = true, .want = &.{"pdf"} },
+        .{ .src = "SELECT n FROM 't.csv' WHERE n > 1;", .sole = true, .want = null },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("{s}\n", .{c.src});
+        const prog = try parser.parseSource(a, c.src, &diag);
+        const stages = prog.stmts[prog.stmts.len - 1].output.stages;
+        const got = try exceptPastFilters(a, stages[1..], c.sole);
+        if (c.want) |w| {
+            try std.testing.expectEqual(w.len, got.?.len);
+            for (w, got.?) |x, y| try std.testing.expectEqualStrings(x, y);
+        } else try std.testing.expect(got == null);
+    }
 }
