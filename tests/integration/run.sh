@@ -288,6 +288,72 @@ LOAD INTO '$pq' AS SELECT n, code FROM db.it_coll;"; then
   if [ $bad = 0 ]; then report "$1-collation" ok; else report "$1-collation" bad; fi
 }
 
+# The pushdown contract: each query asks the source for no more rows than its
+# pushdown allows (`max`, against 3000 in the table), answers what the engine alone
+# answers from a parquet copy, never sends the columns `never` matches, and opens no
+# source it then leaves unread (EXPLAIN ANALYZE). The rows read are what regressed
+# unseen before: a text GROUP BY read every row from 0.14.0 on (one row a group
+# up to 0.13), COUNT(1) was never pushed, and a split load opened the whole table
+# serially before reading it in key ranges.
+pushrt() { # $1 label, $2 CREATE CONNECTION db ..., $3 LOAD target
+  local decl=$2 pq="$out/push_$1.parquet" keys="$out/push_keys.csv" bad=0
+  awk 'BEGIN { print "id,grp,qty,d,note"; split("a|A|b|b ", g, "|");
+    for (i = 1; i <= 3000; i++) printf "%d,\"%s\",%d.%02d,2024-%02d-%02d,note %d\n", i, g[i % 4 + 1], i % 50, i % 100, i % 12 + 1, i % 28 + 1, i }' >"$out/push.csv"
+  printf 'k\n1\n5\n7\n' >"$keys"
+  if ! brun run -c "$decl
+LOAD INTO $3 REPLACE AS SELECT CAST(id AS INT) AS id, CAST(grp AS STRING) AS grp, CAST(qty AS DECIMAL(10,2)) AS qty, CAST(d AS DATE) AS d, CAST(note AS STRING) AS note FROM '$out/push.csv';" ||
+     ! brun run -c "$decl
+LOAD INTO '$pq' AS SELECT id, grp, qty, d, note FROM $3;"; then
+    report "$1-pushdown-contract (setup error)" bad
+    return
+  fi
+  local name max mode cmp never q got want read
+  while IFS='|' read -r name max mode cmp never q; do
+    got=${q//@T/$3}; got=${got//@K/$keys}
+    want=${q//@T/\'$pq\'}; want=${want//@K/$keys}
+    if ! $B run --log-level debug -c "$decl LOAD INTO '$out/push_got.csv' $mode AS $got;" >"$out/push_log.txt" 2>&1 ||
+       ! $B run -q -c "LOAD INTO '$out/push_want.csv' AS $want;" >/dev/null 2>&1; then
+      bad=1; echo "  $1 $name: failed"; tail -2 "$out/push_log.txt"; continue
+    fi
+    read=$(grep -oE '(Read|Loaded) [0-9,]+ row' "$out/push_log.txt" | head -1 | grep -oE '[0-9,]+' | tr -d ,)
+    if [ -z "$read" ] || [ "$read" -gt "$max" ]; then
+      bad=1; echo "  $1 $name: read ${read:-?} rows, at most $max"; grep "sql read" "$out/push_log.txt" | grep -v "1 = 0" | head -2 | cut -c1-240
+    fi
+    if [ "$cmp" = count ]; then
+      [ "$(wc -l <"$out/push_got.csv")" = "$(wc -l <"$out/push_want.csv")" ] || { bad=1; echo "  $1 $name: row count differs"; }
+    elif ! cmp -s <(head -1 "$out/push_got.csv"; tail -n +2 "$out/push_got.csv" | sort) <(head -1 "$out/push_want.csv"; tail -n +2 "$out/push_want.csv" | sort); then
+      bad=1; echo "  $1 $name: answer differs"; diff "$out/push_want.csv" "$out/push_got.csv" | head -4 || true
+    fi
+    if [ -n "$never" ] && grep "sql read" "$out/push_log.txt" | grep -v "1 = 0" | grep -qiE "$never"; then
+      bad=1; echo "  $1 $name: the source was asked for $never"
+    fi
+    $B run -c "$decl EXPLAIN ANALYZE LOAD INTO '$out/push_x.csv' $mode AS $got;" >"$out/push_x.txt" 2>&1 || true
+    if grep -q "opened and not read" "$out/push_x.txt"; then
+      bad=1; echo "  $1 $name: a source was opened and not read"
+    fi
+  done <<'CONTRACT'
+count_star|1||||SELECT count(*) AS n FROM @T
+count_one|1||||SELECT count(1) AS n FROM @T
+count_where|1||||SELECT count(*) AS n FROM @T WHERE id <= 100
+sum_max|1||||SELECT sum(qty) AS s, max(d) AS m FROM @T
+group_text|4||||SELECT grp, count(*) AS n FROM @T GROUP BY grp
+group_text_where|4||||SELECT grp, sum(qty) AS s FROM @T WHERE d >= '2024-06-01' GROUP BY grp
+count_distinct_text|1||||SELECT count(DISTINCT grp) AS n FROM @T
+filter_int|9||||SELECT * FROM @T WHERE id < 10
+filter_text|500||||SELECT id FROM @T WHERE d >= '2024-11-01' AND grp = 'b'
+limit|5||count||SELECT * FROM @T LIMIT 5
+topn|3||||SELECT id, qty FROM @T ORDER BY qty DESC, id LIMIT 3
+except|9|||note|SELECT * EXCEPT (note) FROM @T WHERE id < 10
+cte|1||||WITH x AS (SELECT * FROM @T WHERE id < 100) SELECT count(*) AS n FROM x
+split_map|99|SPLIT BY (id)|||SELECT id, qty FROM @T WHERE id < 100
+split_count|1|SPLIT BY (id)|||SELECT count(1) AS n FROM @T
+split_group_text|4|SPLIT BY (id)|||SELECT grp, count(*) AS n FROM @T GROUP BY grp
+split_agg_engine|3000|SPLIT BY (id)|||SELECT id % 7 AS k, count(*) AS n FROM @T GROUP BY id % 7
+split_join|6|SPLIT BY (id)|||SELECT t.id, t.qty FROM @T t JOIN '@K' k ON t.id = k.k
+CONTRACT
+  if [ $bad = 0 ]; then report "$1-pushdown-contract" ok; else report "$1-pushdown-contract" bad; fi
+}
+
 # A boolean column used as a condition on its own (`WHERE b`, `NOT b`, inside AND
 # and OR): every dialect must take it as its SQL spells a condition — T-SQL has no
 # boolean values, so a bare `[b]` there is refused ("an expression of non-boolean
@@ -321,6 +387,7 @@ LOAD INTO '$pq' AS SELECT n, b FROM db.it_bool;"; then
 }
 
 runs mysql     && collrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"      db.it_coll
+runs mysql     && pushrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"      db.it_push
 runs mysql     && boolrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"      db.it_bool lossy
 
 # Four-byte UTF-8 (an emoji) survives a write and a read: the session speaks
@@ -370,6 +437,8 @@ LOAD INTO db.it_fsp REPLACE AS SELECT CAST(ts AS TIMESTAMP) AS ts, CAST(t AS TIM
 fi
 runs postgres  && collrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      db.it_coll descends  # 16-alpine: musl, byte order
 runs sqlserver && collrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" db.it_coll
+runs postgres  && pushrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      db.it_push
+runs sqlserver && pushrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" db.it_push
 runs postgres  && boolrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      db.it_bool
 runs sqlserver && boolrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" db.it_bool
 
@@ -945,6 +1014,7 @@ LOAD INTO sr.it_replace_nc REPLACE AS SELECT 7 AS range;"; then
   topnrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_topn"
   paramrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');"
   collrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_coll"
+  pushrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_push"
   boolrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_bool" lossy
   catalogrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" it
 fi
@@ -1164,6 +1234,7 @@ LOAD INTO '$out/dr_up_out.csv' AS SELECT k, v FROM dr.it_upsert ORDER BY k;"; th
   topnrt doris "$DB" "db.it_topn"
   paramrt doris "$DB"
   collrt doris "$DB" "db.it_coll"
+  pushrt doris "$DB" "db.it_push"
   boolrt doris "$DB" "db.it_bool" lossy
   catalogrt doris "$DB" it
 fi
