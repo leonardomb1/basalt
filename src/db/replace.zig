@@ -74,7 +74,10 @@ pub fn setupSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, stagin
 /// in by column name, so a target with its columns in another order still lines up.
 /// On SQL Server a target that fills a loaded column by IDENTITY takes the staged
 /// values as given (`sql.identityInsertSql`), as a bulk APPEND keeps them; its staging table
-/// (`createLike`'s UNION ALL) has no IDENTITY of its own to renumber them.
+/// (`createLike`'s UNION ALL) has no IDENTITY of its own to renumber them. There the
+/// copy after a TRUNCATE takes the table lock the TRUNCATE already holds, so it may
+/// be minimally logged; after a DELETE it does not, the lock being refused on a
+/// memory-optimized table, the one target a TRUNCATE cannot clear.
 pub fn cutoverSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, staging: []const u8, schema: types.Schema, how: Cutover) ![]const []const u8 {
     const in = intrinsics(d);
     const qt = try sql.quoteIdent(a, d, target);
@@ -86,7 +89,8 @@ pub fn cutoverSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, stag
         try msgfmt.allocPrint(a, "TRUNCATE TABLE {s}", .{qt})
     else
         try msgfmt.allocPrint(a, "DELETE FROM {s}", .{qt}));
-    const insert = try msgfmt.allocPrint(a, "INSERT INTO {s} ({s}) SELECT {s} FROM {s}", .{ qt, cols, cols, qs });
+    const lock = d == .sqlserver and how == .truncate;
+    const insert = try msgfmt.allocPrint(a, "INSERT INTO {s}{s} ({s}) SELECT {s} FROM {s}", .{ qt, if (lock) " WITH (TABLOCK)" else "", cols, cols, qs });
     if (d == .sqlserver) {
         try out.append(try sql.identityInsertSql(a, qt, schema, true));
         try out.append(insert);
@@ -134,6 +138,9 @@ test "the cutover clears and copies in one transaction, per dialect" {
     try std.testing.expectEqualStrings("INSERT INTO [dbo].[t] ([id],[v]) SELECT [id],[v] FROM [dbo].[_basalt_stage_t_00000001]", ms[3]);
     try std.testing.expectEqualStrings("IF EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID(N'[dbo].[t]') AND is_identity = 1 AND name IN (N'id',N'v')) SET IDENTITY_INSERT [dbo].[t] OFF", ms[4]);
     try std.testing.expectEqualStrings("COMMIT TRANSACTION", ms[5]);
+    const mt = try cutoverSql(a, .sqlserver, "dbo.t", "dbo._basalt_stage_t_00000001", schema, .truncate);
+    try std.testing.expectEqualStrings("TRUNCATE TABLE [dbo].[t]", mt[1]);
+    try std.testing.expectEqualStrings("INSERT INTO [dbo].[t] WITH (TABLOCK) ([id],[v]) SELECT [id],[v] FROM [dbo].[_basalt_stage_t_00000001]", mt[3]);
     const my = try cutoverSql(a, .mysql, "t", "_basalt_stage_t_00000001", schema, .truncate);
     try std.testing.expectEqualStrings("START TRANSACTION", my[0]);
     try std.testing.expectEqualStrings("DELETE FROM `t`", my[1]);

@@ -342,7 +342,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                     mode = .append;
                     plan = p;
                 }
-                const inner = openBulkOrInsert(env.gpa, c, SqlDriver(k).Bulk, info.dialect, target, schema, mode, try redialFor(env.arena, info.kind, cfg), env.errctx) catch |e| {
+                const inner = openBulkOrInsert(env.gpa, c, SqlDriver(k).Bulk, info.dialect, target, schema, mode, try redialFor(env.arena, info.kind, cfg), env.errctx, plan != null or env.table_lock) catch |e| {
                     defer c.close();
                     if (plan) |p| p.abort();
                     return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} sink failed ({s}): {s}", .{ conn.connector, @errorName(e), c.wire.last_error }));

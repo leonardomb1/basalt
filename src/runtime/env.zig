@@ -424,6 +424,8 @@ pub const Env = struct {
     fmt_out: ?analyze.FileFormat = null,
     write_opts: analyze.WriteOptions = .csv,
     cutover: @import("../db/replace.zig").Cutover = .truncate,
+    /// Whether a SQL Server bulk APPEND may take the table lock (`table_lock`).
+    table_lock: bool = true,
     src_name: []const u8 = "",
     /// The running output pipeline's plan state; `runOutputBody` installs a fresh one
     /// and puts the outer back when it returns.

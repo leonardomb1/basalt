@@ -660,7 +660,8 @@ const sink_vtable = driver.sinkVTable(Sink);
 /// `Connection`, `dialect`, `stmt`, `command`, `appendBatch`, `send` (returning the
 /// server's row count) and optionally `segmentHeader` (tds COLMETADATA) and a
 /// `Layout` it reads from the target with `inspect` before the first row (freed by
-/// `freeLayout`), which `command`, `segmentHeader` and `appendBatch` then take.
+/// `freeLayout`), which `command`, `segmentHeader` and `appendBatch` then take;
+/// `lock` says whether that layout may take the table lock (SQL Server's TABLOCK).
 pub fn BulkSink(comptime Proto: type) type {
     const Layout = if (@hasDecl(Proto, "Layout")) Proto.Layout else void;
     return struct {
@@ -677,7 +678,7 @@ pub fn BulkSink(comptime Proto: type) type {
         const Self = @This();
         const vtable = driver.sinkVTable(Self);
 
-        pub fn open(gpa: std.mem.Allocator, conn: *Proto.Connection, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?Redial) !*Self {
+        pub fn open(gpa: std.mem.Allocator, conn: *Proto.Connection, table_name: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?Redial, lock: bool) !*Self {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
             const owned = try ownedSchema(gpa, schema);
@@ -688,7 +689,7 @@ pub fn BulkSink(comptime Proto: type) type {
             const a = aa.allocator();
             const qtable = try quoteIdent(a, Proto.dialect, table_name);
             conn.exec(try createTableSql(a, Proto.dialect, qtable, schema, mode)) catch |e| return onWire(e);
-            const layout: Layout = if (Layout == void) {} else Proto.inspect(conn, gpa, qtable, owned) catch |e| return onWire(e);
+            const layout: Layout = if (Layout == void) {} else Proto.inspect(conn, gpa, qtable, owned, lock) catch |e| return onWire(e);
             errdefer if (Layout != void) Proto.freeLayout(gpa, layout);
             const command = try gpa.dupe(u8, try if (Layout == void) Proto.command(a, qtable, schema) else Proto.command(a, qtable, schema, layout));
             errdefer gpa.free(command);

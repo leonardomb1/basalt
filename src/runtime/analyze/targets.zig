@@ -233,6 +233,18 @@ pub fn cutoverProblem(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!
         fail(diag, "unknown `cutover = '{s}'` (truncate, delete)", .{s});
 }
 
+/// Whether a bulk load into a SQL Server table may take its table lock,
+/// `table_lock = true | false`, true when unset (see `db/sqlserver/tds.zig`): only an
+/// APPEND into a table reads it, a REPLACE's staging table being its run's own.
+pub fn tableLockProblem(w: ast.Write, hints: []const ast.Hint, connector: []const u8, diag: *Diag) Error!bool {
+    const s = hintText(hints, "table_lock") orelse return true;
+    if (!std.mem.eql(u8, connector, "sqlserver"))
+        return fail(diag, "`table_lock` applies to a sqlserver table, whose bulk load takes the table lock", .{});
+    if (w.mode == .overwrite or w.mode == .upsert)
+        return fail(diag, "`table_lock` applies to an APPEND: a REPLACE loads a staging table of its own under the lock, and an UPSERT takes no bulk load", .{});
+    return textconv.boolText(.hint, s) orelse fail(diag, "`table_lock` is true or false, not `{s}`", .{s});
+}
+
 /// Validated here so `check` turns away a malformed range before a run.
 pub fn xlsxOptions(hints: []const ast.Hint, diag: *Diag) Error!xlsx.Options {
     var o = xlsx.Options{};

@@ -322,6 +322,7 @@ pub const formatFromHints = @import("analyze/targets.zig").formatFromHints;
 pub const jsonOptions = @import("analyze/targets.zig").jsonOptions;
 pub const parquetCodecFromHints = @import("analyze/targets.zig").parquetCodecFromHints;
 pub const cutoverProblem = @import("analyze/targets.zig").cutoverProblem;
+pub const tableLockProblem = @import("analyze/targets.zig").tableLockProblem;
 pub const xlsxOptions = @import("analyze/targets.zig").xlsxOptions;
 pub const xmlOptions = @import("analyze/targets.zig").xmlOptions;
 pub const jsonShapeFromHints = @import("analyze/targets.zig").jsonShapeFromHints;
@@ -1984,7 +1985,7 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
 
 const file_sink_keys: []const []const u8 = formats.all_write_keys ++ .{"encoding"};
 const stream_sink_keys = [_][]const u8{ "label_prefix", "compression" };
-const table_sink_keys = [_][]const u8{ "compression", "cutover" };
+const table_sink_keys = [_][]const u8{ "compression", "cutover", "table_lock" };
 
 /// Each file format's write keys, `encoding` beside them for `checkFileSink` to refuse
 /// with its own reason, and how a message names the target and its keys.
@@ -2032,6 +2033,7 @@ pub fn checkSinkForm(w: ast.Write, hints: []const ast.Hint, connector: []const u
     defer scratch.deinit();
     _ = try writeOptions(scratch.allocator(), w, hints, diag);
     _ = try cutoverProblem(w, hints, diag);
+    _ = try tableLockProblem(w, hints, connector, diag);
     const form = w.form orelse return;
     if (std.mem.eql(u8, form, "changes")) {
         if (file and !deltaTarget(w, hints)) return fail(diag, "`USING changes` applies a change feed as an UPSERT into a table; `{s}` is a file", .{w.target});

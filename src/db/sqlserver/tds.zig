@@ -1233,16 +1233,23 @@ const BulkProto = struct {
     /// as `nvarchar(max)` in PLP chunks rather than cut to 4000 characters, which
     /// are NOT NULL, declared so (the server refuses a nullable one for them), and
     /// whether one of the loaded columns is its IDENTITY, whose given values the load
-    /// keeps by turning IDENTITY_INSERT on for `qtable` ahead of each INSERT BULK.
-    pub const Layout = struct { max: []const bool, not_null: []const bool, keep_identity: bool, qtable: []const u8 };
+    /// keeps by turning IDENTITY_INSERT on for `qtable` ahead of each INSERT BULK, and
+    /// whether the load takes the table lock (`tablock`).
+    pub const Layout = struct { max: []const bool, not_null: []const bool, keep_identity: bool, qtable: []const u8, tablock: bool = false };
 
     /// The target's columns as `sys.columns` lists them, matched to `schema` by name.
-    pub fn inspect(conn: *Conn, gpa: std.mem.Allocator, qtable: []const u8, schema: types.Schema) !Layout {
+    /// With `lock`, a table that is a heap with no index and not memory-optimized is
+    /// loaded under TABLOCK: the lanes' bulk-update locks share it and each load is
+    /// minimally logged. A table with an index is left out, where the lock is
+    /// exclusive and the lanes would take turns.
+    pub fn inspect(conn: *Conn, gpa: std.mem.Allocator, qtable: []const u8, schema: types.Schema, lock: bool) !Layout {
         var aa = std.heap.ArenaAllocator.init(gpa);
         defer aa.deinit();
         const a = aa.allocator();
         var q = std.array_list.Managed(u8).init(a);
-        try q.appendSlice("SELECT c.name, CAST(c.max_length AS int), CAST(c.is_identity AS int), CAST(c.is_nullable AS int) FROM sys.columns c WHERE c.object_id = OBJECT_ID(");
+        try q.appendSlice("SELECT c.name, CAST(c.max_length AS int), CAST(c.is_identity AS int), CAST(c.is_nullable AS int), " ++
+            "CAST(CASE WHEN OBJECTPROPERTY(c.object_id, 'TableIsMemoryOptimized') = 0 AND NOT EXISTS (SELECT 1 FROM sys.indexes i WHERE i.object_id = c.object_id AND i.type <> 0) THEN 1 ELSE 0 END AS int) " ++
+            "FROM sys.columns c WHERE c.object_id = OBJECT_ID(");
         try sql.Dialect.sqlserver.writeStrLit(q.writer(), qtable, .catalog_name);
         try q.appendSlice(")");
         const flags = try gpa.alloc(bool, 2 * schema.fields.len);
@@ -1251,7 +1258,9 @@ const BulkProto = struct {
         const max = flags[0..schema.fields.len];
         const not_null = flags[schema.fields.len..];
         var keep_identity = false;
+        var bare_heap = false;
         for (try conn.rowsOf(a, q.items)) |b| for (0..b.len) |r| {
+            if (b.columns[4].getValue(r).int != 0) bare_heap = true;
             const name = b.columns[0].getValue(r).string;
             for (schema.fields, max, not_null) |f, *m, *nn| if (std.ascii.eqlIgnoreCase(f.name, name)) {
                 m.* = b.columns[1].getValue(r).int == -1;
@@ -1259,7 +1268,7 @@ const BulkProto = struct {
                 if (b.columns[2].getValue(r).int != 0) keep_identity = true;
             };
         };
-        return .{ .max = max, .not_null = not_null, .keep_identity = keep_identity, .qtable = try gpa.dupe(u8, qtable) };
+        return .{ .max = max, .not_null = not_null, .keep_identity = keep_identity, .qtable = try gpa.dupe(u8, qtable), .tablock = lock and bare_heap };
     }
 
     pub fn freeLayout(gpa: std.mem.Allocator, layout: Layout) void {
@@ -1274,7 +1283,7 @@ const BulkProto = struct {
             try cols.appendSlice(try sql.quoteName(arena, .sqlserver, f.name));
             try cols.appendSlice(if (m) " nvarchar(max)" else " nvarchar(4000)");
         }
-        return msgfmt.allocPrint(arena, "INSERT BULK {s} ({s})", .{ qtable, cols.items });
+        return msgfmt.allocPrint(arena, "INSERT BULK {s} ({s}){s}", .{ qtable, cols.items, if (layout.tablock) " WITH (TABLOCK)" else "" });
     }
 
     pub fn segmentHeader(w: anytype, gpa: std.mem.Allocator, schema: types.Schema, layout: Layout) !void {
@@ -1379,6 +1388,9 @@ test "INSERT BULK declares a (max) column nvarchar(max) and sends its cells whol
     schema.* = .{ .fields = try a.dupe(types.Schema.Field, &.{.{ .name = "v", .ty = ty }}) };
     const layout = BulkProto.Layout{ .max = &.{true}, .not_null = &.{false}, .keep_identity = true, .qtable = "[t]" };
     try std.testing.expectEqualStrings("INSERT BULK [t] ([v] nvarchar(max))", try BulkProto.command(a, "[t]", schema.*, layout));
+    var locked = layout;
+    locked.tablock = true;
+    try std.testing.expectEqualStrings("INSERT BULK [t] ([v] nvarchar(max)) WITH (TABLOCK)", try BulkProto.command(a, "[t]", schema.*, locked));
     var hw = std.Io.Writer.Allocating.init(a);
     try BulkProto.segmentHeader(&hw.writer, a, schema.*, .{ .max = &.{true}, .not_null = &.{true}, .keep_identity = false, .qtable = "[t]" });
     try std.testing.expectEqualSlices(u8, &.{ 0x81, 1, 0, 0, 0, 0, 0, 0x08, 0, 0xE7, 0xFF, 0xFF }, hw.written()[0..12]);

@@ -45,7 +45,7 @@ AS
   a line), `root` and `row` (an XML file's element names), `newline` and
   `encoding` (a `format = 'records'` file, [Records](formats.md#records)) and
   `label_prefix` (StarRocks, Doris), `cutover` (a REPLACE into PostgreSQL, MySQL
-  or SQL Server); a key the target does not read, or any
+  or SQL Server), `table_lock` (an APPEND into SQL Server); a key the target does not read, or any
   other key, is a plan-time error rather than ignored. Each value is a constant
   expression, as a read's is ([Sources](sources.md#option-values)):
   `WITH (compression = $codec)`.
@@ -71,6 +71,15 @@ AS
   `TRUNCATE` commits on its own. Each run stages into a table of its own, so two
   REPLACEs into one target at once never mix their rows: the last to commit holds
   the target. A run killed before its cleanup leaves its staging table behind.
+- A bulk load into SQL Server takes the table lock (`TABLOCK`) where the table is
+  a heap with no index and not memory-optimized: every lane then loads at once,
+  minimally logged, several times faster than without it. The lock keeps other
+  sessions from reading or writing the table until each load's statement ends;
+  `WITH (table_lock = false)` on an APPEND loads without it, for a table that must
+  stay in use meanwhile. A table with an index never takes it, as there the lock
+  is exclusive and the lanes would load one at a time. A REPLACE always loads its
+  staging table, its run's own, under the lock, and its cutover after a
+  `TRUNCATE` copies under the lock the `TRUNCATE` already holds.
 - Dispositions on a **file target** — the omissible default is *not* `APPEND`:
   a bare `LOAD INTO 'x.csv'`, like `REPLACE`, replaces the file, so a rerun
   replaces it. A local file is written whole: the rows go to `x.csv.part`,

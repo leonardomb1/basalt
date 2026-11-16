@@ -58,6 +58,9 @@ const SqlSinkSpec = struct {
     redial: sql.Redial,
     errctx: ?*op.ErrCtx = null,
     replace_plan: ?*ReplacePlan = null,
+    /// Whether a bulk load may take the table lock: always into a REPLACE's
+    /// staging table, its run's own; else as `table_lock` says.
+    lock: bool = true,
 };
 
 /// A REPLACE's staging and cutover (see `db/replace.zig`), each step on a short
@@ -166,10 +169,11 @@ pub fn redialFor(arena: std.mem.Allocator, kind: SqlKind, cfg: DbConfig) !sql.Re
 }
 
 /// The bulk-vs-INSERT rule, shared by the serial and per-lane paths so they
-/// cannot drift. On error the caller still owns and closes `conn`.
-pub fn openBulkOrInsert(gpa: std.mem.Allocator, conn: anytype, comptime BulkSink: type, dialect: sql.Dialect, target: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?sql.Redial, errctx: ?*op.ErrCtx) !driver.Sink {
+/// cannot drift. On error the caller still owns and closes `conn`. `lock` lets the
+/// bulk load take the table lock (`sql.BulkSink`).
+pub fn openBulkOrInsert(gpa: std.mem.Allocator, conn: anytype, comptime BulkSink: type, dialect: sql.Dialect, target: []const u8, schema: types.Schema, mode: ast.WriteMode, redial: ?sql.Redial, errctx: ?*op.ErrCtx, lock: bool) !driver.Sink {
     if (mode != .upsert) {
-        const b = try BulkSink.open(gpa, conn, target, schema, mode, redial);
+        const b = try BulkSink.open(gpa, conn, target, schema, mode, redial, lock);
         b.errctx = errctx;
         return b.sink();
     }
@@ -185,7 +189,7 @@ fn openLaneSqlSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize)
         inline else => |k| {
             const c = try SqlDriver(k).connect(gpa, spec.cfg);
             errdefer c.close();
-            return openBulkOrInsert(gpa, c, SqlDriver(k).Bulk, spec.dialect, spec.target, spec.schema, spec.lane_mode, spec.redial, spec.errctx);
+            return openBulkOrInsert(gpa, c, SqlDriver(k).Bulk, spec.dialect, spec.target, spec.schema, spec.lane_mode, spec.redial, spec.errctx, spec.lock);
         },
     }
 }
@@ -237,6 +241,7 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
         .lane_mode = if (w.mode == .overwrite) .append else w.mode,
         .redial = try redialFor(env.arena, kind, cfg),
         .errctx = env.errctx,
+        .lock = w.mode == .overwrite or env.table_lock,
     };
     if (w.mode == .overwrite) {
         const plan = try env.arena.create(ReplacePlan);
