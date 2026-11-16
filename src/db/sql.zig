@@ -326,6 +326,13 @@ pub const Dialect = enum {
     }
 
     /// A bool as a value; SQL Server has no TRUE, and a predicate is no value there.
+    /// Whether a boolean is a value as well as a condition. T-SQL has no boolean
+    /// values: a condition is never a value, and a value (a `bit`) becomes one only
+    /// compared, `[b] = 1`.
+    pub fn hasBoolean(self: Dialect) bool {
+        return self != .sqlserver;
+    }
+
     pub fn boolLit(self: Dialect, b: bool) []const u8 {
         return switch (self) {
             .sqlserver => if (b) "1" else "0",

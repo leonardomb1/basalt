@@ -394,11 +394,33 @@ const Tx = struct {
             },
             .call => |c| {
                 if (lookupPushable(c.name)) |p| if (p.like != .none) return self.likePred(c, p.like, need);
-                return self.value(e);
+                return self.condition(e);
             },
             .bool_lit => |b| return try self.arena.dupe(u8, if (b) "(1=1)" else "(1=0)"),
-            else => return self.value(e),
+            else => return self.condition(e),
         }
+    }
+
+    /// A boolean value (a column, a CAST, a CASE) standing as a condition: as is
+    /// where the dialect's booleans are values, compared to 1 where they are not.
+    /// Any other value is sent as is, as `translateExpr` renders values this way too.
+    fn condition(self: Tx, e: *const ast.Expr) Err!?[]const u8 {
+        const v = (try self.value(e)) orelse return null;
+        if (self.dialect.hasBoolean() or !self.boolValued(e)) return v;
+        return try self.fmt("({s} = 1)", .{v});
+    }
+
+    /// Whether `e`, standing as a condition, is a boolean value: a CAST to BOOL, a
+    /// CASE whose branches are, or a column, BOOL where its type is known and any
+    /// column where it is not, as a filter's bare column checked as BOOL to get here.
+    fn boolValued(self: Tx, e: *const ast.Expr) bool {
+        return switch (e.*) {
+            .bool_lit => true,
+            .field => |q| q.parts.len == 1 and if (self.o.schema.indexOf(q.parts[0])) |i| self.o.schema.fields[i].ty.kind == .bool else true,
+            .cast => |c| c.ty.kind == .bool,
+            .cond => |c| self.boolValued(c.then) and self.boolValued(c.els),
+            else => false,
+        };
     }
 
     /// TRY_CAST and text-to-number casts of unprovable input stay engine-side.
@@ -435,7 +457,7 @@ const Tx = struct {
                 return try self.fmt("(CASE WHEN {s} THEN {s} ELSE {s} END)", .{ cnd, t, f });
             },
             .match => |m| return self.match(m),
-            .unary, .binary, .is_null => return self.pred(e, .exact),
+            .unary, .binary, .is_null => return if (self.dialect.hasBoolean()) self.pred(e, .exact) else null,
             else => return null,
         }
     }
@@ -978,6 +1000,37 @@ test "translateExpr: a decimal literal is sent with every digit it was written w
         const got = (try translateExpr(a, try bin(a, .gt, try fld(a, "a"), lit), d, testSchema(), true)).?;
         try testing.expect(std.mem.endsWith(u8, got, try msgfmt.allocPrint(a, " > {s})", .{c.want})));
     };
+}
+
+test "translateExpr: a boolean value standing as a condition is compared to 1 on SQL Server and sent as is elsewhere; a condition used as a value stays in the engine there" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const sch = types.Schema{ .fields = &.{
+        .{ .name = "b", .ty = types.Type.init(.bool) },
+        .{ .name = "n", .ty = types.Type.init(.int) },
+    } };
+    const b = try fld(a, "b");
+    const not_b = try ast.mk(a, .{ .unary = .{ .op = .not, .e = b } });
+    const b_and = try bin(a, .@"and", b, try bin(a, .gt, try fld(a, "n"), try ast.mk(a, .{ .int_lit = 1 })));
+    const b_eq_cond = try bin(a, .eq, b, try bin(a, .gt, try fld(a, "n"), try ast.mk(a, .{ .int_lit = 2 })));
+    const Case = struct { e: *ast.Expr, d: Dialect, want: ?[]const u8 };
+    const cases = [_]Case{
+        .{ .e = b, .d = .sqlserver, .want = "([b] = 1)" },
+        .{ .e = try fld(a, "untyped"), .d = .sqlserver, .want = "([untyped] = 1)" },
+        .{ .e = not_b, .d = .sqlserver, .want = "(NOT (([b] = 1)))" },
+        .{ .e = b_and, .d = .sqlserver, .want = "(([b] = 1) AND ([n] > 1))" },
+        .{ .e = b_eq_cond, .d = .sqlserver, .want = null },
+        .{ .e = b, .d = .postgres, .want = "\"b\"" },
+        .{ .e = not_b, .d = .mysql, .want = "(NOT (`b`))" },
+        .{ .e = b_and, .d = .starrocks, .want = "(`b` AND (`n` > 1))" },
+        .{ .e = b_eq_cond, .d = .postgres, .want = "(\"b\" = (\"n\" > 2))" },
+    };
+    for (cases) |c| {
+        errdefer std.debug.print("dialect {s}\n", .{@tagName(c.d)});
+        const got = try translateExpr(a, c.e, c.d, sch, false);
+        if (c.want) |w| try testing.expectEqualStrings(w, got.?) else try testing.expect(got == null);
+    }
 }
 
 test "translateExpr: a quoted literal against a number or bool column is sent as that type's literal" {

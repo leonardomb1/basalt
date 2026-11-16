@@ -263,7 +263,40 @@ LOAD INTO '$pq' AS SELECT n, code FROM db.it_coll;"; then
   if [ $bad = 0 ]; then report "$1-collation" ok; else report "$1-collation" bad; fi
 }
 
+# A boolean column used as a condition on its own (`WHERE b`, `NOT b`, inside AND
+# and OR): every dialect must take it as its SQL spells a condition — T-SQL has no
+# boolean values, so a bare `[b]` there is refused ("an expression of non-boolean
+# type") and the query failed. Each answer must match the engine's alone over a
+# parquet copy, and each condition must reach the source rather than stay above.
+# Where a boolean reads back as an integer (`lossy`: the MySQL family's TINYINT),
+# the column is made one with CAST, and only the answer is held.
+boolrt() { # $1 label, $2 CREATE CONNECTION db ..., $3 LOAD target, $4 "lossy" or empty
+  local decl=$2 pq="$out/bool_$1.parquet"
+  printf 'n,b\n1,true\n2,false\n3,\n4,true\n5,false\n' >"$out/bool.csv"
+  if ! brun run -c "$decl
+LOAD INTO $3 REPLACE AS SELECT CAST(n AS INT) AS n, CAST(b AS BOOL) AS b FROM '$out/bool.csv';" ||
+     ! brun run -c "$decl
+LOAD INTO '$pq' AS SELECT n, b FROM db.it_bool;"; then
+    report "$1-bool-predicate (setup error)" bad
+    return
+  fi
+  local bad=0 q col=b
+  [ "${4:-}" = lossy ] && col="CAST(b AS BOOL)"
+  for q in "b" "NOT b" "b AND n > 1" "NOT b OR n = 3" "b = true" "b <> false" "b IS NULL" "NOT (b AND n > 2)"; do
+    q=${q//b/$col}
+    $B run --format csv --log-level debug -c "$decl SELECT n FROM db.it_bool WHERE $q ORDER BY n;" >"$out/bool_got.csv" 2>"$out/bool_log.txt" || true
+    $B run --format csv -q -c "SELECT n FROM '$pq' WHERE $q ORDER BY n;" >"$out/bool_want.csv" 2>&1 || true
+    if ! cmp -s "$out/bool_got.csv" "$out/bool_want.csv"; then
+      bad=1; echo "  $1: WHERE $q"; diff "$out/bool_want.csv" "$out/bool_got.csv" | head -4 || true; grep -i error "$out/bool_log.txt" | head -2 || true
+    elif [ "${4:-}" != lossy ] && ! grep "sql read" "$out/bool_log.txt" | grep -qE 'WHERE.*(\[b\]|"b"|`b`)'; then
+      bad=1; echo "  $1: WHERE $q did not reach the source"; grep "sql read" "$out/bool_log.txt" | head -1 || true
+    fi
+  done
+  [ $bad = 0 ] && report "$1-bool-predicate" ok || report "$1-bool-predicate" bad
+}
+
 runs mysql     && collrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"      db.it_coll
+runs mysql     && boolrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"      db.it_bool lossy
 
 # Four-byte UTF-8 (an emoji) survives a write and a read: the session speaks
 # utf8mb4, which a utf8mb3 connection would turn into '?'.
@@ -312,6 +345,8 @@ LOAD INTO db.it_fsp REPLACE AS SELECT CAST(ts AS TIMESTAMP) AS ts, CAST(t AS TIM
 fi
 runs postgres  && collrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      db.it_coll descends  # 16-alpine: musl, byte order
 runs sqlserver && collrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" db.it_coll
+runs postgres  && boolrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"      db.it_bool
+runs sqlserver && boolrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" db.it_bool
 
 # A QUERY batch runs to its end: statements before the SELECT and after it both
 # run, a second result set is refused rather than dropped or appended, and an
@@ -885,6 +920,7 @@ LOAD INTO sr.it_replace_nc REPLACE AS SELECT 7 AS range;"; then
   topnrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_topn"
   paramrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');"
   collrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_coll"
+  boolrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_bool" lossy
   catalogrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" it
 fi
 
@@ -1103,6 +1139,7 @@ LOAD INTO '$out/dr_up_out.csv' AS SELECT k, v FROM dr.it_upsert ORDER BY k;"; th
   topnrt doris "$DB" "db.it_topn"
   paramrt doris "$DB"
   collrt doris "$DB" "db.it_coll"
+  boolrt doris "$DB" "db.it_bool" lossy
   catalogrt doris "$DB" it
 fi
 
