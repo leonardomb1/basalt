@@ -218,8 +218,26 @@ before giving up — 408, 429 and every 5xx except 501, 505 and 511, which name
 something a retry cannot fix — and a
 database that closed the connection or failed on its socket — during login
 (a server turning connections away under a burst of parallel logins) or
-mid-query (`ServerClosedConnection`, `ConnectionIoFailed`). Past an HTTP
-source's in-place backoff and a SQL sink's one reconnect mid-write, basalt does
-not retry: the exit code hands the decision to whatever scheduled the run. A
-`FOR EACH` whose failed items are all transient exits `75` too. The same
+mid-query (`ServerClosedConnection`, `ConnectionIoFailed`), or said it is
+ending it (an administrator's kill, a shutdown, an idle timeout) — and a
+statement the database rolled back under contention and asked to run again
+(`LockConflict`: a deadlock victim, a serialization failure, a lock wait that
+timed out).
+
+Before that, basalt retries in place, with backoff and jitter (at most 5 tries
+and 30 s of waiting): an HTTP source; a database login that failed on the
+network; a SQL query before its first row, on a fresh connection when the one
+it had was dropped; and every SQL write, as each one is a statement of its own
+whose failure left nothing behind — a batch of INSERT or UPSERT rows and a bulk
+segment (sent again on a fresh connection), and each step of a REPLACE (its
+staging table made again, its cutover clearing the target and copying from
+staging again). A read cut off after rows came is not retried, as they were
+used. Past that, the exit code hands the decision to whatever scheduled the
+run. A `FOR EACH` whose failed items are all transient exits `75` too. The same
 end-of-file or write failure on a local file stays permanent.
+
+A query that waits on a lock the run itself holds cannot happen: the
+connections a run keeps open between queries hold no transaction, and a bulk
+load into SQL Server takes no table lock when its query reads that connection.
+A wait on another session's lock lasts as long as the database lets it; a
+connection's `query_timeout` bounds it.

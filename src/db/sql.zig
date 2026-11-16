@@ -100,6 +100,7 @@ pub const Cursor = struct {
         nextBatch: *const fn (*anyopaque, std.mem.Allocator) anyerror!?Batch,
         close: *const fn (*anyopaque) void,
         last_error: ?*const fn (*anyopaque) []const u8 = null,
+        detach: ?*const fn (*anyopaque) bool = null,
     };
 
     pub fn schema(self: Cursor) types.Schema {
@@ -114,6 +115,17 @@ pub const Cursor = struct {
     }
     pub fn close(self: Cursor) void {
         self.vtable.close(self.ptr);
+    }
+    /// Ends the cursor: a cursor that read its reply to the end, its connection outside
+    /// any transaction, leaves that connection open for another query and says true;
+    /// any other closes it as `close` does: a reply cut short leaves the connection
+    /// mid-stream, and an open transaction holds locks another connection may wait on.
+    pub fn detach(self: Cursor) bool {
+        const f = self.vtable.detach orelse {
+            self.vtable.close(self.ptr);
+            return false;
+        };
+        return f(self.ptr);
     }
 };
 
@@ -171,6 +183,13 @@ pub fn fetchTextBatch(conn: anytype, arena: std.mem.Allocator) !?Batch {
 pub fn closeTextCursor(conn: anytype) void {
     conn.meta_arena.deinit();
     conn.close();
+}
+
+pub fn detachTextCursor(conn: anytype) bool {
+    conn.meta_arena.deinit();
+    if (conn.done and conn.idle()) return true;
+    conn.close();
+    return false;
 }
 
 pub const Conn = struct {
@@ -279,6 +298,11 @@ pub fn textCursorVTable(comptime T: type) Cursor.VTable {
         .last_error = struct {
             fn f(p: *anyopaque) []const u8 {
                 return @as(*T, @ptrCast(@alignCast(p))).wire.last_error;
+            }
+        }.f,
+        .detach = struct {
+            fn f(p: *anyopaque) bool {
+                return detachTextCursor(@as(*T, @ptrCast(@alignCast(p))));
             }
         }.f,
     };

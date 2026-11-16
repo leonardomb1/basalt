@@ -7,7 +7,7 @@ const SplitCtx = @import("../connect.zig").SplitCtx;
 const SqlDesc = @import("../env.zig").SqlDesc;
 pub const SqlKind = @import("../env.zig").SqlKind;
 const ast = @import("../../lang/ast.zig");
-const connectSql = @import("../connect.zig").connectSql;
+const pooledSql = @import("../connect.zig").pooledSql;
 const connectorType = @import("../connect.zig").connectorType;
 const forHintName = @import("../env.zig").forHintName;
 const openSourceProjected = @import("source.zig").openSourceProjected;
@@ -233,7 +233,8 @@ pub fn tableColumnsAmong(env: *Env, rd: ast.Read, hints: []const ast.Hint, names
 }
 
 /// The schema zero-row read `probe` gets back, asked of a table once per statement: a
-/// table joined twice asks the same question, each a round trip.
+/// table joined twice asks the same question, each a round trip. Its empty reply is
+/// read to the end, so its connection goes back to the run's pool.
 pub fn probedSchema(env: *Env, probe: ast.Read, hints: []const ast.Hint) !types.Schema {
     const key = if (probe.form == .table) try msgfmt.allocPrint(env.arena, "{s}\x00{s}", .{ probe.connector, try readSql(env, probe) }) else "";
     if (key.len > 0) for (env.probes.items) |p| if (std.mem.eql(u8, p.key, key)) return p.schema;
@@ -241,6 +242,9 @@ pub fn probedSchema(env: *Env, probe: ast.Read, hints: []const ast.Hint) !types.
     defer src.close();
     const schema = try dupeSchema(env.arena, src.schema());
     if (key.len > 0) try env.probes.append(env.arena, .{ .key = key, .schema = schema });
+    var scratch = std.heap.ArenaAllocator.init(env.gpa);
+    defer scratch.deinit();
+    _ = src.next(scratch.allocator()) catch null;
     return schema;
 }
 
@@ -418,7 +422,7 @@ pub fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: a
     if (!splitMayCut(lead, isPostgresCopySink(env, w))) return null;
     const m: usize = hints.count orelse @min(@as(usize, 64), threads * 4);
 
-    var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)), .prof = env.profile };
+    var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)), .prof = env.profile, .pool = env.conn_pool };
     const prober = split.Prober{ .ctx = &pctx, .openFn = proberOpen };
 
     var key: split.Key = undefined;
@@ -462,7 +466,7 @@ pub fn planSplit(env: *Env, desc: SqlDesc, lead: ast.Stage, threads: usize, w: a
 pub fn proberOpen(ctx_ptr: *anyopaque) anyerror!sql.Conn {
     const ctx: *SplitCtx = @ptrCast(@alignCast(ctx_ptr));
     const clock = observe.Clock.start();
-    const conn = try connectSql(ctx.gpa, ctx.kind, ctx.cfg);
+    const conn = try pooledSql(ctx.gpa, ctx.pool, ctx.kind, ctx.cfg);
     const p = ctx.prof orelse return conn;
     return observe.lookups(p, conn, lookupLabel(ctx.kind), clock.ns());
 }

@@ -50,7 +50,7 @@ pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
     if (w.mode != .upsert or w.mode.upsert.keys.len > 0) return w;
     const desc = env.pipe.sql_desc orelse return planErr(env.diag, options.bare_upsert_source_msg);
     const table = desc.table orelse return planErr(env.diag, options.bare_upsert_query_msg);
-    var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)), .prof = env.profile };
+    var pctx = SplitCtx{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = desc.base_sql, .report = try readReport(env, @tagName(desc.kind)), .prof = env.profile, .pool = env.conn_pool };
     const prober = split.Prober{ .ctx = &pctx, .openFn = proberOpen };
     const keys = split.introspectPkCols(env.arena, prober, desc.dialect, desc.read.form.table.parts) catch |e|
         return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read primary key of `{s}`: {s}", .{ table, @errorName(e) }));
@@ -272,7 +272,7 @@ fn checkUpsertTarget(env: *Env, conn: ast.Connection, w: ast.Write, schema: type
     if (w.mode != .upsert) return;
     const info = sqlConnInfo(conn) orelse return;
     if (info.dialect == .sqlserver) return;
-    var pctx = SplitCtx{ .gpa = env.gpa, .kind = info.kind, .cfg = try resolveDbConfig(env, conn, info.port), .base_sql = "", .report = try readReport(env, conn.connector), .prof = env.profile };
+    var pctx = SplitCtx{ .gpa = env.gpa, .kind = info.kind, .cfg = try resolveDbConfig(env, conn, info.port), .base_sql = "", .report = try readReport(env, conn.connector), .prof = env.profile, .pool = env.conn_pool };
     const keys = split.uniqueKeys(env.arena, .{ .ctx = &pctx, .openFn = proberOpen }, info.dialect, try sql.nameParts(env.arena, w.target)) catch |e|
         return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read the unique keys of `{s}`: {s}", .{ w.target, @errorName(e) }));
     const ks = keys orelse return;

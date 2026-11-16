@@ -216,6 +216,8 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var shared_arena = std.heap.ArenaAllocator.init(gpa);
     defer shared_arena.deinit();
     var shared = std.heap.ThreadSafeAllocator{ .child_allocator = shared_arena.allocator() };
+    var conn_pool = @import("connect/pool.zig").Pool.init(gpa);
+    defer conn_pool.deinit();
     var sources = std.array_list.Managed(driver.Source).init(arena);
     defer for (sources.items) |sc| sc.close();
     var env = Env{ .arena = arena, .shared = shared.allocator(), .gpa = gpa, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .diag = diag, .log = &logger, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows_read, .json_params = &json_params, .stdout_format = opts.stdout_format, .explain = opts.explain, .line_base = opts.line_base, .on_result = opts.on_result, .max_rows = opts.max_rows, .on_let = opts.on_let, .held = opts.held, .on_load = opts.on_load, .fns = &fns };
@@ -240,6 +242,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var facts_cache = env_mod.FactsCache.init(gpa);
     defer facts_cache.deinit();
     env.facts_cache = &facts_cache;
+    env.conn_pool = &conn_pool;
     env.loads = &loads;
     env.items = opts.items and (manyLoads(program.stmts[1..]) or opts.log.format == .json);
 
@@ -687,6 +690,7 @@ test {
     _ = @import("plan.zig");
     _ = @import("plan/keypush.zig");
     _ = @import("plan/keypush_tests.zig");
+    _ = @import("connect/pool_tests.zig");
     _ = @import("../testing/postgres_fake.zig");
     _ = @import("lanes.zig");
     _ = @import("scratch.zig");

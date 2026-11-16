@@ -34,6 +34,9 @@ pub const Conn = struct {
     cols: []PgCol = &.{},
     cur_schema: *types.Schema = undefined,
     done: bool = false,
+    /// The last ReadyForQuery's transaction status: `I` idle, `T` in a transaction,
+    /// `E` in a failed one.
+    tx_status: u8 = 'I',
 
     /// The login phase runs from the dial to the first ReadyForQuery.
     pub fn connect(gpa: std.mem.Allocator, host: []const u8, port: u16, user: []const u8, password: []const u8, database: []const u8, tls_mode: sql.TlsMode, to: netconn.Timeouts) !*Conn {
@@ -371,7 +374,9 @@ pub const Conn = struct {
     }
 
     fn readMsg(self: *Conn) !u8 {
-        return readMessage(self.wire.rd(), &self.wire.msg);
+        const t = try readMessage(self.wire.rd(), &self.wire.msg);
+        if (t == 'Z' and self.wire.msg.items.len > 0) self.tx_status = self.wire.msg.items[0];
+        return t;
     }
 
     /// An ErrorResponse `p` as the last error, rerunnable by its SQLSTATE, the end of
@@ -380,6 +385,12 @@ pub const Conn = struct {
         const code = errField(p, 'C') orelse "";
         const sev = errField(p, 'V') orelse errField(p, 'S') orelse "";
         try self.wire.serverError(errMessage(p), .{ .rerun = rerunState(code), .gone = goneState(sev, code) });
+    }
+
+    /// Whether the connection sits idle outside a transaction (its last
+    /// ReadyForQuery said `I`), so it holds no lock and may serve another query.
+    pub fn idle(self: *const Conn) bool {
+        return self.tx_status == 'I';
     }
 };
 

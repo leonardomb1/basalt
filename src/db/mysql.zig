@@ -62,6 +62,8 @@ pub const Conn = struct {
     cols: []MyCol = &.{},
     cur_schema: *types.Schema = undefined,
     done: bool = false,
+    /// The status flags of the last OK or EOF packet, `SERVER_STATUS_IN_TRANS` among them.
+    status: u16 = 0,
     ld_seq: u8 = 0,
     no_backslash: bool = false,
 
@@ -213,6 +215,25 @@ pub const Conn = struct {
         try self.wire.serverError(errMessage(p), .{ .rerun = rerunCode(p), .gone = goneCode(p) });
     }
 
+    /// The status flags of an EOF (`fe`) or OK (`00`) packet.
+    fn noteStatus(self: *Conn, p: []const u8) void {
+        if (p.len == 0) return;
+        if (p[0] == 0xfe and p.len >= 5 and p.len < 9) {
+            self.status = std.mem.readInt(u16, p[3..5], .little);
+            return;
+        }
+        var r: Pkt = .{ .p = p, .i = 1 };
+        _ = lenencInt(&r) catch return;
+        _ = lenencInt(&r) catch return;
+        self.status = r.int(u16) catch return;
+    }
+
+    /// Whether the connection sits outside a transaction, so it holds no lock (an
+    /// open one keeps a metadata lock on every table it read) and may serve another query.
+    pub fn idle(self: *const Conn) bool {
+        return self.status & 0x0001 == 0;
+    }
+
     /// COM_QUERY with `stmt`, returning the sequence number of the server's first reply.
     fn query(self: *Conn, stmt: []const u8) !u8 {
         const payload = try self.wire.gpa.alloc(u8, stmt.len + 1);
@@ -241,6 +262,7 @@ pub const Conn = struct {
             return error.MysqlQueryFailed;
         }
         if (first[0] == 0x00 or first[0] == 0xfe) {
+            self.noteStatus(first);
             self.cols = &.{};
             const empty = try ma.create(types.Schema);
             empty.* = .{ .fields = &.{} };
@@ -271,7 +293,10 @@ pub const Conn = struct {
     pub fn nextRow(self: *Conn, _: std.mem.Allocator, builders: []column.Builder) !sql.RowStep {
         _ = try self.readPacket();
         const p = self.wire.msg.items;
-        if (p.len > 0 and p[0] == 0xfe and p.len < 9) return .end;
+        if (p.len > 0 and p[0] == 0xfe and p.len < 9) {
+            self.noteStatus(p);
+            return .end;
+        }
         if (p.len > 0 and p[0] == 0xff) {
             try self.serverError(p);
             return error.MysqlQueryFailed;

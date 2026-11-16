@@ -11,7 +11,8 @@
 //! WHERE is ignored, so it may return more rows than match, never fewer. A column
 //! or table it does not hold is an ErrorResponse, as is any query holding `fail_on`,
 //! which then carries `fail_msg`; a query holding `drop_on` has its connection
-//! closed unanswered, as a server that went away mid-query; one holding `delay_on`
+//! closed unanswered, as a server that went away mid-query (only the first such
+//! query with `drop_once`, as a proxy dropping one idle connection); one holding `delay_on`
 //! is answered `delay_ms` late, as a slow query; one holding `retype_on` describes
 //! every column as `retype_oid`, as a server typing one query otherwise.
 //!
@@ -46,6 +47,7 @@ pub const FakePg = struct {
     fail_on: ?[]const u8 = null,
     fail_msg: []const u8 = "",
     drop_on: ?[]const u8 = null,
+    drop_once: bool = false,
     delay_on: ?[]const u8 = null,
     delay_ms: u64 = 0,
     retype_on: ?[]const u8 = null,
@@ -188,7 +190,10 @@ pub const FakePg = struct {
                         defer self.mutex.unlock();
                         try self.queries.append(try self.gpa.dupe(u8, text));
                     }
-                    if (self.drop_on) |d| if (std.mem.indexOf(u8, text, d) != null) return;
+                    if (self.drop_on) |d| if (std.mem.indexOf(u8, text, d) != null) {
+                        if (self.drop_once) self.drop_on = null;
+                        return;
+                    };
                     if (self.delay_on) |d| if (std.mem.indexOf(u8, text, d) != null) std.Thread.sleep(self.delay_ms * std.time.ns_per_ms);
                     try self.answer(a, w, text);
                     try message(w, 'Z', "I");

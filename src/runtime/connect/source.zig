@@ -5,7 +5,7 @@
 const Batch = @import("../../exec/batch.zig").Batch;
 const Value = @import("../../exec/value.zig").Value;
 const Env = @import("../env.zig").Env;
-const SqlDriver = @import("../connect.zig").SqlDriver;
+const pooledSql = @import("../connect.zig").pooledSql;
 const analyze = @import("../analyze.zig");
 const options = @import("../analyze/options.zig");
 const ast = @import("../../lang/ast.zig");
@@ -289,19 +289,15 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         env.log.log(.debug, "sql read ({s}): {s}", .{ rd.connector, query });
         const req = try noteRequest(env, shown, hints, query);
         const clock = observe.Clock.start();
-        switch (info.kind) {
-            inline else => |k| {
-                const c = SqlDriver(k).connect(env.gpa, cfg) catch |e|
-                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, e) }));
-                const s = sql.Source.open(env.gpa, c.sqlConn(), query) catch |e| {
-                    defer c.close();
-                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} read failed ({s}): {s}", .{ conn.connector, @errorName(e), c.wire.last_error }));
-                };
-                s.report = try readReport(env, conn.connector);
-                env.pipe.sql_desc = try sqlDescFor(env, info.kind, info.dialect, cfg, query, rd_eff);
-                return observe.source(env.arena, s.source(), req, clock.ns());
-            },
-        }
+        const c = pooledSql(env.gpa, env.conn_pool, info.kind, cfg) catch |e|
+            return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, e) }));
+        const s = sql.Source.open(env.gpa, c, query) catch |e| {
+            defer c.close();
+            return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} read failed ({s}): {s}", .{ conn.connector, @errorName(e), c.lastError() }));
+        };
+        s.report = try readReport(env, conn.connector);
+        env.pipe.sql_desc = try sqlDescFor(env, info.kind, info.dialect, cfg, query, rd_eff);
+        return observe.source(env.arena, s.source(), req, clock.ns());
     }
     return planErr(env.diag, try options.unsupportedSourceMsg(env.arena, conn.connector));
 }

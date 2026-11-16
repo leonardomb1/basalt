@@ -400,6 +400,8 @@ pub const Env = struct {
     params_expr: *std.StringHashMap(*const ast.Expr),
     errctx: *op.ErrCtx,
     facts_cache: ?*FactsCache = null,
+    /// The run's idle SQL connections (`connect/pool.zig`).
+    conn_pool: ?*@import("connect/pool.zig").Pool = null,
     rows_read: *obs.RowCounter,
     json_params: *std.StringHashMap(std.json.Value),
     fns: *const std.StringHashMap(ast.FnDecl),

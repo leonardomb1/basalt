@@ -268,6 +268,12 @@ pub const Conn = struct {
         return e;
     }
 
+    /// Whether the connection sits outside a transaction (no descriptor from a BEGIN
+    /// TRANSACTION), so it holds no lock and may serve another query.
+    pub fn idle(self: *const Conn) bool {
+        return std.mem.allEqual(u8, &self.txn_desc, 0);
+    }
+
     /// The transaction descriptor a BEGIN TRANSACTION reports (ENVCHANGE type 8),
     /// sent back in every later request's headers until a commit or rollback (9, 10)
     /// clears it; a request with none while a transaction is open is refused.
@@ -610,7 +616,7 @@ const TlsShim = struct {
 
 const sql_vtable = sql.connVTable(Conn);
 
-const cursor_vtable = sql.Cursor.VTable{ .schema = curSchema, .nextBatch = curNext, .close = curClose, .last_error = curLastError };
+const cursor_vtable = sql.Cursor.VTable{ .schema = curSchema, .nextBatch = curNext, .close = curClose, .last_error = curLastError, .detach = curDetach };
 
 fn curLastError(ptr: *anyopaque) []const u8 {
     const self: *TdsCursor = @ptrCast(@alignCast(ptr));
@@ -628,6 +634,17 @@ fn curNext(ptr: *anyopaque, arena: std.mem.Allocator) anyerror!?Batch {
 fn curClose(ptr: *anyopaque) void {
     const self: *TdsCursor = @ptrCast(@alignCast(ptr));
     self.closeCursor();
+}
+
+/// A cursor whose batch ran to its last DONE leaves its connection idle (`release`).
+fn curDetach(ptr: *anyopaque) bool {
+    const self: *TdsCursor = @ptrCast(@alignCast(ptr));
+    if (!self.done or !self.conn.idle()) {
+        self.closeCursor();
+        return false;
+    }
+    self.release();
+    return true;
 }
 
 /// SQL Server's largest (max) or text value, 2^31 - 1 bytes.

@@ -24,7 +24,7 @@ const Env = @import("../env.zig").Env;
 const SqlConnInfo = @import("../connect.zig").SqlConnInfo;
 const Value = @import("../../exec/value.zig").Value;
 const ast = @import("../../lang/ast.zig");
-const connectSql = @import("../connect.zig").connectSql;
+const pooledSql = @import("../connect.zig").pooledSql;
 const lookupLabel = @import("../connect/sql_read.zig").lookupLabel;
 const observe = @import("../connect/observe.zig");
 const footerOf = @import("../../format/parquet/folder.zig").parseFooterOf;
@@ -176,7 +176,7 @@ pub fn catalogQuery(env: *Env, conn: ast.Connection, info: SqlConnInfo, q: []con
     defer env.diag.* = saved;
     const cfg = try resolveDbConfig(env, conn, info.port);
     const clock = observe.Clock.start();
-    var c = try connectSql(env.gpa, info.kind, cfg);
+    var c = try pooledSql(env.gpa, env.conn_pool, info.kind, cfg);
     if (env.profile) |p| c = try observe.lookups(p, c, lookupLabel(info.kind), clock.ns());
     var cur = c.queryCursor(q) catch |e| {
         c.close();

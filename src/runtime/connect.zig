@@ -89,6 +89,7 @@ pub const SplitCtx = struct {
     report: ?sql.Report = null,
     want: ?*const types.Schema = null,
     prof: ?*@import("../exec/profile.zig").Profile = null,
+    pool: ?*@import("connect/pool.zig").Pool = null,
 };
 
 const ReadReport = struct {
@@ -137,6 +138,12 @@ pub fn connectSql(gpa: std.mem.Allocator, kind: SqlKind, cfg: DbConfig) !sql.Con
     switch (kind) {
         inline else => |k| return (try SqlDriver(k).connect(gpa, cfg)).sqlConn(),
     }
+}
+
+/// A connection for a query, from the run's pool of idle ones when it has one.
+pub fn pooledSql(gpa: std.mem.Allocator, pool: ?*@import("connect/pool.zig").Pool, kind: SqlKind, cfg: DbConfig) !sql.Conn {
+    const p = pool orelse return connectSql(gpa, kind, cfg);
+    return p.acquire(kind, cfg);
 }
 
 pub fn openSplitSource(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, pred: []const u8) anyerror!driver.Source {
