@@ -1046,3 +1046,29 @@ test "UNNEST takes a call through a hidden column, and the WHERE conjuncts that 
     try testing.expectEqual(std.meta.Tag(ast.Stage.Node).explode, std.meta.activeTag(ks[1].node));
     try testing.expectEqual(std.meta.Tag(ast.Stage.Node).filter, std.meta.activeTag(ks[2].node));
 }
+
+test "sql: grouping sets over aggregates that combine from partials aggregate by every key first and expand those groups; others expand every row" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Case = struct { q: []const u8, pre: bool };
+    const cases = [_]Case{
+        .{ .q = "SELECT g, r, COUNT(*) AS n, SUM(v) AS s, MIN(v) AS lo, MAX(v) AS hi FROM 'x.csv' GROUP BY ROLLUP(g, r);", .pre = true },
+        .{ .q = "SELECT g, COUNT(v) AS c FROM 'x.csv' GROUP BY CUBE(g);", .pre = true },
+        .{ .q = "SELECT g, AVG(v) AS a FROM 'x.csv' GROUP BY ROLLUP(g);", .pre = false },
+        .{ .q = "SELECT g, COUNT(DISTINCT v) AS d FROM 'x.csv' GROUP BY ROLLUP(g);", .pre = false },
+        .{ .q = "SELECT g, string_agg(v, ',') AS s FROM 'x.csv' GROUP BY ROLLUP(g);", .pre = false },
+    };
+    for (cases) |c| {
+        const stages = firstPipelineStages(try parseTest(a, c.q));
+        const explode = for (stages, 0..) |st, i| {
+            if (st.node == .explode) break i;
+        } else return error.TestUnexpectedResult;
+        var before: usize = 0;
+        for (stages[0..explode]) |st| before += @intFromBool(st.node == .aggregate);
+        testing.expectEqual(@as(usize, @intFromBool(c.pre)), before) catch |e| {
+            std.debug.print("{s}\n", .{c.q});
+            return e;
+        };
+    }
+}

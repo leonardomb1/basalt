@@ -141,6 +141,15 @@ test "ROLLUP, CUBE and GROUPING SETS: a row per set, a key own NULL apart, GROUP
     });
 }
 
+test "ROLLUP over aggregates that combine from partials: COUNT 0 over no rows, sums and extremes with NULLs, a qualified key, as one pass gives" {
+    try expectCases("g,v\na,1\na,\nb,5\n", &.{
+        .{ .q = "SELECT g, COUNT(*) AS n, COUNT(v) AS c, SUM(v) AS s, MIN(v) AS lo, MAX(v) AS hi FROM \x27$IN\x27 GROUP BY ROLLUP(g) ORDER BY g NULLS LAST", .want = "g,n,c,s,lo,hi\na,2,1,1,1,1\nb,1,1,5,5,5\n,3,2,6,1,5\n" },
+        .{ .q = "SELECT g, COUNT(*) AS n, SUM(v) AS s FROM \x27$IN\x27 WHERE v > 100 GROUP BY ROLLUP(g)", .want = "g,n,s\n,0,\n" },
+        .{ .q = "SELECT t.g, COUNT(*) AS n FROM \x27$IN\x27 t GROUP BY ROLLUP(t.g) ORDER BY t.g NULLS LAST", .want = "g,n\na,2\nb,1\n,3\n" },
+        .{ .q = "SELECT g, COUNT(*) AS n, AVG(v) AS a FROM \x27$IN\x27 GROUP BY ROLLUP(g) ORDER BY g NULLS LAST", .want = "g,n,a\na,2,1\nb,1,5\n,3,3\n" },
+    });
+}
+
 test "GROUPING names only keys, and only under a grouping set" {
     try expectParseRefused("SELECT g, GROUPING(r) AS b, COUNT(*) AS n FROM \x27a.csv\x27 GROUP BY ROLLUP(g)", "not a grouping key");
 }

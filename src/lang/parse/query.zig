@@ -1892,11 +1892,16 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             }
             try stages.append(.{ .node = .{ .select = try kept.toOwnedSlice() }, .hints = &.{}, .pos = pos });
         }
-        const aggs_out = try aggs.toOwnedSlice();
+        var aggs_out: []const ast.AggItem = try aggs.toOwnedSlice();
         var agg_by = group;
         var key_names: []const ast.SelectItem.Rename = &.{};
         var on_empty: []const []const u8 = &.{};
+        var zero_counts: []const []const u8 = &.{};
         if (grouping_sets) |sets| {
+            if (try preAggregate(self, &stages, real_keys, aggs_out, pos)) |pre| {
+                aggs_out = pre.aggs;
+                zero_counts = pre.counts;
+            }
             const expanded = try expandGroupingSets(self, &stages, real_keys, sets, grouping_used, pos);
             agg_by = expanded.by;
             key_names = expanded.names;
@@ -1912,6 +1917,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             const back = try self.arena.alloc(ast.SelectItem, 1);
             back[0] = .{ .star_rename = key_names };
             try stages.append(.{ .node = .{ .select = back }, .hints = &.{}, .pos = pos });
+            if (zero_counts.len > 0) try stages.append(.{ .node = .{ .select = try zeroedCounts(self, zero_counts) }, .hints = &.{}, .pos = pos });
         }
         if (having_filter) |hf| {
             try self.groupedOnly(hf, group, aggs_out, &.{}, pos);
@@ -2317,6 +2323,51 @@ fn groupingCalls(self: *Parser, e: *ast.Expr, keys: []const ast.QualName, used: 
         }
     };
     return Cx.recur(.{ .p = self, .keys = keys, .used = used, .pos = pos }, e);
+}
+
+const PreAggregated = struct { aggs: []const ast.AggItem, counts: []const []const u8 };
+
+/// When every aggregate of a GROUP BY over grouping sets combines from partials
+/// (COUNT and SUM without DISTINCT, MIN, MAX), the rows are first aggregated by all
+/// the keys, one partial `__pa<i>` each, and the grouping sets expand over those few
+/// groups rather than over every row: the returned aggregates combine the partials
+/// (a COUNT as the SUM of its counts, named in `counts`, which `zeroedCounts` makes 0
+/// over no rows, where a SUM of nothing is NULL). Null when one does not combine,
+/// and every row is expanded as before.
+fn preAggregate(self: *Parser, stages: *std.array_list.Managed(ast.Stage), keys: []const ast.QualName, aggs: []const ast.AggItem, pos: Pos) Error!?PreAggregated {
+    for (aggs) |a| switch (a.func) {
+        .count, .sum => if (a.distinct) return null,
+        .min, .max => {},
+        else => return null,
+    };
+    const partial = try self.arena.alloc(ast.AggItem, aggs.len);
+    const outer = try self.arena.alloc(ast.AggItem, aggs.len);
+    var counts = std.array_list.Managed([]const u8).init(self.arena);
+    for (aggs, partial, outer, 0..) |a, *p, *o, i| {
+        const name = try std.fmt.allocPrint(self.arena, "__pa{d}", .{i});
+        p.* = .{ .name = name, .func = a.func, .arg = a.arg };
+        const combine: ast.AggFunc = switch (a.func) {
+            .count, .sum => .sum,
+            else => a.func,
+        };
+        o.* = .{ .name = a.name, .func = combine, .arg = try self.mk(.{ .field = try self.singleName(name) }) };
+        if (a.func == .count) try counts.append(a.name);
+    }
+    try stages.append(.{ .node = .{ .aggregate = .{ .aggs = partial, .by = keys } }, .hints = &.{}, .pos = pos });
+    return .{ .aggs = outer, .counts = try counts.toOwnedSlice() };
+}
+
+/// Every column, each COUNT in `counts` 0 where a set over no rows left it NULL.
+fn zeroedCounts(self: *Parser, counts: []const []const u8) Error![]const ast.SelectItem {
+    const items = try self.arena.alloc(ast.SelectItem, counts.len + 1);
+    items[0] = .{ .star_except = counts };
+    for (counts, items[1..]) |c, *it| {
+        const args = try self.arena.alloc(*ast.Expr, 2);
+        args[0] = try self.mk(.{ .field = try self.singleName(c) });
+        args[1] = try self.mk(.{ .int_lit = 0 });
+        it.* = .{ .computed = .{ .name = c, .expr = try self.mk(.{ .call = .{ .name = "coalesce", .args = args } }) } };
+    }
+    return items;
 }
 
 const ExpandedSets = struct { by: []const ast.QualName, names: []const ast.SelectItem.Rename, on_empty: []const []const u8 };
