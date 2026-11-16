@@ -65,6 +65,9 @@ FROM EACH TABLE OF (erp.QUERY($$SELECT name, SUBSTRING(name,4,2) FROM sys.tables
 WHERE D_E_L_E_T_ <> '*';               -- descends into EVERY branch's query
 ```
 
+With one name, `AS (table_name)`, the discovery's single column names the tables
+and the branches carry no tag column.
+
 The discovery source may also be a full basalt `SELECT`, executed in-engine at
 plan time (its translatable `WHERE` prefix still descends to the source as
 usual). The connection the *discovered tables* live in is inferred from the

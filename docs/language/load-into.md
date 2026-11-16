@@ -115,7 +115,10 @@ AS
 - `SPLIT BY (col)` parallelizes a load from a SQL table (or a `UNION` of
   them) by ranges of `col`; `JOBS n` fixes the lane count (otherwise the CLI
   `-j` applies). A file source fans out on its own, so `SPLIT BY` over one is
-  a plan-time error, as is `JOBS 0`.
+  a plan-time error, as is `JOBS 0`. A read with no ranges to cut — the column
+  holding one value, of a kind that has no ranges, or its MIN and MAX unreadable
+  — runs on one lane with a warning saying which; one with no rows at all does so
+  quietly.
 
 **stdout is not syntax**: a terminal `SELECT ...;` statement prints the result
 as an aligned table — `basalt run -c "SELECT * FROM 'x.csv';"` works as a

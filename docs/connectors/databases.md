@@ -38,6 +38,24 @@ StarRocks' and Doris' `connect_timeout` and `query_timeout` cover the FE's
 MySQL port. `connect_timeout` also bounds each stream load's connect to its
 load URL; once connected, the HTTP request keeps its own limit.
 
+## Reused connections and retries
+
+A run keeps a connection open between its queries to one server and login, so a
+statement's schema probe, its catalog questions and its read log in once, and the
+next statement reuses that login (up to four idle per server). A connection is kept
+only once its reply was read to the end outside any transaction, so an idle one
+holds no lock the run's own writes could wait on; one the server or a proxy
+dropped while idle is noticed on its next query and dialed again.
+
+A query is sent again, with backoff, until its first row: on a network failure,
+and when the server rolled it back under contention and says to run it again — a
+deadlock victim, a serialization failure, a lock wait that timed out. So is every
+write, each being a statement of its own whose failure left nothing behind: a
+batch of INSERT or UPSERT rows, a bulk segment (on a fresh connection), and each
+step of a REPLACE. Past five tries or 30 s of waiting the run fails, a write that
+kept losing to contention as `LockConflict`, exit 75 like a network failure
+([exit codes](../tools/cli.md)).
+
 ## PostgreSQL and MySQL
 
 Every session runs in UTC, the zone basalt's timestamps are in: PostgreSQL's

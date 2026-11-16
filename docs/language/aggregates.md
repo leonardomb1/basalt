@@ -109,7 +109,10 @@ NULL: `GROUPING(a)` is 1 in the first and 0 in the second, and `GROUPING(a, b)` 
 a number of those bits, the last key the lowest. A key keeps its value inside an
 aggregate (`MAX(region)` over the grand total). Over no input rows a grouping of no
 keys still answers one row, as a plain aggregate does; one with keys answers none.
-Such a query runs on one lane.
+Such a query runs on one lane. When every aggregate combines from partial results
+(`COUNT`, `SUM` without `DISTINCT`, `MIN`, `MAX`), the rows are grouped by every key
+first and only those groups are counted once per grouping, so a ROLLUP costs about
+what a plain GROUP BY does.
 
 ## PIVOT and UNPIVOT
 
