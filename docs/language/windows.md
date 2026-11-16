@@ -264,8 +264,11 @@ arrived. An input past `--op-memory` is sorted to disk by partition and order ke
 and read back a run of whole partitions at a time, so memory is bounded by
 `--op-memory` and the largest partition — without `PARTITION BY`, the whole input
 is one ([Spilling to disk](../tools/cli.md#spilling-to-disk)). Over a local file at
-`-j` above 1 every lane sorts the rows it reads; the rows come out the same at
-every `-j`. Each stage sorts once, then resolves every
+`-j` above 1, a window with a `PARTITION BY` sends each row to one of several
+buckets by its partition key, as the top-k shape above does, and each bucket sorts
+and computes its partitions on a lane of its own; while the rows held stay under
+`--op-memory`, else every lane sorts the rows it reads, spilling, and one thread
+computes the window. Either way the rows come out the same at every `-j`. Each stage sorts once, then resolves every
 row's frame by two forward-moving edges, so a frame of any size costs the same:
 an aggregate adds the rows entering and takes back the rows leaving — exactly for
 integer and decimal sums, counts and the variances over integers, `MIN`/`MAX`
