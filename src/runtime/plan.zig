@@ -766,7 +766,15 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
         current = r.op;
         schema = r.schema;
         current.stampNew(profile.keyOf(stage.pos));
-        if (env.profile != null and stage.node == .select and current == .project) current.project.label = try profile.stageText(env.arena, stage);
+        if (env.profile != null) switch (current) {
+            .project => |p| if (stage.node == .select) {
+                p.label = try profile.stageText(env.arena, stage);
+            },
+            .filter => |f| if (stage.node == .filter) {
+                f.label = try profile.stageText(env.arena, stage);
+            },
+            else => {},
+        };
     }
     try runtime_filters.wire(env.arena, &current);
     return .{ .op = current, .schema = schema };

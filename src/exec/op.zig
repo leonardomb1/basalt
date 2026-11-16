@@ -281,13 +281,14 @@ pub const Op = union(enum) {
     }
 
     /// What this one operator stands for, when its stage cannot say: a union's branch
-    /// shares the stage of every other branch, and the selects one query plans into
-    /// share its position.
+    /// shares the stage of every other branch, the selects one query plans into share
+    /// its position, and so do the filters its WHERE splits into as conjuncts move.
     pub fn label(self: Op) []const u8 {
         return switch (self) {
             .scan => |s| s.label,
             .union_ => |u| u.label,
             .project => |p| p.label,
+            .filter => |f| f.label,
             else => "",
         };
     }
@@ -538,6 +539,7 @@ pub const Filter = struct {
     err: ?*ErrCtx = null,
     back: std.mem.Allocator,
     scratch: ?std.heap.ArenaAllocator = null,
+    label: []const u8 = "",
 
     pub fn next(self: *Filter, arena: std.mem.Allocator) anyerror!?Batch {
         if (self.scratch == null) self.scratch = std.heap.ArenaAllocator.init(self.back);

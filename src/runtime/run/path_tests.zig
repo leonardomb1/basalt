@@ -280,6 +280,7 @@ const report_cases = [_]ReportCase{
     .{ .script = "FOR EACH ROW OF (pg.QUERY($$SELECT \"tname\", \"tag\" FROM catalog$$)) AS (a, b)\n  LOAD INTO '$B/never.csv' AS SELECT id FROM pg.public.t;\nEND FOR;", .explain = true, .says = &.{ "FOR EACH discovery (actuals)", "postgres query, discovery", "FOR EACH 2 rows of 2 share this plan, its figures summed over them: a=t, b=a; a=t2, b=b" } },
     .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.xlsx' AS SELECT a.id FROM '$B/in.csv' a JOIN '$B/twice.csv' b ON a.g = b.g;", .says = &.{ "Sink: xlsx ", "(2.0x)", "project (#1)  id\n" } },
     .{ .script = "EXPLAIN ANALYZE SELECT s.g, COUNT(*) AS n FROM '$B/p1.parquet' s JOIN '$B/p.parquet' l ON l.id = s.id JOIN '$B/p.parquet' m ON m.id = l.v GROUP BY s.g;", .says = &.{"build: left (est."} },
+    .{ .script = "EXPLAIN ANALYZE SELECT a.id FROM '$B/in.csv' a JOIN '$B/twice.csv' b ON a.g = b.g WHERE a.v > 1 AND a.v + length(b.g) > 2;", .says = &.{ "filter (#2)  (v + length(b.g)) > 2\n", "filter (#4)  v > 1\n" } },
     .{ .script = "EXPLAIN ANALYZE SELECT g, string_agg(id, ',') AS s FROM pg.public.t GROUP BY g;", .threads = 4 },
     .{ .script = "EXPLAIN ANALYZE SELECT * FROM pg.public.t PIVOT (SUM(v) FOR g IN ('a'));", .threads = 4, .says = &.{"by the other columns"} },
     .{ .script = "EXPLAIN ANALYZE SELECT g, COUNT(*) AS n FROM pg.public.t GROUP BY ROLLUP(g);", .threads = 4 },
