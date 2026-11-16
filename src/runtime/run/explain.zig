@@ -830,6 +830,33 @@ test "explain: a request no scan claimed prints before the plan in order, a clai
     , printed[std.mem.indexOf(u8, printed, "outside the plan").?..]);
 }
 
+test "explain: a scan's time holds its source's opening, where a query the source answers whole is waited on" {
+    var p = Profile.init(testing.allocator);
+    defer p.deinit();
+    const r = try p.request(.read, "db table orders", "SELECT COUNT_BIG(*) FROM orders");
+    r.ns = 4 * std.time.ns_per_ms;
+    r.open_ns = 4 * std.time.ns_per_ms;
+    var scan = op.Scan{ .src = undefined, .request = r };
+    scan.stats = .{ .at = 1, .ns = std.time.ns_per_ms, .rows = 1, .calls = 2 };
+    _ = try p.absorb(.{ .scan = &scan });
+    try testing.expectEqual(@as(u64, 0), r.open_ns);
+
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    var out = std.Io.Writer.Allocating.init(testing.allocator);
+    defer out.deinit();
+    try renderProfile(ar.allocator(), &p, .{ .wall_ns = 0, .rows_read = 1, .rows_out = 1, .lanes = 1 }, false, &out.writer);
+    const printed = out.written();
+    try testing.expectEqualStrings(
+        \\plan (actuals)
+        \\└─ scan (#1)  db table orders
+        \\      sent: SELECT COUNT_BIG(*) FROM orders
+        \\      time: 5.00ms (100.0%)
+        \\      rows: 1   batches: 2
+        \\
+    , printed[std.mem.indexOf(u8, printed, "plan (actuals)").?..]);
+}
+
 test "explain: a span's children hang under it, its own time theirs taken out, and a folder's footers are one node" {
     var p = Profile.init(testing.allocator);
     defer p.deinit();

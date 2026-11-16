@@ -159,8 +159,7 @@ The **summary** comes first:
 - **Wall time** is the pipeline from start to finish. **Operator time** is every
   operator's own time added up, over every lane: at `-j 8` eight lanes' work
   fills one wall second, so it can exceed the wall time, and a wall time far
-  above it is time spent outside the operators — connecting, waiting on a
-  source, writing.
+  above it is time spent outside the operators, such as writing.
 - **Path** is how the pipeline ran: `serial`, a parallel path and how its input
   divided (`parquet parallel aggregate, 6 row groups`, `postgres split-parallel,
   8 key ranges`), or that the source ran the aggregate or the `ORDER BY ...
@@ -185,9 +184,13 @@ operators below it. Each node shows:
   read's query with the `WHERE` that descended into it, a long column list or `IN`
   list cut to its first items and a count of the rest, or an HTTP read's URL. This
   is where pushdown shows. A
-  split path's reads say `once per key range:` and the query before its ranges are
-  added;
-- `time:` its own time and share. Past 30% of the operator time a node is red,
+  split path's reads say `once per key range:` (`once per page range:` for a
+  PostgreSQL table cut by pages) and the query before its ranges are added;
+- `time:` its own time and share; a scan's holds its source's opening (the login
+  on a connection not yet open, the query sent, the wait for its first rows), so a
+  query the source answers whole, an aggregate it runs, shows its time there. The
+  first request on a connection, often a schema probe, holds its login. Past 30%
+  of the operator time a node is red,
   past 15% yellow, on a terminal without `NO_COLOR`. With lanes,
   `[min=…, max=…]` is the least and most a lane spent on it, and `skew 2.3x`
   calls out a lane far above the lanes' mean (1.5x or more, on a node of 5% or

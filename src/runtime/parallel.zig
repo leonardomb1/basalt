@@ -432,11 +432,13 @@ fn lane(sh: *Shared, lane_idx: usize) void {
             });
         }
 
+        const open_clock = if (tally != null) std.time.Instant.now() catch null else null;
         const src = sh.open(sh.ctx, lane_alloc, sh.predicates[i]) catch |e| {
             sh.queue.fail(e);
             return;
         };
         defer src.close();
+        if (tally) |t| addOpen(open_clock, &t.t[0]);
 
         while (true) {
             if (sh.queue.failed.load(.seq_cst)) return;
@@ -470,6 +472,14 @@ fn lane(sh: *Shared, lane_idx: usize) void {
         }
     }
     if (units and !sh.queue.failed.load(.seq_cst)) unit.commit(&sh.sink_mtx) catch |e| sh.queue.fail(e);
+}
+
+/// Adds the time since `clock`, a range's source opening, to its scan's `t`: the
+/// query, its login and its wait for the first rows the scan's pulls never see.
+fn addOpen(clock: ?std.time.Instant, t: *profile.Tally) void {
+    const c = clock orelse return;
+    const now = std.time.Instant.now() catch return;
+    t.ns += now.since(c);
 }
 
 /// Adds the time since `clock` and a batch of `rows` to `t`, and restarts the clock.

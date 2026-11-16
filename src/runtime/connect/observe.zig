@@ -58,10 +58,13 @@ const TimedSource = struct {
 };
 
 /// `inner` with its pulls counted on `req`, which `open_ns` went to opening; `inner`
-/// itself without a request.
+/// itself without a request. The opening is kept apart too, for the scan that claims
+/// the request: a query the source answers whole (an aggregate it runs) is waited on
+/// as the source opens, before its scan pulls a row.
 pub fn source(arena: std.mem.Allocator, inner: driver.Source, req: ?*Request, open_ns: u64) !driver.Source {
     const r = req orelse return inner;
     r.ns += open_ns;
+    r.open_ns += open_ns;
     const t = try arena.create(TimedSource);
     t.* = .{ .inner = inner, .req = r };
     return .{ .ptr = t, .vtable = &TimedSource.vtable, .stop = inner.stop };

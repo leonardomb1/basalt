@@ -466,6 +466,7 @@ pub const Request = struct {
     label: []const u8,
     text: []const u8,
     ns: u64 = 0,
+    open_ns: u64 = 0,
     rows: u64 = 0,
     calls: u64 = 0,
     claimed: bool = false,

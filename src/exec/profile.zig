@@ -475,7 +475,8 @@ pub const Profile = struct {
         return t.index;
     }
 
-    /// Folds `node`, found at `path` below its chain's root, and returns its id.
+    /// Folds `node`, found at `path` below its chain's root, and returns its id. A scan
+    /// takes the time its source took to open, once, as its pulls never see it.
     fn walk(self: *Profile, node: op.Op, lane: usize, path: u64, count: bool) std.mem.Allocator.Error!Id {
         const st = node.stats();
         const at = if (st.at == 0) self.fallback.get(node) else st.at;
@@ -498,7 +499,12 @@ pub const Profile = struct {
             if (n.request == null) n.request = r;
         };
         if (!count) return id;
-        try addTally(self.gpa, n, lane, .{ .ns = st.ns, .rows = st.rows, .calls = st.calls });
+        var own = Tally{ .ns = st.ns, .rows = st.rows, .calls = st.calls };
+        if (node == .scan) if (node.scan.request) |r| {
+            own.ns += r.open_ns;
+            r.open_ns = 0;
+        };
+        try addTally(self.gpa, n, lane, own);
         var facts_buf: [16]Fact = undefined;
         for (node.facts(&facts_buf)) |f| try addFact(self.gpa, &n.facts, f);
         return id;
