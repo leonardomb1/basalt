@@ -89,12 +89,21 @@ fn sinkAt(m: []const ast.Stage, i: usize) ?SinkShape {
     return .{ .prefix = m[0..i], .joins = m[i..ai], .agg = m[ai], .tail = m[ai + 1 ..] };
 }
 
-/// One keyed join with filters and selects around it, into a write.
+/// One keyed join with filters and selects around it, into a write, or a chain of
+/// them, none right or full: those mark matches only a single join drains.
 fn mapJoin(stages: []const ast.Stage, m: []const ast.Stage, i: usize) ?MapJoinShape {
     if (stages.len < 3 or stages[stages.len - 1].node != .write) return null;
-    for (m[i + 1 ..]) |st| if (!isFilterOrSelect(st)) return null;
+    var chained = false;
+    for (m[i + 1 ..]) |st| {
+        if (st.node == .join) {
+            const lj = st.node.join;
+            if (!lanes.joinKindLaneSafe(lj.kind) or lj.keyless()) return null;
+            chained = true;
+        } else if (!isFilterOrSelect(st)) return null;
+    }
     const j = m[i];
     if (j.node.join.keyless()) return null;
+    if (chained and !lanes.joinKindLaneSafe(j.node.join.kind)) return null;
     return .{ .prefix = m[0..i], .join = j.node.join, .join_hints = j.hints, .suffix = m[i + 1 ..], .stage = j };
 }
 

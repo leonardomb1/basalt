@@ -643,7 +643,8 @@ pub fn runParallelAgg(env: *Env, m_in: ?*const Morsels, head: ?ast.Stage, shape:
         agg_in = pre.out.*;
     }
     if (rest.len > 0) {
-        const chain = (try resolveLaneJoins(env, rest, agg_in, try std.mem.concat(env.arena, ast.Stage, &.{ &.{shape.agg}, shape.tail }))) orelse return false;
+        const held: ?[]const Batch = if (flip == null and m.* == .mem and pre_recs.len == 0) m.mem.batches else null;
+        const chain = (try resolveLaneJoins(env, rest, agg_in, try std.mem.concat(env.arena, ast.Stage, &.{ &.{shape.agg}, shape.tail }), held)) orelse return false;
         joins = try std.mem.concat(env.arena, LaneJoin, &.{ joins, chain.joins });
         agg_in = chain.out_schema;
     }

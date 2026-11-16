@@ -31,6 +31,7 @@ const parallel = @import("../parallel.zig");
 const pqdecode = @import("../../format/parquet/read.zig");
 const planSplit = @import("../connect.zig").planSplit;
 const resolveLaneJoin = @import("join.zig").resolveLaneJoin;
+const resolveLaneJoins = @import("join.zig").resolveLaneJoins;
 const MapJoinShape = @import("shape.zig").MapJoinShape;
 const flipFirstJoin = @import("join.zig").flipFirstJoin;
 const narrowHead = @import("join.zig").narrowHead;
@@ -474,11 +475,19 @@ const MapSink = struct {
 /// must turn; false when it does not.
 pub fn runParallelMap(env: *Env, m_in: ?Morsels, head: ast.Stage, map_stages: []const ast.Stage, jshape: ?MapJoinShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     if (jshape) |js| {
+        const k = nextJoin(js.suffix);
         const left = try std.mem.concat(env.arena, ast.Stage, &.{ &.{try narrowHead(env, head, try std.mem.concat(env.arena, ast.Stage, &.{ map_stages, &.{js.stage}, js.suffix }))}, map_stages });
-        if (try flipFirstJoin(env, left, js.stage, js.suffix, js.suffix, w, opts)) |f| {
+        if (try flipFirstJoin(env, left, js.stage, js.suffix[0..k], js.suffix, w, opts)) |f| {
             defer if (f.mapped) |mc| mc.close();
             env.log.log(.info, "join with `{s}`: the left side is held in memory and the right side read on the lanes, {s}", .{ js.join.alias, f.note["build: left ".len..] });
-            try mapDrive(env, &f.m, f.pre, f.lane, f.out_schema, try resolveUpsertKeys(env, w), opts, stats, lanes_used, f.read_at);
+            var joins: []const LaneJoin = try env.arena.dupe(LaneJoin, &.{f.lane});
+            var out_schema = f.out_schema;
+            if (k < js.suffix.len) {
+                const chain = (try resolveLaneJoins(env, js.suffix[k..], out_schema, &.{}, null)) orelse return false;
+                joins = try std.mem.concat(env.arena, LaneJoin, &.{ joins, chain.joins });
+                out_schema = chain.out_schema;
+            }
+            try mapDrive(env, &f.m, f.pre, joins, out_schema, try resolveUpsertKeys(env, w), opts, stats, lanes_used, f.read_at);
             return true;
         }
     }
@@ -486,16 +495,29 @@ pub fn runParallelMap(env: *Env, m_in: ?Morsels, head: ast.Stage, map_stages: []
     const map = try chainAt(env, m.schema().*, map_stages);
     env.src_name = m.label();
     env.sink_name = sinkLabel(env, w);
-    var lane_join: ?LaneJoin = null;
+    var joins: []const LaneJoin = &.{};
     var out_schema = map.out.*;
     if (jshape) |js| {
-        const lp = (try resolveLaneJoin(env, js.join, js.join_hints, js.suffix, out_schema)) orelse return false;
-        lane_join = lp.lane;
-        out_schema = lp.out_schema;
-        if (m == .parquet) m.parquet.keys = try laneParquetKeys(env, js, lp.lane, map_stages);
+        if (nextJoin(js.suffix) == js.suffix.len) {
+            const lp = (try resolveLaneJoin(env, js.join, js.join_hints, js.suffix, out_schema)) orelse return false;
+            joins = try env.arena.dupe(LaneJoin, &.{lp.lane});
+            out_schema = lp.out_schema;
+        } else {
+            const held: ?[]const Batch = if (m == .mem and map.recs.len == 0) m.mem.batches else null;
+            const chain = (try resolveLaneJoins(env, try std.mem.concat(env.arena, ast.Stage, &.{ &.{js.stage}, js.suffix }), out_schema, &.{}, held)) orelse return false;
+            joins = chain.joins;
+            out_schema = chain.out_schema;
+        }
+        if (m == .parquet) m.parquet.keys = try laneParquetKeys(env, js, joins[0], map_stages);
     }
-    try mapDrive(env, &m, map.recs, lane_join, out_schema, try resolveUpsertKeys(env, w), opts, stats, lanes_used, 0);
+    try mapDrive(env, &m, map.recs, joins, out_schema, try resolveUpsertKeys(env, w), opts, stats, lanes_used, 0);
     return true;
+}
+
+/// Where the next join of `stages` is, or their length.
+fn nextJoin(stages: []const ast.Stage) usize {
+    for (stages, 0..) |st, i| if (st.node == .join) return i;
+    return stages.len;
 }
 
 /// Run `m` through `recs` and `lane_join` into the sink: in file order through
@@ -504,7 +526,7 @@ pub fn runParallelMap(env: *Env, m_in: ?Morsels, head: ast.Stage, map_stages: []
 /// ranges of the rows it wants a unit to hold (`perUnit`): a 4 MB CSV range held
 /// under the encoder's half row group, so every unit went to the writer's one thread
 /// to be encoded, and a range cut by bytes alone held a third of the rows in NDJSON.
-fn mapDrive(env: *Env, m_in: *const Morsels, recs: []const analyze.Resolved, lane_join: ?LaneJoin, out_schema: types.Schema, wr: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, read_at: u64) !void {
+fn mapDrive(env: *Env, m_in: *const Morsels, recs: []const analyze.Resolved, joins: []const LaneJoin, out_schema: types.Schema, wr: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, read_at: u64) !void {
     const arena = env.arena;
     const sink_mode = (try buildParallelSink(env, wr, out_schema)) orelse
         parallel.SinkMode{ .shared = try openSink(env, wr, out_schema) };
@@ -515,7 +537,7 @@ fn mapDrive(env: *Env, m_in: *const Morsels, recs: []const analyze.Resolved, lan
     defer guard.abort();
 
     const nthreads = m.workers(opts.lanes());
-    var g = MapSink{ .env = env, .sink_mode = sink_mode, .join = lane_join, .threads = nthreads };
+    var g = MapSink{ .env = env, .sink_mode = sink_mode, .join = if (joins.len == 1) joins[0] else null, .threads = nthreads };
     var ordered: OrderedOut = undefined;
     if (sink_mode == .shared and m.* != .sql) {
         ordered = try OrderedOut.init(arena, 2 * nthreads, sink_mode.shared);
@@ -523,15 +545,14 @@ fn mapDrive(env: *Env, m_in: *const Morsels, recs: []const analyze.Resolved, lan
     }
     defer if (g.ordered) |o| o.freeRest();
 
-    const joins: []const LaneJoin = if (lane_join) |lj| try arena.dupe(LaneJoin, &.{lj}) else &.{};
     const pl: Pipeline = .{ .m = m, .recs = recs, .joins = joins, .errctx = env.errctx, .rows_read = env.rows_read, .per_lane = g.ordered == null, .read_at = read_at };
     const lanes = try drive(arena, pl, g.parallelSink(), opts.lanes());
     lanes_used.* = @max(lanes_used.*, lanes);
     const how = if (m.* == .sql) "split-parallel" else "parallel";
-    const what = if (lane_join != null) "map+join" else "map";
+    const what = if (joins.len > 0) "map+join" else "map";
     env.log.log(.debug, "{s} {s} {s}: {d} {s} over {d} lanes ({s} sink)", .{ m.label(), how, what, m.count(), m.unitName(), lanes, @tagName(sink_mode) });
     if (env.profile) |p| {
-        if (lane_join) |lj| if (lj.build_root) |b| try p.graftBuild(lj.at, b);
+        for (joins) |lj| if (lj.build_root) |b| try p.graftBuild(lj.at, b);
         p.path = try msgfmt.allocPrint(arena, "{s} {s} {s}, {d} {s}", .{ m.label(), how, what, m.count(), m.unitName() });
         if (m.* == .sql) try p.sentOnLanes(0, try m.sql.split.sentNote(arena));
     }
@@ -627,7 +648,7 @@ pub fn runParallelSqlMapJoin(env: *Env, stages: []const ast.Stage, shape: MapJoi
     const split = try arena.create(SplitCtx);
     split.* = .{ .gpa = env.gpa, .kind = desc.kind, .cfg = desc.cfg, .base_sql = sp.base_sql, .where_extra = where_extra, .report = try connect_mod.readReport(env, @tagName(desc.kind)), .want = src_schema, .reach = sp.reach };
     const m = Morsels{ .sql = .{ .split = split, .predicates = sp.predicates, .schema = src_schema } };
-    try mapDrive(env, &m, pre.recs, lp.lane, lp.out_schema, w, opts, stats, lanes_used, 0);
+    try mapDrive(env, &m, pre.recs, try env.arena.dupe(LaneJoin, &.{lp.lane}), lp.out_schema, w, opts, stats, lanes_used, 0);
     return true;
 }
 

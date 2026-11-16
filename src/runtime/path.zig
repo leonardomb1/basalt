@@ -159,9 +159,12 @@ fn sqlAgg(stages: []const ast.Stage) ?lanes.SinkShape {
 }
 
 /// A SQL read's single map and join, which its key ranges can probe.
+/// A SQL source's map+join: one join, its key ranges' lanes probing one index.
 fn mapJoin(stages: []const ast.Stage) ?lanes.MapJoinShape {
     const shape = lanes.classifyLaneShape(stages) orelse return null;
-    return if (shape == .map_join) shape.map_join else null;
+    if (shape != .map_join) return null;
+    for (shape.map_join.suffix) |st| if (st.node == .join) return null;
+    return shape.map_join;
 }
 
 /// Preconditions every lane path shares. A hinted read is left to the paths that honour

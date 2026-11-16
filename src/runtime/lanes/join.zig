@@ -51,7 +51,7 @@ const LaneJoinChain = struct { joins: []const LaneJoin, out_schema: types.Schema
 /// takes its index once built.
 /// `after` is what follows the span (the aggregate and its tail): each join's build
 /// side then reads only the columns it and what follows take.
-pub fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: types.Schema, after: []const ast.Stage) anyerror!?LaneJoinChain {
+pub fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: types.Schema, after: []const ast.Stage, held: ?[]const Batch) anyerror!?LaneJoinChain {
     const arena = env.arena;
     var plans = std.array_list.Managed(PlannedJoin).init(arena);
     var ats = std.array_list.Managed(u64).init(arena);
@@ -71,12 +71,13 @@ pub fn resolveLaneJoins(env: *Env, join_span: []const ast.Stage, left_schema: ty
         i = k;
     }
     const stand = try standIn(env, plans.items, left_schema);
+    if (held) |rows| try heldSlots(env, plans.items, stand, rows, left_schema);
     const lanes = try arena.alloc(LaneJoin, plans.items.len);
     var n = plans.items.len;
     while (n > 0) {
         n -= 1;
-        const lp = (try indexLaneJoin(env, &plans.items[n], stand[n].build.?)) orelse return closeFrom(env, src_base);
-        stand[n].index = lp.lane.index;
+        const lp = (try indexLaneJoin(env, &plans.items[n], stand.joins[n].build.?)) orelse return closeFrom(env, src_base);
+        stand.joins[n].index = lp.lane.index;
         lanes[n] = lp.lane;
         lanes[n].at = ats.items[n];
     }
@@ -92,8 +93,10 @@ fn closeFrom(env: *Env, src_base: usize) ?LaneJoinChain {
 /// The lanes' chain as one serial tree over an empty head of `head` and the real
 /// build sides (a build side the lanes read in parallel as its chain over an empty
 /// read of its split), wired with its runtime filters; its joins, in order, which
-/// hold no index yet.
-fn standIn(env: *Env, plans: []const PlannedJoin, head: types.Schema) ![]*op.Join {
+/// hold no index yet, and the head's read.
+const StandIn = struct { joins: []*op.Join, head: *op.Scan };
+
+fn standIn(env: *Env, plans: []const PlannedJoin, head: types.Schema) !StandIn {
     const arena = env.arena;
     const hb = try arena.create(connect_mod.OneBatch);
     hb.* = .{ .b = null, .sch = head };
@@ -121,7 +124,111 @@ fn standIn(env: *Env, plans: []const PlannedJoin, head: types.Schema) ![]*op.Joi
         out.* = j;
     }
     try runtime_filters.wire(arena, &cur);
-    return joins;
+    return .{ .joins = joins, .head = hs };
+}
+
+/// Each semi or anti join (not `NOT IN`, whose answer a null key on its build side
+/// decides) keyed on columns of a head held in memory, `rows`, reads its build side
+/// under a filter by the keys those rows hold: a build row whose key no held row has
+/// can match none, so it is dropped as it is read rather than indexed (TPC-H Q21's
+/// EXISTS and NOT EXISTS over every lineitem row, probed by the few orders left).
+fn heldSlots(env: *Env, plans: []const PlannedJoin, stand: StandIn, rows: []const Batch, head: types.Schema) !void {
+    const arena = env.arena;
+    for (plans, stand.joins) |*p, j| {
+        if ((p.j.kind != .semi and p.j.kind != .anti) or p.j.null_aware or p.split == null) continue;
+        const head_cols = (try traceTo(arena, j.probe, p.jr.plan.lks, stand.head)) orelse continue;
+        const at = (try buildScan(arena, &j.build.?)) orelse continue;
+        const scan_cols = (try traceTo(arena, j.build.?, p.jr.plan.rks, at.scan)) orelse continue;
+        const sch = at.scan.src.schema();
+        const kinds = try arena.alloc(types.TypeKind, scan_cols.len);
+        for (kinds, scan_cols) |*k, c| k.* = sch.fields[c].ty.kind;
+        var bytes: usize = 0;
+        for (rows) |b| bytes += b.heapBytes();
+        const hs = try arena.create(types.Schema);
+        hs.* = head;
+        const ix = try arena.create(?*op.JoinIndex);
+        ix.* = try op.JoinIndex.fromBatchesMeeting(arena, rows, hs, head_cols, kinds, bytes, std.math.maxInt(usize), env.pipe.threads);
+        try runtime_filters.addIndexSlot(arena, at.rf, ix, scan_cols, "the rows held before it");
+    }
+}
+
+/// `cols` of `top` as columns of `bottom`, followed down through filters, projections
+/// that pass them through or name them as a plain field, runtime filters and the probe
+/// side of a join they are all left columns of; null where they are computed or reach
+/// another read.
+fn traceTo(arena: std.mem.Allocator, top: op.Op, cols_in: []const usize, bottom: *op.Scan) !?[]usize {
+    var path = std.ArrayListUnmanaged(op.Op).empty;
+    var cur = top;
+    while (true) {
+        try path.append(arena, cur);
+        switch (cur) {
+            .filter => |f| cur = f.child,
+            .runtime_filter => |rf| cur = rf.child,
+            .project => |pr| cur = pr.child,
+            .join => |pj| cur = pj.probe,
+            .scan => |sc| {
+                if (sc != bottom) return null;
+                break;
+            },
+            else => return null,
+        }
+    }
+    const cols = try arena.dupe(usize, cols_in);
+    for (path.items, 0..) |o, at| switch (o) {
+        .project => |pr| for (cols) |*c| switch (pr.cols[c.*].source) {
+            .passthrough => |i| c.* = i,
+            .expr => |e| {
+                if (e.* != .field) return null;
+                c.* = fieldAt(below(path.items[at + 1 ..]), e.field.last()) orelse return null;
+            },
+        },
+        .join => |pj| for (cols) |c| if (c >= pj.left_schema.fields.len) return null,
+        else => {},
+    };
+    return cols;
+}
+
+/// The schema `path`'s first operator hands up: a projection's or join's output, a
+/// read's, or what is below a filter.
+fn below(path: []const op.Op) types.Schema {
+    for (path) |o| switch (o) {
+        .project => |pr| return pr.out_schema.*,
+        .join => |pj| return pj.left_schema.*,
+        .scan => |sc| return sc.src.schema(),
+        else => {},
+    };
+    return .{ .fields = &.{} };
+}
+
+fn fieldAt(sch: types.Schema, name: []const u8) ?usize {
+    var hit: ?usize = null;
+    for (sch.fields, 0..) |f, i| if (std.ascii.eqlIgnoreCase(f.name, name)) {
+        if (hit != null) return null;
+        hit = i;
+    };
+    return hit;
+}
+
+/// The read at the bottom of a build side's stand-in chain and the runtime filter
+/// above it, made there when there is none.
+fn buildScan(arena: std.mem.Allocator, build: *op.Op) !?struct { scan: *op.Scan, rf: *op.RuntimeFilter } {
+    var cur = build;
+    while (true) switch (cur.*) {
+        .filter => |f| cur = &f.child,
+        .project => |pr| cur = &pr.child,
+        .runtime_filter => |rf| {
+            if (rf.child != .scan) return null;
+            return .{ .scan = rf.child.scan, .rf = rf };
+        },
+        .scan => |s| {
+            const rf = try arena.create(op.RuntimeFilter);
+            rf.* = .{ .child = cur.*, .back = arena };
+            rf.stats.at = s.stats.at;
+            cur.* = .{ .runtime_filter = rf };
+            return .{ .scan = s, .rf = rf };
+        },
+        else => return null,
+    };
 }
 
 /// The runtime filter wired above the read at the bottom of a split build side's

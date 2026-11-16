@@ -572,6 +572,90 @@ fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: Turn, w: ast.Write
     return true;
 }
 
+/// A lane aggregate whose joins end in semi and anti joins over large files run with
+/// what comes before them read into memory first: the head and the joins ahead, on
+/// the lanes, narrowed to the columns the rest reads, while they stay under the
+/// largest such file's estimated rows over `joinorder.flip_ratio`. Each semi or anti
+/// join's build side is then read under a filter by the keys the held rows hold
+/// (`lanes/join.zig` `heldSlots`), and the held rows are probed on the lanes. Past
+/// the cap the rows are dropped and the run goes as planned, having spent at most that
+/// many. Not `NOT IN`, whose answer a null key on its build side decides.
+fn holdBeforeSemis(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!bool {
+    const held_name = (try flipName(env)) orelse return false;
+    var si = shape.joins.len;
+    while (si > 0) {
+        const st = shape.joins[si - 1];
+        switch (st.node) {
+            .filter, .select => {},
+            .join => |j| if ((j.kind != .semi and j.kind != .anti) or j.null_aware) break,
+            else => break,
+        }
+        si -= 1;
+    }
+    while (si < shape.joins.len and shape.joins[si].node != .join) si += 1;
+    if (si == 0 or si == shape.joins.len) return false;
+    var before = false;
+    for (shape.joins[0..si]) |st| if (st.node == .join) {
+        before = true;
+    };
+    if (!before) return false;
+
+    const consumer = try std.mem.concat(env.arena, ast.Stage, &.{ &.{shape.agg}, shape.tail });
+    var largest: u64 = 0;
+    for (shape.joins[si..], si..) |st, i| if (st.node == .join) {
+        const after = try std.mem.concat(env.arena, ast.Stage, &.{ shape.joins[i + 1 ..], consumer });
+        const rst = try rightStagesFor(env, st.node.join, after);
+        if (!fileSide(rst)) continue;
+        largest = @max(largest, estimate.ofSide(env, rst).rows orelse continue);
+    };
+    const cap = largest / joinorder.flip_ratio;
+    if (cap < min_flip_rows) return false;
+
+    const pre_len = 1 + shape.prefix.len + si;
+    const keep = (try flipKeeps(env, stages[0..pre_len], stages[pre_len .. stages.len - 1])) orelse return false;
+    const pos = shape.joins[si].pos;
+    const inner = try env.arena.alloc(ast.Stage, pre_len + 2);
+    @memcpy(inner[0..pre_len], stages[0..pre_len]);
+    inner[pre_len] = .{ .node = .{ .select = keep }, .hints = &.{}, .pos = pos };
+    const mw = ast.Write{ .connector = mem_connector, .form = null, .target = "", .mode = .overwrite };
+    inner[pre_len + 1] = .{ .node = .{ .write = mw }, .hints = &.{}, .pos = pos };
+    var ms = env_mod.MemSink{ .arena = env.shared orelse env.arena, .batches = std.array_list.Managed(Batch).init(env.shared orelse env.arena), .cap_rows = cap, .keep_rels = true };
+    {
+        const outer_sink = env.mem_sink;
+        const outer_name = env.sink_name;
+        const outer_free = env.out_order_free;
+        env.mem_sink = &ms;
+        defer env.mem_sink = outer_sink;
+        env.out_order_free = true;
+        defer env.out_order_free = outer_free;
+        defer env.sink_name = outer_name;
+        var scratch: Stats = .{};
+        const outer_scope = enterScope(env, held_name);
+        defer leaveScope(env, outer_scope);
+        runOutputBody(env, opts, inner, inner[pre_len + 1].node, &scratch, lanes_used, batch_arena) catch |e| {
+            if (e != error.PastMemCap) return e;
+            env.log.log(.debug, "the joins before the semi and anti joins leave over {d} rows; they run as planned", .{cap});
+            return false;
+        };
+    }
+    if (ms.batches.items.len == 0) return false;
+    const held_schema = try env.arena.create(types.Schema);
+    held_schema.* = ms.schema;
+    const m = Morsels{ .mem = .{ .batches = ms.batches.items, .schema = held_schema } };
+    const joins = try env.arena.dupe(ast.Stage, shape.joins[si..]);
+    for (joins) |*st| if (st.node == .join) {
+        st.node.join.own_cols = &.{};
+    };
+    const rest = SinkShape{ .prefix = &.{}, .joins = joins, .agg = shape.agg, .tail = shape.tail };
+    if (!try runParallelAgg(env, &m, null, rest, w, opts, stats, lanes_used)) return false;
+    if (env.profile) |p| {
+        const what = try msgfmt.allocPrint(env.arena, "the joins before the semi and anti joins ({d} rows)", .{ms.rows});
+        p.path = try msgfmt.allocPrint(env.arena, "{s} read into memory first, then {s}, their build sides read for the held keys", .{ what, p.path });
+        try p.describe(profile.keyOf(pos), .scan, try msgfmt.allocPrint(env.arena, "{s}, in memory", .{what}));
+    }
+    return true;
+}
+
 const Pick = struct { at: usize, rows: u64 };
 
 /// The join of `shape` a turn takes, with its right side's estimated rows: of the joins
@@ -698,12 +782,19 @@ fn flipKeeps(env: *Env, pre: []const ast.Stage, rest: []const ast.Stage) !?[]con
     return try out.toOwnedSlice();
 }
 
-/// A joined side's columns when it is a file read with only filters after it.
+/// A joined side's columns when it is a file read with only filters and selects after
+/// it (a subquery's renamed keys, as an EXISTS's).
 fn sideSchema(env: *Env, j: ast.Join, after: []const ast.Stage) !?types.Schema {
     const rst = try rightStagesFor(env, j, after);
     if (rst.len == 0 or rst[0].node != .read) return null;
-    for (rst[1..]) |x| if (x.node != .filter) return null;
-    return offlineSchema(env.arena, rst[0].node.read, rst[0].hints, env.tables);
+    for (rst[1..]) |x| if (x.node != .filter and x.node != .select) return null;
+    const sch = offlineSchema(env.arena, rst[0].node.read, rst[0].hints, env.tables) orelse return null;
+    for (rst[1..]) |x| if (x.node == .select) {
+        var ad = analyze.Diag{};
+        const ch = analyze.resolveChain(env.arena, sch, rst[1..], env.params_expr, &ad) catch return null;
+        return ch.out.*;
+    };
+    return sch;
 }
 
 fn sideOf(schemas: []const ?types.Schema, name: []const u8) enum { yes, no, unknown } {
@@ -852,6 +943,8 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     if (chosen == .lanes and !try keysPreferSerial(env, head_stages)) {
         const ln = chosen.lanes;
         if (ln.shape == .sink) if (try flipLaterJoin(env, head_stages, .ofAgg(ln.shape.sink), last.write, opts, stats, lanes_used, batch_arena)) return;
+        if (ln.shape == .sink) if (try holdBeforeSemis(env, head_stages, ln.shape.sink, last.write, opts, stats, lanes_used, batch_arena)) return;
+        if (ln.shape == .map_join) if (heldTurn(env, head_stages)) |t| if (try flipLaterJoin(env, head_stages, t, last.write, opts, stats, lanes_used, batch_arena)) return;
         if (ln.source == .parquet) {
             if (try runParquetLane(env, head_stages, ln.shape, last.write, opts, stats, lanes_used)) return;
         } else if (try runCsvLane(env, head_stages, ln.shape, last.write, opts, stats, lanes_used)) return;

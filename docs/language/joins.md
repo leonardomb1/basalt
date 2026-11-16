@@ -170,9 +170,16 @@ the filtered head is read into memory first, and indexed if it stays under that
 cap (TPC-H Q12: 31K of 6M lineitem rows indexed, the 1.5M orders streamed). It
 is tried only when the head's first row group or chunk passes rows at a rate that
 stays under the cap, and also at `-j 1`, on one worker, where plain `EXPLAIN` adds
-it to the serial path as an `unless`. Any other lane pipeline probes with its head read in every lane and
-keeps the written order — a right side too big for the lanes sends the pipeline
-back to the serial plan, where the choice is made. Key pushdown follows the sides: a SQL right side streamed through an
+it to the serial path as an `unless`. When the joins end in `EXISTS`, `NOT EXISTS` or
+`IN` (semi and anti joins, not `NOT IN`) over files estimated past four times the
+cap's rows, what comes before them is read into memory first the same way, and
+each of those files is read under a filter by the keys the held rows hold: a row of
+theirs whose key no held row has can match none, so it is dropped as it is read
+rather than indexed (TPC-H Q21: two 6M-row lineitem indexes cut to 360K and 250K
+rows for the 76K rows its joins leave). Any other lane pipeline probes with its head read in every lane and
+keeps the written order, a chain of joins included when none is a right or full join
+— a right side too big for the lanes sends the pipeline back to the serial plan,
+where the choice is made. Key pushdown follows the sides: a SQL right side streamed through an
 indexed left side takes the left side's keys once that side is indexed, with no
 read-ahead. `EXPLAIN ANALYZE` (and `run --explain`) prints the choice under the
 join, e.g. `build: left (est. 1.2k rows vs 3.4M rows)`; plain `EXPLAIN` only says

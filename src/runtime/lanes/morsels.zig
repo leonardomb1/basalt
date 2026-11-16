@@ -13,6 +13,7 @@ const Batch = @import("../../exec/batch.zig").Batch;
 const LaneJoin = @import("join.zig").LaneJoin;
 const LaneMem = @import("../parallel.zig").LaneMem;
 const OneBatch = @import("../connect.zig").OneBatch;
+const MemSource = @import("../env.zig").MemSource;
 const analyze = @import("../analyze.zig");
 const buildLaneJoinChain = @import("join.zig").buildLaneJoinChain;
 const chainOps = @import("../plan.zig").chainOps;
@@ -41,6 +42,9 @@ pub const Morsels = union(enum) {
     csv: struct { mapped: *csv.MappedCsv, schema: *const types.Schema, count: usize },
     parquet: PqMorsels,
     sql: struct { split: *const SplitCtx, predicates: []const []const u8, schema: *const types.Schema },
+    /// Rows held in memory, a batch a morsel: what a run read into memory first, the
+    /// joins before a semi or anti join's (`run/output.zig`).
+    mem: struct { batches: []const Batch, schema: *const types.Schema },
 
     /// A mapped file cut into ranges of about `bytes`.
     pub fn ofCsv(mapped: *csv.MappedCsv, sch: *const types.Schema, bytes: usize) Morsels {
@@ -77,6 +81,7 @@ pub const Morsels = union(enum) {
             .csv => |c| c.count,
             .parquet => |m| m.items.len,
             .sql => |s| s.predicates.len,
+            .mem => |x| x.batches.len,
         };
     }
 
@@ -92,6 +97,7 @@ pub const Morsels = union(enum) {
             .csv => |c| c.schema,
             .parquet => |m| m.src_schema,
             .sql => |s| s.schema,
+            .mem => |x| x.schema,
         };
     }
 
@@ -100,6 +106,7 @@ pub const Morsels = union(enum) {
             .csv => "csv",
             .parquet => "parquet",
             .sql => |s| @tagName(s.split.kind),
+            .mem => "memory",
         };
     }
 
@@ -108,6 +115,7 @@ pub const Morsels = union(enum) {
             .csv => "chunks",
             .parquet => |m| if (m.items.len > 0 and m.items[0].rg_end == null) "files" else "row groups",
             .sql => |s| if (s.split.reach.inner) "page ranges" else "key ranges",
+            .mem => "batches",
         };
     }
 
@@ -126,6 +134,11 @@ pub const Morsels = union(enum) {
             .sql => |s| {
                 const q = try s.split.rangeQuery(scratch, s.predicates[i]);
                 return try openSqlQuery(s.split, rd.gpa, q);
+            },
+            .mem => |x| {
+                const src = try scratch.create(MemSource);
+                src.* = .{ .m = .{ .schema = x.schema.*, .batches = x.batches[i..][0..1] } };
+                return src.source();
             },
         }
     }

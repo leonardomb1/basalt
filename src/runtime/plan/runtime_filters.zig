@@ -173,7 +173,12 @@ fn readsFirst(j: *op.Join, built: bool) bool {
 /// its own becomes part of a larger one.
 fn addSlot(arena: std.mem.Allocator, rf: *op.RuntimeFilter, j: *op.Join, cols: []const usize) !void {
     for (rf.slots.items) |sl| if (sl.index == &j.index) return;
-    try rf.slots.append(arena, .{ .index = &j.index, .cols = cols, .label = if (j.name.len > 0) j.name else "?" });
+    return addIndexSlot(arena, rf, &j.index, cols, if (j.name.len > 0) j.name else "?");
+}
+
+/// A slot on `rf` for `index`, its keys `cols` of the scan, named `label`.
+pub fn addIndexSlot(arena: std.mem.Allocator, rf: *op.RuntimeFilter, index: *const ?*op.JoinIndex, cols: []const usize, label: []const u8) !void {
+    try rf.slots.append(arena, .{ .index = index, .cols = cols, .label = label });
     var b = std.array_list.Managed(u8).init(arena);
     try b.appendSlice(if (rf.slots.items.len == 1) "for the join with " else "for the joins with ");
     for (rf.slots.items, 0..) |sl, i| {
