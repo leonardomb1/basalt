@@ -83,8 +83,9 @@ const cases = [_]Case{
 };
 
 const split_cases = [_]Case{
-    .{ .q = "SELECT g, COUNT(*) AS n FROM pg.public.t GROUP BY g", .want = "postgres split-parallel aggregate" },
-    .{ .q = "SELECT DISTINCT COUNT(*) AS n FROM pg.public.t GROUP BY g", .want = "postgres split-parallel aggregate" },
+    .{ .q = "SELECT g, COUNT(*) AS n FROM pg.public.t GROUP BY g", .want = "postgres split-parallel aggregate", .static = "serial; the aggregate runs in the source" },
+    .{ .q = "SELECT DISTINCT COUNT(*) AS n FROM pg.public.t GROUP BY g", .want = "postgres split-parallel aggregate", .static = "serial; the aggregate runs in the source" },
+    .{ .q = "SELECT upper(g) AS k, COUNT(*) AS n FROM pg.public.t GROUP BY upper(g)", .want = "postgres split-parallel aggregate" },
 };
 
 const select_cases = [_]Case{

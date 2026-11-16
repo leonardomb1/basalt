@@ -113,7 +113,9 @@ crosses the wire. The answer never changes, only where the work happens;
   column cast to a float, sums and extremes of decimals, floats, dates and
   timestamps are the source's, and each result is cast to the type the engine
   planned. `HAVING`/sort/limit still run in the engine on the tiny grouped
-  result.
+  result. The grouped query runs as one statement, so `SPLIT BY` does not cut
+  it into key ranges; where it does not descend, `SPLIT BY` reads the rows in
+  ranges to be grouped here.
   The answer is the one the engine would give: every filter must translate
   exactly (the rules above), so a text comparison or `LIKE` the column's
   collation could decide otherwise (`'a' = 'A'` under a case-insensitive one,

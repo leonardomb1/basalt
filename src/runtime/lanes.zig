@@ -114,11 +114,12 @@ fn runShape(env: *Env, split: Morsels, head: ast.Stage, shape: LaneShape, w: ast
 }
 
 /// Recognize the shape a whole aggregate can descend into one grouped source query:
-/// filters only before it (a `select` renames the keys), no hint on the read, and
-/// keys and aggregates `pushdown.wholeAggShape` takes; any tail.
+/// filters only before it (a `select` renames the keys), no hint on the read but
+/// those that cut it into key ranges (one grouped query leaves nothing to cut, as a
+/// top-N does), and keys and aggregates `pushdown.wholeAggShape` takes; any tail.
 pub fn classifyWholeAgg(stages: []const ast.Stage) ?SinkShape {
     if (stages.len < 3 or stages[0].node != .read) return null;
-    if (stages[0].hints.len != 0) return null;
+    for (stages[0].hints) |h| if (!splitHint(h.key)) return null;
     const middle = stages[1 .. stages.len - 1];
     for (middle, 0..) |st, i| switch (st.node) {
         .filter => {},
@@ -129,6 +130,11 @@ pub fn classifyWholeAgg(stages: []const ast.Stage) ?SinkShape {
         else => return null,
     };
     return null;
+}
+
+fn splitHint(key: []const u8) bool {
+    for ([_][]const u8{ "split", "splits", "split_kind" }) |k| if (std.mem.eql(u8, key, k)) return true;
+    return false;
 }
 
 /// Descend the whole aggregate into the source: a QUERY-form read of the grouped SQL
@@ -237,7 +243,7 @@ const Morsels = @import("lanes/morsels.zig").Morsels;
 const parquetSplit = @import("lanes/sources.zig").parquetSplit;
 const csvSplitFile = @import("lanes/sources.zig").csvSplitFile;
 
-test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
+test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hint but a key-range cut" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -286,7 +292,15 @@ test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hints" {
     var hinted_rd = rd;
     hinted_rd.hints = hints;
     const hinted = [_]ast.Stage{ hinted_rd, flt, agg, wrt };
-    try std.testing.expect(classifyWholeAgg(&hinted) == null);
+    try std.testing.expect(classifyWholeAgg(&hinted) != null);
+
+    const feed = try a.alloc(ast.Hint, 2);
+    feed[0] = hints[0];
+    feed[1] = .{ .key = "changes_from", .value = .{ .int = 5 }, .pos = p };
+    var feed_rd = rd;
+    feed_rd.hints = feed;
+    const fed = [_]ast.Stage{ feed_rd, flt, agg, wrt };
+    try std.testing.expect(classifyWholeAgg(&fed) == null);
 }
 
 test "an aggregate's lane shape takes a HAVING tail over joins, and a distinct tail only without them" {
