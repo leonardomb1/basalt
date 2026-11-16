@@ -1881,7 +1881,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             for (aggs.items) |a| {
                 if (a.arg) |arg| try ast.fieldsOf(arg, &needed);
             }
-            try needed.appendSlice(group);
+            try needed.appendSlice(real_keys);
             for (needed.items) |q0| {
                 const q = stripQual(q0, &aliases);
                 const have = for (kept.items) |it| {
@@ -2408,7 +2408,7 @@ fn expandGroupingSets(self: *Parser, stages: *std.array_list.Managed(ast.Stage),
         const copy = try self.mk(.{ .cond = .{ .cond = cond, .then = try self.mk(.null_lit), .els = own } });
         try items.append(.{ .computed = .{ .name = name, .expr = copy } });
         try by.append(try self.singleName(name));
-        try names.append(.{ .from = name, .to = k.last() });
+        try names.append(.{ .from = name, .to = k.last(), .rel = if (k.parts.len == 2) k.parts[0] else "" });
         if (is_used) {
             const bit_name = try groupingName(self, k);
             const bit = try self.mk(.{ .cond = .{ .cond = cond, .then = try self.mk(.{ .int_lit = 1 }), .els = try self.mk(.{ .int_lit = 0 }) } });

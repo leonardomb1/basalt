@@ -78,7 +78,10 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
                 for (in.fields[0..idx]) |g|
                     if (std.mem.eql(u8, nm, renameTo(renames, g.name) orelse g.name) and !std.mem.eql(u8, f.name, g.name))
                         return fail(diag, "`* rename` produces duplicate column `{s}`", .{nm});
-                try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = f.rel, .base = f.base, .clash = f.clash and nm.ptr == f.name.ptr });
+                const rel = for (renames) |r| {
+                    if (r.rel.len > 0 and std.mem.eql(u8, r.from, f.name)) break r.rel;
+                } else null;
+                try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = rel orelse f.rel, .base = if (rel != null) nm else f.base, .clash = f.clash and nm.ptr == f.name.ptr });
             }
         },
         .star_of => |so| for (in.fields, 0..) |f, idx| {

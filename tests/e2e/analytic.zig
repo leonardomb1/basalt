@@ -125,7 +125,7 @@ test "the new aggregates' arguments and window use are refused where they are wr
     for (cases) |c| try expectParseRefused(c.q, c.says);
 }
 
-test "ROLLUP, CUBE and GROUPING SETS: a row per set, a key own NULL apart, GROUPING, keys inside aggregates, a plain key beside" {
+test "ROLLUP, CUBE and GROUPING SETS: a row per set, a key own NULL apart, GROUPING, keys inside aggregates, a plain key beside, a joined table's key by its alias" {
     try expectCases(sales, &.{
         .{ .q = "SELECT g, r, COUNT(*) AS n FROM \x27$IN\x27 GROUP BY ROLLUP(g, r) ORDER BY g NULLS LAST, r NULLS LAST", .want = "g,r,n\na,x,2\na,y,1\na,,3\nb,y,2\nb,,2\nc,x,1\nc,,1\n,,6\n" },
         .{ .q = "SELECT g, r, COUNT(*) AS n FROM \x27$IN\x27 WHERE g <> \x27c\x27 GROUP BY CUBE(g, r) ORDER BY g NULLS LAST, r NULLS LAST", .want = "g,r,n\na,x,2\na,y,1\na,,3\nb,y,2\nb,,2\n,x,2\n,y,3\n,,5\n" },
@@ -137,6 +137,8 @@ test "ROLLUP, CUBE and GROUPING SETS: a row per set, a key own NULL apart, GROUP
         .{ .q = "SELECT g, COUNT(*) AS n FROM \x27$IN\x27 GROUP BY ROLLUP(g) HAVING COUNT(*) > 2 ORDER BY n", .want = "g,n\na,3\n,6\n" },
         .{ .q = "SELECT g, r, COUNT(*) AS n FROM \x27$IN\x27 GROUP BY ROLLUP((g, r)) ORDER BY g NULLS LAST, r", .want = "g,r,n\na,x,2\na,y,1\nb,y,2\nc,x,1\n,,6\n" },
         .{ .q = "SELECT g, string_agg(id, \x27-\x27 ORDER BY id) AS s FROM \x27$IN\x27 GROUP BY ROLLUP(g) ORDER BY g NULLS LAST", .want = "g,s\na,1-2-3\nb,4-5\nc,6\n,1-2-3-4-5-6\n" },
+        .{ .q = "SELECT b.g, GROUPING(b.g) AS gg, COUNT(*) AS n, SUM(a.v) AS s FROM \x27$IN\x27 a JOIN \x27$IN\x27 b ON b.id = a.id GROUP BY ROLLUP(b.g) ORDER BY b.g NULLS LAST", .want = "g,gg,n,s\na,0,3,60\nb,0,2,5\nc,0,1,7\n,1,6,72\n" },
+        .{ .q = "SELECT b.r, upper(a.g) AS ug, COUNT(*) AS n FROM \x27$IN\x27 a JOIN \x27$IN\x27 b ON b.id = a.id GROUP BY CUBE(b.r, upper(a.g)) ORDER BY b.r NULLS LAST, ug NULLS LAST", .want = "r,ug,n\nx,A,2\nx,C,1\nx,,3\ny,A,1\ny,B,2\ny,,3\n,A,3\n,B,2\n,C,1\n,,6\n" },
     });
     try expectCases("g,v\n,1\n,2\na,3\n", &.{
         .{ .q = "SELECT g, GROUPING(g) AS b, COUNT(*) AS n FROM \x27$IN\x27 GROUP BY ROLLUP(g) ORDER BY b, n", .want = "g,b,n\na,0,1\n,0,2\n,1,3\n" },

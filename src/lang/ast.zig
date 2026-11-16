@@ -317,7 +317,9 @@ pub const SelectItem = union(enum) {
     computed: Computed,
 
     pub const Computed = struct { name: []const u8, expr: *Expr };
-    pub const Rename = struct { from: []const u8, to: []const u8 };
+    /// `rel`, when set, is the table the renamed column reads as being of, so a
+    /// grouping set's key copy still answers to `r.r_name`.
+    pub const Rename = struct { from: []const u8, to: []const u8, rel: []const u8 = "" };
     /// `t.*` over a join: the columns of the join side `rel`, or with `rel` empty the
     /// FROM table's, those of none of the join sides `rights`; less the hidden `drop`.
     /// A USING side's own key copy (`copies`) is listed in its place under its key's name.
