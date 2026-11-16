@@ -68,6 +68,21 @@ pages, smaller than Snappy's for somewhat more CPU (a fast DEFLATE level), and
 `compression = 'none'` leaves them uncompressed. `compression` is a Parquet
 sink's option only; any other target refuses it at plan time.
 
+A Parquet file loaded whole into a Parquet file — no `WHERE`, no option on the
+read or the sink, at most a `SELECT` that keeps, drops, reorders or renames
+columns (`*`, `* EXCEPT`, `* RENAME`, `a`, `a AS b`) — has its column chunks
+copied as they stand instead of decoded and encoded again: `Path: parquet chunk
+copy`, several times faster, and the pages keep the source's encodings and
+codec. It applies where every kept column is one the writer would write the
+same way (INT64, DOUBLE, BOOLEAN, strings and bytes, DATE, microsecond TIME and
+TIMESTAMP without UTC, a decimal in its narrowest type); an INT32, FLOAT,
+INT96, unsigned, millisecond, UTC or nested column, or a `compression` option,
+decodes and encodes as before. A NOT NULL column stays NOT NULL, where an
+encoded one is written nullable. Each chunk's page headers are walked before it
+is written, so a truncated chunk fails the load; the pages themselves are not
+decompressed. Page indexes and bloom filters are not carried over, and the
+source's `ARROW:schema` only when every column is kept under its own name.
+
 ## Delta Lake
 
 A folder holding a `_delta_log/` is a Delta table, and a folder read of it —

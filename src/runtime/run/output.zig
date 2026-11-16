@@ -17,6 +17,7 @@ const buildStage = @import("../plan.zig").buildStage;
 const driver = @import("../../exec/driver.zig");
 const descendLeadingWhere = @import("../plan.zig").descendLeadingWhere;
 const buildPipelineLateLead = @import("../plan.zig").buildPipelineLateLead;
+const chunk_copy = @import("chunk_copy.zig");
 const dupeSchema = @import("../connect.zig").dupeSchema;
 const env_mod = @import("../env.zig");
 const exceptColumns = @import("../connect.zig").exceptColumns;
@@ -769,6 +770,8 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
         .source = path.sourceOf(stages[0], env.connections),
         .head_source = path.sourceOf(head_stages[0], env.connections),
     };
+    if (env.union_sink == null and path.chunkCopy(stages, path_facts))
+        if (try chunk_copy.run(env, stages, last.write, stats)) return;
     const chosen = try path.choose(arena, stages, head_stages, path_facts);
     if (chosen == .union_split) {
         delegated.* = true;

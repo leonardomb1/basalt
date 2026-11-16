@@ -404,6 +404,9 @@ pub const Physical = struct {
     keys_serial: bool = false,
     /// At one lane, the first join may still turn around (`path.oneLaneTurn`).
     one_lane_turn: bool = false,
+    /// A Parquet file into a Parquet file whose chunks the run may copy as they
+    /// stand (`path.chunkCopy`), ahead of `path`.
+    chunk_copy: bool = false,
 };
 
 pub const Output = struct {
@@ -1539,7 +1542,7 @@ const Ctx = struct {
             .source = pathmod.sourceOf(downloaded(stages[0]), self.connections),
             .head_source = pathmod.sourceOf(downloaded(head[0]), self.connections),
         };
-        var ph = Physical{ .path = try pathmod.choose(self.arena, stages, head, facts) };
+        var ph = Physical{ .path = try pathmod.choose(self.arena, stages, head, facts), .chunk_copy = pathmod.chunkCopy(stages, facts) };
         ph.one_lane_turn = ph.path == .serial and pathmod.oneLaneTurn(head, facts) != null;
         switch (ph.path) {
             .lanes => |l| {

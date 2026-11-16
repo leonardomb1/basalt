@@ -115,6 +115,12 @@ fn childPrefix(buf: []u8, prefix: []const u8, last: bool) []const u8 {
 /// with what the run may still find that keeps it serial, and a SQL source's chain in
 /// the order the run tries it.
 fn physical(w: anytype, ph: Physical) !void {
+    if (ph.chunk_copy) {
+        try w.writeAll("parquet chunk copy, unless a kept column is nested or of a type basalt writes otherwise; else ");
+        var rest = ph;
+        rest.chunk_copy = false;
+        return physical(w, rest);
+    }
     if (ph.prelude) |p| {
         try w.print("{s} read into memory first (", .{p.what});
         try physical(w, p.inner.*);

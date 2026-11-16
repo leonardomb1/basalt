@@ -319,7 +319,7 @@ pub const Reader = struct {
                 if (n > 0) gone = bm;
                 kept = rows - n;
             }
-            if (self.src.coalesces()) self.held = try self.fetchGroup(arena, g);
+            if (self.src.coalesces()) self.held = try self.fetchGroup(arena, g, self.leaves);
             const cols = try arena.alloc(column.Column, self.outputs.len + @intFromBool(self.positions));
             if (self.positions) {
                 const ps = try arena.alloc(i64, rows);
@@ -406,7 +406,7 @@ pub const Reader = struct {
 
     pub const pos_name = "\x00pos";
 
-    const Chunk = struct { bytes: []const u8, meta: parquet.ColumnMetaData, start: u64 };
+    pub const Chunk = struct { bytes: []const u8, meta: parquet.ColumnMetaData, start: u64 };
 
     const Held = struct { start: u64, bytes: []const u8 };
 
@@ -416,12 +416,12 @@ pub const Reader = struct {
     /// The most one request asks for.
     const range_cap: u64 = 64 << 20;
 
-    /// Fetches the chunks of `g` this read decodes as a few ranges, adjacent and
-    /// nearby chunks merged into one: each request over a network costs a round trip
-    /// and restarts a cold transfer, so one range per chunk ran several times slower.
-    fn fetchGroup(self: *Reader, arena: std.mem.Allocator, g: parquet.RowGroup) ![]const Held {
+    /// Fetches the chunks of `g` for `leaves` as a few ranges, adjacent and nearby
+    /// chunks merged into one: each request over a network costs a round trip and
+    /// restarts a cold transfer, so one range per chunk ran several times slower.
+    fn fetchGroup(self: *Reader, arena: std.mem.Allocator, g: parquet.RowGroup, leaves: []const Leaf) ![]const Held {
         var spans = std.array_list.Managed([2]u64).init(arena);
-        for (self.leaves) |lf| {
+        for (leaves) |lf| {
             if (lf.chunk_idx >= g.columns.len) return Error.CorruptParquetPage;
             const meta = g.columns[lf.chunk_idx].meta orelse return Error.CorruptParquetPage;
             const start = std.math.cast(u64, meta.startOffset()) orelse return Error.CorruptParquetPage;
@@ -462,6 +462,16 @@ pub const Reader = struct {
         for (self.held) |h| if (start >= h.start and end <= h.start + h.bytes.len)
             return .{ .bytes = h.bytes[@intCast(start - h.start)..][0..@intCast(end - start)], .meta = meta, .start = start };
         return .{ .bytes = try self.src.range(arena, start, @intCast(end - start)), .meta = meta, .start = start };
+    }
+
+    /// Row group `g`'s chunks of `leaves`, as stored, fetched as a decode fetches
+    /// them; each runs to the next chunk's start (`chunkEnd`).
+    pub fn chunks(self: *Reader, arena: std.mem.Allocator, g: parquet.RowGroup, leaves: []const Leaf) ![]const Chunk {
+        self.held = if (self.src.coalesces()) try self.fetchGroup(arena, g, leaves) else &.{};
+        defer self.held = &.{};
+        const out = try arena.alloc(Chunk, leaves.len);
+        for (leaves, out) |lf, *c| c.* = try self.chunkOf(arena, g, lf);
+        return out;
     }
 
     pub fn close(self: *Reader) void {

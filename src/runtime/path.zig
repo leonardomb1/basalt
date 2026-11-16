@@ -23,6 +23,7 @@ const connect = @import("connect.zig");
 const lanes = @import("lanes.zig");
 const isMap = @import("analyze/schema.zig").isMap;
 const laneHints = @import("analyze/targets.zig").laneHints;
+const formatOfPath = @import("analyze/targets.zig").formatOfPath;
 const pushdown = @import("pushdown.zig");
 
 pub const Source = enum { parquet, csv, sql, other };
@@ -84,6 +85,30 @@ pub fn choose(arena: std.mem.Allocator, stages: []const ast.Stage, head: []const
             .{ .map_join = s }
         else if (streamsOnly(middle)) .map else .none,
     } };
+}
+
+/// A Parquet file read whole into a Parquet file: no filter, hint or writer option,
+/// at most one SELECT that only keeps, drops and renames columns. The run then copies
+/// the column chunks as they stand where every kept column is one the writer would
+/// write alike (`format/parquet/copy.zig`), else takes the path `choose` names.
+pub fn chunkCopy(stages: []const ast.Stage, f: Facts) bool {
+    if (stages.len < 2 or stages.len > 3 or stages[0].node != .read) return false;
+    const rd = stages[0].node.read;
+    if (stages[0].hints.len > 0 or rd.where.len > 0 or !connect.isParquetFileRead(rd)) return false;
+    if (stages.len == 3) {
+        if (stages[1].node != .select or stages[1].hints.len > 0) return false;
+        for (stages[1].node.select) |it| switch (it) {
+            .star, .star_except, .star_rename => {},
+            .field => |q| if (q.parts.len != 1) return false,
+            .computed => |c| if (c.expr.* != .field or c.expr.field.parts.len != 1) return false,
+            .star_of => return false,
+        };
+    }
+    const w = f.sink;
+    if (!std.mem.eql(u8, w.connector, "csv") or w.split != null or w.changes != null) return false;
+    if (w.mode != .default and w.mode != .overwrite) return false;
+    if (stages[stages.len - 1].hints.len > 0) return false;
+    return formatOfPath(w.target) == .parquet;
 }
 
 /// Whether an aggregate of `stages` answers by the order its rows arrive in

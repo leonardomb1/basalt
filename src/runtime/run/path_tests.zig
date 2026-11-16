@@ -25,6 +25,7 @@ const Case = struct {
     static: ?[]const u8 = null,
     threads: usize = 4,
     select: bool = false,
+    into: []const u8 = "never.csv",
 };
 
 const cases = [_]Case{
@@ -67,6 +68,10 @@ const cases = [_]Case{
     .{ .q = "SELECT COUNT(*) AS n FROM '$B/p.parquet'", .want = "serial" },
     .{ .q = "SELECT COUNT(*) AS n FROM '$B/p.parquet' WHERE v > 0", .want = "parquet parallel aggregate" },
     .{ .q = "SELECT id, v FROM '$B/p1.parquet'", .want = "serial", .static = "parquet parallel map" },
+    .{ .q = "SELECT v, id AS key FROM '$B/p.parquet'", .into = "never.parquet", .want = "parquet chunk copy" },
+    .{ .q = "SELECT * FROM '$B/p.parquet'", .into = "never.parquet", .want = "parquet chunk copy" },
+    .{ .q = "SELECT id, v FROM '$B/p.parquet' WHERE v > 2", .into = "never.parquet", .want = "parquet parallel map" },
+    .{ .q = "SELECT id + 1 AS x FROM '$B/p.parquet'", .into = "never.parquet", .want = "parquet parallel map" },
     .{ .q = "SELECT g, SUM(v) AS s FROM '$B/pf/' GROUP BY g", .want = "parquet parallel aggregate" },
     .{ .q = "SELECT id, v FROM '$B/pf/' WHERE v > 2", .want = "parquet parallel map" },
     .{ .q = "SELECT id, v FROM pg.public.t WHERE v > 1", .want = "postgres split-parallel" },
@@ -198,7 +203,7 @@ fn head(a: std.mem.Allocator, t: []const u8) ![]const u8 {
 fn caseHolds(a: std.mem.Allocator, tmp: *std.testing.TmpDir, base: []const u8, port: u16, c: Case, split: bool) !bool {
     const conn = try msgfmt.allocPrint(a, "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', port = {d}, database = 'd', user = 'u', password = 'p');\n", .{port});
     const q = try std.mem.replaceOwned(u8, a, c.q, "$B", base);
-    const into = if (c.select) "" else try msgfmt.allocPrint(a, "LOAD INTO '{s}/never.csv'{s} AS ", .{ base, if (split) " SPLIT BY (id)" else "" });
+    const into = if (c.select) "" else try msgfmt.allocPrint(a, "LOAD INTO '{s}/{s}'{s} AS ", .{ base, c.into, if (split) " SPLIT BY (id)" else "" });
     const ran = try head(a, try pathOf(a, tmp.dir, try msgfmt.allocPrint(a, "{s}EXPLAIN ANALYZE {s}{s};", .{ conn, into, q }), c.threads));
     const said = try head(a, try pathOf(a, tmp.dir, try msgfmt.allocPrint(a, "{s}EXPLAIN {s}{s};", .{ conn, into, q }), c.threads));
     const ok = std.mem.eql(u8, c.want, ran) and std.mem.eql(u8, c.static orelse c.want, said);
@@ -260,6 +265,7 @@ const report_cases = [_]ReportCase{
     .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.csv' SPLIT BY (id) AS SELECT t.id, k.g FROM pg.public.t t JOIN '$B/in.csv' k ON t.g = k.g;", .threads = 4, .says = &.{"sent: once per key range: SELECT"}, .never = unread },
     .{ .script = "EXPLAIN ANALYZE SELECT id FROM pg.public.t ORDER BY id LIMIT 3;", .threads = 4, .says = &.{"schema probe"}, .never = unread },
     .{ .script = "EXPLAIN ANALYZE SELECT * FROM pg.public.t LIMIT 3;", .threads = 4, .says = &.{"LIMIT 3"}, .never = unread },
+    .{ .script = "EXPLAIN ANALYZE LOAD INTO '$B/never.parquet' AS SELECT v, id AS key FROM '$B/p.parquet';", .says = &.{ "Path: parquet chunk copy, 10 row groups, 2 of 3 columns", "copy the column chunks" } },
     .{ .script = "EXPLAIN ANALYZE SELECT s.v, c.g FROM '$B/in.csv' s JOIN pg.public.t c ON c.id = s.id;", .says = &.{"schema probe"} },
     .{ .script = "EXPLAIN ANALYZE SELECT s.v, c.g FROM '$B/in.csv' s JOIN pg.public.t c ON c.id = s.id;", .threads = 4 },
     .{ .script = "EXPLAIN ANALYZE SELECT * FROM EACH TABLE OF (pg.QUERY($$SELECT \"tname\", \"tag\" FROM catalog$$));", .says = &.{ "postgres query, discovery", "union (#", "2 branches, from discovery", "postgres table t\n", "postgres table t2\n" } },

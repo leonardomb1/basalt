@@ -149,6 +149,9 @@ pub const FileMetaData = struct {
     row_groups: []RowGroup = &.{},
     created_by: []const u8 = "",
     column_orders: usize = 0,
+    /// The Thrift bytes this was parsed from, which it borrows, as `created_by` and
+    /// the names do: a copy rewrites the footer from them (`copy.zig`).
+    raw: []const u8 = "",
 
     /// Leaf columns, in the order their chunks appear. The first schema element is
     /// the synthetic root and is never a column.
@@ -181,7 +184,7 @@ pub fn parseFile(arena: std.mem.Allocator, bytes: []const u8) Error!FileMetaData
 
 pub fn parseFooter(arena: std.mem.Allocator, footer: []const u8) Error!FileMetaData {
     var r = thrift.Reader.init(footer);
-    var md = FileMetaData{};
+    var md = FileMetaData{ .raw = footer };
 
     try r.structBegin();
     while (true) {
@@ -553,6 +556,20 @@ pub const Page = struct {
     next_offset: usize,
 };
 
+pub const Framed = struct { header: PageHeader, body: []const u8, next: usize };
+
+/// The page at `offset` as it is framed: its header, and its body as stored, which
+/// must lie within `bytes`.
+pub fn pageAt(bytes: []const u8, offset: usize) Error!Framed {
+    if (offset >= bytes.len) return Error.NotParquet;
+    const h = try parsePageHeader(bytes[offset..]);
+    if (h.compressed_page_size < 0 or h.uncompressed_page_size < 0) return Error.NotParquet;
+    const body_start = offset + h.header_len;
+    const clen: usize = @intCast(h.compressed_page_size);
+    if (clen > bytes.len - body_start) return Error.NotParquet;
+    return .{ .header = h, .body = bytes[body_start..][0..clen], .next = body_start + clen };
+}
+
 /// Reads one page at `offset`: thrift header, then the body decompressed with the
 /// chunk's codec. In a v2 page the levels precede the values uncompressed, so they
 /// are carved off before decompressing.
@@ -562,15 +579,9 @@ pub fn readPage(
     offset: usize,
     compression: Codec,
 ) (Error || codec.Error)!Page {
-    if (offset >= bytes.len) return Error.NotParquet;
-    const h = try parsePageHeader(bytes[offset..]);
-    if (h.compressed_page_size < 0 or h.uncompressed_page_size < 0) return Error.NotParquet;
-
-    const body_start = offset + h.header_len;
-    const clen: usize = @intCast(h.compressed_page_size);
-    if (body_start + clen > bytes.len) return Error.NotParquet;
-
-    const body = bytes[body_start..][0..clen];
+    const pg = try pageAt(bytes, offset);
+    const h = pg.header;
+    const body = pg.body;
     const ulen: usize = @intCast(h.uncompressed_page_size);
 
     if (h.ty == .data_page_v2) {
@@ -582,11 +593,11 @@ pub fn readPage(
         const out = try arena.alloc(u8, ulen);
         @memcpy(out[0..lvl], body[0..lvl]);
         @memcpy(out[lvl..], values);
-        return .{ .header = h, .data = out, .next_offset = body_start + clen };
+        return .{ .header = h, .data = out, .next_offset = pg.next };
     }
 
     const raw = try codec.decompress(arena, compression, body, ulen);
-    return .{ .header = h, .data = raw, .next_offset = body_start + clen };
+    return .{ .header = h, .data = raw, .next_offset = pg.next };
 }
 
 const t = std.testing;

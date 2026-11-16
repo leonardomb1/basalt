@@ -70,7 +70,10 @@ or a Parquet into row groups, with the shape the lanes run (`map`, `map+join`,
 `aggregate`, `aggregate over joins`, `distinct`, `top-n`, `sort`, `window`); `postgres
 split-parallel …` is a SQL read divided into key ranges; a SQL source's aggregate
 or `ORDER BY … LIMIT` sent to the source comes first, then the split, each
-`unless` what would send it to the next; `… read into memory first (…), then
+`unless` what would send it to the next; `parquet chunk copy` is a Parquet file
+loaded whole into a Parquet file, its column chunks copied as they stand
+([Formats](formats.md)), unless a kept column is one the writer would write
+otherwise, then the path after `else`; `… read into memory first (…), then
 serial` is an aggregating CTE read on its own path ahead of a
 serial rest; `serial` is everything else (a CSV over HTTP is fetched whole, so it
 parses serially; an `UNNEST` or a `LIMIT` without `ORDER BY` over a file streams

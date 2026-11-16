@@ -11,6 +11,7 @@ const eval = @import("../../exec/eval.zig");
 pub const conv_utf8 = 0;
 pub const conv_map = 1;
 pub const conv_list = 3;
+const conv_enum = 4;
 pub const conv_decimal = 5;
 pub const conv_date = 6;
 const conv_time_millis = 7;
@@ -24,6 +25,7 @@ const conv_uint64 = 14;
 pub const conv_int8 = 15;
 pub const conv_int16 = 16;
 pub const conv_int32 = 17;
+const conv_int64 = 18;
 const conv_json = 19;
 const conv_bson = 20;
 const logical = @import("testing_util.zig").logical;
@@ -134,6 +136,67 @@ fn convertedBasaltType(e: parquet.SchemaElement, phys: parquet.PhysicalType) Err
             break :blk types.Type.init(.bytes);
         },
         else => Error.UnsupportedParquetSchema,
+    };
+}
+
+/// What a leaf's annotations say its values are, the same however a writer spelled
+/// it: by a logical type, by the converted type it replaced (a converted temporal is
+/// UTC-adjusted, as the spec defines it), or by nothing on a physical type whose bare
+/// form already says it (a bare INT32 or INT64 is a signed integer of its width).
+pub const Meaning = union(enum) {
+    none,
+    string,
+    @"enum",
+    uuid,
+    json,
+    bson,
+    date,
+    decimal: struct { precision: i32, scale: i32 },
+    time: struct { unit: parquet.TimeUnit, utc: bool },
+    timestamp: struct { unit: parquet.TimeUnit, utc: bool },
+    integer: struct { bits: i8, signed: bool },
+    other,
+};
+
+pub fn meaning(e: parquet.SchemaElement) Meaning {
+    if (e.logical_type) |lt| return switch (lt) {
+        .string => .string,
+        .@"enum" => .@"enum",
+        .uuid => .uuid,
+        .json => .json,
+        .bson => .bson,
+        .date => .date,
+        .decimal => |d| .{ .decimal = .{ .precision = d.precision, .scale = d.scale } },
+        .time => |tt| .{ .time = .{ .unit = tt.unit, .utc = tt.adjusted_to_utc } },
+        .timestamp => |tt| .{ .timestamp = .{ .unit = tt.unit, .utc = tt.adjusted_to_utc } },
+        .integer => |it| .{ .integer = .{ .bits = it.bit_width, .signed = it.signed } },
+        .other => .other,
+    };
+    if (e.converted_type) |c| return switch (c) {
+        conv_utf8 => .string,
+        conv_enum => .@"enum",
+        conv_decimal => .{ .decimal = .{ .precision = e.precision orelse 0, .scale = e.scale orelse 0 } },
+        conv_date => .date,
+        conv_time_millis => .{ .time = .{ .unit = .millis, .utc = true } },
+        conv_time_micros => .{ .time = .{ .unit = .micros, .utc = true } },
+        conv_timestamp_millis => .{ .timestamp = .{ .unit = .millis, .utc = true } },
+        conv_timestamp_micros => .{ .timestamp = .{ .unit = .micros, .utc = true } },
+        conv_uint8 => .{ .integer = .{ .bits = 8, .signed = false } },
+        conv_uint16 => .{ .integer = .{ .bits = 16, .signed = false } },
+        conv_uint32 => .{ .integer = .{ .bits = 32, .signed = false } },
+        conv_uint64 => .{ .integer = .{ .bits = 64, .signed = false } },
+        conv_int8 => .{ .integer = .{ .bits = 8, .signed = true } },
+        conv_int16 => .{ .integer = .{ .bits = 16, .signed = true } },
+        conv_int32 => .{ .integer = .{ .bits = 32, .signed = true } },
+        conv_int64 => .{ .integer = .{ .bits = 64, .signed = true } },
+        conv_json => .json,
+        conv_bson => .bson,
+        else => .other,
+    };
+    return switch (e.ty orelse return .other) {
+        .int32 => .{ .integer = .{ .bits = 32, .signed = true } },
+        .int64 => .{ .integer = .{ .bits = 64, .signed = true } },
+        else => .none,
     };
 }
 
@@ -353,4 +416,15 @@ test "LogicalType wins over a ConvertedType, and agreeing annotations stay put" 
     var other = logical(.int32, .other);
     other.converted_type = 6;
     try testing.expectEqual(types.TypeKind.date, (try basaltType(other)).kind);
+}
+
+test "meaning: the same annotation spelled by a logical type, a converted type or a bare physical type" {
+    const tu = @import("testing_util.zig");
+    try testing.expectEqual(meaning(.{ .ty = .int64 }), meaning(.{ .ty = .int64, .converted_type = conv_int64 }));
+    try testing.expectEqual(meaning(.{ .ty = .int64 }), meaning(tu.logical(.int64, .{ .integer = .{ .bit_width = 64, .signed = true } })));
+    try testing.expectEqual(meaning(.{ .ty = .byte_array, .converted_type = conv_utf8 }), meaning(tu.logical(.byte_array, .string)));
+    try testing.expectEqual(Meaning{ .timestamp = .{ .unit = .micros, .utc = true } }, meaning(.{ .ty = .int64, .converted_type = conv_timestamp_micros }));
+    try testing.expect(!std.meta.eql(meaning(.{ .ty = .byte_array, .converted_type = conv_json }), meaning(tu.logical(.byte_array, .string))));
+    try testing.expectEqual(Meaning.none, meaning(.{ .ty = .byte_array }));
+    try testing.expectEqual(Meaning{ .integer = .{ .bits = 32, .signed = false } }, meaning(.{ .ty = .int32, .converted_type = conv_uint32 }));
 }

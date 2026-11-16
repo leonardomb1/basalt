@@ -217,6 +217,44 @@ fn mapPhysical(t: types.Type, ph: Physical) Error!Mapping {
     };
 }
 
+/// Whether a flat leaf `e`, read and written back by this writer, keeps its physical
+/// type and width and annotations that mean the same (`logical.meaning`), so its
+/// chunk can be copied as it stands. A UINT, INT32, FLOAT, INT96, millisecond or UTC
+/// column does not: the writer widens or re-annotates it. Repetition is not
+/// compared: the reader types every column nullable, so the writer declares it
+/// OPTIONAL, while a copied REQUIRED chunk, which holds no definition levels, stays
+/// REQUIRED, its values the same.
+pub fn writesAsIs(e: parquet.SchemaElement) bool {
+    if (!e.isLeaf() or e.repetition == .repeated) return false;
+    const m = mapType((logical.basaltType(e) catch return false).sinkType()) catch return false;
+    const w = leafElement(e.name, m);
+    if (e.ty != w.ty) return false;
+    if (w.ty == .fixed_len_byte_array and e.type_length != w.type_length) return false;
+    return std.meta.eql(logical.meaning(e), logical.meaning(w));
+}
+
+/// The schema element `writeSchemaLeaf` writes for mapping `m`.
+fn leafElement(name: []const u8, m: Mapping) parquet.SchemaElement {
+    return .{
+        .ty = m.phys,
+        .type_length = m.type_length,
+        .repetition = if (m.optional) .optional else .required,
+        .name = name,
+        .converted_type = m.converted,
+        .scale = m.scale,
+        .precision = m.precision,
+        .logical_type = if (m.converted) |c| switch (c) {
+            logical.conv_utf8 => .string,
+            logical.conv_decimal => .{ .decimal = .{ .scale = m.scale orelse 0, .precision = m.precision orelse 18 } },
+            logical.conv_date => .date,
+            logical.conv_time_micros => .{ .time = .{ .adjusted_to_utc = false, .unit = .micros } },
+            logical.conv_timestamp_micros => .{ .timestamp = .{ .adjusted_to_utc = m.utc, .unit = .micros } },
+            logical.conv_int8, logical.conv_int16, logical.conv_int32 => .{ .integer = .{ .bit_width = @intCast(m.int_bits), .signed = true } },
+            else => null,
+        } else null,
+    };
+}
+
 /// Narrowest two's-complement byte width that holds every `p`-digit decimal;
 /// 16 at p = 38.
 fn flbaLen(p: i32) i32 {
@@ -518,7 +556,7 @@ const RowGroupMeta = struct {
     total_byte_size: i64,
 };
 
-const parquet_content_type = "application/vnd.apache.parquet";
+pub const parquet_content_type = "application/vnd.apache.parquet";
 
 pub const Writer = struct {
     arena: std.mem.Allocator,
@@ -916,7 +954,7 @@ pub const Writer = struct {
         try writeSchemaRoot(&w, self.schema.fields.len);
         for (self.schema.fields, self.lays) |f, lay| {
             const sh = lay.shape orelse {
-                try writeSchemaLeaf(&w, f.name, self.maps[lay.first], self.fieldId(f.name));
+                try writeSchemaLeaf(&w, leafElement(f.name, self.maps[lay.first]), self.fieldId(f.name));
                 continue;
             };
             var leaf = lay.first;
@@ -925,7 +963,7 @@ pub const Writer = struct {
                     try writeSchemaGroup(&w, e, self.fieldId(e.name));
                     continue;
                 }
-                try writeSchemaLeaf(&w, e.name, self.maps[leaf], self.fieldId(e.name));
+                try writeSchemaLeaf(&w, leafElement(e.name, self.maps[leaf]), self.fieldId(e.name));
                 leaf += 1;
             }
         }
@@ -1179,44 +1217,44 @@ fn writeSchemaGroup(w: *thrift.Writer, e: parquet.SchemaElement, id: ?i32) !void
     try w.structEnd();
 }
 
-fn writeSchemaLeaf(w: *thrift.Writer, name: []const u8, m: Mapping, id: ?i32) !void {
+fn writeSchemaLeaf(w: *thrift.Writer, e: parquet.SchemaElement, id: ?i32) !void {
     try w.structBegin();
-    try w.writeI32(1, @intFromEnum(m.phys));
-    if (m.type_length) |n| try w.writeI32(2, n);
-    try w.writeI32(3, @intFromEnum(if (m.optional) parquet.Repetition.optional else parquet.Repetition.required));
-    try w.writeBinary(4, name);
-    if (m.converted) |c| try w.writeI32(6, c);
-    if (m.scale) |s| try w.writeI32(7, s);
-    if (m.precision) |p| try w.writeI32(8, p);
+    try w.writeI32(1, @intFromEnum(e.ty.?));
+    if (e.type_length) |n| try w.writeI32(2, n);
+    try w.writeI32(3, @intFromEnum(e.repetition.?));
+    try w.writeBinary(4, e.name);
+    if (e.converted_type) |c| try w.writeI32(6, c);
+    if (e.scale) |s| try w.writeI32(7, s);
+    if (e.precision) |p| try w.writeI32(8, p);
     if (id) |x| try w.writeI32(9, x);
-    try writeLogicalType(w, m);
+    if (e.logical_type) |lt| try writeLogicalType(w, lt);
     try w.structEnd();
 }
 
 /// `LogicalType` (SchemaElement field 10), emitted beside ConvertedType so old and
-/// new readers agree; it alone carries a timestamp's unit and UTC flag.
-fn writeLogicalType(w: *thrift.Writer, m: Mapping) !void {
-    const c = m.converted orelse return;
+/// new readers agree; it alone carries a timestamp's unit and UTC flag. The writer
+/// counts time in micros.
+fn writeLogicalType(w: *thrift.Writer, lt: parquet.LogicalType) !void {
     try w.fieldBegin(.@"struct", 10);
     try w.structBegin();
-    switch (c) {
-        logical.conv_utf8 => try emptyVariant(w, 1),
-        logical.conv_decimal => {
+    switch (lt) {
+        .string => try emptyVariant(w, 1),
+        .decimal => |d| {
             try w.fieldBegin(.@"struct", 5);
             try w.structBegin();
-            try w.writeI32(1, m.scale orelse 0);
-            try w.writeI32(2, m.precision orelse 18);
+            try w.writeI32(1, d.scale);
+            try w.writeI32(2, d.precision);
             try w.structEnd();
         },
-        logical.conv_date => try emptyVariant(w, 6),
-        logical.conv_time_micros => try timeVariant(w, 7, false),
-        logical.conv_timestamp_micros => try timeVariant(w, 8, m.utc),
-        logical.conv_int8, logical.conv_int16, logical.conv_int32 => {
+        .date => try emptyVariant(w, 6),
+        .time => |tt| try timeVariant(w, 7, tt.adjusted_to_utc),
+        .timestamp => |tt| try timeVariant(w, 8, tt.adjusted_to_utc),
+        .integer => |it| {
             try w.fieldBegin(.@"struct", 10);
             try w.structBegin();
             try w.fieldBegin(.byte, 1);
-            try w.out.append(m.int_bits);
-            try w.writeBool(2, true);
+            try w.out.append(@bitCast(it.bit_width));
+            try w.writeBool(2, it.signed);
             try w.structEnd();
         },
         else => {},
@@ -2756,4 +2794,60 @@ test "a decimal with digits past its column's scale fails the write, naming the 
     var cols = [_]column.Column{try xs.finish()};
     try testing.expectError(Error.DecimalDropsDigits, w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 2 }));
     try testing.expect(std.mem.indexOf(u8, eval.takeFailure(Error.DecimalDropsDigits).?, "`amount`") != null);
+}
+
+test "writesAsIs: every scalar column this writer writes comes back as it went, and what it would widen or re-annotate does not" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fs.path.join(a, &.{ try tmp.dir.realpathAlloc(a, "."), "all.parquet" });
+    const kinds = [_]types.Type{
+        types.Type.init(.int),    types.Type.init(.float),   types.Type.init(.bool),    types.Type.init(.string),
+        types.Type.init(.bytes),  types.Type.init(.date),    types.Type.init(.time),    types.Type.init(.timestamp),
+        types.Type.decimal(9, 2), types.Type.decimal(18, 4), types.Type.decimal(30, 5),
+    };
+    var fields: [kinds.len]types.Schema.Field = undefined;
+    var cols: [kinds.len]column.Column = undefined;
+    for (kinds, &fields, &cols, 0..) |k, *f, *c, i| {
+        f.* = .{ .name = try std.fmt.allocPrint(a, "c{d}", .{i}), .ty = k.asNullable() };
+        var b = column.Builder.init(a, f.ty);
+        try b.append(.null);
+        c.* = try b.finish();
+    }
+    const schema = types.Schema{ .fields = &fields };
+    var w = try Writer.open(a, path, schema, .snappy, .truncate);
+    try w.writeBatch(a, .{ .schema = &schema, .columns = &cols, .len = 1 });
+    try w.close();
+    const md = try parquet.parseFile(a, try std.fs.cwd().readFileAlloc(a, path, 1 << 20));
+    for (md.schema[1..]) |e| testing.expect(writesAsIs(e)) catch |err| {
+        std.debug.print("{s} does not come back as written\n", .{e.name});
+        return err;
+    };
+
+    const tu = @import("testing_util.zig");
+    const refused = [_]parquet.SchemaElement{
+        .{ .name = "i32", .ty = .int32 },
+        .{ .name = "f32", .ty = .float },
+        .{ .name = "i96", .ty = .int96 },
+        .{ .name = "u32", .ty = .int32, .converted_type = 13 },
+        .{ .name = "json", .ty = .byte_array, .converted_type = 19 },
+        .{ .name = "ts_conv", .ty = .int64, .converted_type = logical.conv_timestamp_micros },
+        tu.logical(.int64, .{ .timestamp = .{ .adjusted_to_utc = false, .unit = .millis } }),
+        tu.logical(.int64, .{ .timestamp = .{ .adjusted_to_utc = true, .unit = .micros } }),
+        tu.logical(.fixed_len_byte_array, .{ .decimal = .{ .scale = 2, .precision = 12 } }),
+        .{ .name = "rep", .ty = .int64, .repetition = .repeated },
+    };
+    for (refused) |e| testing.expect(!writesAsIs(e)) catch |err| {
+        std.debug.print("{s} {any} was taken as written alike\n", .{ e.name, e.ty });
+        return err;
+    };
+    const taken = [_]parquet.SchemaElement{
+        .{ .name = "i64", .ty = .int64, .converted_type = 18 },
+        .{ .name = "utf8", .ty = .byte_array, .converted_type = logical.conv_utf8, .repetition = .required },
+        tu.logical(.int64, .{ .timestamp = .{ .adjusted_to_utc = false, .unit = .micros } }),
+        tu.logical(.byte_array, .string),
+    };
+    for (taken) |e| try testing.expect(writesAsIs(e));
 }
