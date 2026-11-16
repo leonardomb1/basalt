@@ -1470,3 +1470,41 @@ test "filterBounds: a filter past a LIMIT prunes no row group, one past a sort s
     try std.testing.expectEqual(@as(usize, 1), (try filterBounds(&env, &.{ gt, lim, lt })).len);
     try std.testing.expectEqual(@as(usize, 0), (try filterBounds(&env, &.{ lim, gt })).len);
 }
+
+test "a change-feed read has no descriptor from its stage alone, so no top-N, whole aggregate or key range goes over the table instead of its changes" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const parser = @import("../lang/sql_parser.zig");
+    const env_mod = @import("env.zig");
+
+    var pd: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(a,
+        \\CREATE CONNECTION ms TYPE sqlserver OPTIONS (host = 'h', database = 'd', user = 'u', password = 'p');
+        \\SELECT id FROM ms.dbo.t WITH (changes_from = 5) ORDER BY id LIMIT 3;
+        \\SELECT id FROM ms.dbo.t WITH (split = id) ORDER BY id LIMIT 3;
+    , &pd);
+    var params = std.StringHashMap(Value).init(a);
+    var bindings = std.StringHashMap(ast.Pipeline).init(a);
+    var connections = std.StringHashMap(ast.Connection).init(a);
+    var leads = std.array_list.Managed(ast.Stage).init(a);
+    for (prog.stmts) |st| switch (st) {
+        .connection => |c| try connections.put(c.name, c),
+        .output => |o| try leads.append(o.stages[0]),
+        else => {},
+    };
+    var sources = std.array_list.Managed(@import("../exec/driver.zig").Source).init(a);
+    var diag = env_mod.Diag{};
+    var log = obs.Logger.init(0, .text, .err);
+    var params_expr = std.StringHashMap(*const ast.Expr).init(a);
+    var errctx = op.ErrCtx{};
+    var rows = obs.RowCounter.init(0);
+    var json = std.StringHashMap(std.json.Value).init(a);
+    const fns = std.StringHashMap(ast.FnDecl).init(a);
+    var env = Env{ .arena = a, .gpa = a, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .diag = &diag, .log = &log, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows, .json_params = &json, .fns = &fns };
+
+    try std.testing.expectEqual(@as(usize, 2), leads.items.len);
+    try std.testing.expect((try sql_read.sqlDescForStage(&env, leads.items[0])) == null);
+    const split_desc = (try sql_read.sqlDescForStage(&env, leads.items[1])).?;
+    try std.testing.expect(std.mem.indexOf(u8, split_desc.base_sql, "[t]") != null);
+}

@@ -20,6 +20,7 @@ const split = @import("split.zig");
 const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const std = @import("std");
+const changes = @import("changes.zig");
 const msgfmt = @import("../../base/msgfmt.zig");
 const observe = @import("observe.zig");
 const columnFacts = @import("facts.zig").columnFacts;
@@ -359,9 +360,13 @@ pub fn sqlDescFor(env: *Env, kind: SqlKind, dialect: sql.Dialect, cfg: DbConfig,
 }
 
 /// Recomputed rather than read from `env.pipe.sql_desc`, which is last-writer-wins: a
-/// join plans its build side after the probe read. Null for a non-splittable read.
+/// join plans its build side after the probe read. Null for a non-splittable read,
+/// and for a change-feed read, whose query is the feed's and known only as it opens:
+/// the table's own would push a top-N or cut key ranges over the table, not its
+/// changes.
 pub fn sqlDescForStage(env: *Env, stage: ast.Stage) !?SqlDesc {
     if (stage.node != .read) return null;
+    if (changes.asked(stage.hints)) return null;
     const rd = stage.node.read;
     const conn = env.connections.get(rd.connector) orelse return null;
     const info = sqlConnInfo(conn) orelse return null;
