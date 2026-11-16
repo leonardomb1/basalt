@@ -34,6 +34,14 @@ pub const Conn = struct {
     sw: std.net.Stream.Writer = undefined,
     msg: std.array_list.Managed(u8),
     last_error: []const u8 = "",
+    /// Whether the server said of `last_error` that the statement may simply run
+    /// again: a deadlock victim, a serialization failure, a lock wait that timed out.
+    /// Nothing of the statement stayed, so a caller that sent it alone may resend it.
+    last_rerun: bool = false,
+    /// Whether the server said with `last_error` that it is ending the connection (an
+    /// administrator's kill, a shutdown, an idle timeout): what failed on it is a
+    /// network failure, `ServerClosedConnection`, not the statement's.
+    last_gone: bool = false,
     tls: ?*sql.TlsState = null,
     carrier: *std.Io.Writer = undefined,
     timeouts: netconn.Timeouts = .{},
@@ -70,6 +78,7 @@ pub const Conn = struct {
     pub fn queryFailed(self: *Conn, e: anyerror) anyerror {
         if (self.timeouts.query_s > 0 and netconn.ioTimedOut(&self.sr, &self.sw))
             self.printError("{s}: no reply within query_timeout ({d} s)", .{ self.peer.get(), self.timeouts.query_s }) catch {};
+        if (self.last_gone) return error.ServerClosedConnection;
         return e;
     }
 
@@ -119,6 +128,15 @@ pub const Conn = struct {
     pub fn putError(self: *Conn, owned: []const u8) void {
         if (self.last_error.len > 0) self.gpa.free(self.last_error);
         self.last_error = owned;
+        self.last_rerun = false;
+        self.last_gone = false;
+    }
+
+    /// The server's error `msg`, as `rerun`, `gone` say of it.
+    pub fn serverError(self: *Conn, msg: []const u8, how: struct { rerun: bool = false, gone: bool = false }) !void {
+        try self.setError(msg);
+        self.last_rerun = how.rerun;
+        self.last_gone = how.gone;
     }
 
     /// `putError` with a copy of `msg`.

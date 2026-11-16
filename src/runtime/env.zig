@@ -89,6 +89,7 @@ pub fn isTransient(e: anyerror) bool {
         error.SshConnectionLost,
         error.S3Throttled,
         error.AzureThrottled,
+        error.LockConflict,
         => true,
         else => false,
     };

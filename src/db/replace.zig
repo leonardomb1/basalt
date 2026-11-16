@@ -62,11 +62,13 @@ pub fn stagingName(a: std.mem.Allocator, target: []const u8, tag: u32) ![]const 
     return msgfmt.allocPrint(a, "{s}_basalt_stage_{s}_{x:0>8}", .{ schema, table[0..@min(table.len, room)], tag });
 }
 
-/// The statement that makes this run's staging table `staging`, shaped like the
-/// target, which must already exist.
+/// The statements that make this run's staging table `staging`, shaped like the
+/// target, which must already exist. The name is this run's own, so a table of it
+/// left by an earlier try whose reply was lost is dropped first, and the setup may run again.
 pub fn setupSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, staging: []const u8) ![]const []const u8 {
-    const out = try a.alloc([]const u8, 1);
-    out[0] = try intrinsics(d).createLike(a, try sql.quoteIdent(a, d, staging), try sql.quoteIdent(a, d, target));
+    const out = try a.alloc([]const u8, 2);
+    out[0] = try dropSql(a, d, staging);
+    out[1] = try intrinsics(d).createLike(a, try sql.quoteIdent(a, d, staging), try sql.quoteIdent(a, d, target));
     return out;
 }
 

@@ -21,6 +21,7 @@ const sql = @import("../../db/sql.zig");
 const sqlConnInfo = @import("../connect.zig").sqlConnInfo;
 const srOpenErr = @import("../env.zig").srOpenErr;
 const std = @import("std");
+const retry = @import("../../net/retry.zig");
 const msgfmt = @import("../../base/msgfmt.zig");
 const replace = @import("../../db/replace.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
@@ -106,12 +107,39 @@ pub const ReplacePlan = struct {
         self.run(&.{drop}, "staging cleanup") catch {};
     }
 
+    /// `stmts` on a connection of their own, run again from the start on a fresh one
+    /// (`net/retry.zig`) after a network failure or when the server says to (a
+    /// deadlock victim): each step may run twice, the setup dropping its own table
+    /// first, the cutover clearing the target and copying from staging again, and a
+    /// transaction the failure cut short rolls back as its connection closes.
     fn run(self: *ReplacePlan, stmts: []const []const u8, step: []const u8) !void {
-        const conn = try connectSql(self.gpa, self.kind, self.cfg);
-        defer conn.close();
-        replace.execAll(conn, stmts) catch |e| {
-            if (self.errctx) |ec| if (conn.lastError().len > 0) ec.set("{s} refused the REPLACE {s}: {s}", .{ @tagName(self.dialect), step, conn.lastError() });
-            return e;
+        const Try = struct {
+            plan: *ReplacePlan,
+            stmts: []const []const u8,
+            msg: std.array_list.Managed(u8),
+            rerun: bool = false,
+
+            fn attempt(t: *@This()) !retry.Verdict {
+                const p = t.plan;
+                const conn = try connectSql(p.gpa, p.kind, p.cfg);
+                defer conn.close();
+                replace.execAll(conn, t.stmts) catch |e| {
+                    t.msg.clearRetainingCapacity();
+                    try t.msg.appendSlice(conn.lastError());
+                    t.rerun = conn.rerunnable();
+                    if (t.rerun) return .{ .failed = .{ .code = 0, .err = e, .retriable = true } };
+                    if (netconn.transientNet(e)) return e;
+                    return .{ .failed = .{ .code = 0, .err = e, .retriable = false } };
+                };
+                return .done;
+            }
+        };
+        var prng = retry.jitterPrng();
+        var t = Try{ .plan = self, .stmts = stmts, .msg = std.array_list.Managed(u8).init(self.gpa) };
+        defer t.msg.deinit();
+        retry.retry(.{ .rand = prng.random(), .base_ms = 250 }, &t, Try.attempt) catch |e| {
+            if (self.errctx) |ec| if (t.msg.items.len > 0) ec.set("{s} refused the REPLACE {s}: {s}", .{ @tagName(self.dialect), step, t.msg.items });
+            return sql.rerunError(t.rerun, e);
         };
     }
 };

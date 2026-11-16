@@ -263,6 +263,8 @@ pub const Conn = struct {
     /// The server's ERROR token text as `last_error`, then `e`.
     fn failWith(self: *Conn, body: []const u8, comptime e: anytype) (@TypeOf(e) || std.mem.Allocator.Error) {
         self.wire.putError(try errorText(self.wire.gpa, body));
+        self.wire.last_rerun = rerunNumber(body);
+        self.wire.last_gone = body.len >= 6 and body[5] >= 20;
         return e;
     }
 
@@ -2403,6 +2405,21 @@ fn featureExtAck(r: *Body) Body.Error![]const u8 {
 
 /// ERROR token body: Number(4) State(1) Class(1) MsgLen(2) Msg(UTF-16), kept as its
 /// low bytes.
+/// An ERROR token's number: 1205 a deadlock victim, 1222 a lock request timed out;
+/// either rolled back what it says, which may then run again.
+fn rerunNumber(body: []const u8) bool {
+    if (body.len < 4) return false;
+    const n = std.mem.readInt(u32, body[0..4], .little);
+    return n == 1205 or n == 1222;
+}
+
+test "an ERROR token is rerunnable by its number: a deadlock victim or a lock timeout, not a key violation" {
+    try std.testing.expect(rerunNumber("\xb5\x04\x00\x00\x2d\x0d"));
+    try std.testing.expect(rerunNumber("\xc6\x04\x00\x00\x38\x10"));
+    try std.testing.expect(!rerunNumber("\x43\x0a\x00\x00\x01\x0e"));
+    try std.testing.expect(!rerunNumber("\xb5\x04"));
+}
+
 fn errorText(gpa: std.mem.Allocator, body: []const u8) ![]const u8 {
     if (body.len < 8) return gpa.dupe(u8, "the server sent a malformed error");
     const msglen: usize = std.mem.readInt(u16, body[6..8], .little);

@@ -118,7 +118,7 @@ pub const Conn = struct {
                     }
                 },
                 'E' => {
-                    try self.wire.setError(errMessage(p));
+                    try self.serverError(p);
                     return error.PgAuthFailed;
                 },
                 'Z' => return,
@@ -219,7 +219,7 @@ pub const Conn = struct {
 
         const t = try self.readMsg();
         if (t == 'E') {
-            try self.wire.setError(errMessage(self.wire.msg.items));
+            try self.serverError(self.wire.msg.items);
             return error.PgAuthFailed;
         }
         if (t != 'R' or (try authCode(self.wire.msg.items)) != 12) return error.PgAuthFailed;
@@ -259,7 +259,7 @@ pub const Conn = struct {
                 },
                 'C' => {},
                 'E' => {
-                    try self.wire.setError(errMessage(p));
+                    try self.serverError(p);
                     return error.PgQueryFailed;
                 },
                 'Z' => {
@@ -284,7 +284,7 @@ pub const Conn = struct {
                 },
                 'Z' => return .end,
                 'E' => {
-                    try self.wire.setError(errMessage(p));
+                    try self.serverError(p);
                     return error.PgQueryFailed;
                 },
                 'T' => {
@@ -306,7 +306,7 @@ pub const Conn = struct {
             const t = try self.readMsg();
             switch (t) {
                 'E' => if (!failed) {
-                    try self.wire.setError(errMessage(self.wire.msg.items));
+                    try self.serverError(self.wire.msg.items);
                     failed = true;
                 },
                 'Z' => break,
@@ -329,7 +329,7 @@ pub const Conn = struct {
             switch (try self.readMsg()) {
                 'G' => return,
                 'E' => {
-                    try self.wire.setError(errMessage(self.wire.msg.items));
+                    try self.serverError(self.wire.msg.items);
                     return error.PgQueryFailed;
                 },
                 'Z' => return error.PgProtocol,
@@ -351,7 +351,7 @@ pub const Conn = struct {
             switch (try self.readMsg()) {
                 'C' => count = parseCopyCount(self.wire.msg.items),
                 'E' => {
-                    try self.wire.setError(errMessage(self.wire.msg.items));
+                    try self.serverError(self.wire.msg.items);
                     return error.PgQueryFailed;
                 },
                 'Z' => return count orelse error.PgProtocol,
@@ -373,7 +373,41 @@ pub const Conn = struct {
     fn readMsg(self: *Conn) !u8 {
         return readMessage(self.wire.rd(), &self.wire.msg);
     }
+
+    /// An ErrorResponse `p` as the last error, rerunnable by its SQLSTATE, the end of
+    /// the connection when FATAL or of a class that says so.
+    fn serverError(self: *Conn, p: []const u8) !void {
+        const code = errField(p, 'C') orelse "";
+        const sev = errField(p, 'V') orelse errField(p, 'S') orelse "";
+        try self.wire.serverError(errMessage(p), .{ .rerun = rerunState(code), .gone = goneState(sev, code) });
+    }
 };
+
+/// A deadlock victim (40P01) or a serialization failure (40001): the server rolled
+/// the transaction back and says to run it again.
+fn rerunState(code: []const u8) bool {
+    return std.mem.eql(u8, code, "40P01") or std.mem.eql(u8, code, "40001");
+}
+
+/// A FATAL or PANIC error, or a connection exception (08) or operator intervention
+/// (57P01 admin shutdown, 57P02 crash shutdown, 57P03 cannot connect now): the
+/// server is closing the connection, as a kill of an idle one sends before it does.
+fn goneState(severity: []const u8, code: []const u8) bool {
+    if (std.mem.eql(u8, severity, "FATAL") or std.mem.eql(u8, severity, "PANIC")) return true;
+    return std.mem.startsWith(u8, code, "08") or std.mem.startsWith(u8, code, "57P0");
+}
+
+test "an ErrorResponse is rerunnable by its SQLSTATE: a deadlock victim or a serialization failure, not a key violation" {
+    const deadlock = "SERROR\x00C40P01\x00Mdeadlock detected\x00\x00";
+    try std.testing.expectEqualStrings("deadlock detected", errMessage(deadlock));
+    try std.testing.expect(rerunState(errField(deadlock, 'C').?));
+    try std.testing.expect(rerunState(errField("SERROR\x00C40001\x00Mcould not serialize access\x00\x00", 'C').?));
+    try std.testing.expect(!rerunState(errField("SERROR\x00C23505\x00Mduplicate key value\x00\x00", 'C').?));
+    try std.testing.expect(errField("SERROR\x00Mno code\x00\x00", 'C') == null);
+    const killed = "SFATAL\x00VFATAL\x00C57P01\x00Mterminating connection due to administrator command\x00\x00";
+    try std.testing.expect(goneState(errField(killed, 'V').?, errField(killed, 'C').?));
+    try std.testing.expect(!goneState("ERROR", "40P01"));
+}
 
 /// PostgreSQL's own ceiling on a message (MaxAllocSize).
 const max_message: usize = (1 << 30) - 1;
@@ -727,17 +761,22 @@ test "COPY writes a BYTES cell as bytea hex, its backslash escaped for the text 
 }
 
 fn errMessage(p: []const u8) []const u8 {
+    return errField(p, 'M') orelse "postgres error";
+}
+
+/// Field `ft` of an ErrorResponse body: `M` its message, `C` its SQLSTATE.
+fn errField(p: []const u8, ft: u8) ?[]const u8 {
     var i: usize = 0;
     while (i < p.len and p[i] != 0) {
-        const ft = p[i];
+        const t = p[i];
         i += 1;
         const start = i;
         while (i < p.len and p[i] != 0) : (i += 1) {}
         const val = p[start..i];
         i += 1;
-        if (ft == 'M') return val;
+        if (t == ft) return val;
     }
-    return "postgres error";
+    return null;
 }
 
 test "a bytea reads as BYTES in either output format and a time as TIME; timetz stays text, and a time past the day fails naming its column" {

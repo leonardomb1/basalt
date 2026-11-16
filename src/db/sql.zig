@@ -182,10 +182,18 @@ pub const Conn = struct {
         exec: *const fn (*anyopaque, []const u8) anyerror!void,
         close: *const fn (*anyopaque) void,
         last_error: ?*const fn (*anyopaque) []const u8 = null,
+        rerun: ?*const fn (*anyopaque) bool = null,
     };
 
     pub fn lastError(self: Conn) []const u8 {
         const f = self.vtable.last_error orelse return "";
+        return f(self.ptr);
+    }
+
+    /// Whether the server said of the last failed statement that it may run again
+    /// (`wire.Conn.last_rerun`).
+    pub fn rerunnable(self: Conn) bool {
+        const f = self.vtable.rerun orelse return false;
         return f(self.ptr);
     }
 
@@ -226,7 +234,19 @@ pub fn connVTable(comptime T: type) Conn.VTable {
                 return @as(*T, @ptrCast(@alignCast(p))).wire.last_error;
             }
         }.f,
+        .rerun = struct {
+            fn f(p: *anyopaque) bool {
+                return @as(*T, @ptrCast(@alignCast(p))).wire.last_rerun;
+            }
+        }.f,
     };
+}
+
+/// `e`, or `LockConflict` when the server said the statement may run again (a
+/// deadlock victim, a serialization failure, a lock wait timed out) and its retries
+/// ran out: a run failing on it is transient, exit 75, as the contention passes.
+pub fn rerunError(rerun: bool, e: anyerror) anyerror {
+    return if (rerun) error.LockConflict else e;
 }
 
 /// A load the server refused: its own message into `errctx`, so the run reports
@@ -620,19 +640,43 @@ pub const Sink = struct {
     fn flush(self: *Sink) !void {
         if (self.pending == 0) return;
         try self.stmt.appendSlice(self.tail);
-        const stmt = self.stmt.items;
-        self.conn.exec(stmt) catch |e| {
-            const rd = self.redial orelse return refused(self.errctx, self.dialect, self.conn.lastError(), e);
-            if (!netconn.transientNet(e)) return refused(self.errctx, self.dialect, self.conn.lastError(), e);
-            self.conn.close();
-            self.conn_alive = false;
-            if (!retry.pauseWith(std.Thread.sleep, 500)) return e;
-            self.conn = try rd.dial(rd.ctx, self.gpa);
-            self.conn_alive = true;
-            try self.conn.exec(stmt);
-        };
+        try self.send(self.stmt.items);
         self.stmt.shrinkRetainingCapacity(self.head_len);
         self.pending = 0;
+    }
+
+    /// `stmt`, a statement of its own (autocommit, so a failure rolled all of it
+    /// back), sent until it lands (`net/retry.zig`): again on the same connection
+    /// when the server says to (a deadlock victim, a serialization failure, a lock
+    /// wait timed out), on a fresh one after a network failure, given a `redial`.
+    fn send(self: *Sink, stmt: []const u8) !void {
+        const Try = struct {
+            sink: *Sink,
+            stmt: []const u8,
+            msg: []const u8 = "",
+
+            fn attempt(t: *@This()) !retry.Verdict {
+                const k = t.sink;
+                if (!k.conn_alive) {
+                    const rd = k.redial.?;
+                    k.conn = try rd.dial(rd.ctx, k.gpa);
+                    k.conn_alive = true;
+                }
+                k.conn.exec(t.stmt) catch |e| {
+                    t.msg = k.conn.lastError();
+                    if (k.conn.rerunnable()) return .{ .failed = .{ .code = 0, .err = e, .retriable = true } };
+                    if (k.redial == null or !netconn.transientNet(e)) return .{ .failed = .{ .code = 0, .err = e, .retriable = false } };
+                    k.conn.close();
+                    k.conn_alive = false;
+                    return e;
+                };
+                return .done;
+            }
+        };
+        var prng = retry.jitterPrng();
+        var t = Try{ .sink = self, .stmt = stmt };
+        retry.retry(.{ .rand = prng.random(), .base_ms = 250 }, &t, Try.attempt) catch |e|
+            return refused(self.errctx, self.dialect, if (self.conn_alive) self.conn.lastError() else t.msg, rerunError(self.conn_alive and self.conn.rerunnable(), e));
     }
 
     pub fn close(self: *Sink) !void {
@@ -717,28 +761,54 @@ pub fn BulkSink(comptime Proto: type) type {
             if (@hasDecl(Proto, "segmentHeader")) try if (Layout == void) Proto.segmentHeader(self.buffer.writer(), self.gpa, self.schema) else Proto.segmentHeader(self.buffer.writer(), self.gpa, self.schema, self.layout);
         }
 
-        /// Send the buffered segment and verify the row count, redialing once and
-        /// resending on a transient failure. A segment holding only a header is dropped
-        /// without a round-trip.
+        /// Send the buffered segment and verify the row count. A segment is one
+        /// statement, all of it rolled back when it fails, so given a `redial` it is
+        /// sent again on a fresh connection (`net/retry.zig`): at once after a network
+        /// failure, after a backoff when the server says to run it again (a deadlock
+        /// victim, a lock wait timed out) or the network keeps failing. A segment
+        /// holding only a header is dropped without a round-trip.
         fn commitSegment(self: *Self) !void {
             if (self.seg_rows == 0) {
                 self.buffer.clearRetainingCapacity();
                 return;
             }
-            self.sendSegment() catch |e| {
-                const rd = self.redial orelse return refused(self.errctx, Proto.dialect, self.conn.wire.last_error, e);
-                if (!netconn.transientNet(e)) return refused(self.errctx, Proto.dialect, self.conn.wire.last_error, e);
-                const fresh = try rd.dial(rd.ctx, self.gpa);
-                self.conn.close();
-                self.conn = @ptrCast(@alignCast(fresh.ptr));
-                try self.sendSegment();
+            const Try = struct {
+                sink: *Self,
+                stale: bool = false,
+                net_fails: usize = 0,
+
+                fn attempt(t: *@This()) !retry.Verdict {
+                    const k = t.sink;
+                    if (t.stale) {
+                        const rd = k.redial.?;
+                        const fresh = try rd.dial(rd.ctx, k.gpa);
+                        k.conn.close();
+                        k.conn = @ptrCast(@alignCast(fresh.ptr));
+                        t.stale = false;
+                    }
+                    k.sendSegment() catch |e| {
+                        const rerun = k.conn.wire.last_rerun;
+                        const net = netconn.transientNet(e);
+                        if (k.redial == null or !(rerun or net)) return .{ .failed = .{ .code = 0, .err = e, .retriable = false } };
+                        t.stale = true;
+                        if (rerun) return .{ .failed = .{ .code = 0, .err = e, .retriable = true } };
+                        t.net_fails += 1;
+                        return if (t.net_fails == 1) .again else e;
+                    };
+                    return .done;
+                }
             };
+            var prng = retry.jitterPrng();
+            var t = Try{ .sink = self };
+            retry.retry(.{ .rand = prng.random(), .base_ms = 250 }, &t, Try.attempt) catch |e|
+                return refused(self.errctx, Proto.dialect, self.conn.wire.last_error, rerunError(self.conn.wire.last_rerun, e));
             self.buffer.clearRetainingCapacity();
             self.seg_rows = 0;
         }
 
         fn sendSegment(self: *Self) !void {
-            const n = (if (Layout == void) Proto.send(self.conn, self.command, self.buffer.items, self.seg_rows) else Proto.send(self.conn, self.command, self.buffer.items, self.seg_rows, self.layout)) catch |e| return onWire(e);
+            const n = (if (Layout == void) Proto.send(self.conn, self.command, self.buffer.items, self.seg_rows) else Proto.send(self.conn, self.command, self.buffer.items, self.seg_rows, self.layout)) catch |e|
+                return if (self.conn.wire.last_gone) error.ServerClosedConnection else onWire(e);
             if (n != self.seg_rows) {
                 if (self.conn.wire.last_error.len == 0)
                     try self.conn.wire.printError("{s} count mismatch: sent {d} rows, server loaded {d}", .{ Proto.stmt, self.seg_rows, n });
@@ -1605,6 +1675,7 @@ const FakeBulk = struct {
     const Connection = struct {
         wire: Wire = .{},
         fail_once: bool = false,
+        deadlocks: usize = 0,
         sends: usize = 0,
         closed: bool = false,
         last_len: usize = 0,
@@ -1615,6 +1686,8 @@ const FakeBulk = struct {
     };
     const Wire = struct {
         last_error: []const u8 = "",
+        last_rerun: bool = false,
+        last_gone: bool = false,
         fn printError(_: *Wire, comptime _: []const u8, _: anytype) !void {}
     };
     const dialect: Dialect = .postgres;
@@ -1630,6 +1703,11 @@ const FakeBulk = struct {
         if (conn.fail_once) {
             conn.fail_once = false;
             return error.ConnectionResetByPeer;
+        }
+        conn.wire.last_rerun = conn.deadlocks > 0;
+        if (conn.deadlocks > 0) {
+            conn.deadlocks -= 1;
+            return error.PgQueryFailed;
         }
         conn.last_len = segment.len;
         return rows;
@@ -1653,7 +1731,7 @@ test "BulkSink: a transient send failure redials once and resends the intact seg
     const schema = types.Schema{ .fields = &.{} };
     const batch = Batch{ .schema = &schema, .columns = &.{}, .len = 3 };
 
-    const s = try BulkSink(FakeBulk).open(gpa, &first, "t", schema, .append, .{ .ctx = &second, .dial = FakeBulk.dial });
+    const s = try BulkSink(FakeBulk).open(gpa, &first, "t", schema, .append, .{ .ctx = &second, .dial = FakeBulk.dial }, false);
     try s.writeBatch(gpa, batch);
     try s.close();
 
@@ -1664,13 +1742,35 @@ test "BulkSink: a transient send failure redials once and resends the intact seg
     try std.testing.expect(second.closed);
 }
 
+test "BulkSink: a deadlock victim's segment is sent again on a fresh connection; with none to dial, it fails as a LockConflict" {
+    const gpa = std.testing.allocator;
+    var first = FakeBulk.Connection{ .deadlocks = 1 };
+    var second = FakeBulk.Connection{};
+    const schema = types.Schema{ .fields = &.{} };
+    const batch = Batch{ .schema = &schema, .columns = &.{}, .len = 2 };
+
+    const s = try BulkSink(FakeBulk).open(gpa, &first, "t", schema, .append, .{ .ctx = &second, .dial = FakeBulk.dial }, false);
+    try s.writeBatch(gpa, batch);
+    try s.close();
+    try std.testing.expectEqual(@as(usize, 1), first.sends);
+    try std.testing.expect(first.closed);
+    try std.testing.expectEqual(@as(usize, 1), second.sends);
+    try std.testing.expectEqual(@as(usize, 8), second.last_len);
+
+    var no_redial = FakeBulk.Connection{ .deadlocks = 1 };
+    const n = try BulkSink(FakeBulk).open(gpa, &no_redial, "t", schema, .append, null, false);
+    try n.writeBatch(gpa, batch);
+    try std.testing.expectError(error.LockConflict, n.close());
+    try std.testing.expectEqual(@as(usize, 1), no_redial.sends);
+}
+
 test "BulkSink: without a redial the transient failure is the caller's" {
     const gpa = std.testing.allocator;
     var only = FakeBulk.Connection{ .fail_once = true };
     const schema = types.Schema{ .fields = &.{} };
     const batch = Batch{ .schema = &schema, .columns = &.{}, .len = 1 };
 
-    const s = try BulkSink(FakeBulk).open(gpa, &only, "t", schema, .append, null);
+    const s = try BulkSink(FakeBulk).open(gpa, &only, "t", schema, .append, null, false);
     try s.writeBatch(gpa, batch);
     try std.testing.expectError(error.ConnectionResetByPeer, s.close());
     try std.testing.expectEqual(@as(usize, 1), only.sends);

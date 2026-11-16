@@ -73,7 +73,12 @@ const TimedConn = struct {
     label: []const u8,
     connect_ns: u64,
 
-    const vtable = sql.Conn.VTable{ .queryCursor = vtQuery, .exec = vtExec, .close = vtClose, .last_error = vtLastError };
+    const vtable = sql.Conn.VTable{ .queryCursor = vtQuery, .exec = vtExec, .close = vtClose, .last_error = vtLastError, .rerun = vtRerun };
+
+    fn vtRerun(ptr: *anyopaque) bool {
+        const self: *TimedConn = @ptrCast(@alignCast(ptr));
+        return self.inner.rerunnable();
+    }
 
     fn vtQuery(ptr: *anyopaque, q: []const u8) anyerror!sql.Cursor {
         const self: *TimedConn = @ptrCast(@alignCast(ptr));

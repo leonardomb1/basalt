@@ -102,7 +102,7 @@ pub const Conn = struct {
                     break;
                 },
                 0xff => {
-                    try self.wire.setError(errMessage(p));
+                    try self.serverError(p);
                     return error.MysqlAuthFailed;
                 },
                 0xfe => {
@@ -155,7 +155,7 @@ pub const Conn = struct {
         const p = self.wire.msg.items;
         if (p.len == 0) return error.MysqlProtocol;
         if (p[0] == 0xff) {
-            try self.wire.setError(errMessage(p));
+            try self.serverError(p);
             return error.MysqlQueryFailed;
         }
         if (p[0] == 0x00 or p[0] == 0xfe) return;
@@ -167,7 +167,7 @@ pub const Conn = struct {
             const r = self.wire.msg.items;
             if (r.len > 0 and r[0] == 0xfe and r.len < 9) return;
             if (r.len > 0 and r[0] == 0xff) {
-                try self.wire.setError(errMessage(r));
+                try self.serverError(r);
                 return error.MysqlQueryFailed;
             }
         }
@@ -179,7 +179,7 @@ pub const Conn = struct {
         const rseq = try self.query(cmd);
         const p = self.wire.msg.items;
         if (p.len > 0 and p[0] == 0xff) {
-            try self.wire.setError(errMessage(p));
+            try self.serverError(p);
             return error.MysqlQueryFailed;
         }
         if (p.len == 0 or p[0] != 0xfb) return error.MysqlProtocol;
@@ -198,7 +198,7 @@ pub const Conn = struct {
         _ = try self.readPacket();
         const p = self.wire.msg.items;
         if (p.len > 0 and p[0] == 0xff) {
-            try self.wire.setError(errMessage(p));
+            try self.serverError(p);
             return error.MysqlQueryFailed;
         }
         return parseOkAffected(p) orelse error.MysqlProtocol;
@@ -206,6 +206,11 @@ pub const Conn = struct {
 
     pub fn close(self: *Conn) void {
         self.wire.close(self);
+    }
+
+    /// An ERR packet `p` as the last error, rerunnable or ending the connection by its code.
+    fn serverError(self: *Conn, p: []const u8) !void {
+        try self.wire.serverError(errMessage(p), .{ .rerun = rerunCode(p), .gone = goneCode(p) });
     }
 
     /// COM_QUERY with `stmt`, returning the sequence number of the server's first reply.
@@ -232,7 +237,7 @@ pub const Conn = struct {
         const first = self.wire.msg.items;
         if (first.len == 0) return error.MysqlProtocol;
         if (first[0] == 0xff) {
-            try self.wire.setError(errMessage(first));
+            try self.serverError(first);
             return error.MysqlQueryFailed;
         }
         if (first[0] == 0x00 or first[0] == 0xfe) {
@@ -268,7 +273,7 @@ pub const Conn = struct {
         const p = self.wire.msg.items;
         if (p.len > 0 and p[0] == 0xfe and p.len < 9) return .end;
         if (p.len > 0 and p[0] == 0xff) {
-            try self.wire.setError(errMessage(p));
+            try self.serverError(p);
             return error.MysqlQueryFailed;
         }
         var r: Pkt = .{ .p = p };
@@ -537,6 +542,32 @@ test "parseOkAffected: small and lenenc counts, non-OK header" {
     try std.testing.expectEqual(@as(?u64, 300), parseOkAffected(&.{ 0x00, 0xfc, 0x2c, 0x01 }));
     try std.testing.expectEqual(@as(?u64, null), parseOkAffected(&.{ 0xff, 0x03 }));
     try std.testing.expectEqual(@as(?u64, null), parseOkAffected(&.{0x00}));
+}
+
+/// ER_LOCK_DEADLOCK (1213) or ER_LOCK_WAIT_TIMEOUT (1205), both rolling back no more
+/// than the statement or its transaction, which may then run again.
+fn rerunCode(p: []const u8) bool {
+    if (p.len < 3) return false;
+    const code = std.mem.readInt(u16, p[1..3], .little);
+    return code == 1213 or code == 1205;
+}
+
+test "an ERR packet is rerunnable by its code: a deadlock or a lock wait timeout, not a duplicate key" {
+    try std.testing.expect(rerunCode("\xff\xbd\x04#40001Deadlock found when trying to get lock"));
+    try std.testing.expect(rerunCode("\xff\xb5\x04#HY000Lock wait timeout exceeded"));
+    try std.testing.expect(!rerunCode("\xff\x26\x04#23000Duplicate entry"));
+    try std.testing.expect(!rerunCode("\xff"));
+    try std.testing.expect(goneCode("\xff\xbf\x0f#HY000The client was disconnected by the server because of inactivity"));
+    try std.testing.expect(goneCode("\xff\x87\x07#70100Connection was killed"));
+    try std.testing.expect(!goneCode("\xff\xbd\x04#40001Deadlock"));
+}
+
+/// ER_SERVER_SHUTDOWN (1053), ER_CONNECTION_KILLED (1927) or
+/// ER_CLIENT_INTERACTION_TIMEOUT (4031): the server is closing the connection.
+fn goneCode(p: []const u8) bool {
+    if (p.len < 3) return false;
+    const code = std.mem.readInt(u16, p[1..3], .little);
+    return code == 1053 or code == 1927 or code == 4031;
 }
 
 fn errMessage(p: []const u8) []const u8 {
