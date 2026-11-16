@@ -226,32 +226,51 @@ for parallel lanes. Exit code `75` means a transient failure worth retrying,
 ## Performance
 
 Against DuckDB, ClickHouse Local, Polars and DataFusion on TPC-H scale factor 1 as
-Parquet (6 million `lineitem` rows), on a bare-metal server (AMD Ryzen 7 PRO 8700GE,
-8 cores), each engine run as a process with 8 threads, best of three; every engine's
-answers match DuckDB's. A query's time is its wall time less the engine's startup.
-The harness, its queries and the full results with memory are in
-[`bench/`](bench/README.md) ([this run](bench/results/2026-11-15-amd-ryzen-7-pro-8700ge-w-radeon-780m-gra.md)).
+Parquet (6 million `lineitem` rows), and moving its 1.5 million `orders` rows out of
+and into PostgreSQL, MySQL and SQL Server, on a bare-metal server (AMD Ryzen 7 PRO
+8700GE, 8 cores), each engine run as a process with 8 threads, best of three; every
+engine's answers match DuckDB's, and every load lands all its rows. A query's time is
+its wall time less the engine's startup; a dash is a move the engine cannot make
+(DataFusion has no database connector, and only basalt writes SQL Server). The
+harness, its queries and the full results with memory are in
+[`bench/`](bench/README.md) ([this run](bench/results/2026-11-16-amd-ryzen-7-pro-8700ge-w-radeon-780m-gra.md)).
 
-| | basalt 0.14.2 | DuckDB 2.0 | ClickHouse 26.11 | Polars 2.1 | DataFusion 55 |
+| | basalt 0.14.6 | DuckDB 2.0 | ClickHouse 26.11 | Polars 2.1 | DataFusion 55 |
 |---|---|---|---|---|---|
-| startup | **1 ms**, 15 MB | 28 ms, 50 MB | 49 ms, 213 MB | 126 ms, 138 MB | 91 ms, 116 MB |
-| `count(DISTINCT)` | **22 ms** | 66 ms | 66 ms | 62 ms | 68 ms |
-| `LIKE` over long strings | **50 ms** | 76 ms | 52 ms | 59 ms | 72 ms |
-| TPC-H Q6 (filter) | 23 ms | 24 ms | 22 ms | **16 ms** | 30 ms |
-| TPC-H Q1 (aggregate) | 59 ms | **39 ms** | 72 ms | 58 ms | 76 ms |
-| TPC-H Q3 (join, top-N) | 54 ms | 42 ms | 72 ms | **28 ms** | 49 ms |
-| TPC-H Q18 (IN, HAVING) | 103 ms | **55 ms** | 72 ms | 61 ms | 148 ms |
-| exact median | 92 ms | **60 ms** | 71 ms | 156 ms | 95 ms |
-| `lineitem` Parquet → CSV | **0.44 s** | 0.81 s | 0.47 s | 0.62 s | 0.72 s |
-| `lineitem` Parquet → Parquet | 0.67 s | **0.49 s** | 0.68 s | 0.51 s | 1.07 s |
-| `lineitem` CSV → Parquet | 1.01 s | 0.92 s | 1.02 s | **0.83 s** | 1.17 s |
-| `lineitem` NDJSON → Parquet | **0.87 s** | 1.16 s | 1.80 s | 1.35 s | 1.67 s |
-| `lineitem` CSV.gz → Parquet | 1.60 s | 2.01 s | **1.25 s** | 1.27 s | 3.24 s |
+| startup | **1 ms**, 15 MB | 27 ms, 50 MB | 48 ms, 215 MB | 125 ms, 136 MB | 90 ms, 118 MB |
+| `count(DISTINCT)` | **23 ms** | 68 ms | 68 ms | 62 ms | 69 ms |
+| `LIKE` over long strings | **49 ms** | 77 ms | 56 ms | 63 ms | 75 ms |
+| TPC-H Q6 (filter) | 23 ms | 25 ms | 23 ms | **18 ms** | 29 ms |
+| TPC-H Q1 (aggregate) | 57 ms | **42 ms** | 74 ms | 64 ms | 77 ms |
+| TPC-H Q3 (join, top-N) | 56 ms | 43 ms | 70 ms | **30 ms** | 50 ms |
+| TPC-H Q5 (six-table join) | 187 ms | 45 ms | 70 ms | **27 ms** | 67 ms |
+| TPC-H Q18 (IN, HAVING) | 102 ms | **56 ms** | 83 ms | 60 ms | 149 ms |
+| TPC-H Q21 (EXISTS, NOT EXISTS) | 266 ms | **81 ms** | 119 ms | 115 ms | 143 ms |
+| running total, `LAG` | 131 ms | **63 ms** | **63 ms** | 76 ms | 116 ms |
+| `ROLLUP` | 137 ms | **28 ms** | 47 ms | 86 ms | 62 ms |
+| `PIVOT` | 58 ms | **13 ms** | 18 ms | 21 ms | 18 ms |
+| exact median | 95 ms | **59 ms** | 71 ms | 162 ms | 96 ms |
+| `lineitem` Parquet → CSV | 0.60 s | 0.79 s | **0.46 s** | 0.62 s | 0.73 s |
+| `lineitem` Parquet → Parquet | **0.15 s** | 0.49 s | 0.71 s | 0.51 s | 1.08 s |
+| `lineitem` CSV → Parquet | 1.08 s | 0.96 s | 1.01 s | **0.82 s** | 1.16 s |
+| `lineitem` NDJSON → Parquet | **0.93 s** | 1.16 s | 1.81 s | 1.39 s | 1.67 s |
+| `lineitem` CSV.gz → Parquet | 1.67 s | 2.02 s | **1.26 s** | 1.29 s | 3.23 s |
+| `orders` PostgreSQL → Parquet | 0.85 s | **0.39 s** | 0.97 s | 1.34 s | — |
+| `orders` Parquet → PostgreSQL | **0.54 s** | 1.29 s | 3.39 s | 2.13 s | — |
+| `orders` MySQL → Parquet | **0.78 s** | 3.82 s | 0.90 s | 1.00 s | — |
+| `orders` Parquet → MySQL | **5.82 s** | 16.20 s | 10.20 s | — | — |
+| `orders` SQL Server → Parquet | **1.35 s** | — | — | 6.54 s | — |
+| `orders` Parquet → SQL Server | 1.05 s | — | — | — | — |
+| `orders` PostgreSQL → MySQL | **6.25 s** | 14.80 s | 10.40 s | — | — |
 
-basalt starts in a millisecond and holds the least memory on most queries. It is the
-fastest at distinct counts, string matching, writing CSV and loading NDJSON, and loads
-gzipped CSV ahead of DuckDB and within a third of the fastest engine. On joins and
-aggregates it is one and a half to two times slower than the fastest engine.
+basalt starts in a millisecond and holds the least memory on 16 of the 19 queries.
+Moving data is where it leads: it is the fastest into and out of PostgreSQL, MySQL
+and SQL Server but for reading PostgreSQL, whose table DuckDB reads as page ranges on
+parallel connections; it copies Parquet to Parquet without decoding it, and is the
+fastest at distinct counts, string matching and loading NDJSON. A file it writes is
+synced to disk before it replaces the target, which the others do not do and a write
+of `lineitem` as CSV pays for. On joins, windows, `ROLLUP` and `PIVOT` it is one and
+a half to seven times slower than the fastest engine.
 
 ## What sets it apart
 
@@ -289,7 +308,7 @@ getting data out of the systems that hold it and into the ones that need it:
 - **Scripts, not just queries.** `PARAM`, `LET`, `FOR EACH` (a load per row, to a
   target named per row), `CASE`, functions and table functions (an API endpoint
   is one), libraries pinned by hash.
-- **Easy to run anywhere.** One static 7.6 MB binary, no runtime, starting in a millisecond;
+- **Easy to run anywhere.** One static 8.2 MB binary, no runtime, starting in a millisecond;
   logins from environment variables; `EXPLAIN ANALYZE` shows every request each
   source was sent.
 
