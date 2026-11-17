@@ -499,7 +499,7 @@ fn runToMemoryCapped(env: *Env, opts: RunOptions, stages: []const ast.Stage, wha
 /// laid out as the pipeline over it would lay it out (one with a window is kept): kept
 /// as a reference it was never run first, and every CTE of a report built on CTEs
 /// ran on one thread. `held` gets each binding run into memory, nested ones too.
-fn materializeNamed(env: *Env, opts: RunOptions, name: []const u8, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, held: *std.array_list.Managed([]const u8)) anyerror!bool {
+pub fn materializeNamed(env: *Env, opts: RunOptions, name: []const u8, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, held: *std.array_list.Managed([]const u8)) anyerror!bool {
     if (env.materialized.contains(name)) return false;
     const b = (try stampedBinding(env, name)) orelse return false;
     var stages = b.stages;

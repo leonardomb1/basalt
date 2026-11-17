@@ -264,6 +264,10 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
 
     var stats = Stats{ .run_id = run_id };
     var lanes_used: usize = 1;
+    var let_held = std.array_list.Managed([]const u8).init(arena);
+    defer for (let_held.items) |name| {
+        _ = env.materialized.remove(name);
+    };
     defer if (opts.summary_out) |so| {
         so.* = runSummary(&env, run_id, stats.rows_out, rows_read.load(.monotonic), @intCast(@max(0, std.time.milliTimestamp() - t0)), lanes_used, &loads, &scan, runnable == 1);
     };
@@ -283,10 +287,18 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
             .print => |p| try runPrint(&env, p, no_loop_vars),
             .call => |c| try runCall(&env, c, no_loop_vars, opts, &stats, &lanes_used, &batch_arena, runForBody),
             .throw => |t| try runThrow(&env, t, no_loop_vars),
-            .let_const => |l| if (l.query != null) try runScalarLet(&env, l, partOfExplain(l, program.stmts[after..]), opts, &lanes_used, &batch_arena),
+            .let_const => |l| if (l.query != null) {
+                const of_explain = partOfExplain(l, program.stmts[after..]);
+                if (!of_explain and opts.lanes() > 1) try shareWithNext(&env, l, program.stmts[after..], opts, &lanes_used, &batch_arena, &let_held);
+                try runScalarLet(&env, l, of_explain, opts, &lanes_used, &batch_arena);
+            },
             else => {},
         }
         env.endStatement(env.wrote_sink);
+        if (s != .let_const and s != .binding) {
+            for (let_held.items) |name| _ = env.materialized.remove(name);
+            let_held.clearRetainingCapacity();
+        }
     }
 
     stats.rows_read = rows_read.load(.monotonic);
@@ -426,6 +438,39 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
     }
 }
 
+/// The bindings a query LET reads that the query right after it reads too, each run
+/// once into memory for both when its shape holds its rows anyway (TPC-H Q15's
+/// revenue view, its maximum taken by the LET and joined by the query); `shared`
+/// gets the names, for the caller to drop once that query has run.
+fn shareWithNext(env: *Env, l: ast.LetConst, rest: []const ast.Stmt, opts: RunOptions, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, shared: *std.array_list.Managed([]const u8)) !void {
+    if (heldValue(env.held, l.name) != null) return;
+    var redefined = std.StringHashMap(void).init(env.arena);
+    const next = for (rest) |s| switch (s) {
+        .output => |p| break p,
+        .let_const => {},
+        .binding => |b| try redefined.put(b.name, {}),
+        else => return,
+    } else return;
+    var theirs = std.StringHashMap(void).init(env.arena);
+    try readsOf(next.stages, &theirs);
+    var mine = std.StringHashMap(void).init(env.arena);
+    try readsOf(l.query.?.stages, &mine);
+    var it = mine.keyIterator();
+    while (it.next()) |name| {
+        if (!theirs.contains(name.*) or redefined.contains(name.*)) continue;
+        _ = try materializeNamed(env, opts, name.*, lanes_used, batch_arena, shared);
+    }
+}
+
+/// The bindings `stages` read: the one at their head and the ones they join.
+fn readsOf(stages: []const ast.Stage, out: *std.StringHashMap(void)) !void {
+    for (stages) |st| switch (st.node) {
+        .ref => |r| try out.put(r, {}),
+        .join => |j| try out.put(j.binding, {}),
+        else => {},
+    };
+}
+
 /// `LET x = (SELECT ...);`: run the query now and keep its single cell as `$x`. Also
 /// the desugared form of a WHERE scalar subquery, which becomes a literal that rides
 /// filter pushdown. One column required, zero rows is NULL, more than one an error.
@@ -512,6 +557,7 @@ fn partOfExplain(l: ast.LetConst, rest: []const ast.Stmt) bool {
 const explainStep = @import("run/explain.zig");
 pub const runOutput = @import("run/output.zig").runOutput;
 const runToMemory = @import("run/output.zig").runToMemory;
+const materializeNamed = @import("run/output.zig").materializeNamed;
 pub const runExplain = @import("run/explain.zig").runExplain;
 pub const defaultLanes = @import("parallel.zig").defaultLanes;
 pub const printPlanArrow = @import("run/explain.zig").printPlanArrow;

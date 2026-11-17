@@ -1793,6 +1793,36 @@ test "a correlated aggregate's side is cut to the keys asked for, by a joined fi
     try std.testing.expect(std.mem.indexOf(u8, outs[1], "--\np_partkey\n1\n11\n21\n") != null);
 }
 
+test "a scalar subquery over a CTE the query also joins gives its rows at any thread count, and the next statement's CTE of that name is its own" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var part = std.array_list.Managed(u8).init(alloc);
+    defer part.deinit();
+    try part.appendSlice("p_partkey\n");
+    for (1..501) |k| try part.writer().print("{d}\n", .{k});
+    try tmp.dir.writeFile(.{ .sub_path = "part.csv", .data = part.items });
+    var line = std.array_list.Managed(u8).init(alloc);
+    defer line.deinit();
+    try line.appendSlice("l_partkey,l_qty,l_price\n");
+    for (0..8000) |i| try line.writer().print("{d},{d},{d}\n", .{ (i * 7) % 500 + 1, (i / 7) % 50, i % 1000 });
+    try tmp.dir.writeFile(.{ .sub_path = "line.csv", .data = line.items });
+    for ([_]usize{ 1, 4 }) |threads| {
+        try checkAndRun(alloc, &tmp,
+            \\LOAD INTO '$B/first.csv' AS
+            \\WITH rev AS (SELECT l_partkey AS k, sum(l_price) AS t FROM '$B/line.csv' GROUP BY l_partkey)
+            \\SELECT p.p_partkey, r.t FROM '$B/part.csv' p JOIN rev r ON p.p_partkey = r.k
+            \\WHERE r.t = (SELECT max(t) FROM rev) ORDER BY p.p_partkey;
+            \\LOAD INTO '$B/second.csv' AS
+            \\WITH rev AS (SELECT l_partkey AS k, count(*) AS t FROM '$B/line.csv' WHERE l_qty > 40 GROUP BY l_partkey)
+            \\SELECT r.k, r.t FROM '$B/part.csv' p JOIN rev r ON p.p_partkey = r.k
+            \\WHERE r.t = (SELECT min(t) FROM rev) ORDER BY r.k LIMIT 3;
+        , threads, &.{});
+        try expectFile(&tmp, "first.csv", "p_partkey,t\n494,11984\n");
+        try expectFile(&tmp, "second.csv", "k,t\n1,2\n3,2\n4,2\n");
+    }
+}
+
 test "a chain of CTEs, each reading the one before, gives the same rows inlined at any thread count" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

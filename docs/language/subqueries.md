@@ -95,7 +95,9 @@ query can ask for, when a filtered table it joins (`p` in `WHERE p.p_brand =
 'Brand#23' AND l.l_quantity < (SELECT 0.2 * avg(l2.l_quantity) ... WHERE l2.l_partkey
 = p.p_partkey)`), its filtered `FROM` table, or an `IN` on the same key pins that
 key: a semi join on that table goes into the aggregate's input as early as the key
-is there, and `EXPLAIN ANALYZE` shows it under the aggregate.
+is there, and `EXPLAIN ANALYZE` shows it under the aggregate. A scalar subquery
+over a CTE that the query itself also joins runs that CTE once when it
+aggregates, held in memory for both.
 
 A correlation is a condition of the subquery's `WHERE` (or of an inner join's `ON`
 inside it). An equality between a column of the subquery and one of the outer
