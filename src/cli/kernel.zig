@@ -727,13 +727,14 @@ fn runScript(
     for (params) |p| if (try paramProblem(a, entry.prog, p.key, .request)) |why|
         return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = why } });
 
-    const kept: []const cli.Pending = if (try cli.declarationsStand(a, decls, entry.pending)) entry.pending else &.{};
+    const stands = try cli.declarationsStand(a, decls, entry.pending);
+    const kept: []const cli.Pending = if (stands) entry.pending else &.{};
     for (kept) |p| try decls.put(p.id, p.text);
     const declared = try a.alloc(Declared, kept.len);
     for (declared, kept) |*d, p| d.* = .{ .kind = @tagName(p.id.kind), .name = p.id.name };
 
     if (entry.executable == 0) {
-        if (declaresLet(entry.pending)) {
+        if (!stands or declaresLet(entry.pending)) {
             var freezer = cli.LetFreezer.init(a);
             var rdiag: runtime.Diag = .{};
             _ = runtime.run(gpa, entry.prog, .{
@@ -751,7 +752,7 @@ fn runScript(
                 locate(&ei, entry.text, entry.entry_at, entry.prog.fileOf(rdiag.pos) orelse "", rdiag.pos, rdiag.end);
                 return reply(a, out, req.id, .{ .ok = false, .elapsed_ms = @intCast(std.time.milliTimestamp() - t0), .declared = declared, .@"error" = ei });
             };
-            try freezer.commit(decls);
+            if (stands) try freezer.commit(decls);
         }
         return reply(a, out, req.id, .{ .ok = true, .elapsed_ms = @intCast(std.time.milliTimestamp() - t0), .declared = declared });
     }

@@ -517,10 +517,14 @@ pub fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg
     const prog = entry.prog;
     const pending = entry.pending;
 
-    if (try declarationsStand(a, &sess.decls, pending)) for (pending) |p| try sess.decls.put(p.id, p.text);
+    const stands = try declarationsStand(a, &sess.decls, pending);
+    if (stands) for (pending) |p| try sess.decls.put(p.id, p.text);
 
     if (entry.executable == 0) {
-        for (pending) |p| if (p.id.kind == .let) {
+        const lets = for (pending) |p| {
+            if (p.id.kind == .let) break true;
+        } else false;
+        if (!stands or lets) {
             var freezer = LetFreezer.init(a);
             var rdiag: runtime.Diag = .{};
             _ = runtime.run(alloc, prog, .{
@@ -534,10 +538,9 @@ pub fn runBlock(alloc: std.mem.Allocator, block: []const u8, sess: *Session, msg
                 try msg.flush();
                 return;
             };
-            try freezer.commit(&sess.decls);
-            break;
-        };
-        if (sess.announce) for (pending) |p| try msg.print("ok: {s} {s}\n", .{ @tagName(p.id.kind), p.id.name });
+            if (stands) try freezer.commit(&sess.decls);
+        }
+        if (sess.announce and stands) for (pending) |p| try msg.print("ok: {s} {s}\n", .{ @tagName(p.id.kind), p.id.name });
         try msg.flush();
         return;
     }

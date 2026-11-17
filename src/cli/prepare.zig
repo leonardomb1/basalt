@@ -153,6 +153,23 @@ pub const LetFreezer = struct {
     }
 };
 
+test "a declaration under a leading comment replaces the session's own, so the entry checks and its declarations stand" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var decls = DeclStore.init(std.testing.allocator);
+    defer decls.deinit();
+    var diag: include.Diag = .{};
+    const first = try prepareEntry(a, &decls, "-- file one\nPARAM p BOOL DEFAULT false;\nSELECT 1 AS a;", &diag, null);
+    try std.testing.expect(try declarationsStand(a, &decls, first.pending));
+    for (first.pending) |x| try decls.put(x.id, x.text);
+
+    const second = try prepareEntry(a, &decls, "-- file two\nPARAM p BOOL DEFAULT false;\n/* lib */ CREATE FUNCTION ws(s STRING) AS trim(s);\nSELECT ws(' a ') AS w;", &diag, null);
+    try std.testing.expectEqual(@as(usize, 2), second.pending.len);
+    try std.testing.expect(try declarationsStand(a, &decls, second.pending));
+    for (try checkText(a, second.text, "<repl>", ".", .{})) |is| try std.testing.expect(is.warning);
+}
+
 test "an entry's @include runs after the session has declarations, its lines keeping their numbers" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();

@@ -90,8 +90,11 @@ fn identPrefix(w: []const u8) []const u8 {
     return w[0..n];
 }
 
-/// The session declaration a statement makes, by its first words, or null.
-pub fn declOf(stmt: []const u8) ?DeclId {
+/// The session declaration a statement makes, by its first words past any leading
+/// comment, or null: a `-- helper` line above a declaration is the script's text,
+/// not another statement.
+pub fn declOf(stmt_in: []const u8) ?DeclId {
+    const stmt = pastComments(stmt_in);
     var i: usize = 0;
     var w = nextWord(stmt, &i) orelse return null;
     if (std.ascii.eqlIgnoreCase(w, "param")) {
@@ -117,6 +120,21 @@ pub fn declOf(stmt: []const u8) ?DeclId {
         return null;
     const n = identPrefix(nextWord(stmt, &i) orelse return null);
     return if (n.len == 0) null else .{ .kind = kind, .name = n };
+}
+
+/// `stmt` past its leading blanks and comments, by the lexer's own spans.
+fn pastComments(stmt: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < stmt.len) {
+        if (std.ascii.isWhitespace(stmt[i])) {
+            i += 1;
+            continue;
+        }
+        const sp = sql_lexer.spanAt(stmt, i) orelse break;
+        if (sp.kind != .line_comment and sp.kind != .block_comment) break;
+        i = sp.end;
+    }
+    return stmt[i..];
 }
 
 /// The session's declarations as text, replayed ahead of each entry, and the value
@@ -247,6 +265,9 @@ test "declOf names session declarations" {
     try std.testing.expectEqual(DeclKind.param, declOf("param since date DEFAULT '2020-01-01'").?.kind);
     try std.testing.expectEqualStrings("since", declOf("param since date").?.name);
     try std.testing.expect(declOf("CREATE WIDGET w") == null);
+    try std.testing.expectEqualStrings("norm", declOf("-- helper\nCREATE FUNCTION norm(s) AS trim(s)").?.name);
+    try std.testing.expectEqualStrings("p", declOf("/* a */ -- b\n  /* c */ PARAM p BOOL DEFAULT false").?.name);
+    try std.testing.expect(declOf("-- PARAM p INT\nSELECT 1") == null);
 
     try std.testing.expect(declOf("SELECT 1") == null);
     try std.testing.expect(declOf("CREATE TABLE t") == null);

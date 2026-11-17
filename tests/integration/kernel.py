@@ -328,6 +328,18 @@ def main(binary):
     _, st = k.reply()
     report("check refuses a column type it does not know", not st["ok"] and "type" in st["error"]["msg"], st)
 
+    # A script of declarations that do not check says why, and keeps none of them.
+    _, st = k.run("CREATE FUNCTION lost(x) AS x;\nPARAM q INT DEFAULT 1;\nPARAM q INT DEFAULT 2;", id="dup")
+    _, st2 = k.run("SELECT lost(1) AS v;", id="dup2")
+    report("a declaration-only script that does not check reports why and keeps nothing",
+           not st["ok"] and "duplicate PARAM" in st["error"]["msg"] and not st2["ok"], (st, st2))
+
+    # A comment above a declaration does not hide it: sent again, it replaces itself.
+    script = "-- helper\nCREATE FUNCTION norm(s STRING) AS trim(s);\nSELECT norm(' a ') AS v;"
+    _, st = k.run(script, id="cm1")
+    data, st2 = k.run(script, id="cm2")
+    report("a commented declaration sent again replaces itself", st["ok"] and st2["ok"] and rows(data) == [{"v": "a"}], (st, st2))
+
     # Reset forgets every declaration.
     k.send(op="reset", id="r")
     _, st = k.reply()
