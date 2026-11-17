@@ -346,9 +346,11 @@ fn offsetOf(text: []const u8, pos: ast.Pos) ?usize {
 pub fn entryStatements(arena: std.mem.Allocator, text: []const u8, entry_at: usize, prog: ast.Program) ![]EntryStmt {
     const Found = struct { off: usize, stmt: ast.Stmt };
     var found = std.array_list.Managed(Found).init(arena);
+    const entry_line = 1 + std.mem.count(u8, text[0..entry_at], "\n");
     for (prog.stmts[1..]) |st| {
         if (engineMade(st)) continue;
         const pos = analyze.stmtPos(st) orelse continue;
+        if (pos.line < entry_line) continue;
         const off = offsetOf(text, pos) orelse continue;
         if (off < entry_at) continue;
         try found.append(.{ .off = off, .stmt = st });
