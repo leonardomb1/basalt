@@ -732,37 +732,52 @@ pub const StrId = struct { id: u32, h: u64 };
 
 /// The id a string key gets, shared by every lane so equal strings meet; ids follow
 /// insertion, so placement hashes the string itself (`StrId.h`) and output order does
-/// not follow thread timing.
+/// not follow thread timing. The strings fall into `shard_count` parts by that hash,
+/// each under its own lock, the part in the id's low bits: under one lock, lanes
+/// meeting many distinct strings (a GROUP BY on customer names) waited on each other.
 pub const StrTable = struct {
-    mtx: std.Thread.Mutex = .{},
-    arena: std.heap.ArenaAllocator,
-    map: std.StringHashMapUnmanaged(u32) = .empty,
-    strs: std.ArrayListUnmanaged([]const u8) = .empty,
+    parts: [shard_count]Shard,
+
+    pub const shard_count = 64;
+    const shard_bits = 6;
+
+    const Shard = struct {
+        mtx: std.Thread.Mutex = .{},
+        arena: std.heap.ArenaAllocator,
+        map: std.StringHashMapUnmanaged(u32) = .empty,
+        strs: std.ArrayListUnmanaged([]const u8) = .empty,
+    };
 
     pub fn init(child: std.mem.Allocator) StrTable {
-        return .{ .arena = std.heap.ArenaAllocator.init(child) };
+        var t: StrTable = undefined;
+        for (&t.parts) |*sh| sh.* = .{ .arena = std.heap.ArenaAllocator.init(child) };
+        return t;
     }
 
     pub fn deinit(self: *StrTable) void {
-        self.arena.deinit();
+        for (&self.parts) |*sh| sh.arena.deinit();
     }
 
-    fn intern(self: *StrTable, s: []const u8) !u32 {
-        self.mtx.lock();
-        defer self.mtx.unlock();
-        const a = self.arena.allocator();
-        const gop = try self.map.getOrPut(a, s);
+    /// `s`'s id, hashed `h`, and the table's own copy of it, which outlives the table's
+    /// users.
+    fn intern(self: *StrTable, s: []const u8, h: u64) !struct { id: u32, own: []const u8 } {
+        const part: u32 = @intCast(h & (shard_count - 1));
+        const sh = &self.parts[part];
+        sh.mtx.lock();
+        defer sh.mtx.unlock();
+        const a = sh.arena.allocator();
+        const gop = try sh.map.getOrPut(a, s);
         if (!gop.found_existing) {
             const own = try a.dupe(u8, s);
             gop.key_ptr.* = own;
-            gop.value_ptr.* = @intCast(self.strs.items.len);
-            try self.strs.append(a, own);
+            gop.value_ptr.* = @intCast(sh.strs.items.len);
+            try sh.strs.append(a, own);
         }
-        return gop.value_ptr.*;
+        return .{ .id = (gop.value_ptr.* << shard_bits) | part, .own = gop.key_ptr.* };
     }
 
     pub fn at(self: *const StrTable, id: u32) []const u8 {
-        return self.strs.items[id];
+        return self.parts[id & (shard_count - 1)].strs.items[id >> shard_bits];
     }
 };
 
@@ -787,8 +802,13 @@ pub const Interner = struct {
     pub fn id(self: Interner, s: []const u8) !StrId {
         const gop = try self.cache.getOrPut(self.alloc, s);
         if (!gop.found_existing) {
-            gop.key_ptr.* = try self.alloc.dupe(u8, s);
-            gop.value_ptr.* = .{ .id = try (try self.shared()).intern(s), .h = std.hash.Wyhash.hash(0x5bd1e995, s) };
+            const h = std.hash.Wyhash.hash(0x5bd1e995, s);
+            const got = (try self.shared()).intern(s, h) catch |e| {
+                self.cache.removeByPtr(gop.key_ptr);
+                return e;
+            };
+            gop.key_ptr.* = got.own;
+            gop.value_ptr.* = .{ .id = got.id, .h = h };
         }
         return gop.value_ptr.*;
     }
