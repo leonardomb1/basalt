@@ -62,27 +62,21 @@ fn allMap(m: []const ast.Stage, explode: bool) bool {
 }
 
 /// `m[0..i]` filters and selects, then lane-safe keyed joins with filters and
-/// selects between, the aggregate, and a tail of filters, selects, sorts and limits;
-/// a distinct, window, explode or second aggregate in the tail only without joins,
-/// run serially over the merged groups, as a ROLLUP's sets over its pre-aggregate
-/// are (TPC-H q01's reordering projection and HAVING ride the tail; refusing them
-/// sent it serial, 379 vs 88 ms).
+/// selects between, the aggregate, and a tail of filters, selects, sorts, limits,
+/// distincts, windows, explodes and further aggregates, run serially over the merged
+/// groups, as a ROLLUP's sets over its pre-aggregate are (TPC-H q01's reordering
+/// projection and HAVING ride the tail; refusing them sent it serial, 379 vs 88 ms).
 fn sinkAt(m: []const ast.Stage, i: usize) ?SinkShape {
     var a: ?usize = null;
-    var joined = false;
     for (m[i..], i..) |st, k| switch (st.node) {
         .filter, .select => {},
         .join => |j| {
             if (a != null or !lanes.joinKindLaneSafe(j.kind) or j.keyless()) return null;
-            joined = true;
         },
-        .aggregate => {
-            if (a == null) {
-                a = k;
-            } else if (joined) return null;
+        .aggregate => if (a == null) {
+            a = k;
         },
-        .sort, .limit => if (a == null) return null,
-        .distinct, .window, .explode => if (a == null or joined) return null,
+        .sort, .limit, .distinct, .window, .explode => if (a == null) return null,
         else => return null,
     };
     const ai = a orelse return null;

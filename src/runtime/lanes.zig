@@ -317,7 +317,7 @@ test "classifyWholeAgg: filters-only prefix, unrestricted tail, no hint but a ke
     try std.testing.expect(classifyWholeAgg(&fed) == null);
 }
 
-test "an aggregate's lane shape takes a HAVING tail over joins, and a distinct tail only without them" {
+test "an aggregate's lane shape takes a HAVING tail and a distinct tail, over joins or not" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -334,7 +334,12 @@ test "an aggregate's lane shape takes a HAVING tail over joins, and a distinct t
         \\LOAD INTO 'o.csv' AS WITH d AS (SELECT id AS did FROM 'x.parquet')
         \\SELECT DISTINCT COUNT(*) AS n FROM 'x.parquet' JOIN d ON id = did GROUP BY g;
     );
-    try std.testing.expect(classifyLaneShape(joined) == null);
+    const joined_shape = (classifyLaneShape(joined) orelse return error.TestExpectedLanes).sink;
+    try std.testing.expect(joined_shape.joins.len == 1);
+    const has_distinct = for (joined_shape.tail) |st| {
+        if (st.node == .distinct) break true;
+    } else false;
+    try std.testing.expect(has_distinct);
 }
 
 test {
