@@ -915,12 +915,20 @@ test "toF64 and toInt give what the i128 conversion and rescaleTo(d, 0) gave, bi
     }
 }
 
-test "wideToF64 gives what @floatFromInt gives, in i128 and past it" {
-    const xs = [_]i256{ 0, -1, std.math.maxInt(i128), std.math.minInt(i128), @as(i256, std.math.maxInt(i128)) * 1000 + 7, -(@as(i256, 1) << 200) + 12345, std.math.maxInt(i256) };
-    for (xs) |x| {
-        const want: f64 = @floatFromInt(x);
-        const got = wideToF64(x);
-        try std.testing.expect(@abs(got - want) <= @abs(want) * 0x1p-52);
+test "wideToF64 gives the nearest f64, in i128 and past it" {
+    const Case = struct { x: i256, want: f64 };
+    const cases = [_]Case{
+        .{ .x = 0, .want = 0 },
+        .{ .x = -1, .want = -1 },
+        .{ .x = std.math.maxInt(i128), .want = 0x1p127 },
+        .{ .x = std.math.minInt(i128), .want = -0x1p127 },
+        .{ .x = @as(i256, std.math.maxInt(i128)) * 1000 + 7, .want = 1000 * 0x1p127 },
+        .{ .x = -(@as(i256, 1) << 200) + 12345, .want = -0x1p200 },
+        .{ .x = std.math.maxInt(i256), .want = 0x1p255 },
+    };
+    for (cases) |c| {
+        const got = wideToF64(c.x);
+        try std.testing.expect(@abs(got - c.want) <= @abs(c.want) * 0x1p-52);
     }
 }
 
