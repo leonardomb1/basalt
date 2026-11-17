@@ -2,7 +2,8 @@ name: Release
 
 # Releases only: a `v*` tag runs the full test gate on every CPU the release ships
 # for, builds the four release binaries, runs each through the integration suites
-# that need no database, and attaches them; it also builds the container image.
+# that need no database, and attaches them; the amd64 and arm64 container image
+# carries two of them.
 # Day-to-day checks are in ci.yml.
 on:
   push:
@@ -115,8 +116,11 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The container image, for amd64 and arm64 under one name: the tested
+  # basalt-x86_64-linux and basalt-aarch64-linux copied onto distroless, so the
+  # image runs the bytes `binaries` ran and nothing is compiled again. With only a
+  # COPY per platform, buildx needs no emulator for the arm64 one.
   image:
-    # Publish the container image for a tag; a manual run only tests and builds.
     needs: binaries
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -125,7 +129,25 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Download tested binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: dist
+
+      - name: Image context
+        run: |
+          (cd dist && sha256sum -c basalt-x86_64-linux.sha256 basalt-aarch64-linux.sha256)
+          mkdir -p image
+          install -m 0755 dist/basalt-x86_64-linux image/basalt-amd64
+          install -m 0755 dist/basalt-aarch64-linux image/basalt-arm64
+          cat > image/Dockerfile <<'EOF'
+          FROM gcr.io/distroless/static-debian12:nonroot
+          ARG TARGETARCH
+          COPY basalt-${TARGETARCH} /usr/local/bin/basalt
+          ENTRYPOINT ["/usr/local/bin/basalt"]
+          EOF
 
       - uses: docker/setup-buildx-action@v3
 
@@ -151,12 +173,11 @@ jobs:
       - name: Build & push
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: image
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   # Attach the tested static binaries as release assets on tags, so they can be run
   # directly (e.g. downloaded + executed in a Windmill bash step — no container).

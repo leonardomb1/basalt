@@ -1,7 +1,8 @@
 # Getting started
 
-Download the binary for Linux x86-64 from the latest release, or build it from
-source with Zig 0.15.2 (see the
+Download the binary for Linux from the latest release (`basalt-x86_64-linux`
+for x86-64 with AVX2; `-baseline` without AVX2, `-avx512` with AVX-512, and
+`basalt-aarch64-linux` for ARM), or build it from source with Zig 0.15.2 (see the
 [README](https://github.com/leonardomb1/basalt#install)):
 
 ```console

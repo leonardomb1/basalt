@@ -148,7 +148,14 @@ WHERE sha256(c.text) NOT IN (SELECT text_hash FROM pg.public.doc_chunks);
 
 ## Install
 
-A prebuilt binary for Linux x86-64, statically linked:
+A prebuilt binary for Linux, statically linked; pick the one for your CPU:
+
+| Binary | CPU |
+|---|---|
+| `basalt-x86_64-linux` | x86-64 with AVX2 (Haswell, Zen and on): the default |
+| `basalt-x86_64-linux-baseline` | any x86-64, for CPUs and VMs without AVX2 |
+| `basalt-x86_64-linux-avx512` | x86-64 with AVX-512 (Skylake-SP, Ice Lake, Zen 4 and on) |
+| `basalt-aarch64-linux` | 64-bit ARM (Graviton, Ampere, Raspberry Pi 4, Docker on Apple silicon) |
 
 ```console
 curl -fsSL -o basalt https://github.com/leonardomb1/basalt/releases/latest/download/basalt-x86_64-linux
@@ -156,7 +163,7 @@ chmod +x basalt
 ./basalt help
 ```
 
-A container image, with scripts mounted rather than baked in:
+A container image for amd64 and arm64, with scripts mounted rather than baked in:
 
 ```console
 docker run --rm -v "$PWD:/scripts:ro" -w /scripts ghcr.io/leonardomb1/basalt check pipeline.sql
