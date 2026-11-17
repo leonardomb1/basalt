@@ -120,6 +120,8 @@ const listed = [_]Builtin{
     .{ .name = "date_diff", .sig = "date_diff(unit, start, end)" },
     .{ .name = "make_date", .sig = "make_date(year, month, day)" },
     .{ .name = "epoch", .sig = "epoch(ts)" },
+    .{ .name = "epoch_ms", .sig = "epoch_ms(ts)" },
+    .{ .name = "epoch_us", .sig = "epoch_us(ts)" },
     .{ .name = "to_timestamp", .sig = "to_timestamp(seconds)" },
     .{ .name = "strftime", .sig = "strftime(ts, format)" },
     .{ .name = "json_reduce", .sig = "json_reduce(arr, initial, (acc, x) -> value)" },

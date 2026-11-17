@@ -157,7 +157,9 @@ timestamp fails in PostgreSQL and DuckDB — never clamped to the last instant;
 | `date_add(unit, n, ts)` | the time moved by `n` units; month and year arithmetic clamps the day of the month (`2026-01-31` plus a month is `2026-02-28`) |
 | `date_diff(unit, start, end)` | the number of units from `start` to `end` |
 | `make_date(year, month, day)` | the date |
-| `epoch(ts)` | seconds since 1970-01-01 00:00:00 |
+| `epoch(ts)` | whole seconds since 1970-01-01 00:00:00, as Unix time counts them (floored, so `1969-12-31 23:59:59.5` is `-1`) |
+| `epoch_ms(ts)` | whole milliseconds since 1970-01-01 00:00:00, floored likewise; `to_timestamp(epoch_ms(ts) / 1000.0)` reads it back |
+| `epoch_us(ts)` | microseconds since 1970-01-01 00:00:00, a timestamp's full resolution |
 | `to_timestamp(seconds)` | the timestamp that many seconds after 1970-01-01 00:00:00 |
 | `strftime(ts, format)` | the time as text |
 | `strptime(text, format)` | the timestamp read out of text: `strptime(dt, '%d/%m/%Y')` |

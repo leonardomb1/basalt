@@ -169,6 +169,8 @@ const base = [_]Builtin{
     .{ .name = "date_diff", .type_fn = typing.dateDiff, .eval_fn = S(f.DateDiff).eval, .vec_fn = S(f.DateDiff).vec },
     .{ .name = "make_date", .type_fn = typing.makeDate, .eval_fn = S(f.MakeDate).eval, .vec_fn = S(f.MakeDate).vec },
     .{ .name = "epoch", .type_fn = typing.epoch, .eval_fn = S(f.Epoch).eval, .vec_fn = S(f.Epoch).vec },
+    .{ .name = "epoch_ms", .type_fn = typing.epoch, .eval_fn = S(f.EpochMs).eval, .vec_fn = S(f.EpochMs).vec },
+    .{ .name = "epoch_us", .type_fn = typing.epoch, .eval_fn = S(f.EpochUs).eval, .vec_fn = S(f.EpochUs).vec },
     .{ .name = "to_timestamp", .type_fn = typing.toTimestamp, .eval_fn = f.ToTimestamp.eval, .vec_fn = f.ToTimestamp.vec },
     .{ .name = "strftime", .type_fn = typing.strftime, .eval_fn = S(f.Strftime).eval, .vec_fn = S(f.Strftime).vec },
     .{ .name = "strptime", .type_fn = typing.strptime, .eval_fn = S(f.Strptime(false)).eval, .vec_fn = S(f.Strptime(false)).vec },

@@ -493,6 +493,22 @@ pub const Epoch = struct {
     }
 };
 
+/// Milliseconds since the epoch, floored as `epoch`'s seconds are.
+pub const EpochMs = struct {
+    pub const args = .{.temporal};
+    pub fn apply(_: Cx, us: i64) EvalError!i64 {
+        return @divFloor(us, civil.us_per_sec / 1000);
+    }
+};
+
+/// Microseconds since the epoch: a TIMESTAMP's own resolution.
+pub const EpochUs = struct {
+    pub const args = .{.temporal};
+    pub fn apply(_: Cx, us: i64) EvalError!i64 {
+        return us;
+    }
+};
+
 /// Seconds since the epoch as a TIMESTAMP, a fraction kept to the microsecond as
 /// PostgreSQL's `to_timestamp` keeps it; a value not a FLOAT or DECIMAL is read as
 /// an INT.

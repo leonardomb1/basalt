@@ -483,9 +483,9 @@ pub const typing = struct {
     }
 
     pub fn epoch(self: *TypeCtx, c: ast.Expr.Call) TypeError!Type {
-        if (c.args.len != 1) return self.err("`epoch` takes one argument", .{});
+        if (c.args.len != 1) return self.err("`{s}` takes one argument", .{c.name});
         const a = try self.argType(c, 0);
-        if (!temporalish(a)) return self.err("`epoch` needs a date or timestamp", .{});
+        if (!temporalish(a)) return self.err("`{s}` needs a date or timestamp", .{c.name});
         return Type.init(.int).withNull(a.nullable);
     }
 
@@ -655,6 +655,7 @@ test "builtin typing: a wrong argument count or kind is refused with the functio
         .{ .src = "make_date(2024, s, 1)", .msg = "`make_date` needs integer arguments" },
         .{ .src = "epoch()", .msg = "`epoch` takes one argument" },
         .{ .src = "epoch(i)", .msg = "`epoch` needs a date or timestamp" },
+        .{ .src = "epoch_ms(i)", .msg = "`epoch_ms` needs a date or timestamp" },
         .{ .src = "to_timestamp()", .msg = "`to_timestamp` takes one argument" },
         .{ .src = "to_timestamp(d)", .msg = "`to_timestamp` needs a numeric argument" },
         .{ .src = "strftime(ts)", .msg = "`strftime` takes (timestamp, format)" },
@@ -749,6 +750,7 @@ test "builtin typing: result kinds, nullability and decimal shapes" {
         .{ .src = "date_diff('day', d, ts)", .kind = .int, .nullable = false },
         .{ .src = "make_date(2024, ni, 1)", .kind = .date, .nullable = true },
         .{ .src = "epoch(ts)", .kind = .int, .nullable = false },
+        .{ .src = "epoch_us(ts)", .kind = .int, .nullable = false },
         .{ .src = "to_timestamp(f)", .kind = .timestamp, .nullable = false },
         .{ .src = "strftime(d, ns)", .kind = .string, .nullable = true },
         .{ .src = "strptime(s, '%Y')", .kind = .timestamp, .nullable = false },

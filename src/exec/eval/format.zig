@@ -248,6 +248,12 @@ test "date builtins: month clamp, boundary diffs, epoch round trip, strftime pad
 
     try std.testing.expectEqual(@as(i64, 1700000000), (try evalLit(a, "epoch(to_timestamp(1700000000))")).int);
     try std.testing.expectEqual(@as(i64, 0), (try evalLit(a, "epoch(cast('1970-01-01' as date))")).int);
+    try std.testing.expectEqual(@as(i64, 1700000000), (try evalLit(a, "epoch(to_timestamp(1700000000.75))")).int);
+    try std.testing.expectEqual(@as(i64, 1700000000750), (try evalLit(a, "epoch_ms(to_timestamp(1700000000.75))")).int);
+    try std.testing.expectEqual(@as(i64, 1700000000750000), (try evalLit(a, "epoch_us(to_timestamp(1700000000.75))")).int);
+    try std.testing.expectEqual(@as(i64, -1), (try evalLit(a, "epoch(to_timestamp(-0.5))")).int);
+    try std.testing.expectEqual(@as(i64, -1), (try evalLit(a, "epoch_ms(to_timestamp(-0.0005))")).int);
+    try std.testing.expectEqual(@as(i64, 86400000), (try evalLit(a, "epoch_ms(cast('1970-01-02' as date))")).int);
 
     try std.testing.expectEqualStrings("1970-01-01 00:00:00", (try evalLit(a, "strftime(to_timestamp(0), '%Y-%m-%d %H:%M:%S')")).string);
     try std.testing.expectEqualStrings("70 01:01:01 %", (try evalLit(a, "strftime(to_timestamp(3661), '%y %H:%M:%S %%')")).string);
