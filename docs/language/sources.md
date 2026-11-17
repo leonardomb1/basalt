@@ -24,7 +24,7 @@ A query reads from one source, named after `FROM`, and joins may read more
 | REST (raw URL) | `FROM HTTP('https://host/api/x')` — the URL exactly as written, the way `QUERY()` is raw SQL |
 | discovered union | `FROM EACH TABLE OF (...)` ([UNION ALL BY NAME](set-operations.md)) |
 | raw records of a file | `FROM lines('app.log')` / `fixed('cnab.ret', 240)` / `split('order.edi', '~')` / `chunks('blob.bin', 65536)` — one row per record as `n`, `offset`, `rec`; see [Raw records](#raw-records) |
-| generated integers | `FROM RANGE(10)` / `FROM RANGE(2, 5)` — `lo..hi-1` as a `range` column; bounds are integer constants: literals, params or expressions of them |
+| generated integers | `FROM RANGE(10)` / `FROM RANGE(2, 5)` — `lo..hi-1` as a `range` column; bounds are integer constants: literals, params or expressions of them; see [Generated rows](#generated-rows) |
 | no source | `SELECT 1 AS x, now() AS t;` — a `SELECT` with no `FROM` yields one row of computed values |
 | CTE | `FROM <name>` |
 | table function | `FROM paid_orders($since) p` — a `CREATE FUNCTION ... RETURNS TABLE` ([user functions](user-functions.md)), also as a `JOIN`'s right side |
@@ -155,6 +155,31 @@ LOAD INTO 'retorno.csv' AS
 SELECT n, substr(CAST(rec AS VARCHAR), 1, 3) AS banco, length(rec) AS bytes
 FROM fixed('sftp://bank/retorno/2026-10.ret.gz', 240, TRUE)
 WHERE n > 1;
+```
+
+## Generated rows
+
+`range(hi)` is the integers `0` to `hi - 1`, and `range(lo, hi)` the integers `lo`
+to `hi - 1`, one row each in an `INT` column named `range`: `generate_series` and
+DuckDB's `range` without a step. A `hi` at or below `lo` gives no row, and a
+negative bound counts as any other. The bounds are fixed when the statement is
+planned — literals, `$params`, loop variables or expressions of them, never
+another table's column — and the rows are made as they are read, so `range(1000000000)`
+holds no more memory than `range(10)`.
+
+A sequence of times is a `date_add` over it, and a series with no gaps a
+`LEFT JOIN` from it. Read it first in `FROM`; to join it as the right side of
+another table, name it in a CTE (`WITH m AS (SELECT * FROM range(60))`).
+
+```sql
+-- one row per minute of the last hour, those with no sample as 0
+WITH s AS (SELECT date_trunc('minute', at) AS minute, avg(busy) AS busy
+           FROM 'cpu_samples.parquet' GROUP BY 1)
+SELECT date_add('minute', r.range, date_trunc('minute', now()) - INTERVAL 59 MINUTE) AS minute,
+       coalesce(s.busy, 0) AS busy
+FROM range(60) r
+LEFT JOIN s ON s.minute = date_add('minute', r.range, date_trunc('minute', now()) - INTERVAL 59 MINUTE)
+ORDER BY minute;
 ```
 
 ## SQL sources
