@@ -1684,6 +1684,30 @@ test "week: ISO weeks from Monday, in date_trunc, extract, date_add and date_dif
     try expectFile(&tmp, "w.csv", "wed,sun,w53,w1,crossed,plus2\n2026-09-28 00:00:00,2026-09-28 00:00:00,53,1,1,2026-10-14\n");
 }
 
+test "other dialects' spellings: year() and the other parts, date_part, substring, datediff, and a date moved by an INTERVAL" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try checkAndRun(alloc, &tmp,
+        \\LOAD INTO '$B/s.csv' AS SELECT
+        \\  year(CAST('2026-01-31' AS DATE)) AS y, month(CAST('2026-01-31' AS DATE)) AS m, day(CAST('2026-01-31' AS DATE)) AS d,
+        \\  hour(CAST('2026-01-31 13:45:10' AS TIMESTAMP)) AS h, date_part('minute', CAST('2026-01-31 13:45:10' AS TIMESTAMP)) AS mi,
+        \\  substring('basalt', 2, 3) AS s1, substring('basalt' FROM 4) AS s2, SUBSTRING('basalt' FROM 1 FOR 2) AS s3,
+        \\  datediff('day', CAST('2026-01-01' AS DATE), CAST('2026-03-01' AS DATE)) AS dd3, datediff(CAST('2026-03-01' AS DATE), CAST('2026-01-01' AS DATE)) AS dd2,
+        \\  CAST('2026-01-31' AS DATE) + INTERVAL 1 MONTH AS plus_month, CAST('2026-01-31' AS DATE) - INTERVAL '2 days' AS minus_days,
+        \\  INTERVAL '1' YEAR + CAST('2024-02-29' AS DATE) AS leap, CAST('2026-01-31 10:00:00' AS TIMESTAMP) + INTERVAL (1 + 1) HOUR AS plus_hours,
+        \\  date_add(CAST('2026-01-31' AS DATE), INTERVAL 1 WEEK) AS duck_add, date_sub(CAST('2026-01-31' AS DATE), INTERVAL 1 WEEK) AS duck_sub;
+    , 1, &.{});
+    try expectFile(&tmp, "s.csv", "y,m,d,h,mi,s1,s2,s3,dd3,dd2,plus_month,minus_days,leap,plus_hours,duck_add,duck_sub\n2026,1,31,13,45,asa,alt,ba,59,59,2026-02-28,2026-01-29,2025-02-28,2026-01-31 12:00:00,2026-02-07,2026-01-24\n");
+    try expectRunRefuses(alloc, &tmp, "SELECT INTERVAL 3 DAY AS x FROM '$B/s.csv';", 1, "an INTERVAL is taken only added to or subtracted from a date or timestamp");
+    try expectRunRefuses(alloc, &tmp, "SELECT CAST('2026-01-31' AS DATE) + 30 AS x FROM '$B/s.csv';", 1, "a date moves by an INTERVAL");
+    try checkAndRun(alloc, &tmp,
+        \\CREATE FUNCTION year(d) AS 42;
+        \\LOAD INTO '$B/u.csv' AS SELECT year(CAST('2026-01-31' AS DATE)) AS y;
+    , 1, &.{});
+    try expectFile(&tmp, "u.csv", "y\n42\n");
+}
+
 test "a chain of CTEs, each reading the one before, gives the same rows inlined at any thread count" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

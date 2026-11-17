@@ -399,6 +399,7 @@ fn expandExprNode(cx: *Ctx, e: *const ast.Expr, subst: ?*Subst, depth: usize) Er
             return mk(cx, e.*);
         },
         .call => |c| return expandCall(cx, c, subst, depth),
+        .binary => |b| if (b.op == .add or b.op == .sub) return expandShift(cx, b, subst, depth),
         .let_in => |l| return expandLetIn(cx, l, subst, depth),
         else => {},
     }
@@ -442,7 +443,64 @@ fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*Subst, depth: usize) Error!*a
         for (fd.params, full) |p, av| try inner.put(p.name, av);
         return expandExpr(cx, fd.body.expr, &inner, depth + 1);
     }
+    if (!c.distinct) if (try sugar(cx, c, args)) |e| return e;
     return mk(cx, .{ .call = .{ .name = c.name, .args = args, .distinct = c.distinct, .span = c.span } });
+}
+
+/// Other dialects' spellings of builtins, written as the builtin, unless the script
+/// defines a function of that name: `year(d)` and the other parts as `extract`,
+/// `date_part` as `extract`, `substring` as `substr`, `datediff` as `date_diff`
+/// (MySQL's two arguments counting the days from the second to the first), and
+/// DuckDB's `date_add` / `date_sub` of an INTERVAL as `date_add(unit, n, d)`.
+fn sugar(cx: *Ctx, c: ast.Expr.Call, args: []const *ast.Expr) Error!?*ast.Expr {
+    const parts = [_][2][]const u8{
+        .{ "year", "year" },      .{ "month", "month" }, .{ "week", "week" },     .{ "day", "day" },
+        .{ "dayofmonth", "day" }, .{ "hour", "hour" },   .{ "minute", "minute" }, .{ "second", "second" },
+    };
+    for (parts) |p| if (args.len == 1 and std.mem.eql(u8, c.name, p[0])) {
+        return try call(cx, c, "extract", &.{ try mk(cx, .{ .str_lit = p[1] }), args[0] });
+    };
+    if (std.mem.eql(u8, c.name, "date_part") and args.len == 2) return try call(cx, c, "extract", args);
+    if (std.mem.eql(u8, c.name, "substring") and (args.len == 2 or args.len == 3)) return try call(cx, c, "substr", args);
+    if (std.mem.eql(u8, c.name, "datediff")) {
+        if (args.len == 3) return try call(cx, c, "date_diff", args);
+        if (args.len == 2) return try call(cx, c, "date_diff", &.{ try mk(cx, .{ .str_lit = "day" }), args[1], args[0] });
+    }
+    if ((std.mem.eql(u8, c.name, "date_add") or std.mem.eql(u8, c.name, "date_sub")) and args.len == 2) {
+        if (intervalOf(args[1])) |iv| return try shifted(cx, iv, args[0], std.mem.eql(u8, c.name, "date_sub"));
+    }
+    return null;
+}
+
+fn call(cx: *Ctx, c: ast.Expr.Call, name: []const u8, args: []const *ast.Expr) Error!*ast.Expr {
+    return mk(cx, .{ .call = .{ .name = name, .args = try cx.arena.dupe(*ast.Expr, args), .span = c.span } });
+}
+
+const Interval = struct { n: *ast.Expr, unit: *ast.Expr };
+
+/// The parser's `__interval(n, unit)` for an `INTERVAL` literal.
+fn intervalOf(e: *const ast.Expr) ?Interval {
+    if (e.* != .call or !std.mem.eql(u8, e.call.name, "__interval") or e.call.args.len != 2) return null;
+    return .{ .n = e.call.args[0], .unit = e.call.args[1] };
+}
+
+/// `x` moved by the interval, back when `back`.
+fn shifted(cx: *Ctx, iv: Interval, x: *ast.Expr, back: bool) Error!*ast.Expr {
+    const n = if (back) try mk(cx, .{ .unary = .{ .op = .neg, .e = iv.n } }) else iv.n;
+    const args = try cx.arena.alloc(*ast.Expr, 3);
+    args[0] = iv.unit;
+    args[1] = n;
+    args[2] = x;
+    return mk(cx, .{ .call = .{ .name = "date_add", .args = args } });
+}
+
+/// A sum or difference, a date or timestamp plus or minus an INTERVAL as `date_add`.
+fn expandShift(cx: *Ctx, b: ast.Expr.Binary, subst: ?*Subst, depth: usize) Error!*ast.Expr {
+    const l = try expandExpr(cx, b.l, subst, depth);
+    const r = try expandExpr(cx, b.r, subst, depth);
+    if (intervalOf(r)) |iv| return shifted(cx, iv, l, b.op == .sub);
+    if (b.op == .add) if (intervalOf(l)) |iv| return shifted(cx, iv, r, false);
+    return mk(cx, .{ .binary = .{ .op = b.op, .l = l, .r = r } });
 }
 
 /// Pad a short argument list from trailing `DEFAULT`s, expanded scope-free: a

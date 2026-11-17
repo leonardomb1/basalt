@@ -218,7 +218,12 @@ pub const TypeCtx = struct {
         const nn = lt.nullable or rt.nullable or lt.unknown or rt.unknown;
         switch (b.op) {
             .add, .sub, .mul, .div, .mod => {
-                if (!(numericish(lt) and numericish(rt))) return self.err("arithmetic needs numeric operands", .{});
+                if (!(numericish(lt) and numericish(rt))) {
+                    const dated = lt.kind == .date or lt.kind == .timestamp or rt.kind == .date or rt.kind == .timestamp;
+                    if (dated and (b.op == .add or b.op == .sub))
+                        return self.err("a date moves by an INTERVAL (`d + INTERVAL 30 DAY`) or date_add('day', 30, d), and two dates part by date_diff('day', a, b)", .{});
+                    return self.err("arithmetic needs numeric operands", .{});
+                }
                 if (decimalArithType(b.op, lt, rt)) |dt| return dt.withNull(nn);
                 const k: types.TypeKind = if (lt.kind == .float or rt.kind == .float or lt.kind == .decimal or rt.kind == .decimal) .float else .int;
                 return Type{ .kind = k, .nullable = nn };
@@ -280,6 +285,8 @@ pub const TypeCtx = struct {
         const b = lookupBuiltin(name) orelse {
             if (std.mem.eql(u8, name, "env") or std.mem.eql(u8, name, "secret"))
                 return self.err("`{s}()` reads the environment only in a LET or a connection option, once before the run: `LET k = {s}('NAME')`, then `$k`", .{ name, name });
+            if (std.mem.eql(u8, name, "__interval"))
+                return self.err("an INTERVAL is taken only added to or subtracted from a date or timestamp, or by date_add or date_sub", .{});
             return self.err("unknown function `{s}`", .{name});
         };
         self.span = null;

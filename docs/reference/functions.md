@@ -163,6 +163,17 @@ timestamp fails in PostgreSQL and DuckDB — never clamped to the last instant;
 | `strptime(text, format)` | the timestamp read out of text: `strptime(dt, '%d/%m/%Y')` |
 | `try_strptime(text, format)` | the same, but null where the text does not fit |
 
+Other dialects' spellings read as these: `year(d)`, `month`, `week`, `day`
+(`dayofmonth`), `hour`, `minute` and `second` as `extract`, `date_part(unit, d)` as
+`extract(unit, d)`, `datediff(unit, start, end)` as `date_diff` (MySQL's
+`datediff(end, start)` counts days), and `substring(s, start, n)` or
+`SUBSTRING(s FROM start FOR n)` as `substr`; a function of the script by one of
+those names is its own. A date or timestamp moves by an `INTERVAL` — `d + INTERVAL
+30 DAY`, `d - INTERVAL '1 month'`, `INTERVAL (n) HOUR + ts`, DuckDB's
+`date_add(d, INTERVAL 1 WEEK)` and `date_sub` — which reads as `date_add`, a whole
+number of one of the units above; an interval anywhere else, and a date plus a bare
+number, are errors that say so.
+
 The format codes are `%Y %m %d %H %M %S %y %%`. `strftime`'s `%Y` is the
 year as a date prints it: at least four digits, more past 9999, and `-` before
 year 0 (`-0001` is 2 BC), so `strftime(d, '%Y-%m-%d')` is `CAST(d AS STRING)`;

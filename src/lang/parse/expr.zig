@@ -370,6 +370,66 @@ noinline fn numberLiteral(self: *Parser) Error!*ast.Expr {
     return self.mk(.{ .dec_lit = d });
 }
 
+/// `INTERVAL 30 DAY`, `INTERVAL '30' DAY`, `INTERVAL (n) DAY` or `INTERVAL '30 days'`,
+/// as `__interval(n, 'day')`: `lang/expand.zig` makes a date or timestamp plus or
+/// minus one a `date_add`, the one place it means anything.
+fn parseInterval(self: *Parser) Error!*ast.Expr {
+    const pos = self.curPos();
+    _ = self.advance();
+    const t = self.cur();
+    var n: *ast.Expr = undefined;
+    var unit: ?[]const u8 = null;
+    switch (t.tag) {
+        .string => {
+            _ = self.advance();
+            var it = std.mem.tokenizeAny(u8, t.text, " \t");
+            const num = it.next() orelse return self.fail(pos, "INTERVAL '{s}' holds no number", .{t.text});
+            const v = std.fmt.parseInt(i64, num, 10) catch return self.fail(pos, "INTERVAL takes a whole number of units, not `{s}`", .{num});
+            n = try self.mk(.{ .int_lit = v });
+            if (it.next()) |u| {
+                if (it.next() != null) return self.fail(pos, "INTERVAL takes one number and one unit, not `{s}`", .{t.text});
+                unit = u;
+            }
+        },
+        .lparen => {
+            _ = self.advance();
+            n = try self.parseExpr();
+            _ = try self.expect(.rparen);
+        },
+        else => n = try numberLiteral(self),
+    }
+    const u = unit orelse try self.expectIdent();
+    const canon = intervalUnit(u) orelse return self.fail(pos, "INTERVAL's unit `{s}` is not year, month, week, day, hour, minute or second", .{u});
+    const args = try self.arena.alloc(*ast.Expr, 2);
+    args[0] = n;
+    args[1] = try self.mk(.{ .str_lit = canon });
+    return self.mk(.{ .call = .{ .name = "__interval", .args = args } });
+}
+
+fn intervalUnit(u: []const u8) ?[]const u8 {
+    for ([_][]const u8{ "year", "month", "week", "day", "hour", "minute", "second" }) |name| {
+        if (std.ascii.eqlIgnoreCase(u, name)) return name;
+        if (u.len == name.len + 1 and std.ascii.eqlIgnoreCase(u[0..name.len], name) and (u[name.len] == 's' or u[name.len] == 'S')) return name;
+    }
+    return null;
+}
+
+/// `SUBSTRING(s FROM a [FOR n])` or `SUBSTRING(s, a [, n])`, as a `substring` call,
+/// which `lang/expand.zig` makes `substr` unless the script defines its own.
+fn parseSubstring(self: *Parser) Error!*ast.Expr {
+    const t = self.advance();
+    _ = self.advance();
+    var args = std.array_list.Managed(*ast.Expr).init(self.arena);
+    try args.append(try self.parseExpr());
+    if (self.eatKw("from")) {
+        try args.append(try self.parseExpr());
+        if (self.eatKw("for")) try args.append(try self.parseExpr());
+    } else while (self.eat(.comma)) try args.append(try self.parseExpr());
+    _ = try self.expect(.rparen);
+    const span = ast.Span{ .start = .{ .line = t.line, .col = t.col, .file = t.file }, .end = .{ .line = t.end_line, .col = t.end_col, .file = t.file } };
+    return self.mk(.{ .call = .{ .name = "substring", .args = try args.toOwnedSlice(), .span = span } });
+}
+
 fn decimalLiteral(text: []const u8) ?ast.Expr.DecLit {
     const d = @import("../../base/decimal.zig").literal(text) orelse return null;
     return .{ .unscaled = d.unscaled, .scale = d.scale };
@@ -449,6 +509,11 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                 if (self.col_uses) |u| u.opaqueUse(true);
                 return self.parseSearch();
             }
+            if (eqlNoCase(t.text, "interval") and self.i + 1 < self.toks.len) switch (self.toks[self.i + 1].tag) {
+                .string, .int, .float, .lparen => return parseInterval(self),
+                else => {},
+            };
+            if (eqlNoCase(t.text, "substring") and self.peekTag() == .lparen) return parseSubstring(self);
             if (eqlNoCase(t.text, "extract") and self.peekTag() == .lparen) {
                 _ = self.advance();
                 _ = self.advance();
