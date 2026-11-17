@@ -1,7 +1,9 @@
 name: Release
 
-# Releases only: a `v*` tag runs the full test gate, the release cross-build, the
-# container image and the release asset. Day-to-day checks are in ci.yml.
+# Releases only: a `v*` tag runs the full test gate on every CPU the release ships
+# for, builds the four release binaries, runs each through the integration suites
+# that need no database, and attaches them; it also builds the container image.
+# Day-to-day checks are in ci.yml.
 on:
   push:
     tags: ['v*']
@@ -17,42 +19,105 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    strategy:
+      matrix:
+        include:
+          - name: x86_64
+            runner: ubuntu-latest
+            cpu: native
+          - name: x86_64 baseline
+            runner: ubuntu-latest
+            cpu: baseline
+          - name: aarch64
+            runner: ubuntu-24.04-arm
+            cpu: native
     steps:
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/setup-zig
 
       - name: Check formatting
+        if: matrix.name == 'x86_64'
         run: zig fmt --check src tests tools build.zig
 
-      - name: Build
-        run: zig build
-
       - name: Test
-        run: zig build test
+        run: zig build test -Dcpu=${{ matrix.cpu }}
 
-      # The exact bytes tested here are what `image` ships and `release` attaches.
-      - name: Release cross-build
+  # Each binary is built on a runner of its architecture so it can be run there:
+  # the stdout and parquet integration suites go through the binary itself, as a
+  # user's script would. The bytes run here are the bytes `release` attaches.
+  #   basalt-x86_64-linux          x86-64-v3 + AES + PCLMUL (AVX2; Haswell, Zen and on)
+  #   basalt-x86_64-linux-baseline x86-64 (any 64-bit x86 CPU, old VMs, emulators)
+  #   basalt-x86_64-linux-avx512   x86-64-v4 + AES + PCLMUL (AVX-512; Skylake-SP, Ice Lake, Zen 4 and on)
+  #   basalt-aarch64-linux         ARMv8-A (Graviton, Ampere, Raspberry Pi 4, Docker on Apple silicon)
+  binaries:
+    name: binaries (${{ matrix.arch }})
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+            builds: |
+              basalt-x86_64-linux x86_64-linux-musl x86_64_v3+aes+pclmul
+              basalt-x86_64-linux-baseline x86_64-linux-musl baseline
+              basalt-x86_64-linux-avx512 x86_64-linux-musl x86_64_v4+aes+pclmul
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            builds: |
+              basalt-aarch64-linux aarch64-linux-musl baseline
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-zig
+
+      - name: Build
         run: |
-          zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -Dcpu=x86_64_v3+aes+pclmul -Dstrip=true
-          cp zig-out/bin/basalt basalt-x86_64-linux
-          sha256sum basalt-x86_64-linux > basalt-x86_64-linux.sha256
+          mkdir -p dist
+          while read -r name target cpu; do
+            [ -n "$name" ] || continue
+            zig build -Doptimize=ReleaseFast -Dtarget="$target" -Dcpu="$cpu" -Dstrip=true --prefix "out/$name"
+            cp "out/$name/bin/basalt" "dist/$name"
+            (cd dist && sha256sum "$name" > "$name.sha256")
+          done <<< "${{ matrix.builds }}"
+          ls -l dist
 
-      - name: Upload binary artifact
+      # The AVX-512 binary runs only where the runner's CPU has AVX-512, which a
+      # hosted runner does not always; otherwise the run says it was not run.
+      - name: Integration suites through each binary
+        run: |
+          for b in dist/basalt-*; do
+            case "$b" in *.sha256) continue ;; esac
+            if [[ "$b" == *avx512 ]]; then
+              missing=""
+              for f in avx512f avx512bw avx512cd avx512dq avx512vl; do grep -qw "$f" /proc/cpuinfo || missing="$f"; done
+              if [ -n "$missing" ]; then
+                echo "::notice::this runner's CPU lacks $missing: $b was built, not run"
+                continue
+              fi
+            fi
+            echo "::group::$b"
+            "$b" --version
+            B="$b" ./tests/integration/run.sh stdout parquet
+            echo "::endgroup::"
+          done
+
+      - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
-          name: basalt-x86_64-linux
-          path: |
-            basalt-x86_64-linux
-            basalt-x86_64-linux.sha256
+          name: binaries-${{ matrix.arch }}
+          path: dist/*
           if-no-files-found: error
           retention-days: 7
 
   image:
     # Publish the container image for a tag; a manual run only tests and builds.
-    needs: test
+    needs: binaries
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -93,24 +158,25 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # Attach the tested static binary as a release asset on tags, so it can be run
+  # Attach the tested static binaries as release assets on tags, so they can be run
   # directly (e.g. downloaded + executed in a Windmill bash step — no container).
-  # No rebuild: the asset is byte-identical to what `test` built and exercised.
+  # No rebuild: the assets are byte-identical to what `binaries` built and ran.
   release:
-    needs: test
+    needs: binaries
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - name: Download tested binary
+      - name: Download tested binaries
         uses: actions/download-artifact@v4
         with:
-          name: basalt-x86_64-linux
+          pattern: binaries-*
+          merge-multiple: true
 
-      - name: Verify checksum
-        run: sha256sum -c basalt-x86_64-linux.sha256
+      - name: Verify checksums
+        run: sha256sum -c *.sha256
 
       - name: Attach to release
         uses: softprops/action-gh-release@v2
@@ -118,3 +184,9 @@ jobs:
           files: |
             basalt-x86_64-linux
             basalt-x86_64-linux.sha256
+            basalt-x86_64-linux-baseline
+            basalt-x86_64-linux-baseline.sha256
+            basalt-x86_64-linux-avx512
+            basalt-x86_64-linux-avx512.sha256
+            basalt-aarch64-linux
+            basalt-aarch64-linux.sha256

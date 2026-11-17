@@ -1,8 +1,11 @@
 name: CI
 
 # The light check for main and pull requests: formatting, the unit and e2e tests,
-# and the book's SQL examples (so docs/ is not ignored). Releases (cross-build,
-# image, assets) run from release.yml on tags.
+# and the book's SQL examples (so docs/ is not ignored), on every CPU the release
+# ships for: x86-64 as the runner has it, x86-64 at its 2003 baseline (no AVX2,
+# no PCLMUL: the scalar fallbacks, two-wide float sums), x86-64-v4 (AVX-512,
+# eight-wide float sums) where the runner has it, and aarch64. Releases
+# (cross-build, image, assets) run from release.yml on tags.
 on:
   push:
     branches: [main]
@@ -27,15 +30,53 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86_64
+            runner: ubuntu-latest
+            cpu: native
+          - name: x86_64 baseline
+            runner: ubuntu-latest
+            cpu: baseline
+          - name: x86_64 avx512
+            runner: ubuntu-latest
+            cpu: x86_64_v4+aes+pclmul
+            needs_flags: avx512f avx512bw avx512cd avx512dq avx512vl
+          - name: aarch64
+            runner: ubuntu-24.04-arm
+            cpu: native
     steps:
       - uses: actions/checkout@v4
 
       - uses: ./.github/actions/setup-zig
 
       - name: Check formatting
+        if: matrix.name == 'x86_64'
         run: zig fmt --check src tests tools build.zig
 
+      # A hosted runner's CPU varies from run to run: without AVX-512 the v4 tests
+      # cannot run, so the binary is only compiled and the run says so.
+      - name: CPU check
+        id: cpu
+        run: |
+          for f in ${{ matrix.needs_flags }}; do
+            if ! grep -qw "$f" /proc/cpuinfo; then
+              echo "::notice::this runner's CPU lacks $f: the ${{ matrix.name }} tests were compiled, not run"
+              echo "runs=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "runs=true" >> "$GITHUB_OUTPUT"
+
       - name: Test
-        run: zig build test
+        if: steps.cpu.outputs.runs == 'true'
+        run: zig build test -Dcpu=${{ matrix.cpu }}
+
+      - name: Build only
+        if: steps.cpu.outputs.runs != 'true'
+        run: zig build -Dcpu=${{ matrix.cpu }}

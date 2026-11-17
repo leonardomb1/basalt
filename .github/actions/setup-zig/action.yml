@@ -1,5 +1,5 @@
 name: Set up Zig
-description: Install Zig from the official release tarball (cached) and put it on PATH.
+description: Install Zig from the official release tarball for the runner's architecture (cached) and put it on PATH.
 
 inputs:
   version:
@@ -9,12 +9,22 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Zig architecture
+      id: arch
+      shell: bash
+      run: |
+        case "${{ runner.arch }}" in
+          X64) echo "zig=x86_64" >> "$GITHUB_OUTPUT" ;;
+          ARM64) echo "zig=aarch64" >> "$GITHUB_OUTPUT" ;;
+          *) echo "no Zig tarball for runner architecture ${{ runner.arch }}" >&2; exit 1 ;;
+        esac
+
     - name: Cache Zig
       id: zig-cache
       uses: actions/cache@v4
       with:
         path: ~/.zig
-        key: zig-${{ inputs.version }}-x86_64-linux
+        key: zig-${{ inputs.version }}-${{ steps.arch.outputs.zig }}-linux
 
     # Tarball naming is arch-first since 0.14.1: zig-<arch>-<os>-<version>.
     - name: Install Zig
@@ -22,7 +32,7 @@ runs:
       shell: bash
       run: |
         mkdir -p ~/.zig
-        curl -fsSL "https://ziglang.org/download/${{ inputs.version }}/zig-x86_64-linux-${{ inputs.version }}.tar.xz" \
+        curl -fsSL "https://ziglang.org/download/${{ inputs.version }}/zig-${{ steps.arch.outputs.zig }}-linux-${{ inputs.version }}.tar.xz" \
           | tar -xJ -C ~/.zig --strip-components=1
 
     - name: Add Zig to PATH
