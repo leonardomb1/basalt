@@ -26,7 +26,10 @@ PRINT <expr>;                     -- progress line on stderr, via the run log
 at plan time. It stands on a line of its own — nothing may follow it there but a
 `--` comment. Each included file is parsed separately (errors report the
 included file's own path and line), includes may nest (depth 16, cycles
-rejected), and paths resolve relative to the including file. A file is spliced
+rejected), and paths resolve relative to the including file, by the path it was
+included as — a symlinked folder is not followed to its target, and the working
+directory plays no part: `mods/m/fns.sql` including `'lib/sys.sql'` reads
+`mods/m/lib/sys.sql`. A file is spliced
 in **once**, at its first include, like C's `#pragma once`: when `outliers.sql`
 and `dispersion.sql` both include `stats.sql` and a script includes both,
 `stats.sql` is in the program one time — its `CREATE FUNCTION`s are not defined
