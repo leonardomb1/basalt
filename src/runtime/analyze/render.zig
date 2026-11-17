@@ -9,6 +9,7 @@ const smb = @import("../../store/smb.zig");
 const std = @import("std");
 const types = @import("../../lang/types.zig");
 const targets = @import("targets.zig");
+const mem_lane_rows = @import("../path.zig").mem_lane_rows;
 const formats = @import("../../format/formats.zig");
 const FileFormat = @import("targets.zig").FileFormat;
 const Diag = @import("../analyze.zig").Diag;
@@ -121,10 +122,13 @@ fn physical(w: anytype, ph: Physical) !void {
         rest.chunk_copy = false;
         return physical(w, rest);
     }
+    if (ph.text.len > 0) return w.writeAll(ph.text);
     if (ph.prelude) |p| {
         try w.print("{s} read into memory first (", .{p.what});
         try physical(w, p.inner.*);
-        return w.writeAll("), then serial");
+        try w.writeAll("), then serial");
+        if (p.mem.len > 0) try w.print(", or memory parallel {s} from {d} rows", .{ p.mem, mem_lane_rows });
+        return;
     }
     switch (ph.path) {
         .serial => try serial(w, ph),

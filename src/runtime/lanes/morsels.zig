@@ -301,12 +301,17 @@ fn driveRun(ctx: *Drive, lane: usize) !void {
 }
 
 /// `src` counted, then through `p`'s map stages and join probes, on `wa`, with the
-/// runtime filters the probes own.
+/// runtime filters the probes own. Rows held in memory were counted where they were
+/// read, and are not again.
 fn chainOver(p: Pipeline, src: driver.Source, wa: std.mem.Allocator) !op.Op {
-    const cs = try wa.create(obs.CountingSource);
-    cs.* = .{ .inner = src, .count = p.rows_read };
+    var counted = src;
+    if (p.m.* != .mem) {
+        const cs = try wa.create(obs.CountingSource);
+        cs.* = .{ .inner = src, .count = p.rows_read };
+        counted = cs.source();
+    }
     const scan = try wa.create(op.Scan);
-    scan.* = .{ .src = cs.source() };
+    scan.* = .{ .src = counted };
     scan.stats.at = p.read_at;
     var read: op.Op = .{ .scan = scan };
     if (p.slots.len > 0) {

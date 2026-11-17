@@ -74,8 +74,9 @@ or `ORDER BY … LIMIT` sent to the source comes first, then the split, each
 loaded whole into a Parquet file, its column chunks copied as they stand
 ([Formats](formats.md)), unless a kept column is one the writer would write
 otherwise, then the path after `else`; `… read into memory first (…), then
-serial` is an aggregating CTE read on its own path ahead of a
-serial rest; `serial` is everything else (a CSV over HTTP is fetched whole, so it
+serial` is an aggregating CTE (or a union whose rows something breaks after it)
+read on its own path ahead of a serial rest, or, past 65,536 rows, of a rest that
+breaks them on lanes over its batches (`then memory parallel aggregate`); `serial` is everything else (a CSV over HTTP is fetched whole, so it
 parses serially; an `UNNEST` or a `LIMIT` without `ORDER BY` over a file streams
 on one lane). A parallel path names what only the source can settle — a table's
 key and size, a CSV that quotes a newline, a Parquet with one row group (over

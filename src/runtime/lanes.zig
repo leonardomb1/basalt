@@ -116,6 +116,31 @@ pub fn shapeLaneSafe(shape: LaneShape) bool {
     };
 }
 
+/// The rows below which a pipeline over a binding held in memory runs serially: its
+/// lanes cost more than they save.
+pub const mem_lane_rows: usize = 1 << 16;
+
+/// Whether `shape` breaks the rows (an aggregate, DISTINCT, top-N, sort or window),
+/// the shapes worth lanes over rows already in memory; a map would only stream them.
+pub fn memLaneShape(shape: LaneShape) bool {
+    return switch (shape) {
+        .sink, .distinct, .top_n, .sort => true,
+        .map, .map_join => false,
+    };
+}
+
+/// `shape` run on lanes over `m`, rows held in memory (`Morsels.mem`); false falls
+/// back, as `runShape` does. Its head is no file to turn a first join around on.
+pub fn runMemLane(env: *Env, m: Morsels, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    return switch (shape) {
+        .sink => |x| runParallelAgg(env, &m, null, x, w, opts, stats, lanes_used),
+        .distinct => |x| runParallelDistinct(env, &m, x.prefix, x.dist, x.tail, w, opts, stats, lanes_used),
+        .top_n => |x| runParallelTopN(env, &m, x.prefix, x.srt, x.lim, w, opts, stats, lanes_used),
+        .sort => |x| runParallelSort(env, &m, x, w, opts, stats, lanes_used),
+        .map, .map_join => false,
+    };
+}
+
 fn runShape(env: *Env, split: Morsels, head: ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     return switch (shape) {
         .sink => |x| runParallelAgg(env, &split, head, x, w, opts, stats, lanes_used),

@@ -175,6 +175,24 @@ pub fn laneEligible(stages: []const ast.Stage, n: usize) bool {
 
 /// Whether a binding of `stages` that a pipeline reads is aggregated first, in
 /// parallel, into memory: built where it is read it ran on one thread.
+/// The shape lanes would run `stages` (a binding held in memory at their head, their
+/// write last) in over its batches (`run/output.zig` `memLanes`), for EXPLAIN; empty
+/// when they would run serially.
+pub fn memLaneText(stages: []const ast.Stage, n: usize) []const u8 {
+    if (n < 2 or stages.len < 3) return "";
+    const shape = lanes.classifyLaneShape(stages) orelse return "";
+    if (!lanes.memLaneShape(shape) or !lanes.shapeLaneSafe(shape)) return "";
+    return switch (shape) {
+        .sink => |x| if (x.joins.len > 0) "aggregate over joins" else "aggregate",
+        .distinct => "distinct",
+        .top_n => "top-n",
+        .sort => |x| if (x.srt.node == .window) "window" else "sort",
+        .map, .map_join => "",
+    };
+}
+
+pub const mem_lane_rows = lanes.mem_lane_rows;
+
 pub fn materializes(stages: []const ast.Stage, n: usize) bool {
     if (n < 2 or stages.len < 2 or stages[0].node != .read) return false;
     for (stages) |st| {

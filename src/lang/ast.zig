@@ -565,6 +565,9 @@ pub const Union = struct {
     positional: bool = false,
     set: SetOp = .union_all,
     set_all: bool = false,
+    /// A set operation's branches put together with their side marks, the operation
+    /// left to the stages after it (`runtime/plan/union.zig` `setOpStages`).
+    marks_only: bool = false,
     pos: Pos,
 };
 

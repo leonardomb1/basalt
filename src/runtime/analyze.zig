@@ -69,6 +69,9 @@ const Value = @import("../exec/value.zig").Value;
 const sql = @import("../db/sql.zig");
 const holes = @import("analyze/holes.zig");
 const msgfmt = @import("../base/msgfmt.zig");
+const union_plan = @import("plan/union.zig");
+/// How the run and EXPLAIN say a union's branches ran, each on its own path.
+pub const union_branches_text = "its branches each on its own path";
 const pathmod = @import("path.zig");
 const splitMayCut = @import("connect/sql_read.zig").splitMayCut;
 const connect = @import("connect.zig");
@@ -390,8 +393,11 @@ pub const Stage = struct {
 /// conditions only the run settles.
 pub const Physical = struct {
     path: pathmod.Path,
-    /// A binding read into memory first, on `inner`'s path.
-    prelude: ?struct { what: []const u8, inner: *const Physical } = null,
+    /// A binding read into memory first, on `inner`'s path, then the rest serially or,
+    /// over enough rows, on lanes over its batches in the shape `mem` names.
+    prelude: ?struct { what: []const u8, inner: *const Physical, mem: []const u8 = "" } = null,
+    /// A path said in words of its own (a union's branches each on its own path).
+    text: []const u8 = "",
     has_breaker: bool = false,
     sink_parallel: bool = false,
     /// The `ORDER BY … LIMIT` a SQL read is sent, as far as offline analysis tells.
@@ -1518,8 +1524,12 @@ const Ctx = struct {
     /// memory first, else the chain from the leading read.
     /// `raw` is before the head binding is laid out.
     fn physicalOf(self: *Ctx, raw: []const ast.Stage, stages_in: []const ast.Stage) Error!Physical {
-        if (raw[0].node == .ref) if (self.bindings.get(raw[0].node.ref)) |b| if (pathmod.materializes((try self.inlineHead(b.stages)).stages, self.lanes))
-            return self.prelude(raw[0].node.ref, b.stages, b.stages.len);
+        if (try self.unionPrelude(raw)) |ph| return ph;
+        if (raw[0].node == .ref) if (self.bindings.get(raw[0].node.ref)) |b| if (pathmod.materializes((try self.inlineHead(b.stages)).stages, self.lanes)) {
+            var ph = try self.prelude(raw[0].node.ref, b.stages, b.stages.len);
+            ph.prelude.?.mem = pathmod.memLaneText(raw, self.lanes);
+            return ph;
+        };
 
         const w = stages_in[stages_in.len - 1].node.write;
         var stages = stages_in;
@@ -1574,6 +1584,35 @@ const Ctx = struct {
     }
 
     /// `stages[0..n]` written into memory, on its own path, ahead of a serial rest.
+    /// A union at the head, through bindings, that the run reads into memory first
+    /// (`run/output.zig` `unionToMemory`): its rows broken after it, a set operation's
+    /// own among them.
+    fn unionPrelude(self: *Ctx, raw: []const ast.Stage) Error!?Physical {
+        if (self.lanes < 2 or raw.len < 2) return null;
+        var stages = raw;
+        var depth: usize = 0;
+        while (stages[0].node == .ref and depth < 16) : (depth += 1) {
+            const b = self.bindings.get(stages[0].node.ref) orelse return null;
+            if (b.stages.len == 0 or (b.stages[0].node != .union_ and b.stages[0].node != .ref)) return null;
+            stages = try std.mem.concat(self.arena, ast.Stage, &.{ b.stages, stages[1..] });
+        }
+        if (stages[0].node != .union_) return null;
+        const u = stages[0].node.union_;
+        if (u.branches.len < 2 or u.marks_only or (u.set != .union_all and u.set_all)) return null;
+        const lowered = u.set != .union_all;
+        const broken = lowered or for (stages[1 .. stages.len - 1]) |st| switch (st.node) {
+            .aggregate, .distinct, .sort, .window => break true,
+            else => {},
+        } else false;
+        if (!broken) return null;
+        const set_stages: []const ast.Stage = if (lowered) try union_plan.setOpStages(self.arena, u.set, stages[0].pos) else &.{};
+        const held = ast.Stage{ .node = .{ .ref = "" }, .hints = &.{}, .pos = stages[0].pos };
+        const outer = try std.mem.concat(self.arena, ast.Stage, &.{ &.{held}, set_stages, stages[1..] });
+        const inner = try self.arena.create(Physical);
+        inner.* = .{ .path = .serial, .text = union_branches_text };
+        return .{ .path = .serial, .prelude = .{ .what = "the union", .inner = inner, .mem = pathmod.memLaneText(outer, self.lanes) } };
+    }
+
     fn prelude(self: *Ctx, what: []const u8, stages: []const ast.Stage, n: usize) Error!Physical {
         const inner = try self.arena.alloc(ast.Stage, n + 1);
         @memcpy(inner[0..n], stages[0..n]);

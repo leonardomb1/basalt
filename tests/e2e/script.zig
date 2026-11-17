@@ -542,6 +542,56 @@ test "a last join turned around on lanes, the joins before it held in memory fir
     }
 }
 
+test "set operations and a large CTE run into memory first, their rows broken on lanes over memory, give the serial rows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var o = std.array_list.Managed(u8).init(alloc);
+    defer o.deinit();
+    try o.appendSlice("ok,ck,pri,st,price\n");
+    for (0..150000) |i| try o.writer().print("{d},{d},{c},{c},{d}\n", .{ i, (i * 7) % 20000, "12345"[i % 5], "FOP"[(i / 3) % 3], (i * 37) % 100000 });
+    try tmp.dir.writeFile(.{ .sub_path = "o.csv", .data = o.items });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    const Case = struct { q: []const u8, says: []const u8 };
+    const cases = [_]Case{
+        .{ .q = "SELECT count(*) AS n, sum(ck) AS s FROM (SELECT ck FROM '$B/o.csv' WHERE pri = '1' INTERSECT SELECT ck FROM '$B/o.csv' WHERE st = 'P') t", .says = "the union read into memory first (its branches each on its own path), then memory parallel aggregate" },
+        .{ .q = "SELECT count(*) AS n, sum(ck) AS s FROM (SELECT ck, pri FROM '$B/o.csv' WHERE price > 1000 EXCEPT SELECT ck, pri FROM '$B/o.csv' WHERE st = 'F') t", .says = "then memory parallel aggregate" },
+        .{ .q = "SELECT count(*) AS n FROM (SELECT ck FROM '$B/o.csv' WHERE pri = '2' UNION SELECT ck FROM '$B/o.csv' WHERE st = 'O') t", .says = "then memory parallel" },
+        .{ .q = "SELECT pri, count(*) AS n, sum(price) AS p FROM (SELECT pri, price FROM '$B/o.csv' WHERE price > 50000 UNION ALL SELECT pri, price FROM '$B/o.csv' WHERE st = 'P') t GROUP BY pri ORDER BY pri", .says = "then memory parallel aggregate" },
+        .{ .q = "WITH s AS (SELECT ck, pri, sum(price) AS t FROM '$B/o.csv' GROUP BY ck, pri) SELECT pri, ck, rank() OVER (PARTITION BY pri ORDER BY t DESC, ck) AS r FROM s ORDER BY r, pri LIMIT 20", .says = "s read into memory first" },
+    };
+    for (cases) |cs| {
+        const q = try std.mem.replaceOwned(u8, alloc, cs.q, "$B", base);
+        defer alloc.free(q);
+        const script = try std.fmt.allocPrint(alloc, "LOAD INTO '{s}/out.csv' AS {s};", .{ base, q });
+        defer alloc.free(script);
+        var outs: [2][]u8 = undefined;
+        var n: usize = 0;
+        defer for (outs[0..n]) |x| alloc.free(x);
+        for ([_]usize{ 1, 4 }) |threads| {
+            var rdiag: Diag = .{};
+            _ = try exec(alloc, script, .{ .threads = threads, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+            outs[n] = try tmp.dir.readFileAlloc(alloc, "out.csv", 1 << 24);
+            n += 1;
+        }
+        try std.testing.expect(std.mem.count(u8, outs[0], "\n") >= 2);
+        try std.testing.expectEqualStrings(outs[0], outs[1]);
+
+        const explain = try std.fmt.allocPrint(alloc, "LET n = 1;\nEXPLAIN ANALYZE LOAD INTO '{s}/never.csv' AS {s};", .{ base, q });
+        defer alloc.free(explain);
+        var rdiag: Diag = .{};
+        var cap = try StderrCapture.begin(tmp.dir);
+        const res = exec(alloc, explain, .{ .threads = 4, .log = .{ .quiet = true, .summary = .none } }, &rdiag);
+        const prof = try cap.end(alloc);
+        defer alloc.free(prof);
+        _ = try res;
+        errdefer std.debug.print("{s}\n", .{prof});
+        try std.testing.expect(std.mem.indexOf(u8, prof, cs.says) != null);
+    }
+}
+
 test "EXISTS and NOT EXISTS after joins that leave few rows read their files for the held keys, and a chain of joins into a file runs on lanes, each giving the serial rows" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

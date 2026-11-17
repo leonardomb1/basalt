@@ -2,6 +2,9 @@
 //! in order, else the serial driver, with its sink opened, written and closed.
 
 const Batch = @import("../../exec/batch.zig").Batch;
+const column = @import("../../exec/column.zig");
+const lane_paths = @import("../lanes.zig");
+const union_plan = @import("../plan/union.zig");
 const Env = @import("../env.zig").Env;
 const RunOptions = @import("../env.zig").RunOptions;
 const SplitCtx = @import("../connect.zig").SplitCtx;
@@ -231,10 +234,15 @@ fn materializeJoinSides(env: *Env, opts: RunOptions, stages: []const ast.Stage, 
 /// `stages` run into memory, under `EXPLAIN ANALYZE` profiled in a scope of their
 /// own named `what`.
 pub fn runToMemory(env: *Env, opts: RunOptions, stages: []const ast.Stage, what: []const u8, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!env_mod.MemSink {
+    return runToMemoryCapped(env, opts, stages, what, lanes_used, batch_arena, null);
+}
+
+/// `runToMemory` failing with `error.PastMemCap` past `cap` rows.
+fn runToMemoryCapped(env: *Env, opts: RunOptions, stages: []const ast.Stage, what: []const u8, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, cap: ?u64) anyerror!env_mod.MemSink {
     const inner = try env.arena.alloc(ast.Stage, stages.len + 1);
     @memcpy(inner[0..stages.len], stages);
     inner[stages.len] = .{ .node = .{ .write = .{ .connector = mem_connector, .form = null, .target = "", .mode = .overwrite } }, .hints = &.{}, .pos = stages[0].pos };
-    var ms = env_mod.MemSink{ .arena = env.arena, .batches = std.array_list.Managed(Batch).init(env.arena) };
+    var ms = env_mod.MemSink{ .arena = env.arena, .batches = std.array_list.Managed(Batch).init(env.arena), .cap_rows = cap };
     const outer_sink = env.mem_sink;
     const outer_name = env.sink_name;
     const outer_free = env.out_order_free;
@@ -296,6 +304,116 @@ fn materializeNamed(env: *Env, opts: RunOptions, name: []const u8, lanes_used: *
     }
     try env.materialized.put(env.arena, name, .{ .schema = ms.schema, .batches = ms.batches.items });
     try held.append(name);
+    return true;
+}
+
+/// The rows a union run into memory first may hold, its branches each and itself;
+/// past them it runs as planned.
+const union_mem_rows: u64 = 1 << 23;
+
+/// A union at the head (or the head binding's, through bindings of bindings), run into memory first when its rows
+/// are broken after it (an aggregate, DISTINCT, sort or window, a set operation's own)
+/// or a branch breaks or joins its own: each branch of its own pipeline run on its
+/// own path, then, rows broken after it, the branches put together, an INTERSECT's or
+/// EXCEPT's side marks kept and the operation left to stages that follow
+/// (`union.setOpStages`), so the lanes take them over memory (`memLanes`). Built in
+/// place, every branch ran on one thread and the set operation counted on one. Null
+/// leaves the stages as they are; `held` gets each binding run into memory.
+fn unionToMemory(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, held: *std.array_list.Managed([]const u8)) anyerror!?[]const ast.Stage {
+    if (opts.lanes() < 2 or stages_in.len < 2 or env.union_sink != null) return null;
+    var stages = stages_in;
+    var depth: usize = 0;
+    while (stages[0].node == .ref and depth < 16) : (depth += 1) {
+        if (env.materialized.contains(stages[0].node.ref)) return null;
+        const b = (try stampedBinding(env, stages[0].node.ref)) orelse return null;
+        if (b.stages.len == 0 or (b.stages[0].node != .union_ and b.stages[0].node != .ref)) return null;
+        stages = try std.mem.concat(env.arena, ast.Stage, &.{ b.stages, stages[1..] });
+    }
+    if (stages[0].node != .union_) return null;
+    const u = stages[0].node.union_;
+    if (u.branches.len < 2 or u.marks_only or (u.set != .union_all and u.set_all)) return null;
+    const lowered = u.set != .union_all;
+    const after = stages[1 .. stages.len - 1];
+    const broken = lowered or for (after) |st| switch (st.node) {
+        .aggregate, .distinct, .sort, .window => break true,
+        else => {},
+    } else false;
+    var branch_breaks = false;
+    for (u.branches) |br| if (br.pipeline) |p| for (p.stages) |st| switch (st.node) {
+        .aggregate, .distinct, .sort, .window, .join, .union_, .ref => branch_breaks = true,
+        else => {},
+    };
+    if (!broken and !branch_breaks) return null;
+
+    const tag = @intFromPtr(stages_in.ptr);
+    const branches = try env.arena.dupe(ast.UnionBranch, u.branches);
+    for (branches, 0..) |*br, i| {
+        const p = br.pipeline orelse continue;
+        const name = try msgfmt.allocPrint(env.arena, "__union_{x}_{d}", .{ tag, i });
+        const ms = runToMemoryCapped(env, opts, p.stages, name, lanes_used, batch_arena, union_mem_rows) catch |e| {
+            if (e == error.PastMemCap) return null;
+            return e;
+        };
+        try env.materialized.put(env.arena, name, .{ .schema = ms.schema, .batches = ms.batches.items });
+        try held.append(name);
+        const ref = try env.arena.alloc(ast.Stage, 1);
+        ref[0] = .{ .node = .{ .ref = name }, .hints = &.{}, .pos = p.pos };
+        br.pipeline = .{ .stages = ref, .pos = p.pos };
+    }
+    var nu = u;
+    nu.branches = branches;
+    nu.marks_only = lowered;
+    const head = ast.Stage{ .node = .{ .union_ = nu }, .hints = stages[0].hints, .pos = stages[0].pos };
+    if (!broken) return try std.mem.concat(env.arena, ast.Stage, &.{ &.{head}, stages[1..] });
+
+    const name = try msgfmt.allocPrint(env.arena, "__union_{x}", .{tag});
+    const ms = runToMemoryCapped(env, opts, &.{head}, name, lanes_used, batch_arena, union_mem_rows) catch |e| {
+        if (e == error.PastMemCap) return null;
+        return e;
+    };
+    try env.materialized.put(env.arena, name, .{ .schema = ms.schema, .batches = ms.batches.items });
+    try held.append(name);
+    if (env.profile) |p| p.path = analyze.union_branches_text;
+    try notePrelude(env, "the union", stages[0].pos);
+    const ref = ast.Stage{ .node = .{ .ref = name }, .hints = &.{}, .pos = stages[0].pos };
+    const set_stages: []const ast.Stage = if (lowered) try union_plan.setOpStages(env.arena, u.set, stages[0].pos) else &.{};
+    return try std.mem.concat(env.arena, ast.Stage, &.{ &.{ref}, set_stages, stages[1..] });
+}
+
+/// A pipeline whose head is a binding held in memory of `lanes.mem_lane_rows` rows or
+/// more, breaking them (an aggregate, DISTINCT, top-N, sort or window), run on lanes
+/// over its batches, a large one cut into views of that many rows: over a CTE run
+/// into memory first, the rest of a report ran on one thread.
+fn memLanes(env: *Env, opts: RunOptions, stages: []const ast.Stage, w: ast.Write, stats: *Stats, lanes_used: *usize) anyerror!bool {
+    if (opts.lanes() < 2 or stages.len < 3 or stages[0].node != .ref) return false;
+    const mat = env.materialized.get(stages[0].node.ref) orelse return false;
+    var rows: usize = 0;
+    for (mat.batches) |b| rows += b.len;
+    if (rows < lane_paths.mem_lane_rows) return false;
+    const shape = lane_paths.classifyLaneShape(stages) orelse return false;
+    if (!lane_paths.memLaneShape(shape) or !lane_paths.shapeLaneSafe(shape)) return false;
+    var pieces = std.array_list.Managed(Batch).init(env.arena);
+    for (mat.batches) |b| {
+        var lo: usize = 0;
+        while (lo < b.len) : (lo += lane_paths.mem_lane_rows) {
+            const n = @min(lane_paths.mem_lane_rows, b.len - lo);
+            if (lo == 0 and n == b.len) {
+                try pieces.append(b);
+                break;
+            }
+            const cols = try env.arena.alloc(column.Column, b.columns.len);
+            for (cols, b.columns) |*o, c| o.* = try column.slice(env.arena, c, lo, n);
+            try pieces.append(.{ .schema = b.schema, .columns = cols, .len = n });
+        }
+    }
+    const sch = try env.arena.create(types.Schema);
+    sch.* = mat.schema;
+    const before = if (env.profile) |p| p.path else "";
+    if (!try lane_paths.runMemLane(env, .{ .mem = .{ .batches = pieces.items, .schema = sch } }, shape, w, opts, stats, lanes_used)) return false;
+    if (env.profile) |p| {
+        if (std.mem.endsWith(u8, before, "then serial"))
+            p.path = try msgfmt.allocPrint(env.arena, "{s}{s}", .{ before[0 .. before.len - "serial".len], p.path });
+    }
     return true;
 }
 
@@ -857,6 +975,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     defer for (run_first.items) |name| {
         _ = env.materialized.remove(name);
     };
+    if (try unionToMemory(env, opts, stages, lanes_used, batch_arena, &run_first)) |s| stages = s;
     _ = try materializeBinding(env, opts, stages, lanes_used, batch_arena, &run_first);
     try materializeJoinSides(env, opts, stages, lanes_used, batch_arena, &run_first);
     stages = try inlineHeadBindings(env, stages);
@@ -949,6 +1068,7 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     if (env.union_sink == null and path.chunkCopy(stages, path_facts))
         if (try chunk_copy.run(env, stages, last.write, stats)) return;
     const chosen = try path.choose(arena, stages, head_stages, path_facts);
+    if (chosen == .serial and env.union_sink == null) if (try memLanes(env, opts, stages, last.write, stats, lanes_used)) return;
     if (chosen == .union_split) {
         return runUnionSplit(env, stages[0].node.union_, stages[0].hints, stages[1 .. stages.len - 1], stages[stages.len - 1], opts, stats, lanes_used, batch_arena);
     }

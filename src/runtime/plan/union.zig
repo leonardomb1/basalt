@@ -415,7 +415,7 @@ pub fn buildUnion(env: *Env, u: ast.Union, hints: []const ast.Hint, after: []con
     const un = try arena.create(op.Union);
     un.* = .{ .children = children };
     if (env.profile != null) un.label = try msgfmt.allocPrint(arena, "{d} branches{s}", .{ specs.len, if (u.branches.len == 0) ", from discovery" else "" });
-    if (u.set == .union_all) return .{ .op = .{ .union_ = un }, .schema = out_schema };
+    if (u.set == .union_all or u.marks_only) return .{ .op = .{ .union_ = un }, .schema = out_schema };
     return buildSetOp(env, u.set, u.set_all, canon, .{ .union_ = un }, out_schema);
 }
 
@@ -490,6 +490,33 @@ fn narrowed(arena: std.mem.Allocator, d: pushdown.Dialect, rd: ast.Read, conj: [
 }
 
 const side_cols = [2][]const u8{ "__set_left", "__set_right" };
+
+/// INTERSECT or EXCEPT (not ALL) as the stages after its branches put together with
+/// their side marks (`Union.marks_only`): each distinct row counted per side, kept
+/// as the operation keeps it, the marks dropped. As stages the lanes can take them;
+/// built into the union they ran on one thread.
+pub fn setOpStages(arena: std.mem.Allocator, set: ast.SetOp, pos: ast.Pos) ![]const ast.Stage {
+    const aggs = try arena.alloc(ast.AggItem, 2);
+    var counted: [2]*ast.Expr = undefined;
+    for (side_cols, aggs, &counted) |name, *a, *c| {
+        const parts = try arena.alloc([]const u8, 1);
+        parts[0] = name;
+        a.* = .{ .name = name, .func = .sum, .arg = try mk(arena, .{ .field = .{ .parts = parts } }) };
+        c.* = try mk(arena, .{ .field = .{ .parts = parts } });
+    }
+    const zero = try mk(arena, .{ .int_lit = 0 });
+    const left_has = try mk(arena, .{ .binary = .{ .op = .gt, .l = counted[0], .r = zero } });
+    const right_has = try mk(arena, .{ .binary = .{ .op = if (set == .intersect) .gt else .eq, .l = counted[1], .r = zero } });
+    const pred = try mk(arena, .{ .binary = .{ .op = .@"and", .l = left_has, .r = right_has } });
+    const drop = try arena.dupe([]const u8, &side_cols);
+    const keep = try arena.alloc(ast.SelectItem, 1);
+    keep[0] = .{ .star_except = drop };
+    const out = try arena.alloc(ast.Stage, 3);
+    out[0] = .{ .node = .{ .aggregate = .{ .aggs = aggs, .by = &.{}, .by_rest = drop } }, .hints = &.{}, .pos = pos };
+    out[1] = .{ .node = .{ .filter = pred }, .hints = &.{}, .pos = pos };
+    out[2] = .{ .node = .{ .select = keep }, .hints = &.{}, .pos = pos };
+    return out;
+}
 
 fn withSideMarks(arena: std.mem.Allocator, items: []const ast.SelectItem, branch: usize) ![]const ast.SelectItem {
     const out = try arena.alloc(ast.SelectItem, items.len + 2);

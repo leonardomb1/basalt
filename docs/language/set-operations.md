@@ -23,6 +23,14 @@ duplicates. Two NULLs count as the same value there, unlike in a join's `ON`.
 stays as many times as the fewer of its two counts, or its count in the first branch
 less its count in the second.
 
+At `-j` above 1, a union whose rows something breaks after it — an aggregate,
+`DISTINCT`, `ORDER BY` or window, or the deduplication of `UNION`, `INTERSECT` and
+`EXCEPT` themselves (not their `ALL` forms) — is read into memory first: each branch
+written as a query runs on its own path, the branches are put together, and what
+follows runs on lanes over them once they hold 65,536 rows or more. `EXPLAIN` says
+`the union read into memory first (its branches each on its own path), then …`. A
+union past 8M rows runs as before, its branches one after another.
+
 `BY NAME` lines branches up by column name instead, and is what reconciling N
 similar tables needs. It applies to `UNION` only, and a chain is one or the other.
 `WITH (schema_from = '<table>')`, after the last branch or after `EACH TABLE OF`,
