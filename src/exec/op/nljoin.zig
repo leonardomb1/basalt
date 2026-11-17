@@ -193,7 +193,25 @@ pub const NLJoin = struct {
     probe_done: bool = false,
     drain_pos: usize = 0,
 
+    /// The right side is read once the left has a row: an INNER, LEFT, SEMI, ANTI or
+    /// CROSS join of no left row has no row, so an empty left reads nothing more;
+    /// a RIGHT or FULL join emits the right side's rows regardless.
     pub fn next(self: *NLJoin, arena: std.mem.Allocator) anyerror!?Batch {
+        if (self.index == null and self.kind != .right and self.kind != .full) {
+            if (self.probe_done) return null;
+            if (self.probe_mem == null) self.probe_mem = std.heap.ArenaAllocator.init(self.state);
+            const pa = self.probe_mem.?.allocator();
+            const lb = while (true) {
+                const b = (try self.probe.next(pa)) orelse {
+                    self.probe_done = true;
+                    self.release();
+                    return null;
+                };
+                if (b.len > 0) break b;
+            };
+            const first = try self.ensureBuild();
+            self.cur = .{ .batch = lb, .spans = try self.spansFor(pa, first, lb) };
+        }
         const ix = try self.ensureBuild();
         while (true) {
             if (self.cur == null) {
@@ -640,6 +658,39 @@ test "nljoin: `<`, BETWEEN, OR of equalities and no condition, every kind; a nul
     };
     try expectRows(&.{ "1|a|2|6|c", "1|a|5|5|q" }, try runNL(a, .inner, .less, &ls, &rs, .{}));
     try expectRows(&.{ "-|c|-|-|-", "1|a|-|-|-", "5|b|2|6|c", "5|b|5|5|q", "9|-|-|-|-" }, try runNL(a, .left, .between, &ls, &rs, .{ .range = true }));
+}
+
+test "nljoin: an empty left side reads no right row, but under RIGHT and FULL, which emit them" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const rs = [_]RRow{ .{ .lo = 2, .hi = 6, .rv = "c" }, .{ .lo = 5, .hi = 5, .rv = "q" } };
+    for (all_kinds) |kind| for ([_]bool{ false, true }) |rg| {
+        var lts = TestSource{ .schema_ = nl_left_schema, .batches = try leftBatches(a, &.{}, 10) };
+        var rts = TestSource{ .schema_ = nl_right_schema, .batches = try rightBatches(a, &rs, 10) };
+        var lscan = Scan{ .src = lts.src() };
+        var rscan = Scan{ .src = rts.src() };
+        const cond = try condExpr(a, .between);
+        var jn = NLJoin{
+            .probe = .{ .scan = &lscan },
+            .build = .{ .scan = &rscan },
+            .left_schema = &nl_left_schema,
+            .right_schema = &nl_right_schema,
+            .out_schema = &nl_pair_schema,
+            .kind = kind,
+            .cond = cond,
+            .pair_schema = &nl_pair_schema,
+            .range = if (rg) try rangeOf(a, cond, nl_pair_schema, 2) else null,
+            .state = a,
+        };
+        const top = Op{ .nl_join = &jn };
+        var rows: usize = 0;
+        while (try top.next(a)) |b| rows += b.len;
+        try testing.expectEqual(try top.next(a), null);
+        const emits = kind == .right or kind == .full;
+        try testing.expectEqual(@as(usize, if (emits) rs.len else 0), rows);
+        try testing.expectEqual(emits, rts.idx > 0);
+    };
 }
 
 test "nljoin: an empty side gives every kind its unmatched rows or nothing" {
