@@ -173,15 +173,16 @@ fn rowwiseVec(arena: std.mem.Allocator, expr: *const ast.Expr, batch: Batch) Vec
 }
 
 /// CASE, both forms: each arm's condition becomes a row mask, folded back to
-/// front over the default so an earlier arm's rows override a later one's.
+/// front over the default so an earlier arm's rows override a later one's. An arm
+/// no row of the batch reaches, the default too, is not computed (`untaken`).
 fn matchVec(arena: std.mem.Allocator, m: ast.Match, batch: Batch) VecError!Vec {
     const n = batch.len;
     const takes = try arena.alloc([]bool, m.arms.len);
     var narms: usize = 0;
-    var acc: Vec = .{ .scalar = .null };
+    var default: ?*const ast.Expr = null;
     for (m.arms) |arm| {
         if (arm.is_default) {
-            acc = try evalVecLazy(arena, arm.value, batch);
+            default = arm.value;
             break;
         }
         const take = try arena.alloc(bool, n);
@@ -197,12 +198,40 @@ fn matchVec(arena: std.mem.Allocator, m: ast.Match, batch: Batch) VecError!Vec {
         takes[narms] = take;
         narms += 1;
     }
+    const claimed = try arena.alloc(bool, n);
+    @memset(claimed, false);
+    const reached = try arena.alloc(bool, narms);
+    for (takes[0..narms], reached) |t, *r| {
+        r.* = n == 0;
+        for (t, claimed) |x, *c| {
+            if (x and !c.*) {
+                c.* = true;
+                r.* = true;
+            }
+        }
+    }
+    var acc: Vec = .{ .scalar = .null };
+    if (default) |d| acc = try branchVec(arena, d, batch, n == 0 or std.mem.indexOfScalar(bool, claimed, false) != null);
     var i = narms;
     while (i > 0) {
         i -= 1;
-        acc = try pickVec(arena, takes[i], try evalVecLazy(arena, m.arms[i].value, batch), acc);
+        acc = try pickVec(arena, takes[i], try branchVec(arena, m.arms[i].value, batch, reached[i]), acc);
     }
     return acc;
+}
+
+/// A CASE or IF branch over `batch` when some row takes it; else a column of nulls of
+/// its type, from the batch's schema, or from the branch over no rows where the
+/// schema cannot type it: an IPv6 decoder under `CASE WHEN length(h) = 8` is neither
+/// compiled nor run on a batch of IPv4 rows, yet the branches' types still have to
+/// agree as when every one is computed.
+fn branchVec(arena: std.mem.Allocator, e: *const ast.Expr, batch: Batch, reached: bool) VecError!Vec {
+    if (reached) return evalVecLazy(arena, e, batch);
+    var tc = TypeCtx{ .schema = batch.schema.*, .arena = arena };
+    const known: ?Type = if (tc.typeOf(e)) |t| (if (t.unknown) null else t) else |_| null;
+    if (known) |t| return .{ .col = try broadcastScalar(arena, .null, t.asNullable(), batch.len) };
+    const v = try evalVecLazy(arena, e, try batch.slice(arena, 0, 0));
+    return if (v == .col) .{ .col = try broadcastScalar(arena, .null, v.col.ty.asNullable(), batch.len) } else v;
 }
 
 fn orInto(take: []bool, c: Vec) VecError!void {
@@ -774,11 +803,12 @@ fn castColWith(comptime from: types.TypeKind, comptime to: types.TypeKind, arena
 
 fn condVec(arena: std.mem.Allocator, c: ast.Expr.Cond, batch: Batch) VecError!Vec {
     const cond = try evalVec(arena, c.cond, batch);
-    const tv = try evalVecLazy(arena, c.then, batch);
-    const ev = try evalVecLazy(arena, c.els, batch);
     const take = try arena.alloc(bool, batch.len);
     @memset(take, false);
     try orInto(take, cond);
+    const n = batch.len;
+    const tv = try branchVec(arena, c.then, batch, n == 0 or std.mem.indexOfScalar(bool, take, true) != null);
+    const ev = try branchVec(arena, c.els, batch, n == 0 or std.mem.indexOfScalar(bool, take, false) != null);
     return pickVec(arena, take, tv, ev);
 }
 
@@ -1653,6 +1683,10 @@ test "vectorized kernels match the rowwise evaluator" {
         .{ .src = "if(x > y, x, y)", .vectorized = true },
         .{ .src = "-x", .vectorized = true },
         .{ .src = "x is null", .vectorized = true },
+        .{ .src = "if(x > 1000, y / 0, x)", .vectorized = true },
+        .{ .src = "if(x < 1000 or x is null, x, y / 0)", .vectorized = true },
+        .{ .src = "case when x > 1000 then y / 0 when y > 1000 then x / 0 else x + y end", .vectorized = true },
+        .{ .src = "case when x >= 0 or x is null then x when y > 0 then y / 0 else y / 0 end", .vectorized = true },
         .{ .src = "if(x != 0, y / x, 0)", .vectorized = false },
         .{ .src = "x != 0 and y / x > 1", .vectorized = false },
         .{ .src = "x == 0 or y / x > 1", .vectorized = false },
