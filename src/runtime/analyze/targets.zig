@@ -578,7 +578,7 @@ fn recordLanes(call: ast.BuiltinRead) bool {
 /// them; everything else stays unresolved.
 pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.Hint, tables: ?*lake.Memo) ?types.Schema {
     if (std.mem.eql(u8, rd.connector, "unit")) return .{ .fields = &.{} };
-    if (rd.form == .builtin) return .{ .fields = arena.dupe(types.Schema.Field, table_builtins.of(rd.form.builtin).schema.fields) catch return null };
+    if (rd.form == .builtin) return .{ .fields = arena.dupe(types.Schema.Field, table_builtins.schemaOf(rd.form.builtin).fields) catch return null };
     if (std.mem.eql(u8, rd.connector, "csv") and rd.form == .path) {
         if (csv.CsvReader.isUrl(rd.form.path) or ftp.isUrl(rd.form.path)) return null;
         if (folder.isFolder(rd.form.path)) {

@@ -1844,6 +1844,33 @@ test "an OR over two joined files filters each file by its own branches, a file 
     }
 }
 
+test "a record builtin over a path pattern reads its files in path order, numbering each, with the file named" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("p/10");
+    try tmp.dir.makePath("p/2");
+    try tmp.dir.makePath("p/x/inner");
+    try tmp.dir.writeFile(.{ .sub_path = "p/10/stat", .data = "ten a\nten b\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "p/2/stat", .data = "two\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "p/2/other", .data = "nope\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "p/.h", .data = "hidden\n" });
+    for ([_]usize{ 1, 4 }) |threads| {
+        try checkAndRun(alloc, &tmp,
+            \\LOAD INTO '$B/globbed.csv' AS
+            \\SELECT replace(file, '$B/', '') AS f, n, offset, CAST(rec AS STRING) AS line FROM lines('$B/p/*/stat') ORDER BY f, n;
+            \\LOAD INTO '$B/digits.csv' AS
+            \\SELECT count(*) AS c FROM lines('$B/p/[0-9]/stat');
+            \\LOAD INTO '$B/single.csv' AS
+            \\SELECT * FROM lines('$B/p/2/stat');
+        , threads, &.{});
+        try expectFile(&tmp, "globbed.csv", "f,n,offset,line\np/10/stat,1,0,ten a\np/10/stat,2,6,ten b\np/2/stat,1,0,two\n");
+        try expectFile(&tmp, "digits.csv", "c\n1\n");
+        try expectFile(&tmp, "single.csv", "n,offset,rec\n1,0,dHdv\n");
+    }
+    try expectRunRefuses(alloc, &tmp, "SELECT count(*) AS c FROM lines('$B/p/*/none');", 1, "no file matches");
+}
+
 test "a chain of CTEs, each reading the one before, gives the same rows inlined at any thread count" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -43,6 +43,9 @@ pub const fields = [_]types.Schema.Field{
     .{ .name = "rec", .ty = .{ .kind = .bytes } },
 };
 
+/// The columns of a pattern's records: each record's own, and the file it came from.
+pub const fields_file = fields ++ [_]types.Schema.Field{.{ .name = "file", .ty = .{ .kind = .string } }};
+
 pub const Rec = struct { offset: u64, bytes: []const u8 };
 
 pub const Splitter = struct {
@@ -255,6 +258,69 @@ pub const RecordSource = struct {
     }
 
     const vtable = driver.sourceVTable(RecordSource);
+};
+
+/// The records of several files read one after another as one read: `n` and `offset`
+/// count within each file, and `file`, when asked for, names it. A file gone by its
+/// turn is passed over, as a process's `/proc` entry is once the process exits.
+pub const MultiRecordSource = struct {
+    arena: std.mem.Allocator,
+    gpa: std.mem.Allocator,
+    files: []const []const u8,
+    mode: Mode,
+    with_file: bool,
+    schema_: types.Schema,
+    at: usize = 0,
+    cur: ?*RecordSource = null,
+
+    pub fn open(arena: std.mem.Allocator, gpa: std.mem.Allocator, files: []const []const u8, mode: Mode, with_file: bool) !*MultiRecordSource {
+        const self = try arena.create(MultiRecordSource);
+        self.* = .{ .arena = arena, .gpa = gpa, .files = files, .mode = mode, .with_file = with_file, .schema_ = .{ .fields = if (with_file) &fields_file else &fields } };
+        return self;
+    }
+
+    pub fn source(self: *MultiRecordSource) driver.Source {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    pub fn schema(self: *MultiRecordSource) types.Schema {
+        return self.schema_;
+    }
+
+    pub fn next(self: *MultiRecordSource, arena: std.mem.Allocator) anyerror!?Batch {
+        while (true) {
+            const cur = self.cur orelse {
+                if (self.at >= self.files.len) return null;
+                const path = self.files[self.at];
+                self.at += 1;
+                self.cur = RecordSource.open(self.arena, self.gpa, path, self.mode) catch |e| {
+                    const any: anyerror = e;
+                    if (any == error.FileNotFound or any == error.ProcessNotFound) continue;
+                    return e;
+                };
+                continue;
+            };
+            const b = (try cur.next(arena)) orelse {
+                cur.close();
+                self.cur = null;
+                continue;
+            };
+            if (!self.with_file) return .{ .schema = &self.schema_, .columns = b.columns, .len = b.len };
+            const cols = try arena.alloc(column.Column, fields_file.len);
+            @memcpy(cols[0..b.columns.len], b.columns);
+            var names = try column.BytesAppender.init(arena, b.len);
+            for (0..b.len) |_| try names.push(self.files[self.at - 1]);
+            cols[b.columns.len] = .{ .ty = fields_file[3].ty, .len = b.len, .validity = try column.Bitmap.initFull(arena, b.len), .data = .{ .bytes = try names.finish() } };
+            return .{ .schema = &self.schema_, .columns = cols, .len = b.len };
+        }
+    }
+
+    pub fn close(self: *MultiRecordSource) void {
+        if (self.cur) |c| c.close();
+        self.cur = null;
+    }
+
+    const vtable = driver.sourceVTable(MultiRecordSource);
 };
 
 /// A mapped file's records cut into lane ranges, each with the record count ahead of

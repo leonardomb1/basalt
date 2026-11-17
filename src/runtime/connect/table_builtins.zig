@@ -18,13 +18,15 @@ const gen = @import("../../exec/gen.zig");
 const folder = @import("../../store/folder.zig");
 const eval = @import("../../exec/eval.zig");
 const records = @import("../../format/records/read.zig");
+const glob = @import("../../store/glob.zig");
+const stream = @import("../../format/stream.zig");
 
 pub const TableBuiltin = struct {
     sig: *const signature.Signature,
     schema: types.Schema,
     label: []const u8,
     mode: ?*const fn (args: []const Value) records.Mode,
-    open: *const fn (arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value) anyerror!driver.Source,
+    open: *const fn (arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value, call: ast.BuiltinRead) anyerror!driver.Source,
 };
 
 pub const table = [_]TableBuiltin{
@@ -76,6 +78,22 @@ pub fn of(call: ast.BuiltinRead) *const TableBuiltin {
     return lookup(call.name).?;
 }
 
+/// The read's columns: a record builtin over a pattern written in the call
+/// (`lines('/proc/*/stat')`) adds `file`, the file each record came from. A path
+/// written `'${param}'` may be one once rendered, so `check`, which reads it before
+/// that, offers `file` too; the run decides on the rendered path.
+pub fn schemaOf(call: ast.BuiltinRead) types.Schema {
+    const b = of(call);
+    if (b.mode != null and literalGlob(call)) return .{ .fields = &records.fields_file };
+    return b.schema;
+}
+
+fn literalGlob(call: ast.BuiltinRead) bool {
+    if (call.args.len == 0) return false;
+    const e = call.args[0];
+    return e.* == .str_lit and (glob.hasGlob(e.str_lit) or std.mem.indexOf(u8, e.str_lit, "${") != null);
+}
+
 /// An argument, its params already substituted, folded to its value; null when it
 /// does not fold or is not one of `kind`: a size is a positive integer up to the
 /// record cap, a path non-empty text naming a file, a text non-empty.
@@ -101,32 +119,37 @@ pub fn pathArg(b: *const TableBuiltin, args: []const Value) ?[]const u8 {
 }
 
 /// `range(hi)` is `range(0, hi)`.
-fn openRange(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value) anyerror!driver.Source {
+fn openRange(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value, _: ast.BuiltinRead) anyerror!driver.Source {
     _ = arena;
     const lo = if (args.len == 2) args[0].int else 0;
     const s = try gen.RangeSource.open(gpa, lo, args[args.len - 1].int);
     return s.source();
 }
 
-fn openLines(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value) anyerror!driver.Source {
-    return openRecords(arena, gpa, args, modeLines(args));
+fn openLines(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value, call: ast.BuiltinRead) anyerror!driver.Source {
+    return openRecords(arena, gpa, args, modeLines(args), call);
 }
 
-fn openFixed(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value) anyerror!driver.Source {
-    return openRecords(arena, gpa, args, modeFixed(args));
+fn openFixed(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value, call: ast.BuiltinRead) anyerror!driver.Source {
+    return openRecords(arena, gpa, args, modeFixed(args), call);
 }
 
-fn openSplit(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value) anyerror!driver.Source {
-    return openRecords(arena, gpa, args, modeSplit(args));
+fn openSplit(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value, call: ast.BuiltinRead) anyerror!driver.Source {
+    return openRecords(arena, gpa, args, modeSplit(args), call);
 }
 
-fn openChunks(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value) anyerror!driver.Source {
-    return openRecords(arena, gpa, args, modeChunks(args));
+fn openChunks(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value, call: ast.BuiltinRead) anyerror!driver.Source {
+    return openRecords(arena, gpa, args, modeChunks(args), call);
 }
 
-fn openRecords(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value, mode: records.Mode) anyerror!driver.Source {
-    const s = try records.RecordSource.open(arena, gpa, args[0].string, mode);
-    return s.source();
+/// One file's records, or a local pattern's files' one after another; no file
+/// matching the pattern is an error naming it.
+fn openRecords(arena: std.mem.Allocator, gpa: std.mem.Allocator, args: []const Value, mode: records.Mode, call: ast.BuiltinRead) anyerror!driver.Source {
+    const path = args[0].string;
+    if (!glob.hasGlob(path)) return (try records.RecordSource.open(arena, gpa, path, mode)).source();
+    const files = try glob.expand(arena, path);
+    if (files.len == 0) return stream.explainf(error.FileNotFound, "no file matches `{s}`", .{path});
+    return (try records.MultiRecordSource.open(arena, gpa, files, mode, literalGlob(call))).source();
 }
 
 fn modeLines(_: []const Value) records.Mode {

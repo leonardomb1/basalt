@@ -381,7 +381,7 @@ pub fn builtinArgs(env: *Env, call: ast.BuiltinRead) ![]Value {
 fn openTableBuiltin(env: *Env, call: ast.BuiltinRead) !driver.Source {
     const b = table_builtins.of(call);
     const vals = try builtinArgs(env, call);
-    return b.open(env.arena, env.gpa, vals) catch |e| {
+    return b.open(env.arena, env.gpa, vals, call) catch |e| {
         if (e == error.OutOfMemory) return e;
         const path = table_builtins.pathArg(b, vals) orelse return e;
         return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s}: could not open `{s}` ({s})", .{ b.label, path, try pathFail(env.arena, path, e) }));

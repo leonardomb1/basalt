@@ -91,6 +91,7 @@ pub const deflate = @import("format/compress/deflate.zig");
 pub const inflate = @import("format/compress/inflate.zig");
 pub const readahead = @import("format/readahead.zig");
 pub const folder = @import("store/folder.zig");
+pub const glob = @import("store/glob.zig");
 pub const pqwrite = @import("format/parquet/write.zig");
 pub const split = @import("runtime/connect/split.zig");
 pub const registry = @import("runtime/connect/registry.zig");

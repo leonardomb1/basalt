@@ -128,6 +128,21 @@ in constant memory; a line or `split` record past 64 MiB fails naming where it
 began, so a binary file is not read as one giant row; `lines('logs')` on a
 folder fails saying it is one.
 
+A local path with `*`, `?` or `[...]` in it is a pattern: its files are read one
+after another, sorted by path, `n` and `offset` counting within each, and a
+fourth column `file STRING` names the one each record came from. A wildcard
+matches within one path segment and, as in a shell, not a name starting with `.`
+unless the pattern's segment does; folders are not matched. A file that is gone
+by its turn is passed over, as a process's `/proc` entry is once it exits, and
+no file matching is an error naming the pattern. `file` is there when the pattern
+is written in the call or in a `'${param}'` path; a `$param` read as a value
+reads the files without it.
+
+```sql
+SELECT file, split_part(CAST(rec AS VARCHAR), ' ', 1) AS pid
+FROM lines('/proc/[0-9]*/stat');
+```
+
 Under `-j`, a local uncompressed file splits across lanes as a CSV does: `fixed`
 and `chunks` at record multiples, `lines` and a one-character `split` after a
 record's end, each lane numbering its records where the file has them, so `n`,
