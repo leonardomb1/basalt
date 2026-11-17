@@ -283,7 +283,7 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
             .print => |p| try runPrint(&env, p, no_loop_vars),
             .call => |c| try runCall(&env, c, no_loop_vars, opts, &stats, &lanes_used, &batch_arena, runForBody),
             .throw => |t| try runThrow(&env, t, no_loop_vars),
-            .let_const => |l| if (l.query != null) try runScalarLet(&env, l, partOfExplain(l, program.stmts[after..])),
+            .let_const => |l| if (l.query != null) try runScalarLet(&env, l, partOfExplain(l, program.stmts[after..]), opts, &lanes_used, &batch_arena),
             else => {},
         }
         env.endStatement(env.wrote_sink);
@@ -430,8 +430,10 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
 /// the desugared form of a WHERE scalar subquery, which becomes a literal that rides
 /// filter pushdown. One column required, zero rows is NULL, more than one an error.
 /// The query is rendered in the script's scope as every statement's is, so a
-/// `'${param}'` path in it names the file it names in a FROM.
-fn runScalarLet(env: *Env, l: ast.LetConst, of_explain: bool) !void {
+/// `'${param}'` path in it names the file it names in a FROM. At `-j` above 1 it runs
+/// on the path a statement's query takes, into memory: built in place it ran on one
+/// thread, a HAVING's scalar subquery (TPC-H Q11's) the slower half of its query.
+fn runScalarLet(env: *Env, l: ast.LetConst, of_explain: bool, opts: RunOptions, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) !void {
     defer env.endStatement(false);
     if (heldValue(env.held, l.name)) |v| {
         try env.params.put(l.name, v);
@@ -443,6 +445,26 @@ fn runScalarLet(env: *Env, l: ast.LetConst, of_explain: bool) !void {
     defer explainStep.closeStep(env, step);
     const stages = (try renderScriptScope(env, l.query.?)).stages;
     if (step) |p| try explainStep.noteStep(env, p, stages);
+    if (opts.lanes() > 1) {
+        const ms = try runToMemory(env, opts, stages, what, lanes_used, batch_arena);
+        if (try analyze.queryLetColumnsProblem(env.arena, l.name, ms.schema.fields.len)) |why| {
+            const e = planErr(env.diag, why);
+            env.diag.pos = l.pos;
+            return e;
+        }
+        var cell: Value = .null;
+        var n: u64 = 0;
+        for (ms.batches.items) |b| {
+            if (b.len > 0 and n == 0) cell = try b.columns[0].getValue(0).own(env.arena);
+            n += b.len;
+        }
+        if (n > 1) return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s}: returned more than one row", .{what}));
+        try env.params.put(l.name, cell);
+        try env.params_expr.put(l.name, try mkLit(env.arena, cell));
+        if (!std.mem.startsWith(u8, l.name, "__scalar")) if (env.on_let) |h| h.f(h.ctx, l.name, cell);
+        env.log.log(.debug, "LET {s} = scalar query result ({s})", .{ l.name, @tagName(std.meta.activeTag(cell)) });
+        return;
+    }
     const pipe = try buildPipeline(env, stages);
     defer pipe.op.release();
     if (try analyze.queryLetColumnsProblem(env.arena, l.name, pipe.schema.fields.len)) |why| {
@@ -489,6 +511,7 @@ fn partOfExplain(l: ast.LetConst, rest: []const ast.Stmt) bool {
 
 const explainStep = @import("run/explain.zig");
 pub const runOutput = @import("run/output.zig").runOutput;
+const runToMemory = @import("run/output.zig").runToMemory;
 pub const runExplain = @import("run/explain.zig").runExplain;
 pub const defaultLanes = @import("parallel.zig").defaultLanes;
 pub const printPlanArrow = @import("run/explain.zig").printPlanArrow;
