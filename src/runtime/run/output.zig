@@ -721,7 +721,9 @@ fn flipLaterJoin(env: *Env, stages: []const ast.Stage, shape: Turn, w: ast.Write
 /// A lane aggregate whose joins end in semi and anti joins over large files run with
 /// what comes before them read into memory first: the head and the joins ahead, on
 /// the lanes, narrowed to the columns the rest reads, while they stay under the
-/// largest such file's estimated rows over `joinorder.flip_ratio`. Each semi or anti
+/// largest such file's estimated rows over `joinorder.flip_ratio`. With no join ahead
+/// the head must be filtered and its first rows' pass rate put it under a quarter of
+/// that (TPC-H Q4's quarter of orders against its EXISTS over lineitem). Each semi or anti
 /// join's build side is then read under a filter by the keys the held rows hold
 /// (`lanes/join.zig` `heldSlots`), and the held rows are probed on the lanes. Past
 /// the cap the rows are dropped and the run goes as planned, having spent at most that
@@ -739,12 +741,15 @@ fn holdBeforeSemis(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: as
         si -= 1;
     }
     while (si < shape.joins.len and shape.joins[si].node != .join) si += 1;
-    if (si == 0 or si == shape.joins.len) return false;
+    if (si == shape.joins.len) return false;
     var before = false;
     for (shape.joins[0..si]) |st| if (st.node == .join) {
         before = true;
     };
-    if (!before) return false;
+    const filtered = for (shape.prefix) |x| {
+        if (x.node == .filter) break true;
+    } else false;
+    if (!before and !filtered) return false;
 
     const consumer = try std.mem.concat(env.arena, ast.Stage, &.{ &.{shape.agg}, shape.tail });
     var largest: u64 = 0;
@@ -754,7 +759,7 @@ fn holdBeforeSemis(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: as
         if (!fileSide(rst)) continue;
         largest = @max(largest, estimate.ofSide(env, rst).rows orelse continue);
     };
-    const cap = largest / joinorder.flip_ratio;
+    const cap = if (before) largest / joinorder.flip_ratio else largest / (joinorder.flip_ratio * 4);
     if (cap < min_flip_rows) return false;
 
     const pre_len = 1 + shape.prefix.len + si;
@@ -765,6 +770,10 @@ fn holdBeforeSemis(env: *Env, stages: []const ast.Stage, shape: SinkShape, w: as
     inner[pre_len] = .{ .node = .{ .select = keep }, .hints = &.{}, .pos = pos };
     const mw = ast.Write{ .connector = mem_connector, .form = null, .target = "", .mode = .overwrite };
     inner[pre_len + 1] = .{ .node = .{ .write = mw }, .hints = &.{}, .pos = pos };
+    if (!before) {
+        const head_rows = estimate.ofSide(env, stages[0..1]).rows orelse return false;
+        if (try passingRows(env, inner[0 .. pre_len + 1], mw, opts, head_rows, std.math.maxInt(u64)) > cap) return false;
+    }
     var ms = env_mod.MemSink{ .arena = env.shared orelse env.arena, .batches = std.array_list.Managed(Batch).init(env.shared orelse env.arena), .cap_rows = cap, .keep_rels = true };
     {
         const outer_sink = env.mem_sink;
