@@ -221,13 +221,23 @@ fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, la
 /// first, in parallel, into memory, as `materializeBinding` runs a head one: as a
 /// join's build side it was built serially, an `IN (SELECT ... GROUP BY ...)`'s
 /// aggregate over a whole table on one thread. The join then reads it from memory
-/// (`plan.joinBindingStages`). `held` gets every binding run into memory, for the
-/// caller to drop.
+/// (`plan.joinBindingStages`). A side that does not aggregate has its own sides
+/// looked at the same way: an `IN` over a join with a correlated aggregate (TPC-H
+/// Q20's) built that aggregate on one thread as a side of a side. `held` gets every
+/// binding run into memory, for the caller to drop.
 fn materializeJoinSides(env: *Env, opts: RunOptions, stages: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, held: *std.array_list.Managed([]const u8)) anyerror!void {
-    if (opts.lanes() < 2) return;
+    return materializeSidesAt(env, opts, stages, lanes_used, batch_arena, held, 0);
+}
+
+fn materializeSidesAt(env: *Env, opts: RunOptions, stages: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, held: *std.array_list.Managed([]const u8), depth: usize) anyerror!void {
+    if (opts.lanes() < 2 or depth > 8) return;
     for (stages) |st| {
         if (st.node != .join) continue;
-        _ = try materializeNamed(env, opts, st.node.join.binding, lanes_used, batch_arena, held);
+        const name = st.node.join.binding;
+        if (try materializeNamed(env, opts, name, lanes_used, batch_arena, held)) continue;
+        if (env.materialized.contains(name)) continue;
+        const b = (try stampedBinding(env, name)) orelse continue;
+        try materializeSidesAt(env, opts, b.stages, lanes_used, batch_arena, held, depth + 1);
     }
 }
 
