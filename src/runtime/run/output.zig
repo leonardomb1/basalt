@@ -217,6 +217,231 @@ fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, la
     return name;
 }
 
+/// Join sides that aggregate by the join's key, their input first cut to the keys the
+/// probe side can hold: an inner or semi join on a smaller side among the joins and
+/// filters around it, or the FROM file itself, pins a probe key to a column of that
+/// side, either read from it (`p.p_partkey`, the file joined as `p`) or matched
+/// against it by the same key, so a group of any other key matches nothing (TPC-H
+/// Q17's average quantity per part over every lineitem row, asked for 204 parts). A
+/// semi join on that side goes into the aggregating side as early as its key column
+/// is there, under a name of its own that `added` gets, for the caller to drop. Not
+/// `NOT IN`, whose answer a null key on its side decides, nor a right or full join,
+/// which emits the side's unmatched rows.
+fn reduceJoinSides(env: *Env, stages: []const ast.Stage, added: *std.array_list.Managed([]const u8)) ![]const ast.Stage {
+    var out: ?[]ast.Stage = null;
+    var seen: ?[]const ast.Stage = null;
+    for (stages, 0..) |st, i| {
+        if (st.node != .join) continue;
+        const j = st.node.join;
+        switch (j.kind) {
+            .left, .inner, .semi, .anti => {},
+            else => continue,
+        }
+        if (j.null_aware or j.deferred.len > 0 or j.left_keys.len != j.right_keys.len) continue;
+        if (std.mem.indexOf(u8, j.binding, keys_tag) != null or env.materialized.contains(j.binding)) continue;
+        const b = (try stampedBinding(env, j.binding)) orelse continue;
+        const ai = groupedAt(b.stages) orelse continue;
+        for (j.left_keys, j.right_keys) |lk, rk| {
+            const by = groupKey(b.stages[ai].node.aggregate, b.stages[ai + 1 ..], rk) orelse continue;
+            const sv = seen orelse blk: {
+                seen = (try pushdown.hoistFilters(env.arena, env.arena, stages, env.bindings, env.tables)) orelse stages;
+                break :blk seen.?;
+            };
+            const src = (try keySource(env, sv, j.binding, lk)) orelse continue;
+            const b_rows = estimate.ofSide(env, b.stages[0..1]).rows orelse continue;
+            if (src.rows * joinorder.flip_ratio > b_rows) continue;
+            const point = try semiPoint(env, b.stages, ai, by);
+            const tag = @intFromPtr(stages.ptr) + i;
+            const side = src.join orelse blk: {
+                const hn = try msgfmt.allocPrint(env.arena, "{s}" ++ keys_tag ++ "head_{x}", .{ j.binding, tag });
+                try env.bindings.put(hn, .{ .stages = src.side, .pos = b.pos });
+                try added.append(hn);
+                break :blk ast.Join{ .kind = .inner, .binding = hn, .alias = hn, .left_keys = &.{}, .right_keys = &.{} };
+            };
+            const rks = try env.arena.alloc(ast.QualName, 1);
+            rks[0] = .{ .parts = try env.arena.dupe([]const u8, &.{src.col}), .span = rk.span };
+            const semi = ast.Stage{ .node = .{ .join = .{
+                .kind = .semi,
+                .binding = side.binding,
+                .alias = if (side.alias.len > 0) side.alias else side.binding,
+                .left_keys = try env.arena.dupe(ast.QualName, &.{point.key}),
+                .right_keys = rks,
+                .right_filter = side.right_filter,
+            } }, .hints = &.{}, .pos = st.pos };
+            const name = try msgfmt.allocPrint(env.arena, "{s}" ++ keys_tag ++ "{x}", .{ j.binding, tag });
+            const cut = try std.mem.concat(env.arena, ast.Stage, &.{ b.stages[0..point.at], &.{semi}, b.stages[point.at..] });
+            try env.bindings.put(name, .{ .stages = cut, .pos = b.pos });
+            try added.append(name);
+            if (out == null) out = try env.arena.dupe(ast.Stage, stages);
+            out.?[i].node.join.binding = name;
+            break;
+        }
+    }
+    return out orelse stages;
+}
+
+const keys_tag = "__keys_";
+
+const Swap = struct { name: []const u8, was: ast.Pipeline };
+
+/// `reduceJoinSides` for the bindings `stages` join and the ones those join, each
+/// reduced binding put in place of its own until the caller restores `swapped`.
+fn reduceNestedSides(env: *Env, stages: []const ast.Stage, added: *std.array_list.Managed([]const u8), swapped: *std.array_list.Managed(Swap), depth: usize) !void {
+    if (depth > 8) return;
+    for (stages) |st| {
+        if (st.node != .join) continue;
+        const name = st.node.join.binding;
+        if (env.materialized.contains(name)) continue;
+        const was = env.bindings.get(name) orelse continue;
+        const cut = try reduceJoinSides(env, was.stages, added);
+        if (cut.ptr != was.stages.ptr) {
+            try swapped.append(.{ .name = name, .was = was });
+            env.bindings.getPtr(name).?.stages = cut;
+        }
+        try reduceNestedSides(env, cut, added, swapped, depth + 1);
+    }
+}
+
+/// The aggregate of `stages` whose groups come out whole: a file read, filters,
+/// selects and joins, the aggregate, then only filters, selects, sorts and DISTINCT,
+/// no LIMIT or window choosing among the groups.
+fn groupedAt(stages: []const ast.Stage) ?usize {
+    if (stages.len < 2 or stages[0].node != .read) return null;
+    const ai = for (stages[1..], 1..) |s, k| switch (s.node) {
+        .aggregate => break k,
+        .filter, .select, .join => {},
+        else => return null,
+    } else return null;
+    const ag = stages[ai].node.aggregate;
+    if (ag.by_rest != null or ag.on_empty.len > 0 or ag.by.len == 0) return null;
+    for (stages[ai + 1 ..]) |s| switch (s.node) {
+        .filter, .select, .sort, .distinct => {},
+        else => return null,
+    };
+    return ai;
+}
+
+/// The group key of `ag` that output column `out` carries through the selects of
+/// `after`, the stages past the aggregate.
+fn groupKey(ag: ast.Aggregate, after: []const ast.Stage, out: ast.QualName) ?ast.QualName {
+    var q = out;
+    var k = after.len;
+    while (k > 0) {
+        k -= 1;
+        if (after[k].node == .select) q = selectSource(after[k].node.select, q) orelse return null;
+    }
+    for (ag.by) |by| if (std.ascii.eqlIgnoreCase(by.last(), q.last())) return by;
+    return null;
+}
+
+/// The column a select's output `q` reads: the field it names or renames, or `q`
+/// itself through `*`; null when computed or not plainly there.
+fn selectSource(items: []const ast.SelectItem, q: ast.QualName) ?ast.QualName {
+    var star = false;
+    for (items) |it| switch (it) {
+        .star => star = true,
+        .field => |f| if (std.ascii.eqlIgnoreCase(f.last(), q.last())) return f,
+        .computed => |c| if (std.ascii.eqlIgnoreCase(c.name, q.last())) {
+            return if (c.expr.* == .field and !c.expr.field.dollar) c.expr.field else null;
+        },
+        else => return null,
+    };
+    return if (star) q else null;
+}
+
+/// Where in `stages` a semi join on group key `by` of the aggregate at `ai` can go,
+/// and the column it is there: walked back past filters, selects that pass or rename
+/// it, and joins that bring no column of its name, to the file read at best.
+fn semiPoint(env: *Env, stages: []const ast.Stage, ai: usize, by: ast.QualName) !struct { at: usize, key: ast.QualName } {
+    var key = by;
+    var at = ai;
+    while (at > 1) : (at -= 1) {
+        switch (stages[at - 1].node) {
+            .filter => {},
+            .select => |items| key = selectSource(items, key) orelse break,
+            .join => |jj| switch (jj.kind) {
+                .semi, .anti => {},
+                .inner, .left => {
+                    if (key.parts.len > 1) {
+                        if (std.ascii.eqlIgnoreCase(key.parts[0], if (jj.alias.len > 0) jj.alias else jj.binding)) break;
+                    } else {
+                        const sch = (try sideSchema(env, jj, stages[at..])) orelse break;
+                        if (sch.indexOf(key.last()) != null) break;
+                    }
+                },
+                else => break,
+            },
+            else => break,
+        }
+    }
+    return .{ .at = at, .key = key };
+}
+
+/// Whether a side's rows are fewer than its file's: a filter cuts them, or they are
+/// held in memory, counted. An estimate reads a file's rows, not a filter's.
+fn narrowed(env: *Env, side: []const ast.Stage) bool {
+    if (side.len > 0 and side[0].node == .ref and env.materialized.contains(side[0].node.ref)) return true;
+    for (side) |st| if (st.node == .filter) return true;
+    return false;
+}
+
+const KeySrc = struct { join: ?ast.Join, side: []const ast.Stage, col: []const u8, rows: u64 };
+
+/// The side estimated smallest among the joins and filters around the join reading
+/// `binding` in `stages` (their filters pushed into the join sides) that pins probe
+/// key `lk` to a column of its own, and that column: an inner join ahead of it that
+/// `lk` names the side of (`p.p_partkey`, `p` its alias), an inner or semi join keyed
+/// on `lk` itself, or the FROM file with its filters when only it has a column `lk`
+/// names.
+fn keySource(env: *Env, stages: []const ast.Stage, binding: []const u8, lk: ast.QualName) !?KeySrc {
+    const at = for (stages, 0..) |st, k| {
+        if (st.node == .join and std.mem.eql(u8, st.node.join.binding, binding)) break k;
+    } else return null;
+    var lo = at;
+    while (lo > 1 and (stages[lo - 1].node == .join or stages[lo - 1].node == .filter)) lo -= 1;
+    var hi = at + 1;
+    while (hi < stages.len and (stages[hi].node == .join or stages[hi].node == .filter)) hi += 1;
+    var best: ?KeySrc = null;
+    for (stages[lo..hi], lo..) |st, k| {
+        if (k == at or st.node != .join) continue;
+        const j0 = st.node.join;
+        if (j0.null_aware or j0.deferred.len > 0 or j0.left_keys.len == 0 or j0.left_keys.len != j0.right_keys.len) continue;
+        const col = col: {
+            if (j0.kind == .inner and k < at and lk.parts.len == 2) {
+                const name = if (j0.alias.len > 0) j0.alias else j0.binding;
+                if (std.ascii.eqlIgnoreCase(lk.parts[0], name)) break :col lk.last();
+            }
+            if (j0.kind != .inner and j0.kind != .semi) continue;
+            for (j0.left_keys, j0.right_keys) |l0, r0| {
+                if (l0.parts.len != lk.parts.len) continue;
+                const same = for (l0.parts, lk.parts) |x, y| {
+                    if (!std.ascii.eqlIgnoreCase(x, y)) break false;
+                } else true;
+                if (same) break :col r0.last();
+            }
+            continue;
+        };
+        const side = try rightStagesFor(env, j0, null);
+        if (!narrowed(env, side)) continue;
+        const rows = estimate.ofSide(env, side).rows orelse continue;
+        if (best == null or rows < best.?.rows) best = .{ .join = j0, .side = side, .col = col, .rows = rows };
+    }
+    if (lo != 1 or stages[0].node != .read or lk.parts.len != 1) return best;
+    const head = offlineSchema(env.arena, stages[0].node.read, stages[0].hints, env.tables) orelse return best;
+    if (head.indexOf(lk.last()) == null) return best;
+    for (stages[1..at], 1..) |st, k| {
+        if (st.node != .join or st.node.join.kind == .semi or st.node.join.kind == .anti) continue;
+        const sch = (try sideSchema(env, st.node.join, stages[k + 1 ..])) orelse return best;
+        if (sch.indexOf(lk.last()) != null) return best;
+    }
+    var m: usize = 1;
+    while (m < stages.len and stages[m].node == .filter) m += 1;
+    if (m == 1) return best;
+    const rows = estimate.ofSide(env, stages[0..m]).rows orelse return best;
+    if (best == null or rows < best.?.rows) best = .{ .join = null, .side = stages[0..m], .col = lk.last(), .rows = rows };
+    return best;
+}
+
 /// The bindings the pipeline's joins read that aggregate a file or table, each run
 /// first, in parallel, into memory, as `materializeBinding` runs a head one: as a
 /// join's build side it was built serially, an `IN (SELECT ... GROUP BY ...)`'s
@@ -994,6 +1219,22 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     defer for (run_first.items) |name| {
         _ = env.materialized.remove(name);
     };
+    var cut_sides = std.array_list.Managed([]const u8).init(env.arena);
+    defer for (cut_sides.items) |name| {
+        _ = env.bindings.remove(name);
+    };
+    var swapped = std.array_list.Managed(Swap).init(env.arena);
+    defer {
+        var k = swapped.items.len;
+        while (k > 0) {
+            k -= 1;
+            if (env.bindings.getPtr(swapped.items[k].name)) |b| b.* = swapped.items[k].was;
+        }
+    }
+    if (opts.lanes() > 1) {
+        stages = try reduceJoinSides(env, stages, &cut_sides);
+        try reduceNestedSides(env, stages, &cut_sides, &swapped, 0);
+    }
     if (try unionToMemory(env, opts, stages, lanes_used, batch_arena, &run_first)) |s| stages = s;
     _ = try materializeBinding(env, opts, stages, lanes_used, batch_arena, &run_first);
     try materializeJoinSides(env, opts, stages, lanes_used, batch_arena, &run_first);

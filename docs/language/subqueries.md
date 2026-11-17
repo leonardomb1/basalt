@@ -90,6 +90,13 @@ What each form becomes:
 | `(SELECT agg(...) ...)` | LEFT JOIN to the aggregate grouped by the keys | a row that matches nothing gets the aggregate over no rows: `COUNT` 0, `coalesce(sum(v), 0)` 0, the others NULL |
 | `(SELECT v ...)` | LEFT JOIN to the rows grouped by the keys | NULL for no row; more than one row for an outer row fails the run with *more than one row returned by a subquery used as an expression* |
 
+On lanes, the aggregate a per-row subquery joins is taken only over the keys the
+query can ask for, when a filtered table it joins (`p` in `WHERE p.p_brand =
+'Brand#23' AND l.l_quantity < (SELECT 0.2 * avg(l2.l_quantity) ... WHERE l2.l_partkey
+= p.p_partkey)`), its filtered `FROM` table, or an `IN` on the same key pins that
+key: a semi join on that table goes into the aggregate's input as early as the key
+is there, and `EXPLAIN ANALYZE` shows it under the aggregate.
+
 A correlation is a condition of the subquery's `WHERE` (or of an inner join's `ON`
 inside it). An equality between a column of the subquery and one of the outer
 query — `o.cust = c.id`, either way round, as many as you like — is a join key.

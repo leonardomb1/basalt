@@ -1744,6 +1744,55 @@ test "a CTE over an aggregating CTE, through a window, is run first at any threa
     try std.testing.expect(std.mem.indexOf(u8, outs[1], "--\ng,s\n") != null);
 }
 
+test "a correlated aggregate's side is cut to the keys asked for, by a joined file, the FROM file or an IN beside it, with the same rows at any thread count" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var part = std.array_list.Managed(u8).init(alloc);
+    defer part.deinit();
+    try part.appendSlice("p_partkey,p_brand,p_size\n");
+    for (1..501) |k| try part.writer().print("{d},B{d},{d}\n", .{ k, k % 5, k % 10 });
+    try tmp.dir.writeFile(.{ .sub_path = "part.csv", .data = part.items });
+    var line = std.array_list.Managed(u8).init(alloc);
+    defer line.deinit();
+    try line.appendSlice("l_partkey,l_qty,l_price\n");
+    for (0..8000) |i| try line.writer().print("{d},{d},{d}\n", .{ (i * 7) % 500 + 1, (i / 7) % 50, i % 1000 });
+    try tmp.dir.writeFile(.{ .sub_path = "line.csv", .data = line.items });
+    var outs: [2][]u8 = undefined;
+    var n: usize = 0;
+    defer for (outs[0..n]) |x| alloc.free(x);
+    for ([_]usize{ 1, 4 }) |threads| {
+        try checkAndRun(alloc, &tmp,
+            \\LOAD INTO '$B/joined.csv' AS
+            \\SELECT sum(l.l_price) AS s, count(*) AS n FROM '$B/line.csv' l JOIN '$B/part.csv' p ON p.p_partkey = l.l_partkey
+            \\WHERE p.p_brand = 'B3' AND l.l_qty < (SELECT 0.5 * avg(l2.l_qty) FROM '$B/line.csv' l2 WHERE l2.l_partkey = p.p_partkey);
+            \\LOAD INTO '$B/head.csv' AS
+            \\SELECT p.p_partkey, l.l_price FROM '$B/part.csv' p JOIN '$B/line.csv' l ON p.p_partkey = l.l_partkey
+            \\WHERE p.p_size = 3 AND l.l_qty = (SELECT min(l2.l_qty) FROM '$B/line.csv' l2 WHERE l2.l_partkey = p.p_partkey)
+            \\ORDER BY p.p_partkey, l.l_price;
+            \\LOAD INTO '$B/nested.csv' AS
+            \\SELECT p_partkey FROM '$B/part.csv' WHERE p_size = 1 AND p_partkey IN (
+            \\  SELECT l.l_partkey FROM '$B/line.csv' l
+            \\  WHERE l.l_partkey IN (SELECT p_partkey FROM '$B/part.csv' WHERE p_brand = 'B1')
+            \\    AND l.l_qty > (SELECT 0.9 * max(l3.l_qty) FROM '$B/line.csv' l3 WHERE l3.l_partkey = l.l_partkey))
+            \\ORDER BY p_partkey;
+        , threads, &.{});
+        var all = std.array_list.Managed(u8).init(alloc);
+        defer all.deinit();
+        for ([_][]const u8{ "joined.csv", "head.csv", "nested.csv" }) |f| {
+            const got = try tmp.dir.readFileAlloc(alloc, f, 1 << 20);
+            defer alloc.free(got);
+            try all.appendSlice(got);
+            try all.appendSlice("--\n");
+        }
+        outs[n] = try all.toOwnedSlice();
+        n += 1;
+    }
+    try std.testing.expectEqualStrings(outs[0], outs[1]);
+    try std.testing.expect(std.mem.startsWith(u8, outs[1], "s,n\n220464,454\n--\np_partkey,l_price\n3,286\n3,786\n13,216\n"));
+    try std.testing.expect(std.mem.indexOf(u8, outs[1], "--\np_partkey\n1\n11\n21\n") != null);
+}
+
 test "a chain of CTEs, each reading the one before, gives the same rows inlined at any thread count" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
