@@ -1823,6 +1823,27 @@ test "a scalar subquery over a CTE the query also joins gives its rows at any th
     }
 }
 
+test "an OR over two joined files filters each file by its own branches, a file one branch leaves out not at all" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "xa.csv", .data = "id,x\n1,A\n2,B\n3,C\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "xb.csv", .data = "id,y\n1,P\n2,Q\n3,R\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "xm.csv", .data = "aid,bid,v\n1,1,11\n1,2,12\n1,3,13\n2,1,21\n2,2,22\n2,3,23\n3,1,31\n3,2,32\n3,3,33\n" });
+    for ([_]usize{ 1, 4 }) |threads| {
+        try checkAndRun(alloc, &tmp,
+            \\LOAD INTO '$B/both.csv' AS
+            \\SELECT m.v FROM '$B/xm.csv' m JOIN '$B/xa.csv' a ON m.aid = a.id JOIN '$B/xb.csv' b ON m.bid = b.id
+            \\WHERE (a.x = 'A' AND b.y = 'Q') OR (a.x = 'B' AND b.y = 'P') ORDER BY m.v;
+            \\LOAD INTO '$B/one.csv' AS
+            \\SELECT m.v FROM '$B/xm.csv' m JOIN '$B/xa.csv' a ON m.aid = a.id JOIN '$B/xb.csv' b ON m.bid = b.id
+            \\WHERE (a.x = 'A' AND b.y = 'Q') OR a.x = 'C' ORDER BY m.v;
+        , threads, &.{});
+        try expectFile(&tmp, "both.csv", "v\n12\n21\n");
+        try expectFile(&tmp, "one.csv", "v\n12\n31\n32\n33\n");
+    }
+}
+
 test "a chain of CTEs, each reading the one before, gives the same rows inlined at any thread count" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

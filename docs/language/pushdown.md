@@ -65,7 +65,12 @@ crosses the wire. The answer never changes, only where the work happens;
   (a local file's header or footer, a select list) and none of them. After a
   `LEFT`, `RIGHT` or `FULL` join it stays above the join, since there it also
   decides the unmatched rows; so does a condition naming both sides, or a bare
-  column name whose side cannot be told.
+  column name whose side cannot be told. An `OR` whose every branch holds a
+  condition on the same joined side (`(n1.n_name = 'FRANCE' AND n2.n_name =
+  'GERMANY') OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')`) stays where
+  it is, and each such side also joins only the rows its own branches allow
+  (`n1` and `n2` each FRANCE or GERMANY), so the joins and their runtime filters
+  narrow the rows before the `OR` is tested.
 - **Text comparisons follow the column's collation**, so the source never keeps
   fewer rows than basalt would. basalt compares text byte by byte; a source
   compares by collation — case-insensitive by default on SQL Server and MySQL,

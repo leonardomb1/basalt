@@ -14,6 +14,7 @@
 //! the left's columns gives each row the same answer above the join as below it.
 
 const ast = @import("../../lang/ast.zig");
+const print = @import("../../lang/print.zig");
 const qual = @import("../pushdown.zig").qual;
 const lookupPushable = @import("translate.zig").lookupPushable;
 const std = @import("std");
@@ -409,6 +410,7 @@ pub fn pushIntoJoinSides(
             const found = if (ast.hasSearch(c) or mayRaise(c)) null else try sideFor(arena, c, list.items[0..i], bindings, tables);
             const side = found orelse {
                 stay = try andWith(arena, stay, c);
+                if (!ast.hasSearch(c) and !mayRaise(c) and try impliedBySides(arena, c, list.items, i, bindings, tables)) changed = true;
                 continue;
             };
             var j = list.items[side.at].node.join;
@@ -429,6 +431,79 @@ pub fn pushIntoJoinSides(
     }
     if (!changed) return null;
     return try list.toOwnedSlice();
+}
+
+/// For an OR whose every branch holds conditions on one joined side alone (TPC-H
+/// Q7's `(n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY') OR (n1.n_name = 'GERMANY'
+/// AND n2.n_name = 'FRANCE')`), each such side's branches ORed together, a condition
+/// the OR implies, added to that join's right filter (`n1`: FRANCE or GERMANY), the
+/// OR itself kept where it is. False when no side got one it lacked.
+fn impliedBySides(
+    arena: std.mem.Allocator,
+    c: *ast.Expr,
+    list: []ast.Stage,
+    at: usize,
+    bindings: *const std.StringHashMap(ast.Pipeline),
+    tables: ?*Tables,
+) !bool {
+    if (c.* != .binary or c.binary.op != .@"or") return false;
+    var branches = std.array_list.Managed(*ast.Expr).init(arena);
+    try splitOr(c, &branches);
+    if (branches.items.len > 16) return false;
+    var per = std.AutoArrayHashMap(usize, std.array_list.Managed(?*ast.Expr)).init(arena);
+    for (branches.items, 0..) |br, bi| {
+        var conj = std.array_list.Managed(*ast.Expr).init(arena);
+        try ast.splitAnd(*ast.Expr, br, &conj);
+        for (conj.items) |x| {
+            const side = (try sideFor(arena, x, list[0..at], bindings, tables)) orelse continue;
+            const own = if (side.alias) |a| try unqualify(arena, x, a) else x;
+            const g = try per.getOrPut(side.at);
+            if (!g.found_existing) {
+                g.value_ptr.* = std.array_list.Managed(?*ast.Expr).init(arena);
+                try g.value_ptr.appendNTimes(null, branches.items.len);
+            }
+            g.value_ptr.items[bi] = try andWith(arena, g.value_ptr.items[bi], own);
+        }
+    }
+    var added = false;
+    var it = per.iterator();
+    next: while (it.next()) |kv| {
+        var any: ?*ast.Expr = null;
+        for (kv.value_ptr.items) |b| {
+            const x = b orelse continue :next;
+            any = if (any) |l| try mkExpr(arena, .{ .binary = .{ .op = .@"or", .l = l, .r = x } }) else x;
+        }
+        const implied = any orelse continue;
+        var j = list[kv.key_ptr.*].node.join;
+        if (j.right_filter) |rf| if (try holdsConjunct(arena, rf, implied)) continue;
+        j.right_filter = try andWith(arena, j.right_filter, implied);
+        list[kv.key_ptr.*].node = .{ .join = j };
+        added = true;
+    }
+    return added;
+}
+
+fn splitOr(e: *ast.Expr, out: *std.array_list.Managed(*ast.Expr)) !void {
+    if (e.* == .binary and e.binary.op == .@"or") {
+        try splitOr(e.binary.l, out);
+        return splitOr(e.binary.r, out);
+    }
+    try out.append(e);
+}
+
+/// Whether `of` has a conjunct written as `e` is.
+fn holdsConjunct(arena: std.mem.Allocator, of: *ast.Expr, e: *ast.Expr) !bool {
+    const want = try exprText(arena, e);
+    var conj = std.array_list.Managed(*ast.Expr).init(arena);
+    try ast.splitAnd(*ast.Expr, of, &conj);
+    for (conj.items) |x| if (std.mem.eql(u8, try exprText(arena, x), want)) return true;
+    return false;
+}
+
+fn exprText(arena: std.mem.Allocator, e: *const ast.Expr) ![]const u8 {
+    var aw = std.Io.Writer.Allocating.init(arena);
+    print.expr(&aw.writer, e) catch return error.OutOfMemory;
+    return aw.written();
 }
 
 const Side = struct { at: usize, alias: ?[]const u8 };
