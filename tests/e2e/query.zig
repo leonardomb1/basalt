@@ -1708,6 +1708,42 @@ test "other dialects' spellings: year() and the other parts, date_part, substrin
     try expectFile(&tmp, "u.csv", "y\n42\n");
 }
 
+test "a CTE over an aggregating CTE, through a window, is run first at any thread count, and the next statement's CTE of the same name is its own" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var csv = std.array_list.Managed(u8).init(alloc);
+    defer csv.deinit();
+    try csv.appendSlice("id,g,v\n");
+    for (0..3000) |i| try csv.writer().print("{d},{c},{d}\n", .{ i, "abcde"[i % 5], i % 97 });
+    try tmp.dir.writeFile(.{ .sub_path = "ga.csv", .data = csv.items });
+    var outs: [2][]u8 = undefined;
+    var n: usize = 0;
+    defer for (outs[0..n]) |x| alloc.free(x);
+    for ([_]usize{ 1, 4 }) |threads| {
+        try checkAndRun(alloc, &tmp,
+            \\LOAD INTO '$B/first.csv' AS
+            \\WITH per AS (SELECT g, id % 3 AS k, sum(v) AS s FROM '$B/ga.csv' GROUP BY g, id % 3),
+            \\     ranked AS (SELECT g, k, s, row_number() OVER (PARTITION BY g ORDER BY s DESC, k) AS rn FROM per),
+            \\     top AS (SELECT g, k, s FROM ranked WHERE rn = 1)
+            \\SELECT g, k, s FROM top ORDER BY g;
+            \\LOAD INTO '$B/second.csv' AS
+            \\WITH per AS (SELECT g, count(*) AS s FROM '$B/ga.csv' WHERE v > 50 GROUP BY g),
+            \\     ranked AS (SELECT g, s, rank() OVER (ORDER BY s DESC, g) AS rn FROM per),
+            \\     top AS (SELECT g, s FROM ranked WHERE rn <= 2)
+            \\SELECT g, s FROM top ORDER BY g;
+        , threads, &.{});
+        const first = try tmp.dir.readFileAlloc(alloc, "first.csv", 1 << 16);
+        defer alloc.free(first);
+        const second = try tmp.dir.readFileAlloc(alloc, "second.csv", 1 << 16);
+        defer alloc.free(second);
+        outs[n] = try std.mem.concat(alloc, u8, &.{ first, "--\n", second });
+        n += 1;
+    }
+    try std.testing.expectEqualStrings(outs[0], outs[1]);
+    try std.testing.expect(std.mem.indexOf(u8, outs[1], "--\ng,s\n") != null);
+}
+
 test "a chain of CTEs, each reading the one before, gives the same rows inlined at any thread count" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

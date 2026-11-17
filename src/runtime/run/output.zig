@@ -204,11 +204,12 @@ fn scanCounts(env: *Env) [4]u64 {
 
 /// A derived table or CTE that aggregates a file or table is run first, in parallel,
 /// into memory, since built where it is read it ran on one thread. Returns the
-/// binding's name when materialized, for the caller to drop afterwards.
-fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!?[]const u8 {
+/// binding's name when it was; `held` gets every binding run into memory, for the
+/// caller to drop afterwards.
+fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, held: *std.array_list.Managed([]const u8)) anyerror!?[]const u8 {
     if (opts.lanes() < 2 or stages[0].node != .ref) return null;
     const name = stages[0].node.ref;
-    if (!try materializeNamed(env, opts, name, lanes_used, batch_arena)) return null;
+    if (!try materializeNamed(env, opts, name, lanes_used, batch_arena, held)) return null;
     try notePrelude(env, name, stages[0].pos);
     return name;
 }
@@ -217,16 +218,14 @@ fn materializeBinding(env: *Env, opts: RunOptions, stages: []const ast.Stage, la
 /// first, in parallel, into memory, as `materializeBinding` runs a head one: as a
 /// join's build side it was built serially, an `IN (SELECT ... GROUP BY ...)`'s
 /// aggregate over a whole table on one thread. The join then reads it from memory
-/// (`plan.joinBindingStages`). Returns their names, for the caller to drop.
-fn materializeJoinSides(env: *Env, opts: RunOptions, stages: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror![]const []const u8 {
-    if (opts.lanes() < 2) return &.{};
-    var names = std.array_list.Managed([]const u8).init(env.arena);
+/// (`plan.joinBindingStages`). `held` gets every binding run into memory, for the
+/// caller to drop.
+fn materializeJoinSides(env: *Env, opts: RunOptions, stages: []const ast.Stage, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, held: *std.array_list.Managed([]const u8)) anyerror!void {
+    if (opts.lanes() < 2) return;
     for (stages) |st| {
         if (st.node != .join) continue;
-        const name = st.node.join.binding;
-        if (try materializeNamed(env, opts, name, lanes_used, batch_arena)) try names.append(name);
+        _ = try materializeNamed(env, opts, st.node.join.binding, lanes_used, batch_arena, held);
     }
-    return names.toOwnedSlice();
 }
 
 /// `stages` run into memory, under `EXPLAIN ANALYZE` profiled in a scope of their
@@ -252,16 +251,34 @@ pub fn runToMemory(env: *Env, opts: RunOptions, stages: []const ast.Stage, what:
 }
 
 /// Binding `name` run on lanes into memory when it aggregates a file or table and is
-/// not there yet; whether it was.
-fn materializeNamed(env: *Env, opts: RunOptions, name: []const u8, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!bool {
+/// not there yet; whether it was. A binding that reads another (a CTE over a CTE)
+/// first has the one it starts from run into memory, when that one aggregates, else
+/// laid out as the pipeline over it would lay it out (one with a window is kept): kept
+/// as a reference it was never run first, and every CTE of a report built on CTEs
+/// ran on one thread. `held` gets each binding run into memory, nested ones too.
+fn materializeNamed(env: *Env, opts: RunOptions, name: []const u8, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator, held: *std.array_list.Managed([]const u8)) anyerror!bool {
     if (env.materialized.contains(name)) return false;
     const b = (try stampedBinding(env, name)) orelse return false;
-    if (!path.materializes(b.stages, opts.lanes())) return false;
+    var stages = b.stages;
+    var n: usize = 0;
+    while (stages.len > 0 and stages[0].node == .ref and n < 16) : (n += 1) {
+        const under = stages[0].node.ref;
+        if (env.materialized.contains(under)) break;
+        if (try materializeNamed(env, opts, under, lanes_used, batch_arena, held)) break;
+        const ub = (try stampedBinding(env, under)) orelse break;
+        if (ub.stages.len == 0 or (ub.stages[0].node != .read and ub.stages[0].node != .ref)) break;
+        const windowed = for (ub.stages) |st| {
+            if (st.node == .window) break true;
+        } else false;
+        if (windowed) break;
+        stages = try std.mem.concat(env.arena, ast.Stage, &.{ ub.stages, stages[1..] });
+    }
+    if (!path.materializes(stages, opts.lanes())) return false;
 
-    const inner = try env.arena.alloc(ast.Stage, b.stages.len + 1);
-    @memcpy(inner[0..b.stages.len], b.stages);
+    const inner = try env.arena.alloc(ast.Stage, stages.len + 1);
+    @memcpy(inner[0..stages.len], stages);
     const w = ast.Write{ .connector = mem_connector, .form = null, .target = "", .mode = .overwrite };
-    inner[b.stages.len] = .{ .node = .{ .write = w }, .hints = &.{}, .pos = b.pos };
+    inner[stages.len] = .{ .node = .{ .write = w }, .hints = &.{}, .pos = b.pos };
     var ms = env_mod.MemSink{ .arena = env.shared orelse env.arena, .batches = std.array_list.Managed(Batch).init(env.shared orelse env.arena) };
     const outer_sink = env.mem_sink;
     const outer_name = env.sink_name;
@@ -275,9 +292,10 @@ fn materializeNamed(env: *Env, opts: RunOptions, name: []const u8, lanes_used: *
     {
         const outer_scope = enterScope(env, name);
         defer leaveScope(env, outer_scope);
-        try runOutputBody(env, opts, inner, inner[b.stages.len].node, &scratch, lanes_used, batch_arena);
+        try runOutputBody(env, opts, inner, inner[stages.len].node, &scratch, lanes_used, batch_arena);
     }
     try env.materialized.put(env.arena, name, .{ .schema = ms.schema, .batches = ms.batches.items });
+    try held.append(name);
     return true;
 }
 
@@ -835,14 +853,12 @@ fn runOutputBody(env: *Env, opts_in: RunOptions, stages_in: []const ast.Stage, l
     defer for (api_held) |name| {
         _ = env.materialized.remove(name);
     };
-    const mat = try materializeBinding(env, opts, stages, lanes_used, batch_arena);
-    defer if (mat) |name| {
+    var run_first = std.array_list.Managed([]const u8).init(env.arena);
+    defer for (run_first.items) |name| {
         _ = env.materialized.remove(name);
     };
-    const sides = try materializeJoinSides(env, opts, stages, lanes_used, batch_arena);
-    defer for (sides) |name| {
-        _ = env.materialized.remove(name);
-    };
+    _ = try materializeBinding(env, opts, stages, lanes_used, batch_arena, &run_first);
+    try materializeJoinSides(env, opts, stages, lanes_used, batch_arena, &run_first);
     stages = try inlineHeadBindings(env, stages);
     const wtk = try windowTopKLanes(env, opts, stages, lanes_used);
     defer if (wtk != null) {
