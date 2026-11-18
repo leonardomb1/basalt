@@ -577,8 +577,9 @@ fn checkScriptStmt(arena: std.mem.Allocator, s: ast.Stmt, program: ast.Program, 
                 if (o == .func and std.mem.eql(u8, o.func.name, c.name)) break o.func;
             } else {
                 const p = procedures.lookup(c.name) orelse
-                    return failPos(diag, c.pos, "CALL: no function or procedure named `{s}` (built-in procedures: delta_optimize, delta_vacuum)", .{c.name});
+                    return failPos(diag, c.pos, "CALL: no function or procedure named `{s}` (built-in procedures: delta_optimize, delta_vacuum, execute_on)", .{c.name});
                 if (try procedures.arityProblem(arena, p, c)) |why| return failPos(diag, c.pos, "{s}", .{why});
+                if (std.mem.eql(u8, p.name, "execute_on")) if (try procedures.executeOnProblem(arena, program.stmts, c)) |why| return failPos(diag, c.pos, "{s}", .{why});
                 return;
             };
             if (fd.body != .stmts or fd.params.len != c.args.len) return;

@@ -18,6 +18,7 @@ const exec = @import("harness.zig").exec;
 const checkAndRun = @import("harness.zig").checkAndRun;
 const expectFile = @import("harness.zig").expectFile;
 const expectRefusedAlike = @import("harness.zig").expectRefusedAlike;
+const expectRunRefuses = @import("harness.zig").expectRunRefuses;
 const PeakAlloc = @import("harness.zig").PeakAlloc;
 
 /// Points fd 2 at a file in `dir` until `end`, which restores it and returns what
@@ -2377,4 +2378,14 @@ test "a '${param}' path names its file in a LET query, a scalar subquery and a F
     const printed = try runToStdout(alloc, tmp.dir, script, .{ .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } });
     defer alloc.free(printed);
     try std.testing.expectEqualStrings("let_n,sub_max\n3,3\nloop_s\n6\n", printed);
+}
+
+test "execute_on is refused before it runs for a connection the script does not declare, one that is no database, or the wrong arguments" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try expectRefusedAlike(alloc, &tmp, "CALL execute_on('nope', $$SELECT 1$$);", "unknown connection `nope` in execute_on");
+    try expectRefusedAlike(alloc, &tmp, "CREATE CONNECTION h TYPE http OPTIONS (base_url = 'http://127.0.0.1:1');\nCALL execute_on('h', $$SELECT 1$$);", "`h` is a http connection");
+    try expectRefusedAlike(alloc, &tmp, "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', port = 1, user = 'u', password = 'p', database = 'd');\nCALL execute_on('pg');", "`execute_on` takes 2 arguments, not 1");
+    try expectRunRefuses(alloc, &tmp, "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', port = 1, user = 'u', password = 'p', database = 'd');\nCALL execute_on('pg', 42);", 1, "takes the SQL to run as text");
 }

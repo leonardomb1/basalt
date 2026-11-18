@@ -319,6 +319,32 @@ pub const Conn = struct {
         if (failed) return error.PgQueryFailed;
     }
 
+    /// Run `text`, one statement or several, for its effect, as `exec` runs it, and
+    /// return the rows its INSERT, UPDATE, DELETE, MERGE and COPY statements changed,
+    /// read from their CommandComplete tags; null when none of them ran. Several
+    /// statements sent at once run in one implicit transaction, as PostgreSQL runs a
+    /// simple query, so a failing one undoes the ones before it.
+    pub fn execBatch(self: *Conn, text: []const u8) !?u64 {
+        try self.sendQuery(text);
+        var failed = false;
+        var changed: ?u64 = null;
+        while (true) {
+            switch (try self.readMsg()) {
+                'E' => if (!failed) {
+                    try self.serverError(self.wire.msg.items);
+                    failed = true;
+                },
+                'C' => if (changedRows(self.wire.msg.items)) |n| {
+                    changed = (changed orelse 0) + n;
+                },
+                'Z' => break,
+                else => {},
+            }
+        }
+        if (failed) return error.PgQueryFailed;
+        return changed;
+    }
+
     fn sendQuery(self: *Conn, stmt: []const u8) !void {
         var body = std.array_list.Managed(u8).init(self.wire.gpa);
         defer body.deinit();
@@ -704,6 +730,27 @@ const Body = wire.Reader(.big, error.PgProtocol);
 fn authCode(p: []const u8) !i32 {
     var r: Body = .{ .p = p };
     return r.int(i32);
+}
+
+/// The rows a CommandComplete tag says its statement changed: the last number of an
+/// INSERT, UPDATE, DELETE, MERGE or COPY tag, null for any other statement.
+fn changedRows(p: []const u8) ?u64 {
+    const tag = std.mem.sliceTo(p, 0);
+    for ([_][]const u8{ "INSERT ", "UPDATE ", "DELETE ", "MERGE ", "COPY " }) |verb| {
+        if (!std.mem.startsWith(u8, tag, verb)) continue;
+        const sp = std.mem.lastIndexOfScalar(u8, tag, ' ') orelse return null;
+        return std.fmt.parseInt(u64, tag[sp + 1 ..], 10) catch null;
+    }
+    return null;
+}
+
+test "changedRows: a DML or COPY tag's count, nothing for other statements" {
+    try std.testing.expectEqual(@as(?u64, 5), changedRows("INSERT 0 5\x00"));
+    try std.testing.expectEqual(@as(?u64, 3), changedRows("UPDATE 3\x00"));
+    try std.testing.expectEqual(@as(?u64, 0), changedRows("DELETE 0\x00"));
+    try std.testing.expectEqual(@as(?u64, 7), changedRows("MERGE 7\x00"));
+    try std.testing.expectEqual(@as(?u64, null), changedRows("CREATE TABLE\x00"));
+    try std.testing.expectEqual(@as(?u64, null), changedRows("SELECT 4\x00"));
 }
 
 fn parseCopyCount(p: []const u8) ?u64 {

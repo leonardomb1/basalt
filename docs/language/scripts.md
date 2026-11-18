@@ -17,6 +17,7 @@ LOAD INTO ... AS <query>;         -- output pipeline(s)
 <query>;                          -- terminal SELECT = print to stdout
 CALL p('x');                      -- run a statement function
 CALL delta_optimize('lake/t/');   -- a built-in procedure (Delta maintenance)
+CALL execute_on('pg', $$...$$);   -- SQL run on a database as written (setup)
 FOR EACH ROW OF (...) ... END FOR;
 CASE ... END CASE;                -- plan-time dispatch
 PRINT <expr>;                     -- progress line on stderr, via the run log
@@ -118,3 +119,37 @@ object), and a progress line there would corrupt it. A `PRINT` is shown whatever
 `--log-format json` it is an NDJSON line with `"level":"print"` and the text as
 its `msg`. `PRINT` is not an output pipeline — a script still needs a `LOAD INTO`
 or a terminal query.
+
+## Running SQL on a database
+
+`CALL execute_on('<connection>', $$ ... $$)` sends SQL to a database connection
+(postgres, mysql, sqlserver, starrocks or doris) as written, for the setup a
+load needs: a `CREATE TABLE` with the types and keys the target wants, an index,
+a `GRANT`, a `TRUNCATE`, a procedure. Several statements may go at once.
+PostgreSQL runs them in one implicit transaction, so a failing one undoes those
+before it. SQL Server runs them as one batch. MySQL runs them one by one, each
+committed as it runs, and stops at the first that fails. A server that takes one
+statement at a time (some StarRocks and Doris versions) refuses several with its
+own message, so send one per call there.
+
+A failing statement fails the run with the server's message, and the SQL is
+never sent again. The SQL runs on a connection of its own, closed after, so a
+`SET` or a temporary table it makes is gone for the reads and loads that follow.
+The run log says how long it took and, on PostgreSQL and MySQL, how many rows
+its statements changed, shown as a `PRINT` is. `check` and `EXPLAIN` send
+nothing; `EXPLAIN ANALYZE` names what it would run.
+
+The SQL is text: `${...}` holes are filled as in any string (loop variables,
+`PARAM`s, `LET`s), and both arguments may be computed:
+`CALL execute_on($target, 'TRUNCATE ' || $table)`. A `FUNCTION execute_on` that
+the script declares is called instead.
+
+```sql ignore
+CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'db', user = 'etl', password = '${PG_PASS}', database = 'dw');
+CALL execute_on('pg', $$
+  CREATE TABLE IF NOT EXISTS sales (id bigint PRIMARY KEY, region text, amount numeric(12,2));
+  CREATE INDEX IF NOT EXISTS sales_region ON sales (region);
+$$);
+LOAD INTO pg.public.sales UPSERT AS SELECT * FROM 'sales.parquet';
+```
+

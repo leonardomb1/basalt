@@ -69,6 +69,20 @@ fn rowLabel(arena: std.mem.Allocator, names: []const []const u8, row: Row) []con
     return if (out.len > 0) out else first;
 }
 
+/// `e` with the `${...}` holes of each text literal in it rendered against `lr`, as a
+/// statement's string literals are: a procedure's arguments, `$$...$$` bodies too.
+fn renderTextHoles(arena: std.mem.Allocator, e: *ast.Expr, lr: LoopRow) anyerror!*ast.Expr {
+    const Cx = struct { arena: std.mem.Allocator, lr: LoopRow };
+    const S = struct {
+        fn recur(cx: Cx, node: *const ast.Expr) anyerror!*ast.Expr {
+            if (node.* == .str_lit and std.mem.indexOf(u8, node.str_lit, "${") != null)
+                return mk(cx.arena, .{ .str_lit = try interpAll(cx.arena, node.str_lit, cx.lr) });
+            return ast.rebuildExpr(cx.arena, node, cx, recur);
+        }
+    };
+    return S.recur(.{ .arena = arena, .lr = lr }, e);
+}
+
 /// Render every `${...}` in `s`. A bare `${var}` substitutes the loop variable,
 /// leaving an unknown one verbatim; anything else is evaluated as an expression.
 pub fn interpAll(arena: std.mem.Allocator, s: []const u8, lr: LoopRow) ![]const u8 {
@@ -626,7 +640,12 @@ pub fn runCall(env: *Env, c: ast.CallStmt, outer: LoopRow, opts: RunOptions, sta
         const dry = env.explain or c.explain;
         const step = try explain.openStep(env, dry, c.name);
         defer explain.closeStep(env, step);
-        return procedures.run(env, p, c, .{ .names = sc.names, .values = sc.values }, dry);
+        var rendered = c;
+        const holes_row = if (outer.outer == null and !outer.script) LoopRow{ .names = outer.names, .types = outer.types, .cells = outer.cells, .nulls = outer.nulls, .values = outer.values, .outer = &env.script_scope } else outer;
+        const args = try env.arena.alloc(*ast.Expr, c.args.len);
+        for (c.args, args) |a, *o| o.* = try renderTextHoles(env.arena, a, holes_row);
+        rendered.args = args;
+        return procedures.run(env, p, rendered, .{ .names = sc.names, .values = sc.values }, dry);
     };
     const body = switch (fd.body) {
         .stmts => |b| b,

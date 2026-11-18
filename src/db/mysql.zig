@@ -47,6 +47,8 @@ const CLIENT_PROTOCOL_41 = 0x00000200;
 const CLIENT_SSL = 0x00000800;
 const CLIENT_SECURE_CONNECTION = 0x00008000;
 const CLIENT_PLUGIN_AUTH = 0x00080000;
+/// SERVER_MORE_RESULTS_EXISTS: another statement's reply follows this one.
+const server_more_results = 0x0008;
 
 pub const Error = error{ MysqlAuthFailed, MysqlQueryFailed, MysqlProtocol } || std.mem.Allocator.Error;
 
@@ -173,6 +175,55 @@ pub const Conn = struct {
                 return error.MysqlQueryFailed;
             }
         }
+    }
+
+    /// Run `text`, one statement or several, for its effect, returning the rows the
+    /// statements changed. Several need the session's multi-statement option, asked
+    /// for with COM_SET_OPTION; a server that refuses it gets the text as one
+    /// statement, so several fail with its own message. Each statement's reply is
+    /// read, a result set to its end and dropped, while the server says more follow;
+    /// an error ends the batch there, as the server stops running it there.
+    pub fn execBatch(self: *Conn, text: []const u8) !?u64 {
+        try self.multiStatements();
+        _ = try self.query(text);
+        var changed: u64 = 0;
+        while (true) {
+            const p = self.wire.msg.items;
+            if (p.len == 0 or p[0] == 0xfb) return error.MysqlProtocol;
+            if (p[0] == 0xff) {
+                try self.serverError(p);
+                return error.MysqlQueryFailed;
+            }
+            if (p[0] == 0x00) {
+                changed += parseOkAffected(p) orelse 0;
+                self.noteStatus(p);
+            } else {
+                var head: Pkt = .{ .p = p };
+                const ncol = try columnCount(&head);
+                for (0..ncol + 1) |_| _ = try self.readPacket();
+                while (true) {
+                    _ = try self.readPacket();
+                    const r = self.wire.msg.items;
+                    if (r.len > 0 and r[0] == 0xfe and r.len < 9) {
+                        self.noteStatus(r);
+                        break;
+                    }
+                    if (r.len > 0 and r[0] == 0xff) {
+                        try self.serverError(r);
+                        return error.MysqlQueryFailed;
+                    }
+                }
+            }
+            if (self.status & server_more_results == 0) return changed;
+            _ = try self.readPacket();
+        }
+    }
+
+    /// COM_SET_OPTION turning multi-statements on for the session; a refusal leaves
+    /// the session as it was.
+    fn multiStatements(self: *Conn) !void {
+        _ = try self.writePacket(0, &.{ 0x1b, 0x00, 0x00 });
+        _ = try self.readPacket();
     }
 
     /// Send the `LOAD DATA LOCAL INFILE` query and wait for the server's local infile

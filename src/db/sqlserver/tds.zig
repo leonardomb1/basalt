@@ -247,6 +247,14 @@ pub const Conn = struct {
         return cur.drainBatch();
     }
 
+    /// Run `text`, one statement or several, as one batch for its effect, as `exec`
+    /// runs it. Null for the rows changed: a DONE token counts a SELECT's rows as it
+    /// counts an UPDATE's, so a total would not say what changed.
+    pub fn execBatch(self: *Conn, text: []const u8) !?u64 {
+        try self.exec(text);
+        return null;
+    }
+
     /// Scan a reply's tokens; an ERROR token sets `last_error` and returns QueryFailed.
     fn scanResultTokens(self: *Conn) !void {
         var r: Body = .{ .p = self.wire.msg.items };

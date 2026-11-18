@@ -201,6 +201,31 @@ runs mysql     && sqlrt mysql     "$MYSQL_OPTS"
 runs postgres  && sqlrt postgres  "$PG_OPTS"
 runs sqlserver && sqlrt sqlserver "$MSSQL_OPTS"
 
+# CALL execute_on: a batch of several statements runs as sent (MySQL's needs the
+# session's multi-statement option), EXPLAIN ANALYZE only names it, and a failing
+# statement fails the run with the server's words.
+execrt() { # $1 label, $2 CREATE CONNECTION db ...
+  local decl=$2 n why
+  if ! brun run -c "$decl
+CALL execute_on('db', \$\$DROP TABLE IF EXISTS it_exec; CREATE TABLE it_exec (a INT); INSERT INTO it_exec VALUES (1), (2)\$\$);
+EXPLAIN ANALYZE CALL execute_on('db', \$\$DROP TABLE it_exec\$\$);"; then
+    report "$1-execute_on (setup error)" bad
+    return
+  fi
+  n=$($B run --format csv -q -c "$decl SELECT count(*) AS n FROM db.it_exec;" 2>&1 | tail -1 || true)
+  why=$($B run -q -c "$decl CALL execute_on('db', \$\$SELECT * FROM it_exec_none\$\$);" 2>&1 || true)
+  if [ "$n" = 2 ] && echo "$why" | grep -q "execute_on db failed"; then
+    report "$1-execute_on" ok
+  else
+    report "$1-execute_on (rows $n; $why)" bad
+  fi
+  $B run -q -c "$decl CALL execute_on('db', \$\$DROP TABLE it_exec\$\$);" >/dev/null 2>&1
+}
+
+runs mysql     && execrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"
+runs postgres  && execrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"
+runs sqlserver && execrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);"
+
 runs mysql     && topnrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"         db.it_topn
 runs postgres  && topnrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"         db.it_topn
 runs sqlserver && topnrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);"    db.it_topn
