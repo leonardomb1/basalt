@@ -1460,10 +1460,12 @@ test "UPDATE a Delta table: SET over the row, a FROM source joined on its key, a
         try load(&tmp, "UPDATE '$B/t/' x SET amt = s.id * 100, grp = s.v FROM '$B/s.csv' s WHERE x.id = s.id AND x.amt < 1000;", threads);
         try load(&tmp, "UPDATE '$B/t/' x SET amt = x.amt - 1 WHERE id IN (SELECT id FROM '$B/k.csv');", threads);
         try testing.expectEqualStrings("id,grp,amt\n1,x,100\n2,y,200\n3,a,25\n4,b,30\n5,a,44\n6,b,49\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+        try load(&tmp, "UPDATE '$B/t/' x SET amt = x.amt + s.id FROM '$B/s.csv' s WHERE x.id = s.id AND x.amt BETWEEN 150 AND 250 AND x.id NOT IN (SELECT id FROM '$B/k.csv');", threads);
+        try testing.expectEqualStrings("id,amt\n1,100\n2,202\n", try rows(a, &tmp, "SELECT id, amt FROM '$B/t/' WHERE id < 3 ORDER BY id"));
         try runRefuses(a, &tmp, "UPDATE '$B/t/' x SET amt = 0 FROM '$B/dup.csv' s WHERE x.id = s.id;", "a row matches more than one row of the FROM source");
-        try testing.expect(!exists(&tmp, "t/_delta_log/00000000000000000004.json"));
+        try testing.expect(!exists(&tmp, "t/_delta_log/00000000000000000005.json"));
         try load(&tmp, "UPDATE '$B/t/' SET amt = 0 WHERE id > 99;", threads);
-        try testing.expect(!exists(&tmp, "t/_delta_log/00000000000000000004.json"));
+        try testing.expect(!exists(&tmp, "t/_delta_log/00000000000000000005.json"));
     }
     try load(&tmp, "LOAD INTO '$B/p/' WITH (format = 'delta', partition_by = 'grp') AS SELECT range + 1 AS id, CASE WHEN range % 2 = 0 THEN 'a' ELSE 'b' END AS grp FROM range(4);", 1);
     try load(&tmp, "UPDATE '$B/p/' SET grp = 'z' WHERE id = 3;", 1);
@@ -1498,7 +1500,7 @@ test "UPDATE a Delta table taking deletion vectors marks the old rows in them, a
     try testing.expectEqualStrings("id,amt,_change_type\n3,-20,update_postimage\n3,20,update_preimage\n4,-30,update_postimage\n4,30,update_preimage\n", try rows(a, &tmp, "SELECT id, amt, _change_type FROM '$B/t/' WITH (changes_from = 2) ORDER BY id, _change_type"));
 }
 
-test "UPDATE a Delta table: a SET of a column it lacks, a FROM matched by other than equalities and a subquery beside a FROM are refused" {
+test "UPDATE a Delta table: a SET of a column it lacks, a FROM matched by other than equalities or only beside a subquery are refused" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1509,7 +1511,33 @@ test "UPDATE a Delta table: a SET of a column it lacks, a FROM matched by other 
     try harness.expectRefusedAlike(gpa, &tmp, "UPDATE '$B/t/' SET nope = 1;", "`UPDATE` sets column `nope`");
     try harness.expectRefusedAlike(gpa, &tmp, "UPDATE '$B/t/' SET amt = nope;", "unknown field `nope`");
     try harness.expectRefusedAlike(gpa, &tmp, "UPDATE '$B/t/' x SET amt = 0 FROM '$B/s.csv' s WHERE x.id > s.id;", "matches the source's rows to the table's by equalities");
-    try parseRefuses(a, "UPDATE 't/' x SET amt = 0 FROM 's.csv' s WHERE x.id = s.id AND x.id IN (SELECT id FROM 's.csv');", "not IN or EXISTS subqueries");
+    try parseRefuses(a, "UPDATE 't/' x SET amt = 0 FROM 's.csv' s WHERE x.id IN (SELECT id FROM 's.csv');", "beside any subquery");
     try parseRefuses(a, "UPDATE 't/' SET amt = 0, amt = 1;", "sets column `amt` twice");
     try parseRefuses(a, "UPDATE 't/' x SET amt = 0 FROM 's.csv' s;", "matches the source's rows to the table's in a WHERE");
+}
+
+test "UPDATE a Delta table with a variant column carries it through raw, sets it from JSON text, and refuses to read it" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT id, CAST(grp AS VARCHAR) AS v FROM '$B/a.csv' WHERE id < 0;", 0);
+    const v0 = try logFile(a, &tmp, "t", 0);
+    var meta: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, v0, '\n');
+    while (lines.next()) |l| if (std.mem.startsWith(u8, l, "{\"metaData\":")) {
+        meta = l;
+    };
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000001.json", .data = try std.mem.concat(a, u8, &.{
+        "{\"commitInfo\":{\"timestamp\":1}}\n",
+        "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"variantType\"],\"writerFeatures\":[\"variantType\"]}}\n",
+        try std.mem.replaceOwned(u8, a, meta, "\\\"name\\\":\\\"v\\\",\\\"type\\\":\\\"string\\\"", "\\\"name\\\":\\\"v\\\",\\\"type\\\":\\\"variant\\\""),
+        "\n",
+    }) });
+    try load(&tmp, "LOAD INTO '$B/t/' AS SELECT 1 AS id, '{\"a\":[1,2.5],\"t\":true}' AS v UNION ALL SELECT 2, '-12.5' UNION ALL SELECT 3, NULL;", 1);
+    try load(&tmp, "UPDATE '$B/t/' SET id = id + 10 WHERE id = 1;", 1);
+    try load(&tmp, "UPDATE '$B/t/' SET v = '[\"x\"]' WHERE id = 2;", 1);
+    try testing.expectEqualStrings("id,v\n2,\"[\"\"x\"\"]\"\n3,\n11,\"{\"\"a\"\":[1,2.5],\"\"t\"\":true}\"\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+    try runRefuses(a, &tmp, "UPDATE '$B/t/' SET id = 0 WHERE v IS NULL;", "`v` holds a variant, which an UPDATE reads only to write it back");
 }

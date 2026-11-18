@@ -2020,8 +2020,7 @@ const Ctx = struct {
 /// analysis) leaves a condition reading a value only the run knows to the run.
 pub fn deleteProblem(arena: std.mem.Allocator, w: ast.Write, stages: []const ast.Stage, connections: *const std.StringHashMap(ast.Connection), params: *const ParamMap, offline: bool) !?[]const u8 {
     if (connections.get(w.connector)) |conn| {
-        const info = connect.sqlConnInfo(conn) orelse return "`DELETE FROM` deletes from a database table (postgres, mysql, sqlserver) or a Delta table's folder";
-        if (info.dialect == .starrocks or info.dialect == .doris) return "`DELETE FROM` a StarRocks or Doris table is not supported yet";
+        const info = connect.sqlConnInfo(conn) orelse return "`DELETE FROM` deletes from a database table (postgres, mysql, sqlserver, starrocks, doris) or a Delta table's folder";
         if (deleteShapeProblem(stages)) |why| return why;
         return switch (try deleteConds(arena, w, stages, info.dialect, params, offline)) {
             .sql, .unbound => null,
@@ -2113,8 +2112,7 @@ pub fn updateProblem(arena: std.mem.Allocator, w: ast.Write, stages: []const ast
     if (table_schema) |ts| if (ts.fields.len > 0) for (u.sets) |st| if (update_rules.column(ts, st.column) == null)
         return try msgfmt.allocPrint(arena, "`UPDATE` sets column `{s}`, which {s} lacks", .{ st.column, w.target });
     if (connections.get(w.connector)) |conn| {
-        const info = connect.sqlConnInfo(conn) orelse return "`UPDATE` changes a database table (postgres, mysql, sqlserver) or a Delta table's folder";
-        if (info.dialect == .starrocks or info.dialect == .doris) return "`UPDATE` of a StarRocks or Doris table is not supported yet";
+        const info = connect.sqlConnInfo(conn) orelse return "`UPDATE` changes a database table (postgres, mysql, sqlserver, starrocks, doris) or a Delta table's folder";
         return switch (try update_rules.build(arena, u, dmlTable(w.target), sh, info.dialect, params, offline)) {
             .sql, .unbound => null,
             .unsendable => |e| try msgfmt.allocPrint(arena, "UPDATE {s}: `{s}` cannot be sent to {s} as written; it runs in the database, so it takes the table's columns, the FROM source's, constants and the functions {s} has", .{ w.target, try exprText(arena, e), @tagName(info.dialect), @tagName(info.dialect) }),

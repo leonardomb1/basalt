@@ -1,7 +1,8 @@
 # INSERT, DELETE and UPDATE
 
 These change the rows of a table that already exists: a database table
-(PostgreSQL, MySQL or SQL Server) or a Delta table (a folder, `'path/'`). Each
+(PostgreSQL, MySQL, SQL Server, StarRocks or Doris) or a Delta table (a folder,
+`'path/'`). Each
 statement lands whole or not at all. `LOAD INTO` is the statement that creates,
 replaces and upserts tables and writes files; these leave the table's definition
 alone and change only its rows.
@@ -34,11 +35,19 @@ as given. If the connection breaks while that last statement runs, the run fails
 saying it cannot know whether the rows landed, rather than sending them twice. On
 a Delta table the rows are one commit, as an `APPEND`.
 
+On StarRocks and Doris the staging table is made by `CREATE TABLE ... AS SELECT`
+over the inserted columns, the rows reach it by Stream Load, and one
+`INSERT ... SELECT`, a load transaction of its own, moves them into the table.
+StarRocks keeps the target's NOT NULL on the staging table, so there a NULL
+into such a column fails the Stream Load into it, naming the rejected rows' log;
+either way the table is left as it was. Into a StarRocks Primary Key table or a Doris Unique Key
+table a row whose key is already there replaces it, as their own `INSERT` does.
+
 `INSERT` takes the options of a `LOAD INTO` to its target after the column list,
 `WITH (merge_schema = true)` on a Delta table among them, and a query starting
-with `WITH` is its own: `INSERT INTO t WITH q AS (...) SELECT ...`. StarRocks and
-Doris tables, and CSV, Parquet and other files, are not `INSERT` targets yet;
-`LOAD INTO ... APPEND` adds to them.
+with `WITH` is its own: `INSERT INTO t WITH q AS (...) SELECT ...`. CSV,
+Parquet and other files are not `INSERT` targets yet; `LOAD INTO ... APPEND`
+adds to them.
 
 ## DELETE
 
@@ -74,15 +83,24 @@ refused, as is an `IN` whose left side is an expression.
 
 `check` and `EXPLAIN` connect to nothing, and `EXPLAIN ANALYZE` names the
 statement it would run without loading the subqueries or deleting a row.
-StarRocks and Doris tables are not `DELETE` targets yet.
+
+StarRocks and Doris take the same statement, and decide what their table's
+model allows: a StarRocks Primary Key table or a Doris Unique Key table (merge on
+write) takes any condition and subquery, while a Duplicate Key table takes only
+simple conditions on its columns; StarRocks refuses a subquery there with its
+own message.
+They report no count of deleted rows for a table that is not keyed, so the run
+log then says only that it deleted.
 
 ### On a Delta table
 
 basalt finds the rows itself, evaluating the conditions and subqueries as a
 `SELECT` would, and deletes them in one commit, recorded as a `DELETE`. A file
-whose partition values rule the conditions out is not read; one whose partition
-values make every condition true, with no subquery, is removed whole without
-being read. A file holding a deleted row is rewritten without it, in the same
+whose partition values rule the conditions out is not read, nor is one whose
+statistics in the log (`minValues`, `maxValues`, `nullCount`) do for a
+condition comparing a column with a constant, and a file read skips the row
+groups its footer rules out the same way; one whose partition values make every
+condition true, with no subquery, is removed whole without being read. A file holding a deleted row is rewritten without it, in the same
 commit that removes it, and a file holding none is left as it is. On a table that
 takes deletion vectors (`delta.enableDeletionVectors`) the file is kept and its
 deleted rows marked in its vector instead, and a table keeping a change data feed
@@ -122,27 +140,32 @@ every row is updated.
 matches them to the table's by equalities between their columns, `o.id = p.id`,
 and may add conditions on either side. A row of the table that no source row
 matches is left as it is. A row two source rows match is an error, as it would
-take one of several values, and nothing is changed. A `WHERE` beside a `FROM`
-holds no subquery; join what it would read into the source instead.
+take one of several values, and nothing is changed. Beside a `FROM` the `WHERE`
+may hold `IN` and `EXISTS` subqueries too; it needs at least one condition
+without one, the match to the source.
 
 On a database the `SET` and `WHERE` go to the database as SQL, as a `DELETE`'s
 conditions do, so a value is computed and converted as the database computes and
 converts it (its arithmetic, its rounding into the column's type). The FROM
 source's columns that the statement reads load into a staging table of the run's
 own, as a `DELETE`'s subqueries do, and the statement joins the table to it: in
-PostgreSQL `UPDATE ... FROM`, in MySQL `UPDATE ... JOIN`, in SQL Server
-`UPDATE ... FROM ... JOIN`. The run log says how many rows the database reports
-it changed, which in MySQL leaves out a row set to the values it already had.
+PostgreSQL, StarRocks and Doris `UPDATE ... FROM`, in MySQL `UPDATE ... JOIN`, in
+SQL Server `UPDATE ... FROM ... JOIN`. The run log says how many rows the
+database reports it changed, which in MySQL leaves out a row set to the values it
+already had. StarRocks updates only a Primary Key table and Doris only a Unique
+Key one; another table is refused with their own message.
 
 On a Delta table basalt computes the new values, each cast to its column's type,
 and writes the changed rows to new files in the same commit that rewrites, or on
 a table taking deletion vectors marks, the files they came from, recorded as an
 `UPDATE`. A row whose partition column changes moves to its new partition. Files
-the conditions on the table's partition columns rule out are not read. A table
-keeping a change data feed gets each row's `update_preimage` and
-`update_postimage`. A table with a variant column is not an `UPDATE` target yet.
+and row groups that the conditions on the table rule out, by partition values or
+statistics, are not read. A table keeping a change data feed gets each row's
+`update_preimage` and `update_postimage`. A variant column is carried through as
+the table holds it, so an updated row keeps its other variants' types, and `SET`
+gives one a value as JSON text; a `SET` or `WHERE` may not read a variant
+column yet.
 
 `EXPLAIN` and `EXPLAIN ANALYZE` behave as for a `DELETE`: on a database they name
 the statement without staging a row; on a Delta table `EXPLAIN` says how many
 files it would read and `EXPLAIN ANALYZE` how many rows it would update.
-StarRocks and Doris tables are not `UPDATE` targets yet.

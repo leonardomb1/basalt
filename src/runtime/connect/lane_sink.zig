@@ -35,7 +35,32 @@ const StreamLoadSpec = struct {
     mode: ast.WriteMode,
     logger: ?*obs.Logger = null,
     errctx: ?*op.ErrCtx = null,
+    /// An INSERT's staging, loaded by the lanes and applied once they are done.
+    insert_plan: ?*ReplacePlan = null,
 };
+
+fn finishLaneStreamInsert(ctx: *anyopaque) anyerror!void {
+    const spec: *StreamLoadSpec = @ptrCast(@alignCast(ctx));
+    if (spec.insert_plan) |p| try p.finish();
+}
+
+fn abortLaneStreamInsert(ctx: *anyopaque) void {
+    const spec: *StreamLoadSpec = @ptrCast(@alignCast(ctx));
+    if (spec.insert_plan) |p| p.abort();
+}
+
+/// A StarRocks or Doris INSERT's staging: a table of the run's own made over the
+/// FE's SQL connection (`CREATE TABLE ... AS SELECT`, the target's columns the
+/// INSERT names, emptied), the Stream Load target until one `INSERT ... SELECT`
+/// moves the rows into the target.
+pub fn streamInsertPlan(env: *Env, conn: ast.Connection, w: ast.Write, schema: types.Schema) !*ReplacePlan {
+    const info = sqlConnInfo(conn).?;
+    const cfg = try resolveDbConfig(env, conn, info.port);
+    const p = try env.arena.create(ReplacePlan);
+    p.* = .{ .gpa = env.gpa, .kind = info.kind, .cfg = cfg, .dialect = info.dialect, .target = w.target, .schema = schema, .how = env.cutover, .errctx = env.errctx, .insert = true };
+    p.prepare(env.arena) catch |e| return planErr(env.diag, try @import("sink.zig").insertSetupFailed(env, conn.connector, w.target, e));
+    return p;
+}
 
 fn openLaneStreamLoadSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize) anyerror!driver.Sink {
     const spec: *StreamLoadSpec = @ptrCast(@alignCast(ctx_ptr));
@@ -251,7 +276,7 @@ pub fn buildParallelSink(env: *Env, w: ast.Write, schema_in: types.Schema) !?par
     try @import("sink.zig").uniqueTargetColumns(env, w, schema);
     if (env.explain or env.union_sink != null) return null;
     if (try buildStreamLoadSpec(env, w, schema)) |spec|
-        return parallel.SinkMode{ .per_lane = .{ .open = openLaneStreamLoadSink, .ctx = spec } };
+        return parallel.SinkMode{ .per_lane = .{ .open = openLaneStreamLoadSink, .ctx = spec, .finish = finishLaneStreamInsert, .abort = abortLaneStreamInsert } };
     if (try buildSqlSinkSpec(env, w, schema)) |spec|
         return parallel.SinkMode{ .per_lane = .{ .open = openLaneSqlSink, .ctx = spec, .finish = finishLaneReplace, .abort = abortLaneReplace } };
     return null;
@@ -310,10 +335,15 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
 fn buildStreamLoadSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*StreamLoadSpec {
     const conn = env.connections.get(w.connector) orelse return null;
     const flavor = streamload.Flavor.of(conn.connector) orelse return null;
-    if (w.insert != null) return planErr(env.diag, try msgfmt.allocPrint(env.arena, "INSERT INTO a {s} table is not supported yet; LOAD INTO … APPEND loads it", .{flavor.name()}));
-
     var cfg = try resolveStreamLoadConfig(env, conn, flavor);
     cfg.run_id = if (cfg.run_id != 0) cfg.run_id else @intCast(std.time.milliTimestamp());
+    if (w.insert != null) {
+        const plan = try streamInsertPlan(env, conn, w, schema);
+        cfg.auto_create = false;
+        const spec = try env.arena.create(StreamLoadSpec);
+        spec.* = .{ .cfg = cfg, .target = plan.stagingTarget(), .schema = schema, .mode = .append, .logger = env.log, .errctx = env.errctx, .insert_plan = plan };
+        return spec;
+    }
 
     const setup = streamload.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
         return srOpenErr(env, e, try msgfmt.allocPrint(env.arena, "{s} setup failed", .{flavor.name()}));

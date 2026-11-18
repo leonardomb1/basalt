@@ -470,7 +470,7 @@ const Tx = struct {
             },
             .call => |c| return self.call(c),
             .cond => |c| {
-                const cnd = (try self.pred(c.cond, .exact)) orelse return null;
+                const cnd = (try self.pred(c.cond, self.nestedNeed())) orelse return null;
                 const t = (try self.value(c.then)) orelse return null;
                 const f = (try self.value(c.els)) orelse return null;
                 return try self.fmt("(CASE WHEN {s} THEN {s} ELSE {s} END)", .{ cnd, t, f });
@@ -488,9 +488,15 @@ const Tx = struct {
             else => {},
         }
         switch (e.*) {
-            .unary, .binary, .is_null => return if (self.dialect.hasBoolean()) self.pred(e, .exact) else null,
+            .unary, .binary, .is_null => return if (self.dialect.hasBoolean()) self.pred(e, self.nestedNeed()) else null,
             else => return null,
         }
+    }
+
+    /// What a condition nested in a value needs: as written where the database
+    /// decides (`.source`), else exactly.
+    fn nestedNeed(self: Tx) Need {
+        return if (self.o.need == .source) .source else .exact;
     }
 
     /// A `from_one` call descends only from position 1 (a UTF-8 SQL Server varchar counts
@@ -522,10 +528,11 @@ const Tx = struct {
     fn match(self: Tx, m: ast.Match) Err!?[]const u8 {
         var out = std.array_list.Managed(u8).init(self.arena);
         const w = out.writer();
+        const decides = self.o.need == .source;
         if (m.subject) |subj| {
             const sk = self.kind(subj);
-            if (sk == .text) return null;
-            if (sk == .unknown) for (m.arms) |arm| for (arm.pats) |p| switch (p.*) {
+            if (sk == .text and !decides) return null;
+            if (sk == .unknown and !decides) for (m.arms) |arm| for (arm.pats) |p| switch (p.*) {
                 .int_lit, .float_lit, .dec_lit => {},
                 else => return null,
             };
@@ -540,12 +547,12 @@ const Tx = struct {
                 try w.print(" ELSE {s}", .{v});
             } else if (m.subject != null) {
                 for (arm.pats) |p| {
-                    if (self.kind(p) == .text) return null;
+                    if (self.kind(p) == .text and !decides) return null;
                     const ps = (try self.value(p)) orelse return null;
                     try w.print(" WHEN {s} THEN {s}", .{ ps, v });
                 }
             } else {
-                const g = (try self.pred(arm.guard orelse return null, .exact)) orelse return null;
+                const g = (try self.pred(arm.guard orelse return null, self.nestedNeed())) orelse return null;
                 try w.print(" WHEN {s} THEN {s}", .{ g, v });
             }
         }
@@ -1002,6 +1009,26 @@ test "translateExpr: concat stays NULL on a NULL argument in every dialect" {
     const e = try ast.mk(a, .{ .is_null = .{ .e = c, .negated = false } });
     try testing.expectEqualStrings("(CASE WHEN \"b\" IS NULL OR 'z' IS NULL THEN NULL ELSE CONCAT(\"b\", 'z') END IS NULL)", (try translateExpr(a, e, .postgres, testSchema(), true)).?);
     try testing.expectEqualStrings("(CONCAT(`b`, 'z') IS NULL)", (try translateExpr(a, e, .mysql, testSchema(), true)).?);
+}
+
+test "translateValue: arithmetic, and a CASE's text guard, go as written only where the database decides" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const five = try ast.mk(a, .{ .int_lit = 5 });
+    const sum = try ast.mk(a, .{ .binary = .{ .op = .add, .l = try fld(a, "amt"), .r = five } });
+    try testing.expectEqualStrings("(\"amt\" + 5)", (try translateValue(a, sum, .postgres, .{ .need = .source })).?);
+    try testing.expect((try translateValue(a, sum, .postgres, .{ .need = .exact })) == null);
+    const neg = try ast.mk(a, .{ .unary = .{ .op = .neg, .e = sum } });
+    try testing.expectEqualStrings("(-(`amt` + 5))", (try translateValue(a, neg, .mysql, .{ .need = .source })).?);
+    const guard = try ast.mk(a, .{ .binary = .{ .op = .eq, .l = try fld(a, "region"), .r = try ast.mk(a, .{ .str_lit = "eu" }) } });
+    const arms = try a.dupe(ast.MatchArm, &.{
+        .{ .pats = &.{}, .guard = guard, .value = five, .is_default = false },
+        .{ .pats = &.{}, .guard = null, .value = try ast.mk(a, .{ .int_lit = 0 }), .is_default = true },
+    });
+    const case = try ast.mk(a, .{ .match = .{ .subject = null, .arms = arms } });
+    try testing.expectEqualStrings("(CASE WHEN (\"region\" = 'eu') THEN 5 ELSE 0 END)", (try translateValue(a, case, .postgres, .{ .need = .source })).?);
+    try testing.expect((try translateValue(a, case, .postgres, .{ .need = .exact })) == null);
 }
 
 test "translateExpr: AND of comparisons, per-dialect quoting" {

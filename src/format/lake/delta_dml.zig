@@ -35,6 +35,7 @@ const types = @import("../../lang/types.zig");
 const vec = @import("../../exec/eval/vec.zig");
 const write = @import("delta_write.zig");
 const keepsRows = @import("delta_maint.zig").keepsRows;
+const Bound = @import("../parquet/stats.zig").Bound;
 
 const refuse = table.refuse;
 
@@ -50,6 +51,10 @@ pub const Op = enum {
     }
 };
 
+/// A column holding a variant: `whole` when it is one, not one inside a struct, list
+/// or map.
+pub const Variant = struct { name: []const u8, whole: bool };
+
 pub const Target = struct {
     op: Op,
     st: *delta.State,
@@ -63,6 +68,12 @@ pub const Target = struct {
     /// and position in it, `tag` and `pos`.
     match: []const delta.Add,
     layout: *const fit.Layout,
+    /// The conditions' bounds on single columns, by which a read of `layout` skips
+    /// row groups.
+    bounds: []const Bound,
+    /// The columns holding a variant, which an UPDATE's `layout` reads raw, as it
+    /// writes them back, so an updated row's other variants keep their types.
+    variants: []const Variant = &.{},
     width: usize,
     tag: usize,
     pos: usize,
@@ -71,10 +82,11 @@ pub const Target = struct {
 /// The `op` of `root`'s table at its newest version, refused when basalt does not
 /// write the table or it is append-only. `conds` are its conditions on the table,
 /// `$` values bound: a file whose partition values make one false or NULL holds no
-/// row to change, and one naming another column rules nothing out. `whole_ok` (a
-/// DELETE with no subquery) lets a file whose partition values make every one true
-/// go unread.
-pub fn open(arena: std.mem.Allocator, root: []const u8, op: Op, conds: []const *const ast.Expr, whole_ok: bool) !Target {
+/// row to change, and one naming another column rules nothing out; so is one whose
+/// statistics (`minValues`, `maxValues`, `nullCount`) rule out one of `bounds`, the
+/// conditions' bounds on single columns. `whole_ok` (a DELETE with no subquery)
+/// lets a file whose partition values make every one true go unread.
+pub fn open(arena: std.mem.Allocator, root: []const u8, op: Op, conds: []const *const ast.Expr, bounds: []const Bound, whole_ok: bool) !Target {
     if (write.storeProblem(root)) |why| return refuse("cannot {s} Delta table `{s}`: {s}", .{ if (op == .delete) "delete from" else "update", root, why });
     const st = try delta.snapshot(arena, root, .{}, null);
     try st.checkProtocol();
@@ -84,14 +96,13 @@ pub fn open(arena: std.mem.Allocator, root: []const u8, op: Op, conds: []const *
         return refuse("{s} is append-only (`delta.appendOnly`), so {s} cannot change its rows", .{ st.name, if (op == .delete) "a DELETE" else "an UPDATE" });
     const all = st.files.values();
     const fl = try delta.layoutOf(arena, st, root, all);
-    if (op == .update) for (fl.layout.variant_types) |vt| if (vt != null)
-        return refuse("{s} has a variant column; an UPDATE of it is not supported yet", .{st.name});
     const feed = feeds(st);
     var files = std.array_list.Managed(delta.Add).init(arena);
     var whole = std.array_list.Managed(delta.Add).init(arena);
     var match = std.array_list.Managed(delta.Add).init(arena);
     var match_files = std.array_list.Managed(fit.Layout.File).init(arena);
-    for (all, fl.files) |a, f| {
+    for (all, fl.files, 0..) |a, f, i| {
+        if (fl.layout.pruned(i, bounds)) continue;
         var every = true;
         const out = for (conds) |e| {
             const v = vec.constEval(arena, e, st.part_cols, f.parts) catch {
@@ -111,10 +122,15 @@ pub fn open(arena: std.mem.Allocator, root: []const u8, op: Op, conds: []const *
         try match_files.append(f);
     }
     var base = fl.layout;
-    if (op == .update and keepsRows(st)) base = try delta.withRows(arena, st, base);
+    var variants = std.array_list.Managed(Variant).init(arena);
+    if (op == .update) {
+        for (base.variant_types, 0..) |vt, i| if (vt) |j| try variants.append(.{ .name = base.schema.fields[i].name, .whole = j == .string });
+        base = try delta.rawVariants(arena, base);
+        if (keepsRows(st)) base = try delta.withRows(arena, st, base);
+    }
     const lay = try tagLayout(arena, base, match_files.items);
     const nf = base.schema.fields.len;
-    return .{ .op = op, .st = st, .root = root, .files = files.items, .whole = whole.items, .match = match.items, .layout = lay, .width = nf, .tag = nf, .pos = nf + 1 };
+    return .{ .op = op, .st = st, .root = root, .files = files.items, .whole = whole.items, .match = match.items, .layout = lay, .bounds = bounds, .variants = variants.items, .width = nf, .tag = nf, .pos = nf + 1 };
 }
 
 pub const Done = struct {

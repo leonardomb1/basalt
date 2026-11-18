@@ -187,9 +187,10 @@ pub fn parseDeleteFrom(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Er
 }
 
 /// `UPDATE <table> [alias] SET col = expr, ... [FROM <source> [alias]] [WHERE ...]`,
-/// read as `SELECT * FROM <table> [alias] [JOIN <source> [alias] ON <where>]
-/// [WHERE ...]`: the rows to change, a write setting the columns. Under FROM the
-/// WHERE joins the source to the table, so it holds no subquery.
+/// read as `SELECT * FROM <table> [alias] [JOIN <source> [alias] ON ...] [WHERE ...]`:
+/// the rows to change, a write setting the columns. Under FROM the WHERE's
+/// conjuncts join the source to the table, all but those holding a subquery, which
+/// stay its WHERE; for an inner join the two say the same.
 pub fn parseUpdate(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
     const pos = self.curPos();
     const start = self.i;
@@ -244,12 +245,6 @@ pub fn parseUpdate(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!
         const fp = ast.Pos{ .line = self.toks[f].line, .col = self.toks[f].col, .file = self.toks[f].file };
         if (where_at == null) return self.fail(fp, "`UPDATE ... FROM` matches the source's rows to the table's in a WHERE, `WHERE t.id = s.id`", .{});
         if (where_at.? == f + 1) return self.fail(fp, "`UPDATE ... FROM` names its source before the WHERE", .{});
-        var k = where_at.? + 1;
-        while (k < end) : (k += 1) {
-            const t = self.toks[k];
-            const sub = t.tag == .ident and (std.ascii.eqlIgnoreCase(t.text, "exists") or std.ascii.eqlIgnoreCase(t.text, "in")) and k + 2 < end and self.toks[k + 1].tag == .lparen and self.toks[k + 2].tag == .ident and std.ascii.eqlIgnoreCase(self.toks[k + 2].text, "select");
-            if (sub) return self.fail(.{ .line = t.line, .col = t.col, .file = t.file }, "`UPDATE ... FROM` takes conditions and the source's match in its WHERE, not IN or EXISTS subqueries; join the subquery's rows into the FROM source", .{});
-        }
     }
 
     var toks = std.array_list.Managed(@TypeOf(upd)).init(self.arena);
@@ -259,10 +254,31 @@ pub fn parseUpdate(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!
     try toks.append(tokenAs(upd, .ident, "from"));
     try toks.appendSlice(self.toks[start + 1 .. set_at]);
     if (from_at) |f| {
+        const wh = where_at.?;
         try toks.append(tokenAs(self.toks[f], .ident, "join"));
-        try toks.appendSlice(self.toks[f + 1 .. where_at.?]);
-        try toks.append(tokenAs(self.toks[where_at.?], .ident, "on"));
-        try toks.appendSlice(self.toks[where_at.? + 1 ..]);
+        try toks.appendSlice(self.toks[f + 1 .. wh]);
+        var on = std.array_list.Managed(@TypeOf(upd)).init(self.arena);
+        var rest = std.array_list.Managed(@TypeOf(upd)).init(self.arena);
+        for (try conjuncts(self.arena, self.toks, wh + 1, end)) |c| {
+            const part = self.toks[c[0]..c[1]];
+            const sub = for (part) |t| {
+                if (t.tag == .ident and std.ascii.eqlIgnoreCase(t.text, "select")) break true;
+            } else false;
+            const into = if (sub) &rest else &on;
+            if (into.items.len > 0) try into.append(tokenAs(self.toks[wh], .ident, "and"));
+            try into.append(tokenAs(self.toks[wh], .lparen, "("));
+            try into.appendSlice(part);
+            try into.append(tokenAs(self.toks[wh], .rparen, ")"));
+        }
+        if (on.items.len == 0)
+            return self.fail(.{ .line = self.toks[wh].line, .col = self.toks[wh].col, .file = self.toks[wh].file }, "`UPDATE ... FROM` matches the source's rows to the table's in its WHERE, `WHERE t.id = s.id`, beside any subquery", .{});
+        try toks.append(tokenAs(self.toks[wh], .ident, "on"));
+        try toks.appendSlice(on.items);
+        if (rest.items.len > 0) {
+            try toks.append(tokenAs(self.toks[wh], .ident, "where"));
+            try toks.appendSlice(rest.items);
+        }
+        try toks.appendSlice(self.toks[end..]);
     } else try toks.appendSlice(self.toks[self.i..]);
     self.toks = try toks.toOwnedSlice();
     self.i = start;
@@ -299,6 +315,40 @@ pub fn parseUpdate(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!
     try all.append(.{ .node = .{ .write = write }, .hints = &.{}, .pos = pos });
     try self.endStmt();
     try out.append(.{ .output = .{ .stages = try all.toOwnedSlice(), .pos = pos } });
+}
+
+/// The top-level conjuncts of `toks[from..to]` (a WHERE), as token ranges: split at
+/// each `AND` outside parentheses, a CASE and a BETWEEN's own.
+fn conjuncts(arena: std.mem.Allocator, toks: anytype, from: usize, to: usize) ![]const [2]usize {
+    var out = std.array_list.Managed([2]usize).init(arena);
+    var depth: usize = 0;
+    var cases: usize = 0;
+    var between = false;
+    var start = from;
+    var k = from;
+    while (k < to) : (k += 1) {
+        const t = toks[k];
+        switch (t.tag) {
+            .lparen => depth += 1,
+            .rparen => depth -|= 1,
+            .ident => if (depth == 0) {
+                if (std.ascii.eqlIgnoreCase(t.text, "case")) cases += 1;
+                if (std.ascii.eqlIgnoreCase(t.text, "end")) cases -|= 1;
+                if (cases == 0 and std.ascii.eqlIgnoreCase(t.text, "between")) between = true;
+                if (cases == 0 and std.ascii.eqlIgnoreCase(t.text, "and")) {
+                    if (between) {
+                        between = false;
+                    } else {
+                        try out.append(.{ start, k });
+                        start = k + 1;
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    try out.append(.{ start, to });
+    return out.items;
 }
 
 /// A token made in place of `at`, at its position, for a statement read as another.

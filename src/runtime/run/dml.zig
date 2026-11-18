@@ -144,7 +144,7 @@ pub fn runUpdate(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
             try stageMember(env, w, m, opts, lanes_used, batch_arena);
             if (j.null_aware) try warnNullKey(env, info, conn, what, "updated", m);
         }
-        try conds.append(try memberSql(a, d, table, m));
+        try conds.append(try memberSql(a, d, if (d == .sqlserver and src != null) "basalt_target" else table, m));
     }
 
     const qt = try sql.quoteIdent(a, d, w.target);
@@ -154,7 +154,7 @@ pub fn runUpdate(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
     const stmt = if (src) |staging| blk: {
         const qs = try sql.quoteIdent(a, d, staging);
         break :blk switch (d) {
-            .mysql, .starrocks, .doris => try msgfmt.allocPrint(a, "UPDATE {s} JOIN {s} s ON {s} SET {s}{s}", .{ qt, qs, on, sets, where }),
+            .mysql => try msgfmt.allocPrint(a, "UPDATE {s} JOIN {s} s ON {s} SET {s}{s}", .{ qt, qs, on, sets, where }),
             .sqlserver => try msgfmt.allocPrint(a, "UPDATE basalt_target SET {s} FROM {s} AS basalt_target JOIN {s} s ON {s}{s}", .{ sets, qt, qs, on, where }),
             else => try msgfmt.allocPrint(a, "UPDATE {s} SET {s} FROM {s} s WHERE {s}{s}", .{ qt, sets, qs, on, if (where.len > 0) try msgfmt.allocPrint(a, " AND {s}", .{where[" WHERE ".len..]}) else "" }),
         };
@@ -219,7 +219,7 @@ fn runDeleteDelta(env: *Env, w: ast.Write, between_in: []const ast.Stage, opts: 
         else => {},
     };
     const t0 = std.time.milliTimestamp();
-    const t = lake_dml.open(a, w.target, .delete, conds.items, !subqueries) catch |e| return lakeFailed(env, e);
+    const t = lake_dml.open(a, w.target, .delete, conds.items, try boundsOf(env, conds.items), !subqueries) catch |e| return lakeFailed(env, e);
     const dry = env.explain or opts.explain;
     if (dry and !opts.explain) {
         const whole = if (t.whole.len == 0) "" else try msgfmt.allocPrint(a, ", and remove {d} whole by its partition values", .{t.whole.len});
@@ -267,7 +267,7 @@ fn runUpdateDelta(env: *Env, w: ast.Write, between_in: []const ast.Stage, opts: 
         else => {},
     };
     const t0 = std.time.milliTimestamp();
-    const t = lake_dml.open(a, w.target, .update, conds.items, false) catch |e| return lakeFailed(env, e);
+    const t = lake_dml.open(a, w.target, .update, conds.items, try boundsOf(env, conds.items), false) catch |e| return lakeFailed(env, e);
     const cols: types.Schema = .{ .fields = t.layout.schema.fields[0..t.width] };
     if (try analyze.updateProblem(a, w, between_in, env.connections, env.params_expr, cols, false)) |why| return planErr(env.diag, why);
     const dry = env.explain or opts.explain;
@@ -275,6 +275,8 @@ fn runUpdateDelta(env: *Env, w: ast.Write, between_in: []const ast.Stage, opts: 
         env.log.script(try msgfmt.allocPrint(a, "UPDATE {s}: would read {d} of its {d} file{s}", .{ w.target, t.match.len, t.st.files.count(), if (t.st.files.count() == 1) "" else "s" }));
         return;
     }
+    if (try variantRead(a, w, between, t.variants)) |name|
+        return planErr(env.diag, try msgfmt.allocPrint(a, "UPDATE {s}: `{s}` holds a variant, which an UPDATE reads only to write it back as it is; a SET or WHERE does not read it yet", .{ w.target, name }));
     const sets = try a.alloc(ast.SelectItem, t.width + 2);
     for (sets[0..t.width], cols.fields) |*it, f| {
         it.* = .{ .field = .{ .parts = try a.dupe([]const u8, &.{f.name}) } };
@@ -284,7 +286,12 @@ fn runUpdateDelta(env: *Env, w: ast.Write, between_in: []const ast.Stage, opts: 
         }
         for (u.sets) |set| if (std.ascii.eqlIgnoreCase(set.column, f.name)) {
             const e = try analyze.dmlOwn(a, w, try analyze.substExpr(a, set.expr, env.params_expr));
-            it.* = .{ .computed = .{ .name = f.name, .expr = try ast.mk(a, .{ .cast = .{ .e = @constCast(e), .ty = f.ty } }) } };
+            var ty = f.ty;
+            for (t.variants) |v| if (std.mem.eql(u8, v.name, f.name)) {
+                if (!v.whole) return planErr(env.diag, try msgfmt.allocPrint(a, "UPDATE {s}: `{s}` holds a variant inside it, which an UPDATE does not set yet", .{ w.target, f.name }));
+                ty = types.Type.init(.string).asNullable();
+            };
+            it.* = .{ .computed = .{ .name = f.name, .expr = try ast.mk(a, .{ .cast = .{ .e = @constCast(e), .ty = ty } }) } };
         };
     }
     sets[t.width] = .{ .field = .{ .parts = try a.dupe([]const u8, &.{lake_dml.tag_name}) } };
@@ -309,6 +316,26 @@ fn runUpdateDelta(env: *Env, w: ast.Write, between_in: []const ast.Stage, opts: 
     env.log.script(try msgfmt.allocPrint(a, "UPDATE {s}: would update {d} row{s}, reading {d} of its {d} file{s}", .{ w.target, n, if (n == 1) "" else "s", t.match.len, t.st.files.count(), if (t.st.files.count() == 1) "" else "s" }));
 }
 
+/// The first variant column (of `variants`) that an UPDATE's conditions, FROM keys
+/// or SET expressions read, by its bare name or the table's alias; null when none.
+fn variantRead(a: std.mem.Allocator, w: ast.Write, between: []const ast.Stage, variants: []const lake_dml.Variant) !?[]const u8 {
+    if (variants.len == 0) return null;
+    var exprs = std.array_list.Managed(*const ast.Expr).init(a);
+    var names = std.array_list.Managed(ast.QualName).init(a);
+    for (between) |st| switch (st.node) {
+        .filter => |f| try exprs.append(f),
+        .join => |j| {
+            try names.appendSlice(j.left_keys);
+            if (j.residual) |r| try exprs.append(r);
+        },
+        else => {},
+    };
+    for (w.update.?.sets) |set| try exprs.append(set.expr);
+    for (exprs.items) |e| try ast.fieldsOf(try analyze.dmlOwn(a, w, e), &names);
+    for (names.items) |q| if (q.parts.len == 1 and !q.dollar) for (variants) |v| if (std.ascii.eqlIgnoreCase(q.parts[0], v.name)) return v.name;
+    return null;
+}
+
 /// Marks in `hits` (one per file of `t.match`) the position of each row the stages
 /// `between` keep, built over `t.layout` as a query's stages are over its read.
 fn findRows(env: *Env, t: *const lake_dml.Target, between: []const ast.Stage, hits: []std.DynamicBitSetUnmanaged) !void {
@@ -320,6 +347,7 @@ fn findRows(env: *Env, t: *const lake_dml.Target, between: []const ast.Stage, hi
 /// FROM source matched on more than one row; `target` names the table for that.
 fn findRowsInto(env: *Env, t: *const lake_dml.Target, stages: []const ast.Stage, hits: []std.DynamicBitSetUnmanaged, writer: ?*lake_dml.Writer, target: []const u8) !void {
     const src = try Folder.openLayout(env.arena, t.layout, null);
+    src.bounds = t.bounds;
     const s = src.source();
     defer s.close();
     const scan = try env.arena.create(op.Scan);
@@ -369,6 +397,14 @@ fn warnNullKeyEngine(env: *Env, what: []const u8, done: []const u8, j: ast.Join)
         _ = scratch.reset(.retain_capacity);
     }
     if (n > 0) env.log.log(.warn, "{s}: the NOT IN subquery returned {d} NULL{s}, so by SQL's rule no row is {s}; `WHERE {s} IS NOT NULL` in the subquery leaves them out", .{ what, n, if (n == 1) "" else "s", done, rk.last() });
+}
+
+/// The single-column bounds of conditions `conds` (`col op literal`), as a read
+/// skips files and row groups by.
+fn boundsOf(env: *Env, conds: []const *const ast.Expr) ![]const @import("../../format/parquet/stats.zig").Bound {
+    const stages = try env.arena.alloc(ast.Stage, conds.len);
+    for (stages, conds) |*st, c| st.* = .{ .node = .{ .filter = @constCast(c) }, .hints = &.{}, .pos = .{ .line = 0, .col = 0 } };
+    return plan.filterBounds(env, stages);
 }
 
 /// A Delta table's refusal or failure as the run's error, in its own words.
@@ -456,7 +492,9 @@ fn countOf(env: *Env, info: connect.SqlConnInfo, conn: ast.Connection, q: []cons
 }
 
 /// Runs `stmt`, the statement `what` names, on a connection of its own, returning
-/// the rows the database reports it changed, when it reports them.
+/// the rows the database reports it changed, when it reports them: StarRocks and
+/// Doris report none for a table that is not keyed by a primary or unique key, so
+/// a count of 0 there is no count.
 fn execStmt(env: *Env, info: connect.SqlConnInfo, conn: ast.Connection, what: []const u8, stmt: []const u8) !?u64 {
     const cfg = try dbconfig.resolveDbConfig(env, conn, info.port);
     return switch (info.kind) {
@@ -469,6 +507,7 @@ fn execStmt(env: *Env, info: connect.SqlConnInfo, conn: ast.Connection, what: []
                 const why = if (c.wire.last_error.len > 0) c.wire.last_error else @errorName(e);
                 return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} failed: {s}", .{ what, why }));
             };
+            if (info.dialect == .starrocks or info.dialect == .doris) break :blk if (n) |x| (if (x > 0) x else null) else null;
             break :blk if (k == .sqlserver) c.last_done_count else n;
         },
     };

@@ -295,14 +295,58 @@ INSERT INTO db.$t SELECT range + 1 AS id, CASE WHEN range % 2 = 0 THEN 'a' ELSE 
   $B run -q -c "$decl UPDATE db.$t SET amt = amt - 1 WHERE id IN (SELECT id FROM '$out/upd_in.csv');" >/dev/null 2>&1 || bad=1
   got=$(urows)
   [ "$got" = "id,grp,amt 1,x,100 2,y,200 3,a,25 4,b,30 5,a,44 6,b,49 " ] || { echo "  rows: $got"; bad=1; }
+  $B run -q -c "$decl UPDATE db.$t x SET amt = x.amt + s.id FROM '$out/upd_src.csv' s WHERE x.id = s.id AND CASE WHEN x.amt > 150 THEN 1 ELSE 0 END = 1 AND x.id NOT IN (SELECT id FROM '$out/upd_in.csv');" >/dev/null 2>&1 || bad=1
+  got=$(urows)
+  [ "$got" = "id,grp,amt 1,x,100 2,y,202 3,a,25 4,b,30 5,a,44 6,b,49 " ] || { echo "  from+in: $got"; bad=1; }
   w=$($B run -c "$decl UPDATE db.$t x SET amt = 0 FROM '$out/upd_dup.csv' s WHERE x.id = s.id;" 2>&1 || true)
   echo "$w" | grep -q "holds 1 key on more than one row" || { echo "  dup: $w"; bad=1; }
   got=$(urows)
-  [ "$got" = "id,grp,amt 1,x,100 2,y,200 3,a,25 4,b,30 5,a,44 6,b,49 " ] || { echo "  after dup: $got"; bad=1; }
+  [ "$got" = "id,grp,amt 1,x,100 2,y,202 3,a,25 4,b,30 5,a,44 6,b,49 " ] || { echo "  after dup: $got"; bad=1; }
   got=$($B run --format csv -q -c "$decl SELECT count(*) AS n FROM db.QUERY(\$\$SELECT table_name FROM information_schema.tables WHERE table_name LIKE '_basalt_stage_it_upd%'\$\$);" 2>&1 | tail -1 || true)
   [ "$got" = 0 ] || { echo "  staging left: $got"; bad=1; }
   if [ $bad = 0 ]; then report "$1-update" ok; else report "$1-update" bad; fi
   $B run -q -c "$decl CALL execute_on('db', \$\$DROP TABLE it_upd\$\$);" >/dev/null 2>&1 || true
+}
+
+# INSERT, UPDATE and DELETE on StarRocks or Doris, into a table keyed by its
+# primary (StarRocks) or unique (Doris) key, the model their UPDATE and their
+# DELETE with a subquery need: an INSERT by name with a default applied, a NULL
+# into a NOT NULL column refused with nothing landed, SET with a LET, a FROM file
+# and an IN subquery, NOT IN and NOT EXISTS deletes, a FROM key on two rows
+# refused, and no staging table left behind.
+olapdmlrt() { # $1 label, $2 CREATE CONNECTION db ..., $3 the table's key and distribution clause
+  local decl=$2 keyed=$3 got bad=0 w
+  printf 'id,v\n1,x\n2,y\n9,z\n' >"$out/od_src.csv"
+  printf 'id,v\n1,x\n1,y\n' >"$out/od_dup.csv"
+  printf 'id\n1\n2\n3\n5\n6\n' >"$out/od_keep.csv"
+  orows() { $B run --format csv -q -c "$decl SELECT id, grp, amt FROM db.it_odml ORDER BY id;" 2>&1 | tr '\n' ' ' || true; }
+  if ! brun run -c "$decl
+CALL execute_on('db', \$\$DROP TABLE IF EXISTS it_odml\$\$);
+CALL execute_on('db', \$\$CREATE TABLE it_odml (id INT NOT NULL, grp VARCHAR(5) NOT NULL, amt INT DEFAULT '7') $keyed\$\$);
+INSERT INTO db.it_odml SELECT range + 1 AS id, CASE WHEN range % 2 = 0 THEN 'a' ELSE 'b' END AS grp, range * 10 AS amt FROM range(5);
+INSERT INTO db.it_odml (grp, id) SELECT 'b', 6;"; then report "$1-dml (setup error)" bad; return; fi
+  got=$(orows)
+  [ "$got" = "id,grp,amt 1,a,0 2,b,10 3,a,20 4,b,30 5,a,40 6,b,7 " ] || { echo "  insert: $got"; bad=1; }
+  w=$($B run -c "$decl INSERT INTO db.it_odml SELECT 99 AS id, NULL AS grp, 1 AS amt;" 2>&1 || true)
+  echo "$w" | grep -q "error" || { echo "  null insert accepted: $w"; bad=1; }
+  $B run -q -c "$decl LET inc = 5; UPDATE db.it_odml SET amt = amt + \$inc WHERE grp = 'a';" >/dev/null 2>&1 || bad=1
+  $B run -q -c "$decl UPDATE db.it_odml x SET amt = s.id * 100, grp = s.v FROM '$out/od_src.csv' s WHERE x.id = s.id AND x.amt < 1000;" >/dev/null 2>&1 || bad=1
+  $B run -q -c "$decl UPDATE db.it_odml SET amt = amt - 1 WHERE id IN (SELECT id FROM '$out/od_keep.csv' WHERE id > 4);" >/dev/null 2>&1 || bad=1
+  got=$(orows)
+  [ "$got" = "id,grp,amt 1,x,100 2,y,200 3,a,25 4,b,30 5,a,44 6,b,6 " ] || { echo "  update: $got"; bad=1; }
+  $B run -q -c "$decl UPDATE db.it_odml x SET amt = x.amt + s.id FROM '$out/od_src.csv' s WHERE x.id = s.id AND x.amt > 150 AND x.id NOT IN (SELECT id FROM '$out/od_keep.csv' WHERE id > 4);" >/dev/null 2>&1 || bad=1
+  got=$(orows)
+  [ "$got" = "id,grp,amt 1,x,100 2,y,202 3,a,25 4,b,30 5,a,44 6,b,6 " ] || { echo "  from+in: $got"; bad=1; }
+  w=$($B run -c "$decl UPDATE db.it_odml x SET amt = 0 FROM '$out/od_dup.csv' s WHERE x.id = s.id;" 2>&1 || true)
+  echo "$w" | grep -q "holds 1 key on more than one row" || { echo "  dup: $w"; bad=1; }
+  $B run -q -c "$decl DELETE FROM db.it_odml WHERE id NOT IN (SELECT id FROM '$out/od_keep.csv');" >/dev/null 2>&1 || bad=1
+  $B run -q -c "$decl DELETE FROM db.it_odml x WHERE x.amt < 30 AND NOT EXISTS (SELECT 1 FROM '$out/od_src.csv' k WHERE k.id = x.id);" >/dev/null 2>&1 || bad=1
+  got=$(orows)
+  [ "$got" = "id,grp,amt 1,x,100 2,y,202 5,a,44 " ] || { echo "  delete: $got"; bad=1; }
+  got=$($B run --format csv -q -c "$decl SELECT count(*) AS n FROM db.QUERY(\$\$SELECT table_name FROM information_schema.tables WHERE table_name LIKE '_basalt_stage%'\$\$);" 2>&1 | tail -1 || true)
+  [ "$got" = 0 ] || { echo "  staging left: $got"; bad=1; }
+  if [ $bad = 0 ]; then report "$1-dml" ok; else report "$1-dml" bad; fi
+  $B run -q -c "$decl CALL execute_on('db', \$\$DROP TABLE IF EXISTS it_odml\$\$);" >/dev/null 2>&1 || true
 }
 
 runs mysql     && updrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"     it.it_upd
@@ -1226,6 +1270,7 @@ LOAD INTO sr.it_replace_nc REPLACE AS SELECT 7 AS range;"; then
   collrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_coll"
   pushrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_push"
   upsertkeyrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');"
+  olapdmlrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "PRIMARY KEY (id) DISTRIBUTED BY HASH(id) BUCKETS 2"
   boolrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_bool" lossy
   catalogrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" it
 fi
@@ -1447,6 +1492,7 @@ LOAD INTO '$out/dr_up_out.csv' AS SELECT k, v FROM dr.it_upsert ORDER BY k;"; th
   collrt doris "$DB" "db.it_coll"
   pushrt doris "$DB" "db.it_push"
   upsertkeyrt doris "$DB"
+  olapdmlrt doris "$DB" "UNIQUE KEY (id) DISTRIBUTED BY HASH(id) BUCKETS 2 PROPERTIES ('replication_num' = '1', 'enable_unique_key_merge_on_write' = 'true')"
   boolrt doris "$DB" "db.it_bool" lossy
   catalogrt doris "$DB" it
 fi
@@ -1502,7 +1548,8 @@ lakert() { # $1 label, $2 the remote folder the tables were copied to, ending `/
 }
 
 # A Delta table written to an object store: created partitioned, appended to,
-# upserted (whole rows, PARTIAL COLS, and spilling past --op-memory), replaced,
+# upserted (whole rows, PARTIAL COLS, and spilling past --op-memory), deleted
+# from (a whole partition and a row), updated, inserted into, replaced,
 # each version read back; an UPSERT of no rows creates its table. The
 # commits go through the store's create-if-absent PUT, which a store ignoring
 # `If-None-Match` fails.
@@ -1540,6 +1587,16 @@ lakewrite() { # $1 label, $2 the remote folder to write under, ending `/`
     check "$1-delta-write-empty-upsert" "$out/dw_$1_empty.csv" "$out/dw_empty.csv"
   else
     report "$1-delta-write-empty-upsert (run error)" bad
+  fi
+  printf 'id,name,val\n1,alpha,22\n2,"beta, gamma",\n11,alpha,22\n12,"beta, gamma",100\n13,delta,71\n20,zeta,5\n' >"$out/dw_dml.csv"
+  if brun run -c "DELETE FROM '$t' WHERE name = 'omega';" &&
+     brun run -c "DELETE FROM '$t' WHERE id = 3;" &&
+     brun run -c "UPDATE '$t' SET val = val * 2 WHERE name = 'alpha';" &&
+     brun run -c "INSERT INTO '$t' SELECT 20 AS id, 'zeta' AS name, 5 AS val;" &&
+     brun run -c "LOAD INTO '$out/dw_$1_dml.csv' AS SELECT * FROM '$t' ORDER BY id;"; then
+    check "$1-delta-write-dml" "$out/dw_$1_dml.csv" "$out/dw_dml.csv"
+  else
+    report "$1-delta-write-dml (run error)" bad
   fi
   if brun run -j 4 -c "LOAD INTO '$t' REPLACE AS SELECT id + 100 AS id, name, val FROM 'tests/integration/seed.csv' WHERE id = 1;" &&
      brun run -c "LOAD INTO '$out/dw_$1_rep.csv' AS SELECT * FROM '$t' ORDER BY id;"; then
@@ -1661,7 +1718,7 @@ if runs s3; then
   export AWS_REGION="us-east-1"
 
   docker compose -f tests/integration/compose.yaml exec -T s3 sh -c \
-    "echo 's3.bucket.create -name basalt-it' | weed shell" >/dev/null 2>&1
+    "echo 's3.bucket.create -name basalt-it' | weed shell" >/dev/null 2>&1 || true
 
   # Single object: out through the writer, back through the signed reader — a
   # green run exercises both halves of the SigV4 path.

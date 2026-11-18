@@ -131,13 +131,14 @@ pub fn insertSetupSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, 
 /// An INSERT's one step on the target: the staged rows copied in by column name in
 /// a single statement of a transaction, so they land all together or not at all.
 /// On SQL Server a loaded IDENTITY column takes the staged values, as a bulk APPEND
-/// keeps them.
+/// keeps them. On StarRocks and Doris the statement is its own load transaction.
 pub fn insertApplySql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, staging: []const u8, schema: types.Schema) ![]const []const u8 {
     const in = intrinsics(d);
     const qt = try sql.quoteIdent(a, d, target);
     const qs = try sql.quoteIdent(a, d, staging);
     const cols = try sql.colList(a, d, schema);
     const insert = try msgfmt.allocPrint(a, "INSERT INTO {s} ({s}) SELECT {s} FROM {s}", .{ qt, cols, cols, qs });
+    if (d == .starrocks or d == .doris) return a.dupe([]const u8, &.{insert});
     var out = std.array_list.Managed([]const u8).init(a);
     try out.append(in.begin);
     if (d == .sqlserver) {

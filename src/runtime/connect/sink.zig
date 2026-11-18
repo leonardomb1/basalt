@@ -63,6 +63,7 @@ pub fn resolveUpsertKeys(env: *Env, w: ast.Write) !ast.Write {
 
 fn fileWriteMode(env: *Env, w: ast.Write) !driver.FileMode {
     if (w.mode != .append) return .truncate;
+    if (env.write_opts == .delta) return .append;
     if (env.write_opts == .json and env.write_opts.json == .array) return planErr(env.diag, try msgfmt.allocPrint(env.arena, analyze.json_array_append_fmt, .{w.target}));
     const why = analyze.appendUnsupported(w.target, env.fmt_out) orelse return .append;
     return planErr(env.diag, try msgfmt.allocPrint(env.arena, analyze.append_unsupported_fmt, .{ w.target, why }));
@@ -324,15 +325,21 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         return planErr(env.diag, try options.unknownConnectionMsg(env.arena, w.connector, "write"));
     try checkUpsertTarget(env, conn, w, schema);
     if (streamload.Flavor.of(conn.connector)) |flavor| {
-        if (w.insert != null) return planErr(env.diag, try msgfmt.allocPrint(env.arena, "INSERT INTO a {s} table is not supported yet; LOAD INTO … APPEND loads it", .{flavor.name()}));
-        const cfg = try resolveStreamLoadConfig(env, conn, flavor);
+        var cfg = try resolveStreamLoadConfig(env, conn, flavor);
         if (streamload.unquotableName(flavor, cfg.database, w.target, schema)) |name|
             return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} cannot name a database, table or column `{s}`: it drops a backtick from a quoted name, so the rows would land under another name", .{ flavor.name(), name }));
-        const s = streamload.StreamLoadSink.open(env.gpa, cfg, w.target, schema, w.mode) catch |e|
+        const plan: ?*ReplacePlan = if (w.insert != null) try @import("lane_sink.zig").streamInsertPlan(env, conn, w, schema) else null;
+        if (plan != null) cfg.auto_create = false;
+        const s = streamload.StreamLoadSink.open(env.gpa, cfg, if (plan) |p| p.stagingTarget() else w.target, schema, if (plan != null) .append else w.mode) catch |e| {
+            if (plan) |p| p.abort();
             return srOpenErr(env, e, try msgfmt.allocPrint(env.arena, "{s} sink open failed", .{flavor.name()}));
+        };
         s.logger = env.log;
         s.errctx = env.errctx;
-        return s.sink();
+        const p = plan orelse return s.sink();
+        const rs = try env.arena.create(ReplaceSink);
+        rs.* = .{ .inner = s.sink(), .plan = p };
+        return rs.sink();
     }
     if (sqlConnInfo(conn)) |info| {
         const cfg = try resolveDbConfig(env, conn, info.port);
