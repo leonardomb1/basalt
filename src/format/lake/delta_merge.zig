@@ -343,25 +343,9 @@ pub const Merge = struct {
     /// deletion vector deleted and those the rewrite matched or deleted, as a file
     /// to add again with that vector; a file left with no row is only removed.
     fn vectors(self: *Merge, a: std.mem.Allocator, touched: []const delta.Add) ![]const ReAdd {
-        var out = std.array_list.Managed(ReAdd).init(a);
-        for (touched, self.hits) |f, h| {
-            var all = std.array_list.Managed(u64).init(a);
-            try all.appendSlice(h.items);
-            if (f.dv) |d| {
-                const ref = dvs.Ref{ .name = self.plan.name, .root = self.plan.root, .file = f.path, .d = try dvs.descriptor(self.plan.name, f.path, d) };
-                try all.appendSlice(try roaring.rowsIn(a, try dvs.load(a, &ref, std.math.maxInt(u64))));
-            }
-            std.mem.sort(u64, all.items, {}, std.sort.asc(u64));
-            var n: usize = 0;
-            for (all.items, 0..) |x, i| if (i == 0 or x != all.items[n - 1]) {
-                all.items[n] = x;
-                n += 1;
-            };
-            const rows = all.items[0..n];
-            if (fileRows(a, f.stats)) |total| if (rows.len >= total) continue;
-            try out.append(.{ .add = f, .rows = rows });
-        }
-        return out.items;
+        const hits = try a.alloc([]const u64, self.hits.len);
+        for (hits, self.hits) |*o, h| o.* = h.items;
+        return readds(a, self.plan.name, self.plan.root, touched, hits);
     }
 
     /// A layout over `adds` whose rows carry their file's position in `adds` as
@@ -742,8 +726,34 @@ pub const Merge = struct {
     }
 };
 
+/// Each of `touched` (files of the table `name` at `root`) with the rows deleted
+/// once a commit removing it lands: those its deletion vector deleted and its
+/// `hits`, as a file to add again with that vector; a file left with no row is
+/// only removed.
+pub fn readds(a: std.mem.Allocator, name: []const u8, root: []const u8, touched: []const delta.Add, hits: []const []const u64) ![]const ReAdd {
+    var out = std.array_list.Managed(ReAdd).init(a);
+    for (touched, hits) |f, h| {
+        var all = std.array_list.Managed(u64).init(a);
+        try all.appendSlice(h);
+        if (f.dv) |d| {
+            const ref = dvs.Ref{ .name = name, .root = root, .file = f.path, .d = try dvs.descriptor(name, f.path, d) };
+            try all.appendSlice(try roaring.rowsIn(a, try dvs.load(a, &ref, std.math.maxInt(u64))));
+        }
+        std.mem.sort(u64, all.items, {}, std.sort.asc(u64));
+        var n: usize = 0;
+        for (all.items, 0..) |x, i| if (i == 0 or x != all.items[n - 1]) {
+            all.items[n] = x;
+            n += 1;
+        };
+        const rows = all.items[0..n];
+        if (fileRows(a, f.stats)) |total| if (rows.len >= total) continue;
+        try out.append(.{ .add = f, .rows = rows });
+    }
+    return out.items;
+}
+
 /// A file's row count by its statistics (`numRecords`), null when they lack it.
-fn fileRows(a: std.mem.Allocator, stats: ?[]const u8) ?u64 {
+pub fn fileRows(a: std.mem.Allocator, stats: ?[]const u8) ?u64 {
     const s = dtypes.parseStats(a, stats orelse return null) orelse return null;
     return switch (s.get("numRecords") orelse return null) {
         .integer => |x| std.math.cast(u64, x),

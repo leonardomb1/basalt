@@ -44,7 +44,7 @@ pub fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats
         env.explain = true;
         defer env.explain = outer;
         var o = opts;
-        o.explain = true;
+        o.explain = e.mode == .analyze;
         return runOutput(env, e.pipeline, o, stats, lanes_used, batch_arena);
     }
 

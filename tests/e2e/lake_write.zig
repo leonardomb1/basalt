@@ -1351,3 +1351,94 @@ test "INSERT INTO a Delta table matches columns by name, leaves a nullable colum
     try harness.expectRefusedAlike(gpa, &tmp, "INSERT INTO '$B/t/' SELECT 1 AS id, 'x' AS nope;", "the rows have column `nope`");
     try harness.expectRefusedAlike(gpa, &tmp, "INSERT INTO '$B/t.csv' SELECT 1 AS id;", "`INSERT INTO` adds rows to a table");
 }
+
+test "DELETE FROM a Delta table: conditions and IN / NOT IN / NOT EXISTS subqueries, one DELETE commit rewriting only the files holding a deleted row" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "k.csv", .data = "id\n1\n2\n3\n" });
+    for ([_]usize{ 1, 4 }) |threads| {
+        tmp.dir.deleteTree("t") catch {};
+        try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT range + 1 AS id, CASE WHEN range % 2 = 0 THEN 'a' ELSE 'b' END AS grp FROM range(6);", threads);
+        try load(&tmp, "LOAD INTO '$B/t/' AS SELECT range + 11 AS id, 'c' AS grp FROM range(3);", threads);
+        try load(&tmp, "LET g = 'b'; DELETE FROM '$B/t/' WHERE grp = $g AND id > 2;", threads);
+        try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "t", 2, "remove"));
+        try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "t", 2, "add"));
+        try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 2), "\"operation\":\"DELETE\",\"operationParameters\":{\"predicate\":\"[\\\"(grp = 'b') AND (id > 2)\\\"]\"}") != null);
+        try testing.expectEqualStrings("id\n1\n2\n3\n5\n11\n12\n13\n", try rows(a, &tmp, "SELECT id FROM '$B/t/' ORDER BY id"));
+        try load(&tmp, "DELETE FROM '$B/t/' d WHERE d.id IN (SELECT id FROM '$B/k.csv');", threads);
+        try load(&tmp, "DELETE FROM '$B/t/' x WHERE x.grp = 'c' AND NOT EXISTS (SELECT 1 FROM '$B/k.csv' k WHERE k.id + 10 = x.id);", threads);
+        try testing.expectEqualStrings("id\n5\n11\n12\n13\n", try rows(a, &tmp, "SELECT id FROM '$B/t/' ORDER BY id"));
+        try load(&tmp, "DELETE FROM '$B/t/' WHERE id NOT IN (SELECT id FROM '$B/k.csv' UNION ALL SELECT NULL);", threads);
+        try testing.expect(!exists(&tmp, "t/_delta_log/00000000000000000005.json"));
+        try load(&tmp, "DELETE FROM '$B/t/' WHERE id NOT IN (SELECT id + 10 FROM '$B/k.csv');", threads);
+        try testing.expectEqualStrings("id\n11\n12\n13\n", try rows(a, &tmp, "SELECT id FROM '$B/t/' ORDER BY id"));
+        try load(&tmp, "DELETE FROM '$B/t/';", threads);
+        try testing.expectEqualStrings("n\n0\n", try rows(a, &tmp, "SELECT count(*) AS n FROM '$B/t/'"));
+    }
+}
+
+test "DELETE FROM a partitioned Delta table removes a partition's files unread, and a table taking deletion vectors marks rows in them, with their change data" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/p/' WITH (format = 'delta', partition_by = 'grp') AS SELECT range + 1 AS id, CASE WHEN range % 2 = 0 THEN 'a' ELSE 'b' END AS grp FROM range(6);", 1);
+    try load(&tmp, "DELETE FROM '$B/p/' WHERE grp = 'a';", 1);
+    try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "p", 1, "remove"));
+    try testing.expectEqual(@as(usize, 0), try actions(a, &tmp, "p", 1, "add"));
+    try testing.expectEqualStrings("id,grp\n2,b\n4,b\n6,b\n", try rows(a, &tmp, "SELECT * FROM '$B/p/' ORDER BY id"));
+
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT range + 1 AS id, CASE WHEN range % 2 = 0 THEN 'a' ELSE 'b' END AS grp FROM range(6);", 1);
+    const v0 = try logFile(a, &tmp, "t", 0);
+    var meta: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, v0, '\n');
+    while (lines.next()) |l| if (std.mem.startsWith(u8, l, "{\"metaData\":")) {
+        meta = l;
+    };
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000001.json", .data = try std.mem.concat(a, u8, &.{
+        "{\"commitInfo\":{\"timestamp\":1}}\n",
+        "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"deletionVectors\"],\"writerFeatures\":[\"deletionVectors\",\"changeDataFeed\"]}}\n",
+        try std.mem.replaceOwned(u8, a, meta, "\"configuration\":{}", "\"configuration\":{\"delta.enableDeletionVectors\":\"true\",\"delta.enableChangeDataFeed\":\"true\"}"),
+        "\n",
+    }) });
+    try load(&tmp, "DELETE FROM '$B/t/' WHERE grp = 'a' AND id > 1;", 1);
+    const v2 = try logFile(a, &tmp, "t", 2);
+    try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "t", 2, "remove"));
+    try testing.expectEqual(@as(usize, 1), try actions(a, &tmp, "t", 2, "add"));
+    try testing.expect(std.mem.indexOf(u8, v2, "\"cardinality\":2}") != null);
+    try testing.expect(std.mem.indexOf(u8, v2, "{\"cdc\":{\"path\":\"_change_data/cdc-") != null);
+    try load(&tmp, "DELETE FROM '$B/t/' WHERE id = 2;", 1);
+    try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 3), "\"cardinality\":3}") != null);
+    try testing.expectEqualStrings("id,grp\n1,a\n4,b\n6,b\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+    try testing.expectEqualStrings("id,_change_type,_commit_version\n3,delete,2\n5,delete,2\n2,delete,3\n", try rows(a, &tmp, "SELECT id, _change_type, _commit_version FROM '$B/t/' WITH (changes_from = 2) ORDER BY _commit_version, id"));
+}
+
+test "DELETE FROM a Delta table: a folder holding none, an append-only table and a correlation by other than equalities are refused" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "k.csv", .data = "id\n1\n" });
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT 1 AS id;", 1);
+    try harness.expectRefusedAlike(gpa, &tmp, "DELETE FROM '$B/t/' x WHERE EXISTS (SELECT 1 FROM '$B/k.csv' k WHERE k.id > x.id);", "correlated by equalities");
+    try harness.expectRefusedAlike(gpa, &tmp, "DELETE FROM '$B/t/' WHERE nope = 1;", "unknown field `nope`");
+    try tmp.dir.makePath("e");
+    try runRefuses(a, &tmp, "DELETE FROM '$B/e/' WHERE id = 1;", "it is not a Delta table");
+    const v0 = try logFile(a, &tmp, "t", 0);
+    var meta: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, v0, '\n');
+    while (lines.next()) |l| if (std.mem.startsWith(u8, l, "{\"metaData\":")) {
+        meta = l;
+    };
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000001.json", .data = try std.mem.concat(a, u8, &.{
+        "{\"commitInfo\":{\"timestamp\":1}}\n",
+        try std.mem.replaceOwned(u8, a, meta, "\"configuration\":{}", "\"configuration\":{\"delta.appendOnly\":\"true\"}"),
+        "\n",
+    }) });
+    try runRefuses(a, &tmp, "DELETE FROM '$B/t/' WHERE id = 1;", "is append-only (`delta.appendOnly`), so a DELETE cannot remove its rows");
+}

@@ -48,12 +48,15 @@ DELETE FROM pg.public.orders o WHERE o.id IN (SELECT order_id FROM 'refunds.csv'
 DELETE FROM pg.public.orders o
  WHERE NOT EXISTS (SELECT 1 FROM erp.dbo.pedidos p WHERE p.id = o.id AND p.empresa = o.empresa);
 DELETE FROM pg.public.staging_orders;
+DELETE FROM 's3://lake/orders/' WHERE dia < '2024-01-01';
 ```
 
 The `WHERE` holds conditions on the table's columns, joined by `AND`, and `IN`,
 `NOT IN`, `EXISTS` and `NOT EXISTS` subqueries over any source: a file, another
 connection, the same database. The table may take an alias, as in a `SELECT`.
 Without a `WHERE` every row is deleted.
+
+### On a database
 
 The conditions on the table's columns go to the database as SQL, as they are
 written, so the database decides them as it would its own statement: its
@@ -69,12 +72,30 @@ equalities, written as `col IN (SELECT ...)` or in the `EXISTS`'s `WHERE`,
 `p.id = o.id AND p.empresa = o.empresa`; any other correlation, `p.id > o.id`, is
 refused, as is an `IN` whose left side is an expression.
 
-A `NOT IN` stays a `NOT IN` on the database, so SQL's rule holds: when the
-subquery returns a NULL, no row is deleted, and the run warns naming how many it
-returned. `WHERE col IS NOT NULL` in the subquery, or a `NOT EXISTS`, is the
-usual intent.
+`check` and `EXPLAIN` connect to nothing, and `EXPLAIN ANALYZE` names the
+statement it would run without loading the subqueries or deleting a row.
+StarRocks and Doris tables are not `DELETE` targets yet.
 
-The run log says how many rows were deleted. `check` and `EXPLAIN` connect to
-nothing, and `EXPLAIN ANALYZE` names the statement it would run without loading
-the subqueries or deleting a row. StarRocks and Doris tables, and Delta tables,
-are not `DELETE` targets yet.
+### On a Delta table
+
+basalt finds the rows itself, evaluating the conditions and subqueries as a
+`SELECT` would, and deletes them in one commit, recorded as a `DELETE`. A file
+whose partition values rule the conditions out is not read; one whose partition
+values make every condition true, with no subquery, is removed whole without
+being read. A file holding a deleted row is rewritten without it, in the same
+commit that removes it, and a file holding none is left as it is. On a table that
+takes deletion vectors (`delta.enableDeletionVectors`) the file is kept and its
+deleted rows marked in its vector instead, and a table keeping a change data feed
+(`delta.enableChangeDataFeed`) gets each deleted row as a `delete` change. An
+append-only table (`delta.appendOnly`) is refused. The commit fails as a conflict
+when another writer removed a file the `DELETE` read since it started; appends
+beside it are not a conflict. `EXPLAIN` says how many files it would read, and
+`EXPLAIN ANALYZE` how many rows it would delete, committing nothing.
+
+### Either way
+
+A `NOT IN` keeps SQL's rule: when the subquery returns a NULL, no row is
+deleted, and the run warns naming how many it returned. `WHERE col IS NOT NULL`
+in the subquery, or a `NOT EXISTS`, is the usual intent. The run log says how
+many rows were deleted. Nothing is deleted when the run fails before the last
+statement or commit.

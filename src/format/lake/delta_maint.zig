@@ -173,7 +173,7 @@ pub fn optimize(gpa: std.mem.Allocator, arena: std.mem.Allocator, root: []const 
 
 /// Whether `st`'s table keeps its rows' ids through a rewrite: writer feature
 /// `rowTracking` with `delta.enableRowTracking`.
-fn keepsRows(st: *const delta.State) bool {
+pub fn keepsRows(st: *const delta.State) bool {
     const on = for (st.writer_features) |f| {
         if (std.mem.eql(u8, f, "rowTracking")) break true;
     } else false;

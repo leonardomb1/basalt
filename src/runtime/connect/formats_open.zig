@@ -422,7 +422,7 @@ fn xmlOpenFailed(env: *Env, path: []const u8, e: anyerror) anyerror {
 }
 
 /// A Delta write's warning (`delta_merge.Warn`) logged at `warn`.
-fn warnLog(ctx: *anyopaque, msg: []const u8) void {
+pub fn warnLog(ctx: *anyopaque, msg: []const u8) void {
     const log: *obs.Logger = @ptrCast(@alignCast(ctx));
     log.log(.warn, "{s}", .{msg});
 }

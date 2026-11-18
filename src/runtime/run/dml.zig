@@ -1,6 +1,12 @@
-//! `DELETE FROM` on a database table. The parser reads it as the rows to delete: the
-//! table read, conditions on its columns, and each IN or EXISTS subquery as a semi or
-//! anti join on a binding. None of that is read here. The conditions go to the
+//! `DELETE FROM` on a database table or a Delta table. The parser reads it as the rows
+//! to delete: the table read, conditions on its columns, and each IN or EXISTS
+//! subquery as a semi or anti join on a binding.
+//!
+//! On a Delta table the engine finds the rows: the conditions and joins are built
+//! as any query's are over the table's files read with each row's file and position
+//! (`lake/delta_delete.zig`), and the rows they keep are deleted in one commit.
+//!
+//! On a database none of that is read here. The conditions go to the
 //! database as SQL, written as they were (`pushdown/translate`, `need = .source`: the
 //! database decides its text comparisons, as for any statement it runs); each
 //! subquery's rows, its key columns alone, are loaded first into a staging table of
@@ -20,6 +26,13 @@ const options = @import("../analyze/options.zig");
 const env_mod = @import("../env.zig");
 const stampedBinding = @import("../plan.zig").stampedBinding;
 const analyze = @import("../analyze.zig");
+const plan = @import("../plan.zig");
+const op = @import("../../exec/op.zig");
+const Folder = @import("../../format/parquet/folder.zig").Folder;
+const lake_delete = @import("../../format/lake/delta_delete.zig");
+const eval = @import("../../exec/eval.zig");
+const print = @import("../../lang/print.zig");
+const warnLog = @import("../connect/formats_open.zig").warnLog;
 
 const Env = env_mod.Env;
 const RunOptions = env_mod.RunOptions;
@@ -35,8 +48,7 @@ pub fn runDelete(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
     const w = stages[stages.len - 1].node.write;
     const between = stages[1 .. stages.len - 1];
     if (try analyze.deleteProblem(env.arena, w, between, env.connections, env.params_expr, false)) |why| return planErr(env.diag, why);
-    const conn = env.connections.get(w.connector) orelse
-        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "`DELETE FROM` a Delta table `{s}` is not supported yet; it deletes from a database table", .{w.target}));
+    const conn = env.connections.get(w.connector) orelse return runDeleteDelta(env, w, between, opts, stats);
     const info = connect.sqlConnInfo(conn).?;
     const d = info.dialect;
     const table = analyze.deleteTable(w.target);
@@ -92,6 +104,112 @@ pub fn runDelete(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
         env.log.script(try msgfmt.allocPrint(env.arena, "Deleted {d} row{s} from {s} in {d} ms", .{ n, if (n == 1) "" else "s", w.target, ms }))
     else
         env.log.script(try msgfmt.allocPrint(env.arena, "Deleted from {s} in {d} ms", .{ w.target, ms }));
+}
+
+/// `DELETE FROM` Delta table `w.target`: the rows of its files that the stages
+/// `between` keep, found on the engine, deleted in one commit; under EXPLAIN only
+/// counted.
+fn runDeleteDelta(env: *Env, w: ast.Write, between_in: []const ast.Stage, opts: RunOptions, stats: *Stats) !void {
+    const a = env.arena;
+    const between = try analyze.substFilterParams(a, between_in, env.params_expr);
+    var conds = std.array_list.Managed(*const ast.Expr).init(a);
+    var texts = std.array_list.Managed([]const u8).init(a);
+    var subqueries = false;
+    for (between) |st| switch (st.node) {
+        .filter => |f| {
+            const own = try analyze.deleteOwn(a, w, f);
+            try conds.append(own);
+            var aw = std.Io.Writer.Allocating.init(a);
+            print.expr(&aw.writer, own) catch return error.OutOfMemory;
+            try texts.append(aw.written());
+        },
+        .join => |j| {
+            subqueries = true;
+            try texts.append(if (j.null_aware)
+                try msgfmt.allocPrint(a, "{s} NOT IN (subquery)", .{j.left_keys[0].last()})
+            else if (j.kind == .anti) "NOT EXISTS (subquery)" else "EXISTS (subquery)");
+        },
+        else => {},
+    };
+    const t0 = std.time.milliTimestamp();
+    const t = lake_delete.open(a, w.target, conds.items, !subqueries) catch |e| return lakeFailed(env, e);
+    const dry = env.explain or opts.explain;
+    if (dry and !opts.explain) {
+        const whole = if (t.whole.len == 0) "" else try msgfmt.allocPrint(a, ", and remove {d} whole by its partition values", .{t.whole.len});
+        env.log.script(try msgfmt.allocPrint(a, "DELETE FROM {s}: would read {d} of its {d} file{s}{s}", .{ w.target, t.match.len, t.st.files.count(), if (t.st.files.count() == 1) "" else "s", whole }));
+        return;
+    }
+    const hits = try a.alloc(std.DynamicBitSetUnmanaged, t.match.len);
+    for (hits) |*h| h.* = .{};
+    if (t.match.len > 0) try findRows(env, &t, between, hits);
+    if (!dry) for (between) |st| if (st.node == .join and st.node.join.null_aware) try warnNullKeyEngine(env, w.target, st.node.join);
+    if (dry) {
+        const n = try lake_delete.rowsOf(a, &t, hits);
+        env.log.script(try msgfmt.allocPrint(a, "DELETE FROM {s}: would delete {d} row{s}, reading {d} of its {d} file{s}", .{ w.target, n, if (n == 1) "" else "s", t.match.len, t.st.files.count(), if (t.st.files.count() == 1) "" else "s" }));
+        return;
+    }
+    const got = lake_delete.apply(env.gpa, a, &t, hits, try std.mem.join(a, " AND ", texts.items), .{ .space = env.space, .op_memory = env.op_memory, .threads = env.pipe.threads, .err = env.errctx, .warn = .{ .ctx = env.log, .f = warnLog } }) catch |e| return lakeFailed(env, e);
+    stats.rows_out += got.rows;
+    const ms = std.time.milliTimestamp() - t0;
+    env.log.script(try msgfmt.allocPrint(a, "Deleted {d} row{s} from {s} in {d} ms ({d} file{s} removed, {d} added)", .{ got.rows, if (got.rows == 1) "" else "s", w.target, ms, got.removed, if (got.removed == 1) "" else "s", got.added }));
+}
+
+/// Marks in `hits` (one per file of `t.match`) the position of each row the stages
+/// `between` keep, built over `t.layout` as a query's stages are over its read.
+fn findRows(env: *Env, t: *const lake_delete.Target, between: []const ast.Stage, hits: []std.DynamicBitSetUnmanaged) !void {
+    const src = try Folder.openLayout(env.arena, t.layout, null);
+    const s = src.source();
+    defer s.close();
+    const scan = try env.arena.create(op.Scan);
+    scan.* = .{ .src = s };
+    var current: op.Op = .{ .scan = scan };
+    var schema = t.layout.schema;
+    for (between) |st| {
+        if (st.node == .select) continue;
+        const r = try plan.buildStage(env, st, current, schema);
+        current = r.op;
+        schema = r.schema;
+    }
+    defer current.release();
+    const ti = schema.indexOf(lake_delete.tag_name).?;
+    const pi = schema.indexOf(lake_delete.pos_name).?;
+    var scratch = std.heap.ArenaAllocator.init(env.gpa);
+    defer scratch.deinit();
+    while (try current.next(scratch.allocator())) |b| {
+        for (0..b.len) |r| {
+            const h = &hits[@intCast(b.columns[ti].getValue(r).int)];
+            const p: usize = @intCast(b.columns[pi].getValue(r).int);
+            if (p >= h.bit_length) try h.resize(env.arena, @max(p + 1, h.bit_length * 2), false);
+            h.set(p);
+        }
+        _ = scratch.reset(.retain_capacity);
+    }
+}
+
+/// SQL's rule for a NULL among a `NOT IN` subquery's rows, said as a warning when
+/// the subquery, run once more on the engine, holds one.
+fn warnNullKeyEngine(env: *Env, target: []const u8, j: ast.Join) !void {
+    const b = (try stampedBinding(env, j.binding)) orelse return;
+    const rk = j.right_keys[0];
+    const key = try ast.mk(env.arena, .{ .field = .{ .parts = try env.arena.dupe([]const u8, &.{rk.last()}), .span = rk.span } });
+    const test_null = try ast.mk(env.arena, .{ .is_null = .{ .e = key, .negated = false } });
+    const stages = try std.mem.concat(env.arena, ast.Stage, &.{ b.stages, &.{.{ .node = .{ .filter = test_null }, .hints = &.{}, .pos = b.pos }} });
+    const pipe = try plan.buildPipeline(env, stages);
+    defer pipe.op.release();
+    var scratch = std.heap.ArenaAllocator.init(env.gpa);
+    defer scratch.deinit();
+    var n: u64 = 0;
+    while (try pipe.op.next(scratch.allocator())) |bt| {
+        n += bt.len;
+        _ = scratch.reset(.retain_capacity);
+    }
+    if (n > 0) env.log.log(.warn, "DELETE FROM {s}: the NOT IN subquery returned {d} NULL{s}, so by SQL's rule no row is deleted; `WHERE {s} IS NOT NULL` in the subquery leaves them out", .{ target, n, if (n == 1) "" else "s", rk.last() });
+}
+
+/// A Delta table's refusal or failure as the run's error, in its own words.
+fn lakeFailed(env: *Env, e: anyerror) anyerror {
+    if (e == error.OutOfMemory) return e;
+    return planErrT(env.diag, e, eval.takeFailure(e) orelse @errorName(e));
 }
 
 /// Loads subquery `m`'s rows, its key columns alone, into its staging table on the

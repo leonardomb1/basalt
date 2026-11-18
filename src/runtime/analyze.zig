@@ -1190,7 +1190,7 @@ fn writtenFiles(arena: std.mem.Allocator, stmts: []const ast.Stmt, out: *std.arr
 fn writtenFile(p: ast.Pipeline, out: *std.array_list.Managed([]const u8)) Error!void {
     if (p.stages.len == 0) return;
     const last = p.stages[p.stages.len - 1];
-    if (last.node != .write or !std.mem.eql(u8, last.node.write.connector, "csv")) return;
+    if (last.node != .write or !std.mem.eql(u8, last.node.write.connector, "csv") or last.node.write.delete != null) return;
     try out.append(last.node.write.target);
 }
 
@@ -1632,7 +1632,7 @@ const Ctx = struct {
     /// cannot write or rows that do not fit it; its label, or null when the target
     /// is remote, templated, or no Delta table.
     fn offlineDelta(self: *Ctx, w: ast.Write, hints: []const ast.Hint, schema_in: ?types.Schema) !?[]const u8 {
-        if (!deltaTarget(w, hints) or std.mem.indexOf(u8, w.target, "://") != null or std.mem.indexOf(u8, w.target, "${") != null) return null;
+        if (w.delete != null or !deltaTarget(w, hints) or std.mem.indexOf(u8, w.target, "://") != null or std.mem.indexOf(u8, w.target, "${") != null) return null;
         const opts = try writeOptions(self.arena, w, hints, self.diag);
         const create = (formatFromHints(hints, self.diag) catch null) == .delta;
         const schema = if (schema_in) |s| (try insertColumns(self.arena, w, s)) orelse
@@ -1763,6 +1763,7 @@ const Ctx = struct {
 
     fn resolveSink(self: *Ctx, w: ast.Write, hints: []const ast.Hint) !Sink {
         if (std.mem.eql(u8, w.connector, "csv") or std.mem.eql(u8, w.connector, "stdout")) {
+            if (w.delete != null) return .{ .connector = w.connector, .target = w.target, .mode = "delete", .format = "delta" };
             try checkFileSink(w, hints, self.diag);
             try checkSinkForm(w, hints, w.connector, self.diag);
             if (deltaTarget(w, hints))
@@ -2047,6 +2048,12 @@ fn readsRunValue(arena: std.mem.Allocator, e: *const ast.Expr, params: *const Pa
     }.f;
     for (try dollarRefs(arena, e)) |q| if (params.get(q.last())) |v| if (ast.anyExpr(v, {}, nul)) return true;
     return false;
+}
+
+/// Condition `e` of DELETE `w` naming the table's columns bare, as its alias or
+/// name drops from them.
+pub fn deleteOwn(arena: std.mem.Allocator, w: ast.Write, e: *const ast.Expr) !*const ast.Expr {
+    return stripTableRef(arena, @constCast(e), w.delete.?.alias, deleteTable(w.target));
 }
 
 /// The table a DELETE's target names, its schema and database left off.
