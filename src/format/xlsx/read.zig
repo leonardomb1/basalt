@@ -316,6 +316,46 @@ fn relKind(rels: []const Rel, kind: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Where a workbook keeps what an edit of one of its sheets needs: the workbook part,
+/// the sheet's part and name (`sheet`, else the first), the other sheets' parts and
+/// names, and the styles part.
+pub const Located = struct {
+    workbook: []const u8,
+    sheet_part: []const u8,
+    sheet_name: []const u8,
+    others: []const []const u8,
+    styles: ?[]const u8,
+};
+
+pub fn locate(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []const u8, sheet: ?[]const u8) !Located {
+    const root = try readRels(arena, gpa, path, "_rels/.rels", "");
+    const wb_part = relKind(root, "officeDocument") orelse return error.NotXlsx;
+    const wb_rels = try readRels(arena, gpa, path, try relsOf(arena, wb_part), wb_part);
+    var chosen: ?[]const u8 = null;
+    var chosen_name: []const u8 = "";
+    var others = std.array_list.Managed([]const u8).init(arena);
+    var p = try openPart(arena, gpa, path, wb_part);
+    defer closePart(&p);
+    while (try p.tk.next()) |t| switch (t) {
+        .open => |o| if (std.mem.eql(u8, o.name, "sheet")) {
+            const name = try decodeAttr(arena, o.attr("name") orelse continue);
+            const rid = o.attr("id") orelse continue;
+            for (wb_rels) |r| {
+                if (!std.mem.eql(u8, r.id, rid)) continue;
+                if (!std.mem.eql(u8, r.kind, "worksheet")) break;
+                const want = if (sheet) |w| std.ascii.eqlIgnoreCase(w, name) else chosen == null;
+                if (want and chosen == null) {
+                    chosen = r.target;
+                    chosen_name = name;
+                } else try others.append(r.target);
+                break;
+            }
+        },
+        else => {},
+    };
+    return .{ .workbook = wb_part, .sheet_part = chosen orelse return error.XlsxSheetNotFound, .sheet_name = chosen_name, .others = others.items, .styles = relKind(wb_rels, "styles") };
+}
+
 pub const Reader = struct {
     arena: std.mem.Allocator,
     gpa: std.mem.Allocator,

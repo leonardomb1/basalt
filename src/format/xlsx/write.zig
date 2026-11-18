@@ -130,77 +130,12 @@ pub const Writer = struct {
     }
 
     fn cell(self: *Writer, c: *const column.Column, r: usize, ref: []const u8) !void {
-        if (!c.validity.get(r)) return;
-        const w = self.sheet;
-        switch (c.ty.kind) {
-            .string => {
-                try w.print("<c r=\"{s}{d}\"", .{ ref, self.row });
-                return self.text(c.data.bytes.at(r));
-            },
-            .bytes => {
-                const b = c.data.bytes.at(r);
-                if (std.base64.standard.Encoder.calcSize(b.len) > max_cell_chars) return tooLong(self.row, ref);
-                try w.print("<c r=\"{s}{d}\" t=\"inlineStr\"><is><t>", .{ ref, self.row });
-                try std.base64.standard.Encoder.encodeWriter(w, b);
-                return w.writeAll("</t></is></c>");
-            },
-            .bool => return w.print("<c r=\"{s}{d}\" t=\"b\"><v>{d}</v></c>", .{ ref, self.row, @intFromBool(c.data.b[r]) }),
-            .int => {
-                const v = c.data.i64[r];
-                if (@abs(v) <= 1 << 53) return w.print("<c r=\"{s}{d}\"><v>{d}</v></c>", .{ ref, self.row, v });
-                return w.print("<c r=\"{s}{d}\" t=\"inlineStr\"><is><t>{d}</t></is></c>", .{ ref, self.row, v });
-            },
-            .float => {
-                const x = c.data.f64[r];
-                if (!std.math.isFinite(x)) return;
-                const ax = @abs(x);
-                if (ax == 0 or (ax >= 1e-6 and ax < 1e15)) return w.print("<c r=\"{s}{d}\"><v>{d}</v></c>", .{ ref, self.row, x });
-                return w.print("<c r=\"{s}{d}\"><v>{e}</v></c>", .{ ref, self.row, x });
-            },
-            .decimal => {
-                const d = column.decimals(c.*).at(r);
-                try w.print("<c r=\"{s}{d}\"", .{ ref, self.row });
-                if (decimal.exactInDouble(d.unscaled)) {
-                    try w.writeAll("><v>");
-                    try decimal.writeDecimal(w, d.unscaled, d.scale);
-                    return w.writeAll("</v></c>");
-                }
-                try w.writeAll(" t=\"inlineStr\"><is><t>");
-                try decimal.writeDecimal(w, d.unscaled, d.scale);
-                return w.writeAll("</t></is></c>");
-            },
-            .date => {
-                const days: i64 = c.data.i32[r];
-                if (serial.ofDays(days)) |v|
-                    return w.print("<c r=\"{s}{d}\" s=\"" ++ style_date ++ "\"><v>{d}</v></c>", .{ ref, self.row, v });
-                try w.print("<c r=\"{s}{d}\" t=\"inlineStr\"><is><t>", .{ ref, self.row });
-                try format.writeDate(w, days);
-                return w.writeAll("</t></is></c>");
-            },
-            .timestamp => {
-                const us = c.data.i64[r];
-                if (serial.ofMicros(us)) |v|
-                    return w.print("<c r=\"{s}{d}\" s=\"" ++ style_timestamp ++ "\"><v>{d}</v></c>", .{ ref, self.row, v });
-                try w.print("<c r=\"{s}{d}\" t=\"inlineStr\"><is><t>", .{ ref, self.row });
-                try format.writeTimestamp(w, us);
-                return w.writeAll("</t></is></c>");
-            },
-            .time => {
-                return w.print("<c r=\"{s}{d}\" s=\"" ++ style_time ++ "\"><v>{d}</v></c>", .{ ref, self.row, serial.ofTime(c.data.i64[r]) });
-            },
-            .array, .@"struct", .map => unreachable,
-        }
+        return writeCell(self.sheet, c, r, ref, self.row, .{});
     }
 
     /// Finishes a cell opened up to its reference as an inline string.
     fn text(self: *Writer, s: []const u8) !void {
-        const w = self.sheet;
-        const valid = std.unicode.utf8ValidateSlice(s);
-        if (s.len > max_cell_chars and charsOf(s, valid) > max_cell_chars) return tooLong(self.row, "");
-        const preserve = s.len > 0 and (isSpace(s[0]) or isSpace(s[s.len - 1]));
-        try w.writeAll(if (preserve) " t=\"inlineStr\"><is><t xml:space=\"preserve\">" else " t=\"inlineStr\"><is><t>");
-        try escape.text(w, s, .{ .ooxml = true });
-        try w.writeAll("</t></is></c>");
+        return writeText(self.sheet, s, self.row);
     }
 
     pub fn close(self: *Writer) !void {
@@ -230,6 +165,84 @@ pub const Writer = struct {
 };
 
 const sink_vtable = driver.sinkVTable(Writer);
+
+/// The cell styles a writer's temporal cells name, as indices into the workbook's
+/// `cellXfs`: the writer's own, or those added to a workbook it edits.
+pub const Styles = struct { date: []const u8 = style_date, timestamp: []const u8 = style_timestamp, time: []const u8 = style_time };
+
+/// Cell `r` of `c` at column `ref` of sheet row `row`, nothing for a null, its temporal
+/// styles `st`.
+pub fn writeCell(w: *std.Io.Writer, c: *const column.Column, r: usize, ref: []const u8, row: u32, st: Styles) !void {
+    if (!c.validity.get(r)) return;
+    switch (c.ty.kind) {
+        .string => {
+            try w.print("<c r=\"{s}{d}\"", .{ ref, row });
+            return writeText(w, c.data.bytes.at(r), row);
+        },
+        .bytes => {
+            const b = c.data.bytes.at(r);
+            if (std.base64.standard.Encoder.calcSize(b.len) > max_cell_chars) return tooLong(row, ref);
+            try w.print("<c r=\"{s}{d}\" t=\"inlineStr\"><is><t>", .{ ref, row });
+            try std.base64.standard.Encoder.encodeWriter(w, b);
+            return w.writeAll("</t></is></c>");
+        },
+        .bool => return w.print("<c r=\"{s}{d}\" t=\"b\"><v>{d}</v></c>", .{ ref, row, @intFromBool(c.data.b[r]) }),
+        .int => {
+            const v = c.data.i64[r];
+            if (@abs(v) <= 1 << 53) return w.print("<c r=\"{s}{d}\"><v>{d}</v></c>", .{ ref, row, v });
+            return w.print("<c r=\"{s}{d}\" t=\"inlineStr\"><is><t>{d}</t></is></c>", .{ ref, row, v });
+        },
+        .float => {
+            const x = c.data.f64[r];
+            if (!std.math.isFinite(x)) return;
+            const ax = @abs(x);
+            if (ax == 0 or (ax >= 1e-6 and ax < 1e15)) return w.print("<c r=\"{s}{d}\"><v>{d}</v></c>", .{ ref, row, x });
+            return w.print("<c r=\"{s}{d}\"><v>{e}</v></c>", .{ ref, row, x });
+        },
+        .decimal => {
+            const d = column.decimals(c.*).at(r);
+            try w.print("<c r=\"{s}{d}\"", .{ ref, row });
+            if (decimal.exactInDouble(d.unscaled)) {
+                try w.writeAll("><v>");
+                try decimal.writeDecimal(w, d.unscaled, d.scale);
+                return w.writeAll("</v></c>");
+            }
+            try w.writeAll(" t=\"inlineStr\"><is><t>");
+            try decimal.writeDecimal(w, d.unscaled, d.scale);
+            return w.writeAll("</t></is></c>");
+        },
+        .date => {
+            const days: i64 = c.data.i32[r];
+            if (serial.ofDays(days)) |v|
+                return w.print("<c r=\"{s}{d}\" s=\"{s}\"><v>{d}</v></c>", .{ ref, row, st.date, v });
+            try w.print("<c r=\"{s}{d}\" t=\"inlineStr\"><is><t>", .{ ref, row });
+            try format.writeDate(w, days);
+            return w.writeAll("</t></is></c>");
+        },
+        .timestamp => {
+            const us = c.data.i64[r];
+            if (serial.ofMicros(us)) |v|
+                return w.print("<c r=\"{s}{d}\" s=\"{s}\"><v>{d}</v></c>", .{ ref, row, st.timestamp, v });
+            try w.print("<c r=\"{s}{d}\" t=\"inlineStr\"><is><t>", .{ ref, row });
+            try format.writeTimestamp(w, us);
+            return w.writeAll("</t></is></c>");
+        },
+        .time => {
+            return w.print("<c r=\"{s}{d}\" s=\"{s}\"><v>{d}</v></c>", .{ ref, row, st.time, serial.ofTime(c.data.i64[r]) });
+        },
+        .array, .@"struct", .map => unreachable,
+    }
+}
+
+/// Finishes a cell opened up to its reference as an inline string, in sheet row `row`.
+pub fn writeText(w: *std.Io.Writer, s: []const u8, row: u32) !void {
+    const valid = std.unicode.utf8ValidateSlice(s);
+    if (s.len > max_cell_chars and charsOf(s, valid) > max_cell_chars) return tooLong(row, "");
+    const preserve = s.len > 0 and (isSpace(s[0]) or isSpace(s[s.len - 1]));
+    try w.writeAll(if (preserve) " t=\"inlineStr\"><is><t xml:space=\"preserve\">" else " t=\"inlineStr\"><is><t>");
+    try escape.text(w, s, .{ .ooxml = true });
+    try w.writeAll("</t></is></c>");
+}
 
 fn explainf(e: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
     @branchHint(.cold);

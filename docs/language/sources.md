@@ -306,9 +306,11 @@ to do are on [Pushdown](pushdown.md).
   chunking. Read as `utf8`, a cell that is not valid UTF-8 fails the read, naming
   the file, line and column. `latin1` and `cp1252` decode every byte, so a file
   whose bytes are not what you claimed does not fail there, it just yields
-  mojibake: prefer the publisher's stated encoding over guessing. The delimiter
-  is also accepted on a `LOAD INTO` file target; `encoding` is not — a CSV sink
-  always writes UTF-8, and being told otherwise is an error rather than ignored.
+  mojibake: prefer the publisher's stated encoding over guessing. Both are
+  also accepted on a `LOAD INTO` CSV target, which then writes in that
+  delimiter and encoding, failing on a character the encoding cannot hold.
+  A `records` file takes `encoding` too; any other sink writes UTF-8, and
+  `encoding` on one is an error rather than ignored.
 - **`WITH (format = 'csv' | 'parquet' | 'arrow' | 'xlsx')`** — read or write a
   path as this format whatever its extension says. Needed
   for a file named `.dat` or `.txt`, and for a URL that serves CSV from an

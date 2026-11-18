@@ -16,11 +16,19 @@ pub const FileFormat = enum { csv, parquet, arrow, xlsx, json, xml, records, del
 pub const Lanes = enum { row_groups, local_ranges, serial };
 
 /// Writing a format: why a `.gz` name cannot gzip it and why `APPEND` cannot extend
-/// it, each null when it can.
+/// it, each null when it can, and how `DELETE`, `UPDATE` and `INSERT` change a file.
 pub const Write = struct {
     gzip_refused: ?[]const u8 = null,
     append_refused: ?[]const u8 = null,
+    change: Change = .whole,
 };
+
+/// How `DELETE`, `UPDATE` and `INSERT` change one file of a format: its records
+/// copied byte for byte but for the ones changed and the rows added at its end
+/// (`text`), its sheet changed inside a workbook kept as it was (`sheet`), the file
+/// read and written again whole (`whole`), or not at all, `refused` finishing the
+/// sentence its statement starts.
+pub const Change = union(enum) { text, sheet, whole, refused: []const u8 };
 
 pub const Format = struct {
     tag: FileFormat,
@@ -52,8 +60,8 @@ pub const table = [_]Format{
         .lanes = .local_ranges,
         .stdin = true,
         .read_keys = &.{ "format", "delimiter", "delim", "encoding" },
-        .write = .{},
-        .write_keys = &.{ "format", "delimiter", "delim" },
+        .write = .{ .change = .text },
+        .write_keys = &.{ "format", "delimiter", "delim", "encoding" },
     },
     .{
         .tag = .parquet,
@@ -93,7 +101,7 @@ pub const table = [_]Format{
         .archive_refused = "an Excel workbook is itself a zip archive, so it cannot be read out of another; extract it first",
         .lanes = .serial,
         .read_keys = &.{ "format", "sheet", "range", "header" },
-        .write = .{ .gzip_refused = "an Excel workbook is a zip archive already, so it is written without a `.gz`/`.zst` suffix", .append_refused = "an Excel workbook is a zip archive whose directory is written last, so appending means rewriting the file" },
+        .write = .{ .gzip_refused = "an Excel workbook is a zip archive already, so it is written without a `.gz`/`.zst` suffix", .append_refused = "an Excel workbook is a zip archive whose directory is written last, so appending means rewriting the file", .change = .sheet },
         .write_keys = &.{ "format", "sheet" },
     },
     .{
@@ -106,7 +114,7 @@ pub const table = [_]Format{
         .lanes = .serial,
         .stdin = true,
         .read_keys = &.{ "format", "items", "sample" },
-        .write = .{},
+        .write = .{ .change = .text },
         .write_keys = &.{ "format", "array" },
     },
     .{
@@ -119,7 +127,7 @@ pub const table = [_]Format{
         .lanes = .serial,
         .stdin = true,
         .read_keys = &.{ "format", "row", "encoding" },
-        .write = .{ .append_refused = "an XML file's root element closes on its last line, so appending means rewriting the file" },
+        .write = .{ .append_refused = "an XML file's root element closes on its last line, so appending means rewriting the file", .change = .{ .refused = "writes the file again, and an XML file is written in basalt's own shape, losing the rest of its structure" } },
         .write_keys = &.{ "format", "root", "row" },
     },
     .{
@@ -131,7 +139,7 @@ pub const table = [_]Format{
         .read_refused = "the `records` format is written, not read; read raw records with lines(), fixed(), split() or chunks()",
         .lanes = .serial,
         .read_keys = &.{},
-        .write = .{},
+        .write = .{ .change = .{ .refused = "needs columns to match rows by, and a records file has none" } },
         .write_keys = &.{ "format", "newline", "encoding" },
     },
     .{
@@ -144,7 +152,7 @@ pub const table = [_]Format{
         .archive_refused = "a Delta table is a folder of Parquet files and its log, read from its root folder; extract it first",
         .lanes = .row_groups,
         .read_keys = &.{ "format", "version", "timestamp", "changes_from", "changes_to" },
-        .write = .{},
+        .write = .{ .change = .{ .refused = "changes a Delta table named by its folder, ending in `/`" } },
         .write_keys = &.{ "format", "partition_by", "compression", "merge_schema", "overwrite_schema" },
     },
     .{

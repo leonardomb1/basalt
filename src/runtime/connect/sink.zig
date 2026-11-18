@@ -318,6 +318,7 @@ fn sameName(a: []const u8, b: []const u8, ci: bool) bool {
 
 fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     if (std.mem.eql(u8, w.connector, "csv")) {
+        if (w.insert != null and env.write_opts != .delta) return @import("file_insert.zig").open(env, w, schema);
         const fmode = try fileWriteMode(env, w);
         return formats_open.of(env.write_opts).write(env, w, schema, fmode);
     }

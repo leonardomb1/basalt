@@ -1275,6 +1275,29 @@ LOAD INTO sr.it_replace_nc REPLACE AS SELECT 7 AS range;"; then
   catalogrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" it
 fi
 
+# DELETE, UPDATE and INSERT on a CSV, a Parquet and an Excel file under the remote
+# folder $2 (through the connection $3 declares, if any), read back against the same
+# changes made to local files.
+dmlops() { echo "DELETE FROM '$1' WHERE id = 1; UPDATE '$1' SET name = upper(name), val = val + 1 WHERE id = 3; INSERT INTO '$1' SELECT 99 AS id, 'novo' AS name;"; }
+filedml() { # $1 label, $2 the remote folder, ending `/`, $3 a connection statement or empty
+  local f ext got want c=${3-}
+  for f in dml.csv dml.parquet dml.xlsx; do
+    ext=${f#*.}
+    got="$out/$1_dml_${ext}_got.csv"
+    want="$out/$1_dml_${ext}_want.csv"
+    if brun run -c "$c LOAD INTO '$2$f' AS SELECT * FROM 'tests/integration/seed.csv';" &&
+       brun run -c "LOAD INTO '$out/$1_$f' AS SELECT * FROM 'tests/integration/seed.csv';" &&
+       brun run -c "$c $(dmlops "$2$f")" &&
+       brun run -c "$(dmlops "$out/$1_$f")" &&
+       brun run -c "$c LOAD INTO '$got' AS SELECT * FROM '$2$f';" &&
+       brun run -c "LOAD INTO '$want' AS SELECT * FROM '$out/$1_$f';"; then
+      check "$1-file-dml-$ext" "$got" "$want"
+    else
+      report "$1-file-dml-$ext (run error)" bad
+    fi
+  done
+}
+
 # SFTP: an OpenSSH server, reached with a password and with an Ed25519 key, its
 # host keys taken from the container itself rather than trusted on first connect.
 if runs sftp; then
@@ -1362,6 +1385,7 @@ if runs sftp; then
      docker exec $SC sh -c 'ls /config/out' | grep -q "isdir.part"; then
     report "sftp-failed-rename-leaves-nothing" bad
   else report "sftp-failed-rename-leaves-nothing" ok; fi
+  filedml sftp "sftp://box/~/out/" "$KEY"
 
   # a second connection to the same server with a wrong pin is refused, not handed the first one's session
   $B run -q -c "$PW CREATE CONNECTION pinned TYPE sftp OPTIONS (host = '127.0.0.1', port = 42222, user = 'basalt', password = 'it', host_key = 'SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA');
@@ -1434,6 +1458,7 @@ if runs smb; then
   else
     report "smb-aborted-load-keeps-target (run error)" bad
   fi
+  filedml smb "smb://box/data/" "$SMB"
 
   # the failures say what they are
   $B run -q -c "CREATE CONNECTION box TYPE smb OPTIONS (host = '127.0.0.1', port = 44445, user = 'basalt', password = 'wrong'); SELECT * FROM 'smb://box/data/seed.csv';" >"$out/smb_pw.txt" 2>&1 || true
@@ -1705,6 +1730,7 @@ SELECT COUNT(*) AS rows, SUM(id) AS ids, SUM(val) AS vals FROM 'az://devstoreacc
     report "azure-lake (upload error)" bad
   fi
   lakewrite azure "az://devstoreaccount1/basalt-it/"
+  filedml azure "az://devstoreaccount1/basalt-it/"
 fi
 
 # S3 (SeaweedFS). Real SigV4 signing, ListObjectsV2 and ranged GETs against an S3
@@ -1854,6 +1880,7 @@ SELECT id, name FROM 's3://basalt-it/bronze/seed.parquet' ORDER BY id;"; then
     report "s3-lake (upload error)" bad
   fi
   lakewrite s3 "s3://basalt-it/"
+  filedml s3 "s3://basalt-it/"
 fi
 
 # Quoted column names, end to end. Headers with spaces are the rule in

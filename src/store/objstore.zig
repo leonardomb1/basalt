@@ -271,6 +271,8 @@ pub const Upload = struct {
     last_status: ?anyerror = null,
     err_buf: [256]u8 = undefined,
     released: bool = false,
+    /// The ETag the object must still have for the upload to land, or empty.
+    if_match: []const u8 = "",
 
     const io_vtable = std.Io.Writer.VTable{ .drain = drain(Upload) };
 
@@ -585,6 +587,14 @@ pub const Object = struct {
         return r.modified_ms;
     }
 
+    /// The object's ETag by a HEAD, null when the store gives none.
+    pub fn etag(self: Object, arena: std.mem.Allocator, client: *HttpClient) !?[]const u8 {
+        const hdrs = try self.requestHeaders(arena, "HEAD", "");
+        const r = try exchange(arena, client, .{ .method = .HEAD, .url = self.url, .headers = hdrs });
+        if (r.code != 200) return self.statusToError(r.code, r.body);
+        return if (r.etag.len > 0) try arena.dupe(u8, r.etag) else null;
+    }
+
     /// Deletes the object, one signed DELETE; one already gone is no error, as a
     /// cleanup that failed halfway is simply run again.
     pub fn delete(self: Object, arena: std.mem.Allocator, client: *HttpClient) !void {
@@ -614,7 +624,17 @@ pub const Writer = struct {
         last_status: *const fn (*anyopaque) ?anyerror,
         last_error: *const fn (*anyopaque) []const u8,
         abort: ?*const fn (*anyopaque) void = null,
+        if_match: ?*const fn (*anyopaque, []const u8) void = null,
     };
+
+    /// Makes the upload land only over the object whose ETag is `etag`, as read: a
+    /// store that finds another there refuses it (`ObjectChanged`). False for a
+    /// writer that cannot ask (SFTP, SMB).
+    pub fn ifMatch(self: Writer, etag: []const u8) bool {
+        const f = self.vtable.if_match orelse return false;
+        f(self.ptr, etag);
+        return true;
+    }
 
     pub fn finish(self: Writer) !void {
         return self.vtable.finish(self.ptr);
@@ -669,9 +689,30 @@ pub fn writer(w: anytype) Writer {
             const self: *T = @ptrCast(@alignCast(p));
             self.abort();
         }
-        const vt = Writer.VTable{ .finish = finish, .last_status = lastStatus, .last_error = lastError, .abort = if (@hasDecl(T, "abort")) abort else null };
+        fn ifMatch(p: *anyopaque, etag: []const u8) void {
+            const self: *T = @ptrCast(@alignCast(p));
+            if (T == Upload) self.if_match = etag else self.up.if_match = etag;
+        }
+        const guarded = T == Upload or (@hasField(T, "up") and @FieldType(T, "up") == Upload);
+        const vt = Writer.VTable{ .finish = finish, .last_status = lastStatus, .last_error = lastError, .abort = if (@hasDecl(T, "abort")) abort else null, .if_match = if (guarded) ifMatch else null };
     };
     return .{ .io = &w.interface, .ptr = w, .vtable = &Adapter.vt };
+}
+
+/// The ETag of the object at `url` as it stands, by a HEAD on a client of its own;
+/// null for a path that is no object or a store that gives none.
+pub fn etagOf(arena: std.mem.Allocator, url: []const u8) !?[]const u8 {
+    if (!isUrl(url)) return null;
+    const obj = try parse(arena, url);
+    var client = http_client.initClient(std.heap.smp_allocator);
+    defer client.deinit();
+    return obj.etag(arena, &client);
+}
+
+/// The error an upload made under `If-Match` meets when the store holds another
+/// version of the object than the one read.
+pub fn changed() anyerror {
+    return @import("../exec/eval/support.zig").explain(error.ObjectChanged, "the object changed since it was read, so the rewrite is not put in its place; run it again");
 }
 
 pub fn cast(comptime T: type, ptr: *const anyopaque) *const T {

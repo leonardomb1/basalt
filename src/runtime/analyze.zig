@@ -57,6 +57,7 @@ const textconv = @import("../exec/textconv.zig");
 const pqdecode = @import("../format/parquet/read.zig");
 const s3 = @import("../store/s3.zig");
 const ftp = @import("../store/ftp.zig");
+const scheme = @import("../store/scheme.zig");
 const registry = @import("connect/registry.zig");
 const table_builtins = @import("connect/table_builtins.zig");
 const keypush = @import("plan/keypush.zig");
@@ -1488,6 +1489,10 @@ const Ctx = struct {
         }
 
         const w = stages[stages.len - 1].node.write;
+        if ((w.delete != null or w.update != null) and self.connections.get(w.connector) == null and !folder.isFolder(w.target)) if (try fileDmlProblem(self.arena, w, stages[0].hints)) |why| {
+            self.diag.stamp(stages[stages.len - 1].pos);
+            return fail(self.diag, "{s}", .{why});
+        };
         if (w.delete != null) if (try deleteProblem(self.arena, w, stages[1 .. stages.len - 1], self.connections, self.params, true)) |why| {
             self.diag.stamp(stages[stages.len - 1].pos);
             return fail(self.diag, "{s}", .{why});
@@ -1778,8 +1783,8 @@ const Ctx = struct {
 
     fn resolveSink(self: *Ctx, w: ast.Write, hints: []const ast.Hint) !Sink {
         if (std.mem.eql(u8, w.connector, "csv") or std.mem.eql(u8, w.connector, "stdout")) {
-            if (w.delete != null) return .{ .connector = w.connector, .target = w.target, .mode = "delete", .format = "delta" };
-            if (w.update != null) return .{ .connector = w.connector, .target = w.target, .mode = "update", .format = "delta" };
+            if (w.delete != null) return .{ .connector = w.connector, .target = w.target, .mode = "delete", .format = if (folder.isFolder(w.target)) "delta" else null };
+            if (w.update != null) return .{ .connector = w.connector, .target = w.target, .mode = "update", .format = if (folder.isFolder(w.target)) "delta" else null };
             try checkFileSink(w, hints, self.diag);
             try checkSinkForm(w, hints, w.connector, self.diag);
             if (deltaTarget(w, hints))
@@ -2026,7 +2031,7 @@ pub fn deleteProblem(arena: std.mem.Allocator, w: ast.Write, stages: []const ast
             .sql, .unbound => null,
             .unsendable => |e| try msgfmt.allocPrint(arena, "DELETE FROM {s}: `{s}` cannot be sent to {s} as written; the condition runs in the database, so it takes the table's columns, constants and the functions {s} has", .{ w.target, try exprText(arena, e), @tagName(info.dialect), @tagName(info.dialect) }),
         };
-    } else if (!folder.isFolder(w.target)) return "`DELETE FROM` deletes from a database table or a Delta table's folder (`'path/'`), not a file";
+    }
     return deleteShapeProblem(stages);
 }
 
@@ -2100,6 +2105,27 @@ fn exprText(arena: std.mem.Allocator, e: *const ast.Expr) ![]const u8 {
     return aw.written();
 }
 
+/// Why a DELETE, UPDATE or INSERT cannot rewrite the file `w.target`, read with `hints`: one
+/// that is only read (a URL, a member of an archive), one basalt cannot write back
+/// (zstd), or one whose rewrite would not keep what it holds beyond its rows.
+pub fn fileDmlProblem(arena: std.mem.Allocator, w: ast.Write, hints: []const ast.Hint) !?[]const u8 {
+    const verb: []const u8 = if (w.delete != null) "`DELETE FROM`" else if (w.update != null) "`UPDATE`" else "`INSERT INTO`";
+    const path = w.target;
+    const where = scheme.of(path);
+    if (where.has(.http)) return try msgfmt.allocPrint(arena, "{s} writes the file again, and a URL is only read", .{verb});
+    if (where.has(.remote) and !where.has(.replaced_on_write)) return try msgfmt.allocPrint(arena, "{s} writes the file again, and basalt does not write to {s}", .{ verb, where.layer() });
+    if (csv.splitArchive(path) != null) return try msgfmt.allocPrint(arena, "{s} writes the file again, and a file inside an archive is only read", .{verb});
+    if (csv.splitCodec(path).codec == .zstd) return try msgfmt.allocPrint(arena, "{s} writes the file again, and basalt writes no zstd", .{verb});
+    var d = Diag{};
+    const want = formatFromHints(hints, &d) catch return d.msg;
+    if (hintText(hints, "items") != null) return try msgfmt.allocPrint(arena, "{s} writes the file again, and a JSON document read through `items` would keep only those rows", .{verb});
+    if (hintText(hints, "range") != null) return try msgfmt.allocPrint(arena, "{s} changes the rows of a whole sheet, and a sheet read through `range` is only part of one; drop `range`", .{verb});
+    return switch (formats.of(readFormat(path, want)).write.change) {
+        .text, .sheet, .whole => null,
+        .refused => |why| try msgfmt.allocPrint(arena, "{s} {s}", .{ verb, why }),
+    };
+}
+
 /// Why an `UPDATE` cannot run, from its table, the stages between its table read and
 /// its write, and the table's columns when known (`table_schema`): a table that is
 /// neither a database's nor a Delta folder, a SET of a column it lacks, or, on a
@@ -2117,7 +2143,7 @@ pub fn updateProblem(arena: std.mem.Allocator, w: ast.Write, stages: []const ast
             .sql, .unbound => null,
             .unsendable => |e| try msgfmt.allocPrint(arena, "UPDATE {s}: `{s}` cannot be sent to {s} as written; it runs in the database, so it takes the table's columns, the FROM source's, constants and the functions {s} has", .{ w.target, try exprText(arena, e), @tagName(info.dialect), @tagName(info.dialect) }),
         };
-    } else if (!folder.isFolder(w.target)) return "`UPDATE` changes a database table or a Delta table's folder (`'path/'`), not a file";
+    }
     return null;
 }
 
@@ -2173,15 +2199,19 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
     _ = try dialectFromHints(hints, diag);
     const encodes = to_file and ast.nameIn(formats.of((try formatFromHints(hints, diag)) orelse formatOfPath(w.target) orelse .csv).write_keys, "encoding");
     if (hintText(hints, "encoding") != null and !encodes)
-        return fail(diag, "`encoding` applies to a read; a CSV sink always writes UTF-8", .{});
+        return fail(diag, "`encoding` applies to a read and to a CSV or records file written; this sink always writes UTF-8", .{});
     if (to_file) if (try writeFormat(w, hints, diag)) |f| if (folder.isFolder(w.target) and f != .delta)
         return fail(diag, "cannot write `{s}`: a folder is written as a Delta table, not as {s} files; drop `format`, or name a file", .{ w.target, formats.of(f).label });
     if (deltaTarget(w, hints)) {
         if (delta_write.storeProblem(w.target)) |why| return fail(diag, "cannot write Delta table `{s}`: {s}", .{ w.target, why });
         return;
     }
-    if (w.insert != null)
-        return fail(diag, "`INSERT INTO` adds rows to a table: a database table or a Delta folder (`'path/'`); `LOAD INTO '{s}' APPEND` adds rows to a CSV or NDJSON file", .{w.target});
+    if (w.insert != null) {
+        var fa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer fa.deinit();
+        if (try fileDmlProblem(fa.allocator(), w, hints)) |why| return fail(diag, "{s}", .{why});
+        return;
+    }
     if (w.mode == .upsert)
         return fail(diag, "`UPSERT` needs a table to merge into; a file is written whole — use `REPLACE` (the default) or `APPEND`", .{});
     if (w.mode == .append) {

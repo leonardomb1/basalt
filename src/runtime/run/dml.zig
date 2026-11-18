@@ -27,6 +27,8 @@ const options = @import("../analyze/options.zig");
 const env_mod = @import("../env.zig");
 const stampedBinding = @import("../plan.zig").stampedBinding;
 const analyze = @import("../analyze.zig");
+const file_dml = @import("file_dml.zig");
+const folder = @import("../../store/folder.zig");
 const update_rules = @import("../analyze/update.zig");
 const plan = @import("../plan.zig");
 const op = @import("../../exec/op.zig");
@@ -51,7 +53,10 @@ pub fn runDelete(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
     const w = stages[stages.len - 1].node.write;
     const between = stages[1 .. stages.len - 1];
     if (try analyze.deleteProblem(env.arena, w, between, env.connections, env.params_expr, false)) |why| return planErr(env.diag, why);
-    const conn = env.connections.get(w.connector) orelse return runDeleteDelta(env, w, between, opts, stats);
+    const conn = env.connections.get(w.connector) orelse {
+        if (!folder.isFolder(w.target)) return file_dml.run(env, w, stages[0], between, .delete, opts, stats);
+        return runDeleteDelta(env, w, between, opts, stats);
+    };
     const info = connect.sqlConnInfo(conn).?;
     const d = info.dialect;
     const table = analyze.dmlTable(w.target);
@@ -108,7 +113,10 @@ pub fn runUpdate(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
     const u = w.update.?;
     const between = stages[1 .. stages.len - 1];
     if (try analyze.updateProblem(a, w, between, env.connections, env.params_expr, null, false)) |why| return planErr(env.diag, why);
-    const conn = env.connections.get(w.connector) orelse return runUpdateDelta(env, w, between, opts, stats);
+    const conn = env.connections.get(w.connector) orelse {
+        if (!folder.isFolder(w.target)) return file_dml.run(env, w, stages[0], between, .update, opts, stats);
+        return runUpdateDelta(env, w, between, opts, stats);
+    };
     const info = connect.sqlConnInfo(conn).?;
     const d = info.dialect;
     var why: []const u8 = "";

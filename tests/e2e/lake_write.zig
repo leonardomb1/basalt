@@ -1349,7 +1349,6 @@ test "INSERT INTO a Delta table matches columns by name, leaves a nullable colum
     }
     try harness.expectRefusedAlike(gpa, &tmp, "INSERT INTO '$B/t/' (id) SELECT 1 AS id, 2 AS x;", "INSERT INTO");
     try harness.expectRefusedAlike(gpa, &tmp, "INSERT INTO '$B/t/' SELECT 1 AS id, 'x' AS nope;", "the rows have column `nope`");
-    try harness.expectRefusedAlike(gpa, &tmp, "INSERT INTO '$B/t.csv' SELECT 1 AS id;", "`INSERT INTO` adds rows to a table");
 }
 
 test "DELETE FROM a Delta table: conditions and IN / NOT IN / NOT EXISTS subqueries, one DELETE commit rewriting only the files holding a deleted row" {

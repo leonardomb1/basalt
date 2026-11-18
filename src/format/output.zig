@@ -18,6 +18,20 @@ const objstore = @import("../store/objstore.zig");
 const stream = @import("stream.zig");
 const Part = @import("../store/part.zig").Part;
 
+/// The object version the next upload of `path` must replace (`expectVersion`).
+threadlocal var expected: ?struct { path: []const u8, etag: []const u8 } = null;
+
+/// Makes the next `Output.open` of `path` on this thread an upload sent with
+/// `If-Match: etag`, for a writer opened by a format that knows nothing of it.
+pub fn expectVersion(path: []const u8, etag: []const u8) void {
+    expected = .{ .path = path, .etag = etag };
+}
+
+/// Drops a version `expectVersion` named that no open took.
+pub fn forgetVersion() void {
+    expected = null;
+}
+
 pub const Output = struct {
     backend: Backend,
     buf: [stream.LINE_BUF]u8 = undefined,
@@ -35,12 +49,17 @@ pub const Output = struct {
     };
 
     /// `.append` opens a local file at its end (`end` is where it was), and is
-    /// refused for a remote one, which is written whole.
+    /// refused for a remote one, which is written whole. An upload of the path
+    /// `expectVersion` named last lands only over that version.
     pub fn open(arena: std.mem.Allocator, path: []const u8, content_type: []const u8, mode: driver.FileMode) !*Output {
         const self = try arena.create(Output);
         if (mode == .append and objstore.isRemote(path)) return error.AppendNotSupported;
         if (try objstore.openRemote(arena, path, content_type)) |o| {
             self.* = .{ .backend = .{ .object = o } };
+            if (expected) |x| if (std.mem.eql(u8, x.path, path)) {
+                _ = o.ifMatch(x.etag);
+                expected = null;
+            };
         } else {
             self.* = .{ .backend = undefined };
             self.backend = .{ .file = if (mode == .append) try std.fs.cwd().createFile(path, .{ .truncate = false, .read = true }) else try self.part.create(path) };
@@ -84,6 +103,15 @@ pub const Output = struct {
             .none => {},
             .gzip => self.gz = try deflate.Deflate.init(pagecache.process, self.raw(), .{}),
             .zstd => return error.ZstdWriteUnsupported,
+        }
+    }
+
+    /// An upload made to land only over the object version `etag` names
+    /// (`objstore.Writer.ifMatch`); a local file or memory is untouched.
+    pub fn ifMatch(self: *Output, etag: []const u8) void {
+        switch (self.backend) {
+            .object => |o| _ = o.ifMatch(etag),
+            .file, .memory => {},
         }
     }
 

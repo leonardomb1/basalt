@@ -612,7 +612,8 @@ pub const MultipartWriter = struct {
         try objstore.retry(self.policy(), ctx, struct {
             fn attempt(c: Ctx) !objstore.Verdict {
                 const w = c.w;
-                const hdrs = try w.signed("PUT", w.obj.uri_path, &.{}, c.ph, w.content_type);
+                const signed_hdrs = try w.signed("PUT", w.obj.uri_path, &.{}, c.ph, w.content_type);
+                const hdrs = if (w.up.if_match.len > 0) try std.mem.concat(w.up.alloc(), std.http.Header, &.{ signed_hdrs, &.{.{ .name = "If-Match", .value = w.up.if_match }} }) else signed_hdrs;
                 const r = try objstore.exchange(w.up.alloc(), w.up.client, .{
                     .method = .PUT,
                     .url = w.obj.url,
@@ -624,6 +625,7 @@ pub const MultipartWriter = struct {
                     w.up.last_status = null;
                     return .done;
                 }
+                if (r.code == 412 and w.up.if_match.len > 0) return objstore.changed();
                 if (try w.createBucketIfMissing(r.code, r.body)) return .again;
                 return w.failed(r);
             }
@@ -689,8 +691,10 @@ pub const MultipartWriter = struct {
                 const w = c.w;
                 const replay = w.completing;
                 w.completing = true;
-                const hdrs = try w.signed("POST", w.obj.uri_path, c.q, c.ph, null);
+                const signed_hdrs = try w.signed("POST", w.obj.uri_path, c.q, c.ph, null);
+                const hdrs = if (w.up.if_match.len > 0) try std.mem.concat(w.up.alloc(), std.http.Header, &.{ signed_hdrs, &.{.{ .name = "If-Match", .value = w.up.if_match }} }) else signed_hdrs;
                 var r = try objstore.exchange(w.up.alloc(), w.up.client, .{ .method = .POST, .url = c.url, .headers = hdrs, .payload = c.body });
+                if (r.code == 412 and w.up.if_match.len > 0) return objstore.changed();
                 if (r.code == 200 and std.mem.indexOf(u8, r.body, "<Error>") != null) r.code = 500;
                 const gone = statusToError(r.code, r.body) == Error.S3UploadMissing;
                 if (r.code == 200 or (replay and gone and try w.landed())) {

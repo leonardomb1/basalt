@@ -149,6 +149,7 @@ pub const SignParams = struct {
     content_length: usize = 0,
     content_type: []const u8 = "",
     range: []const u8 = "",
+    if_match: []const u8 = "",
     if_none_match: []const u8 = "",
     query: []const []const u8 = &.{},
 };
@@ -168,7 +169,7 @@ pub fn authHeader(arena: std.mem.Allocator, account: []const u8, key_b64: []cons
     try w.print("{s}\n", .{p.content_type});
     try w.writeAll("\n");
     try w.writeAll("\n");
-    try w.writeAll("\n");
+    try w.print("{s}\n", .{p.if_match});
     try w.print("{s}\n", .{p.if_none_match});
     try w.writeAll("\n");
     try w.print("{s}\n", .{p.range});
@@ -231,6 +232,7 @@ fn signedHeaders(arena: std.mem.Allocator, account: []const u8, key: []const u8,
     for (p.ms_headers) |h| try out.append(.{ .name = h.name, .value = h.value });
     try out.append(.{ .name = "Authorization", .value = auth });
     if (p.range.len > 0) try out.append(.{ .name = "Range", .value = p.range });
+    if (p.if_match.len > 0) try out.append(.{ .name = "If-Match", .value = p.if_match });
     if (p.if_none_match.len > 0) try out.append(.{ .name = "If-None-Match", .value = p.if_none_match });
     return out.toOwnedSlice();
 }
@@ -347,6 +349,7 @@ pub const BlockBlobWriter = struct {
             .ms_headers = &.{.{ .name = "x-ms-blob-content-type", .value = self.content_type }},
             .content_length = body.items.len,
             .query = &.{"comp:blocklist"},
+            .if_match = self.up.if_match,
         };
         try self.sendCreating(url, sign, body.items);
     }
@@ -390,7 +393,7 @@ pub const BlockBlobWriter = struct {
         return created;
     }
 
-    const Sign = struct { ms_headers: []const MsHeader = &.{}, content_length: usize, query: []const []const u8 };
+    const Sign = struct { ms_headers: []const MsHeader = &.{}, content_length: usize, query: []const []const u8, if_match: []const u8 = "" };
     const Send = struct { w: *BlockBlobWriter, url: []const u8, sign: Sign, body: []const u8 };
 
     /// PUT with retry, signed afresh per attempt. `last_status` is cleared on success,
@@ -406,12 +409,14 @@ pub const BlockBlobWriter = struct {
                     .ms_headers = c.sign.ms_headers,
                     .content_length = c.sign.content_length,
                     .query = c.sign.query,
+                    .if_match = c.sign.if_match,
                 });
                 const r = try objstore.exchange(w.up.alloc(), w.up.client, .{ .method = .PUT, .url = c.url, .headers = hdrs, .payload = c.body });
                 if (r.code == 201 or r.code == 200) {
                     w.up.last_status = null;
                     return .done;
                 }
+                if (r.code == 412 and c.sign.if_match.len > 0) return objstore.changed();
                 return w.failed(r);
             }
         }.attempt);

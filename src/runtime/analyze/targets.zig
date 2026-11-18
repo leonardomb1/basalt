@@ -382,8 +382,9 @@ pub fn xmlNamesFromHints(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Err
 
 pub const json_array_append_fmt = "`APPEND` into `{s}` is not supported: a JSON array closes on its last byte, so appending means rewriting the file. Write NDJSON (no `array`) to append, or use `REPLACE`";
 
-/// An Excel sink's worksheet name, `Sheet1` when unset; validated here so `check`
-/// refuses a name Excel would.
+/// An Excel sink's worksheet name, empty when unset (a new workbook's is then
+/// `Sheet1`, an INSERT's the workbook's first); validated here so `check` refuses a
+/// name Excel would.
 pub fn xlsxSheetFromHints(hints: []const ast.Hint, diag: *Diag) Error![]const u8 {
     for (hints) |h| {
         if (!std.mem.eql(u8, h.key, "sheet")) continue;
@@ -394,7 +395,7 @@ pub fn xlsxSheetFromHints(hints: []const ast.Hint, diag: *Diag) Error![]const u8
         if (xlsxwrite.sheetNameProblem(name)) |why| return fail(diag, "`sheet = '{s}'`: {s}", .{ name, why });
         return name;
     }
-    return "Sheet1";
+    return "";
 }
 
 /// An XML read's options: `row` names the row element, `encoding` overrides the

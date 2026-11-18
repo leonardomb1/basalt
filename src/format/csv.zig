@@ -94,6 +94,8 @@ pub const Dialect = struct {
     delim: u8 = ',',
     encoding: Encoding = .utf8,
     text: []const []const u8 = &.{},
+    /// A writer's line ending: `\r\n` where true, else `\n`.
+    crlf: bool = false,
 };
 
 /// The column names of a header line, every one a nullable string until sniffed. A
@@ -147,8 +149,13 @@ pub const CsvReader = struct {
     line_no: u64 = 0,
     rec_line: u64 = 0,
     slot: ?[]const i16 = null,
+    /// Bytes of the current file's decoded stream taken so far, and the span of the
+    /// record `readLine` last returned.
+    offset: u64 = 0,
+    rec_start: u64 = 0,
+    rec_end: u64 = 0,
 
-    const Pending = struct { text: []const u8, line_no: u64, path: []const u8 };
+    const Pending = struct { text: []const u8, line_no: u64, path: []const u8, start: u64 = 0, end: u64 = 0 };
 
     pub fn project(self: *CsvReader, names: []const []const u8) !void {
         const p = (try Projection.of(self.arena, self.schema, names)) orelse return;
@@ -160,6 +167,7 @@ pub const CsvReader = struct {
     fn begin(self: *CsvReader, path: []const u8) void {
         self.path = path;
         self.line_no = 0;
+        self.offset = 0;
         self.rdr = self.stream.reader;
         self.eol = sniffEol(self.rdr);
     }
@@ -243,7 +251,7 @@ pub const CsvReader = struct {
             if (skipsBlank(line, fields.items.len)) continue;
             const own = try arena.dupe(u8, line);
             if (pending.items.len < SAMPLE_ROWS) sniff.feed(own);
-            try pending.append(.{ .text = own, .line_no = self.rec_line, .path = self.path });
+            try pending.append(.{ .text = own, .line_no = self.rec_line, .path = self.path, .start = self.rec_start, .end = self.rec_end });
         }
         sniff.whole = self.stream_eof;
         texttype.settle(fields.items, sniff.cols, sniff.whole, self.dialect.text);
@@ -254,6 +262,11 @@ pub const CsvReader = struct {
     }
 
     pub fn next(self: *CsvReader, arena: std.mem.Allocator) !?Batch {
+        return self.nextInto(arena, null);
+    }
+
+    /// `next`, each row's record span appended to `spans` (its start, then its end).
+    fn nextInto(self: *CsvReader, arena: std.mem.Allocator, spans: ?*[2]column.Builder) !?Batch {
         if (self.done) return null;
         const ncols = self.schema.fields.len;
         const builders = try arena.alloc(column.Builder, ncols);
@@ -283,11 +296,15 @@ pub const CsvReader = struct {
                     self.done = true;
                     break;
                 };
-                at = .{ .text = line, .line_no = self.rec_line, .path = self.path };
+                at = .{ .text = line, .line_no = self.rec_line, .path = self.path, .start = self.rec_start, .end = self.rec_end };
             }
             if (skipsBlank(line, ncols)) continue;
             splitInto(arena, line, builders, self.dialect, self.slot) catch |e|
                 return rowFailure(e, at.path, at.line_no, line, self.schema, self.dialect, self.slot);
+            if (spans) |sp| {
+                try sp[0].append(.{ .int = @intCast(at.start) });
+                try sp[1].append(.{ .int = @intCast(at.end) });
+            }
             rows += 1;
         }
         if (rows == 0) return null;
@@ -329,7 +346,9 @@ pub const CsvReader = struct {
     /// ends, so a quoted CRLF keeps it.
     fn readLine(self: *CsvReader) !?[]const u8 {
         self.rec_line = self.line_no + 1;
+        self.rec_start = self.offset;
         const first = (try self.takePhysical()) orelse return null;
+        self.rec_end = self.offset;
         if (!quotesOpen(first, self.dialect.delim, false)) return trimCr(first);
 
         self.join_buf.clearRetainingCapacity();
@@ -343,17 +362,26 @@ pub const CsvReader = struct {
             try self.join_buf.append(self.eol);
             try self.join_buf.appendSlice(more);
         }
+        self.rec_end = self.offset;
         return trimCr(self.join_buf.items);
     }
 
     /// A line past the read buffer is gathered into `long_buf`, up to `MAX_RECORD`; a
-    /// truncated or corrupt compressed stream is named with where it broke.
+    /// truncated or corrupt compressed stream is named with where it broke. `offset`
+    /// counts each line with its ending, one byte too many for a last line without one.
     fn takePhysical(self: *CsvReader) !?[]const u8 {
         const line = self.rdr.takeDelimiter(self.eol) catch |e| switch (e) {
-            error.StreamTooLong => return try self.takeLong(),
+            error.StreamTooLong => {
+                const long = try self.takeLong();
+                self.offset += long.len + 1;
+                return long;
+            },
             error.ReadFailed => return self.readFailed(),
         };
-        if (line != null) self.line_no += 1;
+        if (line) |l| {
+            self.line_no += 1;
+            self.offset += l.len + 1;
+        }
         return line;
     }
 
@@ -943,9 +971,63 @@ inline fn putCell(arena: std.mem.Allocator, b: *column.Builder, raw: []const u8,
 
 const source_vtable = driver.sourceVTable(CsvReader);
 
+/// The hidden columns a `Spans` read adds: where a row's record starts in the decoded
+/// stream, and the byte past its end, its line ending included.
+pub const span_start = "\x00span_start";
+pub const span_end = "\x00span_end";
+
+/// One CSV file read serially, each row with its record's span as two last columns,
+/// for a rewrite that copies the bytes around the records it changes as they stand.
+pub const Spans = struct {
+    reader: *CsvReader,
+    schema: types.Schema,
+
+    pub fn open(arena: std.mem.Allocator, reader: *CsvReader) !*Spans {
+        const n = reader.schema.fields.len;
+        const fields = try arena.alloc(types.Schema.Field, n + 2);
+        @memcpy(fields[0..n], reader.schema.fields);
+        fields[n] = .{ .name = span_start, .ty = types.Type.init(.int) };
+        fields[n + 1] = .{ .name = span_end, .ty = types.Type.init(.int) };
+        const self = try arena.create(Spans);
+        self.* = .{ .reader = reader, .schema = .{ .fields = fields } };
+        return self;
+    }
+
+    pub fn next(self: *Spans, arena: std.mem.Allocator) !?Batch {
+        var sp = [2]column.Builder{ try column.Builder.initCapacity(arena, types.Type.init(.int), BATCH_ROWS), try column.Builder.initCapacity(arena, types.Type.init(.int), BATCH_ROWS) };
+        const b = (try self.reader.nextInto(arena, &sp)) orelse return null;
+        const cols = try arena.alloc(column.Column, b.columns.len + 2);
+        @memcpy(cols[0..b.columns.len], b.columns);
+        cols[b.columns.len] = try sp[0].finish();
+        cols[b.columns.len + 1] = try sp[1].finish();
+        return .{ .schema = &self.schema, .columns = cols, .len = b.len };
+    }
+
+    pub fn close(self: *Spans) void {
+        self.reader.close();
+    }
+
+    pub fn source(self: *Spans) driver.Source {
+        return .{ .ptr = self, .vtable = &spans_vtable };
+    }
+};
+
+const spans_vtable = driver.sourceVTable(Spans);
+
+/// Rows of `batch` as CSV text under `delim`, each ending in `\n`, as the sink
+/// renders them.
+pub fn renderRows(w: *std.Io.Writer, batch: Batch, delim: u8) !void {
+    if (scalarCanNeedQuote(delim)) return renderCells(w, batch, CsvText(true){ .delim = delim });
+    return renderCells(w, batch, CsvText(false){ .delim = delim });
+}
+
 pub const CsvWriter = struct {
     out: *Output,
     dialect: Dialect = .{},
+    /// Under an INSERT, the file's columns in its order, each the rows' column of that
+    /// name or null (written empty); `file` their schema.
+    order: ?[]const ?usize = null,
+    file: types.Schema = .{ .fields = &.{} },
 
     /// `.append` resumes at the file's end and writes the header only to an empty file,
     /// so a second header never lands among the rows; a file with rows must already
@@ -968,7 +1050,7 @@ pub const CsvWriter = struct {
         }
         try self.out.compress(path);
         if (newline) try self.out.writer().writeByte('\n');
-        if (header) try writeHeader(self.out.writer(), schema, dialect);
+        if (header) try self.headerOut(arena, schema);
         return self;
     }
 
@@ -1066,7 +1148,8 @@ pub const CsvWriter = struct {
         return self;
     }
 
-    pub fn writeBatch(self: *CsvWriter, _: std.mem.Allocator, batch: Batch) !void {
+    pub fn writeBatch(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch) !void {
+        if (self.order != null or self.dialect.encoding != .utf8) return self.writeRendered(try self.renderBatch(arena, batch));
         self.renderRows(self.out.writer(), batch) catch |e| return self.out.specific(e);
     }
 
@@ -1074,15 +1157,108 @@ pub const CsvWriter = struct {
     /// the shared sink's lock only for the append (`driver.Sink.VTable.renderBatch`).
     fn renderRows(self: *CsvWriter, w: *std.Io.Writer, batch: Batch) !void {
         const d = self.dialect.delim;
-        if (scalarCanNeedQuote(d)) return renderCells(w, batch, CsvText(true){ .delim = d });
-        return renderCells(w, batch, CsvText(false){ .delim = d });
+        const crlf = self.dialect.crlf;
+        if (scalarCanNeedQuote(d)) return renderCells(w, batch, CsvText(true){ .delim = d, .crlf = crlf });
+        return renderCells(w, batch, CsvText(false){ .delim = d, .crlf = crlf });
     }
 
     pub fn renderBatch(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch) ![]const u8 {
         var aw = std.Io.Writer.Allocating.init(arena);
         try aw.ensureUnusedCapacity(batch.len * 64 + 64);
-        self.renderRows(&aw.writer, batch) catch |e| return self.out.specific(e);
-        return aw.writer.buffered();
+        const b = if (self.order) |o| try self.reordered(arena, batch, o) else batch;
+        self.renderRows(&aw.writer, b) catch |e| return self.out.specific(e);
+        if (self.dialect.encoding == .utf8) return aw.writer.buffered();
+        return encodeField(arena, self.dialect.encoding, aw.writer.buffered()) catch |e| switch (e) {
+            error.Unencodable => explainf(e, "a row holds a character {s} cannot hold", .{@tagName(self.dialect.encoding)}),
+            else => e,
+        };
+    }
+
+    /// `batch` laid out as the file's columns: each the rows' column of its name, or
+    /// an empty one.
+    fn reordered(self: *CsvWriter, arena: std.mem.Allocator, batch: Batch, order: []const ?usize) !Batch {
+        const cols = try arena.alloc(column.Column, order.len);
+        for (cols, order) |*c, o| c.* = if (o) |i| batch.columns[i] else blk: {
+            var bd = try column.Builder.initCapacity(arena, types.Type.init(.string).asNullable(), batch.len);
+            for (0..batch.len) |_| try bd.append(.null);
+            break :blk try bd.finish();
+        };
+        return .{ .schema = &self.file, .columns = cols, .len = batch.len };
+    }
+
+    /// An INSERT into the existing CSV `path`: the rows' columns matched to its header
+    /// by name, one it lacks refused and one the rows lack written empty, each row
+    /// ending as the file's lines do (`\r\n` or `\n`) and in `dialect`'s encoding. A
+    /// local file is appended to in place; a remote one, which is written whole, is
+    /// copied into its new upload first. A file whose last byte is no line ending is
+    /// refused: its last line may be one a failed write cut short.
+    pub fn openInsert(arena: std.mem.Allocator, path: []const u8, schema: types.Schema, dialect_in: Dialect) !*CsvWriter {
+        var dialect = dialect_in;
+        const remote = stream.isUrl(path);
+        const out = try Output.open(arena, path, "text/csv", if (remote) .truncate else .append);
+        errdefer out.abort();
+        var head: []const u8 = "";
+        var last: ?u8 = null;
+        if (remote) {
+            try out.compress(path);
+            const in = try Stream.open(arena, path);
+            defer in.close();
+            const r = in.reader;
+            var first = true;
+            var hb = std.array_list.Managed(u8).init(arena);
+            while (true) {
+                const chunk = r.peekGreedy(1) catch |e| switch (e) {
+                    error.EndOfStream => break,
+                    else => |x| return x,
+                };
+                if (first) {
+                    const nl = std.mem.indexOfScalar(u8, chunk, '\n');
+                    try hb.appendSlice(chunk[0 .. nl orelse chunk.len]);
+                    if (nl != null) first = false;
+                }
+                try out.writer().writeAll(chunk);
+                last = chunk[chunk.len - 1];
+                r.toss(chunk.len);
+            }
+            head = hb.items;
+        } else if (out.end > 0) {
+            last = try out.lastByte(arena, path);
+            head = try appendHeader(arena, path, out.localFile().?, splitCodec(path).codec, dialect.delim);
+            try out.compress(path);
+        } else try out.compress(path);
+        const self = try arena.create(CsvWriter);
+        self.* = .{ .out = out, .dialect = dialect };
+        if (last == null) {
+            try self.headerOut(arena, schema);
+            return self;
+        }
+        if (last.? != '\n' and last.? != '\r')
+            return explainf(error.CsvTornTail, "`{s}` does not end in a line break, so its last line may be one a failed write cut short; check it, and if it is whole add the line break and run again", .{path});
+        dialect.crlf = head.len > 0 and head[head.len - 1] == '\r';
+        self.dialect = dialect;
+        const have = try headerFields(arena, trimCr(stripBom(head)), dialect);
+        const order = try arena.alloc(?usize, have.len);
+        for (order, have) |*o, h| o.* = for (schema.fields, 0..) |f, i| {
+            if (std.mem.eql(u8, f.name, h.name)) break i;
+        } else null;
+        for (schema.fields) |f| if (for (have) |h| {
+            if (std.mem.eql(u8, f.name, h.name)) break false;
+        } else true)
+            return explainf(error.AppendHeaderMismatch, "`{s}` has no column `{s}`; an INSERT writes only the file's columns, `{s}`", .{ path, f.name, clip(trimCr(stripBom(head))) });
+        self.order = order;
+        self.file = .{ .fields = have };
+        return self;
+    }
+
+    /// The header of `schema` in the writer's dialect and encoding.
+    fn headerOut(self: *CsvWriter, arena: std.mem.Allocator, schema: types.Schema) !void {
+        var aw = std.Io.Writer.Allocating.init(arena);
+        for (schema.fields, 0..) |f, i| {
+            if (i > 0) try aw.writer.writeByte(self.dialect.delim);
+            try writeHeaderField(&aw.writer, f.name, self.dialect.delim);
+        }
+        try aw.writer.writeAll(if (self.dialect.crlf) "\r\n" else "\n");
+        try self.out.writer().writeAll(try encodeField(arena, self.dialect.encoding, aw.written()));
     }
 
     pub fn writeRendered(self: *CsvWriter, bytes: []const u8) !void {
@@ -1112,7 +1288,7 @@ fn renderCells(w: *std.Io.Writer, batch: Batch, p: anytype) !void {
             if (i > 0) try w.writeByte(p.delim);
             try celltext.write(w, col, r, p);
         }
-        try w.writeByte('\n');
+        try w.writeAll(if (p.crlf) "\r\n" else "\n");
     }
 }
 
@@ -1122,6 +1298,7 @@ fn renderCells(w: *std.Io.Writer, batch: Batch, p: anytype) !void {
 fn CsvText(comptime quote_scalars: bool) type {
     return struct {
         delim: u8,
+        crlf: bool = false,
 
         pub const null_text = "";
         pub const bool_true = "true";

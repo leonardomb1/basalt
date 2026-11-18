@@ -19,6 +19,14 @@ const Output = @import("../output.zig").Output;
 
 pub const Shape = enum { ndjson, array };
 
+/// Rows of `batch` as NDJSON lines, each object keyed by `schema`'s column names in
+/// order and ending in `\n`, as the writer renders them.
+pub fn renderLines(arena: std.mem.Allocator, schema: types.Schema, batch: Batch) ![]const u8 {
+    const out = try Output.openMemory(arena);
+    const w = try Writer.init(arena, out, schema, .ndjson);
+    return w.renderBatch(arena, batch);
+}
+
 pub const Writer = struct {
     out: *Output,
     keys: []const []const u8,
@@ -35,6 +43,37 @@ pub const Writer = struct {
         try out.compress(path);
         if (newline) try out.writer().writeByte('\n');
         return self;
+    }
+
+    /// An INSERT into the existing NDJSON `path`: appended to in place when local; a
+    /// remote one, written whole, is copied into its new upload first. A file whose
+    /// last byte is no line break is refused: its last line may be one a failed write
+    /// cut short.
+    pub fn openInsert(arena: std.mem.Allocator, path: []const u8, schema: types.Schema) !*Writer {
+        const remote = @import("../stream.zig").isUrl(path);
+        const out = try Output.open(arena, path, "application/x-ndjson", if (remote) .truncate else .append);
+        errdefer out.abort();
+        var last: ?u8 = null;
+        if (remote) {
+            try out.compress(path);
+            const in = try @import("../stream.zig").Stream.open(arena, path);
+            defer in.close();
+            while (true) {
+                const chunk = in.reader.peekGreedy(1) catch |e| switch (e) {
+                    error.EndOfStream => break,
+                    else => |x| return x,
+                };
+                try out.writer().writeAll(chunk);
+                last = chunk[chunk.len - 1];
+                in.reader.toss(chunk.len);
+            }
+        } else {
+            if (out.end > 0) last = try out.lastByte(arena, path);
+            try out.compress(path);
+        }
+        if (last) |l| if (l != '\n')
+            return @import("../../exec/eval.zig").explain(error.JsonTornTail, try std.fmt.allocPrint(arena, "`{s}` does not end in a line break, so its last line may be one a failed write cut short; check it, and if it is whole add the line break and run again", .{path}));
+        return init(arena, out, schema, .ndjson);
     }
 
     pub fn openStdout(arena: std.mem.Allocator, schema: types.Schema) !*Writer {

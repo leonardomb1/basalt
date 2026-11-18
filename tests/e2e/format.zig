@@ -28,7 +28,7 @@ test "read a semicolon latin-1 file end to end" {
     try std.testing.expectEqualStrings("SIT,N\nLIQUIDAÇÃO,2\nCANCELADA,1\n", out);
 }
 
-test "a CSV cell that is not UTF-8 fails the run naming file, line and column, serial and in lanes; latin-1 reads it" {
+test "a CSV cell that is not UTF-8 fails the run naming file, line and column, serial and in lanes; latin-1 reads it, and a CSV file is written in latin-1 or cp1252" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -47,6 +47,9 @@ test "a CSV cell that is not UTF-8 fails the run naming file, line and column, s
     try tmp.dir.writeFile(.{ .sub_path = "l1.csv", .data = "id,cidade\n1,Bel\xe9m\n" });
     try checkAndRun(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT cidade FROM '$B/l1.csv' WITH (encoding = 'latin1');", 1, &.{});
     try @import("harness.zig").expectFile(&tmp, "out.csv", "cidade\nBel\u{e9}m\n");
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/out.csv' WITH (delimiter = ';', encoding = 'cp1252') AS SELECT cidade, '\u{20ac}' AS moeda FROM '$B/l1.csv' WITH (encoding = 'latin1');", 1, &.{});
+    try @import("harness.zig").expectFile(&tmp, "out.csv", "cidade;moeda\nBel\xe9m;\x80\n");
+    try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' WITH (encoding = 'latin1') AS SELECT '\u{20ac}' AS moeda;", 1, "a row holds a character latin1 cannot hold");
 }
 
 test "an unreadable extension is refused by run, not just check" {

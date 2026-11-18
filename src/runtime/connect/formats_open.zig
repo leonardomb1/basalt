@@ -214,7 +214,8 @@ const impls = struct {
 
         pub fn write(env: *Env, w: ast.Write, schema: types.Schema, mode: driver.FileMode) anyerror!driver.Sink {
             _ = mode;
-            const xw = xlsxwrite.Writer.open(env.arena, w.target, schema, env.write_opts.xlsx) catch |e| switch (e) {
+            const sheet = if (env.write_opts.xlsx.len > 0) env.write_opts.xlsx else "Sheet1";
+            const xw = xlsxwrite.Writer.open(env.arena, w.target, schema, sheet) catch |e| switch (e) {
                 error.XlsxTooManyColumns, error.XlsxNestedColumn, error.XlsxBadSheetName => return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, eval.takeFailure(e) orelse @errorName(e) })),
                 else => return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not open output Excel workbook `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
             };

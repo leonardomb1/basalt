@@ -367,6 +367,11 @@ pub const Scan = struct {
     state: enum { start, first, more, done } = .start,
     mapped: bool = false,
     released: usize = 0,
+    /// Bytes of the input dropped from the front of `buf`, so `base + at` is where
+    /// the scan stands in the input; and the span of the value `next` last returned.
+    base: u64 = 0,
+    last_start: u64 = 0,
+    last_end: u64 = 0,
 
     const release_every = 4 << 20;
 
@@ -389,6 +394,7 @@ pub const Scan = struct {
             const rest = self.buf.items.len - self.at;
             std.mem.copyForwards(u8, self.buf.items[0..rest], self.buf.items[self.at..]);
             self.buf.items.len = rest;
+            self.base += self.at;
             self.at = 0;
         }
         const want = @max(min, self.chunk);
@@ -425,6 +431,16 @@ pub const Scan = struct {
         if (self.array) return null;
         _ = (try self.peek()) orelse return null;
         return self.buf.items[self.at..];
+    }
+
+    /// Where the line holding the value at `i` in `buf` starts, when only spaces and
+    /// tabs come before it there; else the value's own start. In the input's offsets.
+    pub fn lead(self: *const Scan, i: usize) u64 {
+        var j = i;
+        while (j > 0 and (self.buf.items[j - 1] == ' ' or self.buf.items[j - 1] == '\t')) j -= 1;
+        if (j > 0 and self.buf.items[j - 1] != '\n') j = i;
+        if (j == 0 and self.base > 0) j = i;
+        return self.base + j;
     }
 
     /// Takes the next `n` bytes as read, releasing the mapped pages behind them.
@@ -474,7 +490,9 @@ pub const Scan = struct {
         while (true) {
             const t = self.buf.items[self.at..];
             if (valueEnd(t, self.eof)) |end| {
+                self.last_start = self.lead(self.at);
                 self.advance(end);
+                self.last_end = self.base + self.at;
                 return t[0..end];
             }
             if (self.eof) return error.InvalidJson;
@@ -532,6 +550,7 @@ pub const Reader = struct {
     whole: ?[]const u8 = null,
     elems: ?jt.Elements = null,
     held: []const []const u8 = &.{},
+    held_spans: []const [2]u64 = &.{},
     held_at: usize = 0,
     rows_seen: u64 = 0,
     done: bool = false,
@@ -569,33 +588,46 @@ pub const Reader = struct {
         }
         var infer = Infer{};
         var held = std.array_list.Managed([]const u8).init(arena);
+        var spans = std.array_list.Managed([2]u64).init(arena);
         try held.appendSlice(self.held);
+        for (self.held) |_| try spans.append(.{ 0, 0 });
         while (held.items.len < opts.sample) {
             const row = (try self.nextRow(arena, true)) orelse {
                 infer.whole = opts.alone;
                 break;
             };
             try held.append(try arena.dupe(u8, row));
+            try spans.append(.{ self.scan.last_start, self.scan.last_end });
         }
         for (held.items) |row| try infer.note(arena, row);
         self.held = held.items;
+        self.held_spans = spans.items;
         self.schema = try infer.schema(arena);
         return self;
     }
 
     pub fn next(self: *Reader, arena: std.mem.Allocator) Error!?Batch {
+        return self.nextInto(arena, null);
+    }
+
+    /// `next`, each row's span in the input appended to `spans` (its start, then
+    /// the byte past its value).
+    fn nextInto(self: *Reader, arena: std.mem.Allocator, spans: ?*[2]column.Builder) Error!?Batch {
         if (self.done) return null;
         var rows = try Rows.init(arena, self.schema, self.opts.known, self.opts.batch_rows);
         while (rows.len < self.opts.batch_rows) {
             if (self.held_at < self.held.len) {
                 try rows.add(arena, self.held[self.held_at]);
+                if (spans) |sp| try spanOf(sp, self.held_spans[self.held_at]);
                 self.held_at += 1;
                 continue;
             }
             if (self.elems == null and self.whole == null) if (try self.scan.unread()) |t| if (t[0] == '{') {
                 if (try rows.addPrefix(arena, t)) |n| {
+                    const from = self.scan.lead(self.scan.at);
                     self.scan.advance(n);
                     self.rows_seen += 1;
+                    if (spans) |sp| try spanOf(sp, .{ from, self.scan.base + self.scan.at });
                     continue;
                 }
             };
@@ -604,9 +636,14 @@ pub const Reader = struct {
                 break;
             };
             try rows.add(arena, row);
+            if (spans) |sp| try spanOf(sp, .{ self.scan.last_start, self.scan.last_end });
         }
         if (rows.len == 0) return null;
         return try rows.finish(arena, &self.schema);
+    }
+
+    fn spanOf(sp: *[2]column.Builder, at: [2]u64) Error!void {
+        for (sp, at) |*b, v| b.append(.{ .int = @intCast(v) }) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else unreachable;
     }
 
     /// The next row's text after the held ones, validated when `check`; a row for a
@@ -643,6 +680,52 @@ pub const Reader = struct {
     pub fn source(self: *Reader) driver.Source {
         return .{ .ptr = self, .vtable = &vtable };
     }
+};
+
+pub const span_start = "\x00span_start";
+pub const span_end = "\x00span_end";
+
+/// One NDJSON input read serially, each row with the span of its object in the input
+/// as two last columns (the start of its line when only spaces lead the object there,
+/// else its first byte; and the byte past its closing brace), for a
+/// rewrite that copies the bytes around the rows it changes as they stand. A
+/// top-level array, or an `items` path, has no rows of their own lines: null.
+pub const Spans = struct {
+    reader: *Reader,
+    schema: types.Schema,
+
+    pub fn open(arena: std.mem.Allocator, reader: *Reader) Error!?*Spans {
+        if (reader.scan.array or reader.whole != null or reader.elems != null or reader.opts.items != null) return null;
+        const n = reader.schema.fields.len;
+        const fields = try arena.alloc(types.Schema.Field, n + 2);
+        @memcpy(fields[0..n], reader.schema.fields);
+        fields[n] = .{ .name = span_start, .ty = types.Type.init(.int) };
+        fields[n + 1] = .{ .name = span_end, .ty = types.Type.init(.int) };
+        const self = try arena.create(Spans);
+        self.* = .{ .reader = reader, .schema = .{ .fields = fields } };
+        return self;
+    }
+
+    pub fn next(self: *Spans, arena: std.mem.Allocator) Error!?Batch {
+        const cap = self.reader.opts.batch_rows;
+        var sp = [2]column.Builder{ try column.Builder.initCapacity(arena, types.Type.init(.int), cap), try column.Builder.initCapacity(arena, types.Type.init(.int), cap) };
+        const b = (try self.reader.nextInto(arena, &sp)) orelse return null;
+        const cols = try arena.alloc(column.Column, b.columns.len + 2);
+        @memcpy(cols[0..b.columns.len], b.columns);
+        cols[b.columns.len] = try sp[0].finish();
+        cols[b.columns.len + 1] = try sp[1].finish();
+        return .{ .schema = &self.schema, .columns = cols, .len = b.len };
+    }
+
+    pub fn close(self: *Spans) void {
+        self.reader.close();
+    }
+
+    pub fn source(self: *Spans) driver.Source {
+        return .{ .ptr = self, .vtable = &spans_vtable };
+    }
+
+    const spans_vtable = driver.sourceVTable(Spans);
 };
 
 /// JSON files read as one table (`files.Files`); the first of several is not `alone`.

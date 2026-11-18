@@ -1,8 +1,8 @@
 # INSERT, DELETE and UPDATE
 
 These change the rows of a table that already exists: a database table
-(PostgreSQL, MySQL, SQL Server, StarRocks or Doris) or a Delta table (a folder,
-`'path/'`). Each
+(PostgreSQL, MySQL, SQL Server, StarRocks or Doris), a Delta table (a folder,
+`'path/'`), or a single file ([Files](#files)). Each
 statement lands whole or not at all. `LOAD INTO` is the statement that creates,
 replaces and upserts tables and writes files; these leave the table's definition
 alone and change only its rows.
@@ -45,9 +45,8 @@ table a row whose key is already there replaces it, as their own `INSERT` does.
 
 `INSERT` takes the options of a `LOAD INTO` to its target after the column list,
 `WITH (merge_schema = true)` on a Delta table among them, and a query starting
-with `WITH` is its own: `INSERT INTO t WITH q AS (...) SELECT ...`. CSV,
-Parquet and other files are not `INSERT` targets yet; `LOAD INTO ... APPEND`
-adds to them.
+with `WITH` is its own: `INSERT INTO t WITH q AS (...) SELECT ...`. Into a
+file, see [Files](#files).
 
 ## DELETE
 
@@ -169,3 +168,74 @@ column yet.
 `EXPLAIN` and `EXPLAIN ANALYZE` behave as for a `DELETE`: on a database they name
 the statement without staging a row; on a Delta table `EXPLAIN` says how many
 files it would read and `EXPLAIN ANALYZE` how many rows it would update.
+
+## Files
+
+```sql ignore
+INSERT INTO 'vendas.csv' WITH (delimiter = ';', encoding = 'latin1') SELECT * FROM erp.dbo.vendas WHERE dia = $dia;
+DELETE FROM 's3://lake/clientes.parquet' WHERE ativo = false;
+UPDATE 'precos.xlsx' WITH (sheet = 'Tabela') SET preco = preco * 1.05 WHERE categoria = 'A';
+UPDATE 'clientes.ndjson' c SET email = n.email FROM 'novos.csv' n WHERE c.id = n.id;
+```
+
+A single file takes the three statements too: a CSV (or TSV), NDJSON or JSON
+array, Parquet, Avro or Arrow file, or one sheet of an Excel workbook, gzipped
+or not, local or on S3, Azure, SFTP or SMB. Its read options follow its name, as
+in a `SELECT`: `delimiter`, `encoding`, `sheet`, `format`. The `WHERE`, its
+subqueries and an `UPDATE`'s `FROM` are those of a table's statement, evaluated
+by basalt as on a Delta table, and a row two `FROM` rows match is an error here
+too.
+
+A `DELETE` or `UPDATE` writes the file again whole and puts it in place of the
+old one in one step, a local file's new copy renamed over it and a remote one's
+written in one upload, so a reader sees the old file or the new one, never a
+mix, and a run that fails leaves the file as it was. Rows keep their order, and
+nothing is written when no row changes. What the new file keeps depends on the
+format:
+
+- A CSV or NDJSON file is copied byte for byte. Every record the statement does
+  not change stays exactly as it was, with its quoting and line ending, and so do
+  a byte order mark, blank lines and the file's text encoding. A deleted record
+  goes with its line ending. An updated CSV record is written as `LOAD INTO`
+  writes a row, in the file's delimiter and encoding; an updated NDJSON object
+  keeps its other keys as they were and changes only the ones set.
+- An Excel workbook keeps every part but the sheet as it was: the other sheets,
+  the shared strings, the styles. In the sheet each row kept is copied as it
+  is, moved up past the rows deleted above it, and an updated row is written as
+  `LOAD INTO` writes one, losing its cells' own formatting. A sheet whose rows
+  something names by place is refused, as moving them would leave it pointing
+  at other cells: a formula, merged cells, conditional formats, data
+  validations, hyperlinks, tables, drawings or comments in it, or a formula or
+  defined name elsewhere in the workbook naming it. So is a sheet read through
+  `range`, only part of one.
+- Any other format is read and written again as `LOAD INTO` writes it, the
+  updated rows in their places; a JSON array stays an array.
+
+`INSERT` adds rows to a file that exists; one that does not is an error, and
+`LOAD INTO` makes it. The rows' columns are matched to the file's by name: a
+column the rows lack is left empty, one the file lacks is an error, and the
+file's own columns do not change. A local CSV or NDJSON file takes the rows at
+its end, in place: a CSV's in its own delimiter, encoding and line ending, a
+gzipped one's as a gzip member of their own, which gzip readers read on into.
+If the write fails, the file is cut back to where it ended. A file whose last
+byte is not a line break is refused, as its last line may be one a failed write
+cut short. A remote CSV or NDJSON file is written again whole, the new rows
+after its own; an Excel sheet takes them after its last row, its workbook
+otherwise as it was; any other format is written again whole, its rows first,
+each new value cast to its column's type.
+
+A local file whose size, modification time or inode changed between the read
+and the swap, another writer's doing, is not replaced: the run fails saying so,
+and running it again starts from the new file. On S3 and Azure the upload is
+sent with `If-Match` on the ETag read first, so the store refuses it in the
+same case. SFTP and SMB have no such check, so two runs changing one file there
+at once can lose one's changes. A local symbolic link, a file with other hard
+links or one that is not a regular file is refused, as the rewrite would put a
+file of its own in their place.
+
+What a rewrite would lose is refused: an XML file (basalt writes XML in its
+own shape), a `records` file, a JSON document read through `items`, a file
+inside an archive (`'a.zip :: b.csv'`), a zstd file and a file read over HTTP
+or FTP.
+`EXPLAIN` says how the file would be written, and `EXPLAIN ANALYZE` how many
+rows would change, writing nothing.
