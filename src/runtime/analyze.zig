@@ -77,6 +77,7 @@ const splitMayCut = @import("connect/sql_read.zig").splitMayCut;
 const connect = @import("connect.zig");
 const csv = @import("../format/csv.zig");
 const translate = @import("pushdown/translate.zig");
+const update_rules = @import("analyze/update.zig");
 
 pub const Diag = struct {
     buf: [512]u8 = undefined,
@@ -1190,7 +1191,7 @@ fn writtenFiles(arena: std.mem.Allocator, stmts: []const ast.Stmt, out: *std.arr
 fn writtenFile(p: ast.Pipeline, out: *std.array_list.Managed([]const u8)) Error!void {
     if (p.stages.len == 0) return;
     const last = p.stages[p.stages.len - 1];
-    if (last.node != .write or !std.mem.eql(u8, last.node.write.connector, "csv") or last.node.write.delete != null) return;
+    if (last.node != .write or !std.mem.eql(u8, last.node.write.connector, "csv") or last.node.write.delete != null or last.node.write.update != null) return;
     try out.append(last.node.write.target);
 }
 
@@ -1491,6 +1492,20 @@ const Ctx = struct {
             self.diag.stamp(stages[stages.len - 1].pos);
             return fail(self.diag, "{s}", .{why});
         };
+        if (w.update) |u| {
+            if (try updateProblem(self.arena, w, stages[1 .. stages.len - 1], self.connections, self.params, source.schema, true)) |why| {
+                self.diag.stamp(stages[stages.len - 1].pos);
+                return fail(self.diag, "{s}", .{why});
+            }
+            if (cur) |c| {
+                const items = try self.arena.alloc(ast.SelectItem, u.sets.len);
+                for (items, u.sets) |*it, st| it.* = .{ .computed = .{ .name = st.column, .expr = @constCast(try dmlOwn(self.arena, w, st.expr)) } };
+                for (u.sets, 0..) |st, i| {
+                    errdefer self.diag.stamp(st.pos);
+                    _ = try self.propagate(c, .{ .node = .{ .select = items[i .. i + 1] }, .hints = &.{}, .pos = st.pos });
+                }
+            }
+        }
         const sink = self.resolveSink(w, stages[stages.len - 1].hints) catch |e| {
             self.diag.stamp(stages[stages.len - 1].pos);
             return e;
@@ -1632,7 +1647,7 @@ const Ctx = struct {
     /// cannot write or rows that do not fit it; its label, or null when the target
     /// is remote, templated, or no Delta table.
     fn offlineDelta(self: *Ctx, w: ast.Write, hints: []const ast.Hint, schema_in: ?types.Schema) !?[]const u8 {
-        if (w.delete != null or !deltaTarget(w, hints) or std.mem.indexOf(u8, w.target, "://") != null or std.mem.indexOf(u8, w.target, "${") != null) return null;
+        if (w.delete != null or w.update != null or !deltaTarget(w, hints) or std.mem.indexOf(u8, w.target, "://") != null or std.mem.indexOf(u8, w.target, "${") != null) return null;
         const opts = try writeOptions(self.arena, w, hints, self.diag);
         const create = (formatFromHints(hints, self.diag) catch null) == .delta;
         const schema = if (schema_in) |s| (try insertColumns(self.arena, w, s)) orelse
@@ -1764,6 +1779,7 @@ const Ctx = struct {
     fn resolveSink(self: *Ctx, w: ast.Write, hints: []const ast.Hint) !Sink {
         if (std.mem.eql(u8, w.connector, "csv") or std.mem.eql(u8, w.connector, "stdout")) {
             if (w.delete != null) return .{ .connector = w.connector, .target = w.target, .mode = "delete", .format = "delta" };
+            if (w.update != null) return .{ .connector = w.connector, .target = w.target, .mode = "update", .format = "delta" };
             try checkFileSink(w, hints, self.diag);
             try checkSinkForm(w, hints, w.connector, self.diag);
             if (deltaTarget(w, hints))
@@ -2024,7 +2040,7 @@ pub const DeleteConds = union(enum) { sql: []const []const u8, unsendable: *cons
 /// that `params` does not bind. `offline`, a condition reading a value the analysis
 /// holds a NULL in place of (a query LET, an `env()`, a loop variable) is skipped.
 pub fn deleteConds(arena: std.mem.Allocator, w: ast.Write, stages: []const ast.Stage, d: sql.Dialect, params: *const ParamMap, offline: bool) !DeleteConds {
-    const table = deleteTable(w.target);
+    const table = dmlTable(w.target);
     var out = std.array_list.Managed([]const u8).init(arena);
     for (stages) |st| if (st.node == .filter) {
         if (offline and try readsRunValue(arena, st.node.filter, params)) continue;
@@ -2040,7 +2056,7 @@ pub fn deleteConds(arena: std.mem.Allocator, w: ast.Write, stages: []const ast.S
 }
 
 /// Whether `e` reads a `$` the analysis binds to a stand-in holding a NULL.
-fn readsRunValue(arena: std.mem.Allocator, e: *const ast.Expr, params: *const ParamMap) !bool {
+pub fn readsRunValue(arena: std.mem.Allocator, e: *const ast.Expr, params: *const ParamMap) !bool {
     const nul = struct {
         fn f(_: void, n: *const ast.Expr) ?bool {
             return if (n.* == .null_lit) true else null;
@@ -2050,14 +2066,15 @@ fn readsRunValue(arena: std.mem.Allocator, e: *const ast.Expr, params: *const Pa
     return false;
 }
 
-/// Condition `e` of DELETE `w` naming the table's columns bare, as its alias or
-/// name drops from them.
-pub fn deleteOwn(arena: std.mem.Allocator, w: ast.Write, e: *const ast.Expr) !*const ast.Expr {
-    return stripTableRef(arena, @constCast(e), w.delete.?.alias, deleteTable(w.target));
+/// Expression `e` of DELETE or UPDATE `w` naming the table's columns bare, as its
+/// alias or name drops from them.
+pub fn dmlOwn(arena: std.mem.Allocator, w: ast.Write, e: *const ast.Expr) !*const ast.Expr {
+    const alias = if (w.delete) |d| d.alias else if (w.update) |u| u.alias else "";
+    return stripTableRef(arena, @constCast(e), alias, dmlTable(w.target));
 }
 
-/// The table a DELETE's target names, its schema and database left off.
-pub fn deleteTable(target: []const u8) []const u8 {
+/// The table a DELETE's or UPDATE's target names, its schema and database left off.
+pub fn dmlTable(target: []const u8) []const u8 {
     return if (std.mem.lastIndexOfScalar(u8, target, '.')) |i| target[i + 1 ..] else target;
 }
 
@@ -2082,6 +2099,28 @@ fn exprText(arena: std.mem.Allocator, e: *const ast.Expr) ![]const u8 {
     var aw = std.Io.Writer.Allocating.init(arena);
     @import("../lang/print.zig").expr(&aw.writer, e) catch return error.OutOfMemory;
     return aw.written();
+}
+
+/// Why an `UPDATE` cannot run, from its table, the stages between its table read and
+/// its write, and the table's columns when known (`table_schema`): a table that is
+/// neither a database's nor a Delta folder, a SET of a column it lacks, or, on a
+/// database, an expression its one statement cannot carry. `offline` (the analysis)
+/// leaves an expression reading a value only the run knows to the run.
+pub fn updateProblem(arena: std.mem.Allocator, w: ast.Write, stages: []const ast.Stage, connections: *const std.StringHashMap(ast.Connection), params: *const ParamMap, table_schema: ?types.Schema, offline: bool) !?[]const u8 {
+    const u = w.update.?;
+    var why: []const u8 = "";
+    const sh = (try update_rules.shapeOf(arena, u, stages, &why)) orelse return why;
+    if (table_schema) |ts| if (ts.fields.len > 0) for (u.sets) |st| if (update_rules.column(ts, st.column) == null)
+        return try msgfmt.allocPrint(arena, "`UPDATE` sets column `{s}`, which {s} lacks", .{ st.column, w.target });
+    if (connections.get(w.connector)) |conn| {
+        const info = connect.sqlConnInfo(conn) orelse return "`UPDATE` changes a database table (postgres, mysql, sqlserver) or a Delta table's folder";
+        if (info.dialect == .starrocks or info.dialect == .doris) return "`UPDATE` of a StarRocks or Doris table is not supported yet";
+        return switch (try update_rules.build(arena, u, dmlTable(w.target), sh, info.dialect, params, offline)) {
+            .sql, .unbound => null,
+            .unsendable => |e| try msgfmt.allocPrint(arena, "UPDATE {s}: `{s}` cannot be sent to {s} as written; it runs in the database, so it takes the table's columns, the FROM source's, constants and the functions {s} has", .{ w.target, try exprText(arena, e), @tagName(info.dialect), @tagName(info.dialect) }),
+        };
+    } else if (!folder.isFolder(w.target)) return "`UPDATE` changes a database table or a Delta table's folder (`'path/'`), not a file";
+    return null;
 }
 
 /// Why a DELETE's conditions cannot run as one statement: anything but conditions on

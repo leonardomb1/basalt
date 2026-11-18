@@ -278,6 +278,37 @@ INSERT INTO db.$t SELECT range + 1 AS id, CASE WHEN (range + 1) % 3 = 0 THEN 'eu
   $B run -q -c "$decl CALL execute_on('db', \$\$DROP TABLE it_del\$\$);" >/dev/null 2>&1 || true
 }
 
+# UPDATE: SET sent as SQL with a LET bound, a FROM file staged and joined on its
+# key with a condition on the table, an IN subquery, a FROM key on two rows
+# refused with nothing changed, and no staging table left behind.
+updrt() { # $1 label, $2 CREATE CONNECTION db ..., $3 the table as the connection names it
+  local decl=$2 t=$3 got bad=0 w
+  printf 'id,v\n1,x\n2,y\n9,z\n' >"$out/upd_src.csv"
+  printf 'id,v\n1,x\n1,y\n' >"$out/upd_dup.csv"
+  printf 'id\n5\n6\n' >"$out/upd_in.csv"
+  urows() { $B run --format csv -q -c "$decl SELECT id, grp, amt FROM db.$t ORDER BY id;" 2>&1 | tr '\n' ' ' || true; }
+  if ! brun run -c "$decl
+CALL execute_on('db', \$\$DROP TABLE IF EXISTS it_upd; CREATE TABLE it_upd (id INT, grp VARCHAR(5), amt INT)\$\$);
+INSERT INTO db.$t SELECT range + 1 AS id, CASE WHEN range % 2 = 0 THEN 'a' ELSE 'b' END AS grp, range * 10 AS amt FROM range(6);"; then report "$1-update (setup error)" bad; return; fi
+  $B run -q -c "$decl LET inc = 5; UPDATE db.$t SET amt = amt + \$inc WHERE grp = 'a';" >/dev/null 2>&1 || bad=1
+  $B run -q -c "$decl UPDATE db.$t x SET amt = s.id * 100, grp = s.v FROM '$out/upd_src.csv' s WHERE x.id = s.id AND x.amt < 1000;" >/dev/null 2>&1 || bad=1
+  $B run -q -c "$decl UPDATE db.$t SET amt = amt - 1 WHERE id IN (SELECT id FROM '$out/upd_in.csv');" >/dev/null 2>&1 || bad=1
+  got=$(urows)
+  [ "$got" = "id,grp,amt 1,x,100 2,y,200 3,a,25 4,b,30 5,a,44 6,b,49 " ] || { echo "  rows: $got"; bad=1; }
+  w=$($B run -c "$decl UPDATE db.$t x SET amt = 0 FROM '$out/upd_dup.csv' s WHERE x.id = s.id;" 2>&1 || true)
+  echo "$w" | grep -q "holds 1 key on more than one row" || { echo "  dup: $w"; bad=1; }
+  got=$(urows)
+  [ "$got" = "id,grp,amt 1,x,100 2,y,200 3,a,25 4,b,30 5,a,44 6,b,49 " ] || { echo "  after dup: $got"; bad=1; }
+  got=$($B run --format csv -q -c "$decl SELECT count(*) AS n FROM db.QUERY(\$\$SELECT table_name FROM information_schema.tables WHERE table_name LIKE '_basalt_stage_it_upd%'\$\$);" 2>&1 | tail -1 || true)
+  [ "$got" = 0 ] || { echo "  staging left: $got"; bad=1; }
+  if [ $bad = 0 ]; then report "$1-update" ok; else report "$1-update" bad; fi
+  $B run -q -c "$decl CALL execute_on('db', \$\$DROP TABLE it_upd\$\$);" >/dev/null 2>&1 || true
+}
+
+runs mysql     && updrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"     it.it_upd
+runs postgres  && updrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"     public.it_upd
+runs sqlserver && updrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" dbo.it_upd
+
 runs mysql     && delrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"     it.it_del
 runs postgres  && delrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"     public.it_del
 runs sqlserver && delrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" dbo.it_del

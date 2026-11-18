@@ -377,9 +377,9 @@ pub const Plan = struct {
     in_fields: []const types.Schema.Field = &.{},
     new_meta: bool = false,
     optimize: bool = false,
-    /// A DELETE's conditions as its commit records them, its files' removes set
-    /// in the sink's `deleting`.
-    delete: ?[]const u8 = null,
+    /// A DELETE's or UPDATE's operation and conditions as its commit records them,
+    /// its files' removes set in the sink's `dml`.
+    dml: ?struct { op: []const u8, predicate: []const u8 } = null,
     field_ids: ?*const std.StringHashMapUnmanaged(i32) = null,
     max_column_id: ?i64 = null,
     row: ?RowPlan = null,
@@ -961,7 +961,7 @@ const Open = struct {
     cdc: bool = false,
 };
 
-pub const Deleting = struct { removed: []const delta.Add, read_set: []const []const u8, readds: []const merge.ReAdd = &.{} };
+pub const Dml = struct { removed: []const delta.Add, read_set: []const []const u8, readds: []const merge.ReAdd = &.{} };
 
 pub const Sink = struct {
     gpa: std.mem.Allocator,
@@ -995,9 +995,9 @@ pub const Sink = struct {
     row_counts: std.ArrayListUnmanaged(u64) = .empty,
     ict: ?i64 = null,
     compacting: ?[]const delta.Add = null,
-    /// A DELETE's files to remove, the ones it read, and those it adds again with a
-    /// deletion vector.
-    deleting: ?Deleting = null,
+    /// A DELETE's or UPDATE's files to remove, the ones it read, and those it adds
+    /// again with a deletion vector.
+    dml: ?Dml = null,
     warn: ?merge.Warn = null,
     /// Set once `close` or `abort` has freed everything, so an `abort` after a
     /// failed `close` does nothing.
@@ -1049,7 +1049,7 @@ pub const Sink = struct {
         }
         self.file_schema = .{ .fields = fields };
         self.phys = phys;
-        if (p.mode == .upsert or p.delete != null) if (p.snap) |st| if (st.property("delta.enableChangeDataFeed")) |v| if (textconv.boolText(.delta_property, v) orelse false) {
+        if (p.mode == .upsert or p.dml != null) if (p.snap) |st| if (st.property("delta.enableChangeDataFeed")) |v| if (textconv.boolText(.delta_property, v) orelse false) {
             const cf = try a.alloc(types.Schema.Field, p.data.len + 1);
             @memcpy(cf[0..p.data.len], fields[0..p.data.len]);
             cf[p.data.len] = .{ .name = fit.change_type_name, .ty = types.Type.init(.string).asNullable() };
@@ -1089,11 +1089,11 @@ pub const Sink = struct {
             },
             else => if (p.optimize) {
                 try w.print("{{\"commitInfo\":{{\"timestamp\":{d},\"operation\":\"OPTIMIZE\",\"operationParameters\":{{\"predicate\":\"[]\"", .{now});
-            } else if (p.delete) |pred| {
-                try w.print("{{\"commitInfo\":{{\"timestamp\":{d},\"operation\":\"DELETE\",\"operationParameters\":{{\"predicate\":", .{now});
+            } else if (p.dml) |dml| {
+                try w.print("{{\"commitInfo\":{{\"timestamp\":{d},\"operation\":\"{s}\",\"operationParameters\":{{\"predicate\":", .{ now, dml.op });
                 var pa = std.Io.Writer.Allocating.init(a);
                 try pa.writer.writeByte('[');
-                if (pred.len > 0) try jsontext.string(&pa.writer, pred);
+                if (dml.predicate.len > 0) try jsontext.string(&pa.writer, dml.predicate);
                 try pa.writer.writeByte(']');
                 try jsontext.string(w, pa.written());
             } else {
@@ -1107,7 +1107,7 @@ pub const Sink = struct {
             self.ict = ict;
             try w.print(",\"inCommitTimestamp\":{d}", .{ict});
         };
-        try w.print(",\"isBlindAppend\":{s},\"engineInfo\":\"basalt/{s}\",\"txnId\":\"{s}\"}}}}\n", .{ if (p.mode == .append and p.snap != null and !p.optimize and p.delete == null) "true" else "false", @import("build_options").version, &self.txn });
+        try w.print(",\"isBlindAppend\":{s},\"engineInfo\":\"basalt/{s}\",\"txnId\":\"{s}\"}}}}\n", .{ if (p.mode == .append and p.snap != null and !p.optimize and p.dml == null) "true" else "false", @import("build_options").version, &self.txn });
         if (p.snap == null) {
             try w.writeAll("{\"protocol\":{\"minReaderVersion\":1,\"minWriterVersion\":2}}\n");
             try w.print("{{\"metaData\":{{\"id\":\"{s}\",\"format\":{{\"provider\":\"parquet\",\"options\":{{}}}},\"schemaString\":", .{&dlog.uuid()});
@@ -1449,13 +1449,13 @@ pub const Sink = struct {
             for (rs, files) |*r, f| r.* = f.raw;
             read_set = rs;
         }
-        if (self.deleting) |d| {
+        if (self.dml) |d| {
             removes = d.removed;
             read_set = d.read_set;
             readds = d.readds;
         }
         while (self.files.count() > 0) try self.finishFile(self.files.keys()[0]);
-        if (p.snap != null and self.n_added == 0 and ((p.mode == .append and self.compacting == null and self.deleting == null) or removes.len == 0)) return;
+        if (p.snap != null and self.n_added == 0 and ((p.mode == .append and self.compacting == null and self.dml == null) or removes.len == 0)) return;
         const now = std.time.milliTimestamp();
         const w = &self.adds.writer;
         for (removes) |f| {
@@ -1476,7 +1476,7 @@ pub const Sink = struct {
         for (self.dirs.keys()) |d| try dlog.syncDir(d);
         var ts = dlog.TableStore{ .root = p.root };
         self.committed = dlog.commit(a, ts.store(), p.name, .{
-            .kind = if (p.snap == null) .create else if (self.compacting != null or self.deleting != null) .upsert else switch (p.mode) {
+            .kind = if (p.snap == null) .create else if (self.compacting != null or self.dml != null) .upsert else switch (p.mode) {
                 .append => .append,
                 .replace => .replace,
                 .upsert => .upsert,

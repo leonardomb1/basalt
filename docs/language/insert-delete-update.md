@@ -99,3 +99,50 @@ deleted, and the run warns naming how many it returned. `WHERE col IS NOT NULL`
 in the subquery, or a `NOT EXISTS`, is the usual intent. The run log says how
 many rows were deleted. Nothing is deleted when the run fails before the last
 statement or commit.
+
+## UPDATE
+
+```sql ignore
+UPDATE pg.public.orders SET status = 'late' WHERE due < '2025-01-01' AND status = 'open';
+UPDATE pg.public.orders SET amount = amount * 1.1 WHERE id IN (SELECT order_id FROM 'repriced.csv');
+UPDATE pg.public.orders o
+   SET amount = p.total, status = p.status
+  FROM erp.dbo.pedidos p
+ WHERE o.id = p.id AND o.empresa = p.empresa AND p.dia = $dia;
+UPDATE 's3://lake/orders/' SET region = upper(region) WHERE region = 'eu';
+```
+
+`SET` gives each column it names a value computed from the row: the table's
+columns, the FROM source's, constants, `$param`s and `LET`s. A column the table
+lacks is an error, as is one set twice. The `WHERE` holds conditions and `IN`,
+`NOT IN`, `EXISTS` and `NOT EXISTS` subqueries, as a `DELETE`'s does; without one
+every row is updated.
+
+`FROM` names a source, of any kind, whose rows give the new values: the `WHERE`
+matches them to the table's by equalities between their columns, `o.id = p.id`,
+and may add conditions on either side. A row of the table that no source row
+matches is left as it is. A row two source rows match is an error, as it would
+take one of several values, and nothing is changed. A `WHERE` beside a `FROM`
+holds no subquery; join what it would read into the source instead.
+
+On a database the `SET` and `WHERE` go to the database as SQL, as a `DELETE`'s
+conditions do, so a value is computed and converted as the database computes and
+converts it (its arithmetic, its rounding into the column's type). The FROM
+source's columns that the statement reads load into a staging table of the run's
+own, as a `DELETE`'s subqueries do, and the statement joins the table to it: in
+PostgreSQL `UPDATE ... FROM`, in MySQL `UPDATE ... JOIN`, in SQL Server
+`UPDATE ... FROM ... JOIN`. The run log says how many rows the database reports
+it changed, which in MySQL leaves out a row set to the values it already had.
+
+On a Delta table basalt computes the new values, each cast to its column's type,
+and writes the changed rows to new files in the same commit that rewrites, or on
+a table taking deletion vectors marks, the files they came from, recorded as an
+`UPDATE`. A row whose partition column changes moves to its new partition. Files
+the conditions on the table's partition columns rule out are not read. A table
+keeping a change data feed gets each row's `update_preimage` and
+`update_postimage`. A table with a variant column is not an `UPDATE` target yet.
+
+`EXPLAIN` and `EXPLAIN ANALYZE` behave as for a `DELETE`: on a database they name
+the statement without staging a row; on a Delta table `EXPLAIN` says how many
+files it would read and `EXPLAIN ANALYZE` how many rows it would update.
+StarRocks and Doris tables are not `UPDATE` targets yet.

@@ -1440,5 +1440,76 @@ test "DELETE FROM a Delta table: a folder holding none, an append-only table and
         try std.mem.replaceOwned(u8, a, meta, "\"configuration\":{}", "\"configuration\":{\"delta.appendOnly\":\"true\"}"),
         "\n",
     }) });
-    try runRefuses(a, &tmp, "DELETE FROM '$B/t/' WHERE id = 1;", "is append-only (`delta.appendOnly`), so a DELETE cannot remove its rows");
+    try runRefuses(a, &tmp, "DELETE FROM '$B/t/' WHERE id = 1;", "is append-only (`delta.appendOnly`), so a DELETE cannot change its rows");
+}
+
+test "UPDATE a Delta table: SET over the row, a FROM source joined on its key, an IN subquery, a row moved to another partition; one UPDATE commit each" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "s.csv", .data = "id,v\n1,x\n2,y\n9,z\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "k.csv", .data = "id\n5\n6\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "dup.csv", .data = "id,v\n1,x\n1,y\n" });
+    for ([_]usize{ 1, 4 }) |threads| {
+        tmp.dir.deleteTree("t") catch {};
+        try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT range + 1 AS id, CASE WHEN range % 2 = 0 THEN 'a' ELSE 'b' END AS grp, range * 10 AS amt FROM range(6);", threads);
+        try load(&tmp, "LET inc = 5; UPDATE '$B/t/' SET amt = amt + $inc WHERE grp = 'a';", threads);
+        try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 1), "\"operation\":\"UPDATE\",\"operationParameters\":{\"predicate\":\"[\\\"grp = 'a'\\\"]\"}") != null);
+        try load(&tmp, "UPDATE '$B/t/' x SET amt = s.id * 100, grp = s.v FROM '$B/s.csv' s WHERE x.id = s.id AND x.amt < 1000;", threads);
+        try load(&tmp, "UPDATE '$B/t/' x SET amt = x.amt - 1 WHERE id IN (SELECT id FROM '$B/k.csv');", threads);
+        try testing.expectEqualStrings("id,grp,amt\n1,x,100\n2,y,200\n3,a,25\n4,b,30\n5,a,44\n6,b,49\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+        try runRefuses(a, &tmp, "UPDATE '$B/t/' x SET amt = 0 FROM '$B/dup.csv' s WHERE x.id = s.id;", "a row matches more than one row of the FROM source");
+        try testing.expect(!exists(&tmp, "t/_delta_log/00000000000000000004.json"));
+        try load(&tmp, "UPDATE '$B/t/' SET amt = 0 WHERE id > 99;", threads);
+        try testing.expect(!exists(&tmp, "t/_delta_log/00000000000000000004.json"));
+    }
+    try load(&tmp, "LOAD INTO '$B/p/' WITH (format = 'delta', partition_by = 'grp') AS SELECT range + 1 AS id, CASE WHEN range % 2 = 0 THEN 'a' ELSE 'b' END AS grp FROM range(4);", 1);
+    try load(&tmp, "UPDATE '$B/p/' SET grp = 'z' WHERE id = 3;", 1);
+    try testing.expectEqualStrings("id,grp\n1,a\n2,b\n3,z\n4,b\n", try rows(a, &tmp, "SELECT * FROM '$B/p/' ORDER BY id"));
+    try testing.expectEqualStrings("n\n1\n", try rows(a, &tmp, "SELECT count(*) AS n FROM '$B/p/' WHERE grp = 'a'"));
+}
+
+test "UPDATE a Delta table taking deletion vectors marks the old rows in them, and its change data feed has each row's pre- and postimage" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT range + 1 AS id, range * 10 AS amt FROM range(4);", 1);
+    const v0 = try logFile(a, &tmp, "t", 0);
+    var meta: []const u8 = "";
+    var lines = std.mem.splitScalar(u8, v0, '\n');
+    while (lines.next()) |l| if (std.mem.startsWith(u8, l, "{\"metaData\":")) {
+        meta = l;
+    };
+    try tmp.dir.writeFile(.{ .sub_path = "t/_delta_log/00000000000000000001.json", .data = try std.mem.concat(a, u8, &.{
+        "{\"commitInfo\":{\"timestamp\":1}}\n",
+        "{\"protocol\":{\"minReaderVersion\":3,\"minWriterVersion\":7,\"readerFeatures\":[\"deletionVectors\"],\"writerFeatures\":[\"deletionVectors\",\"changeDataFeed\"]}}\n",
+        try std.mem.replaceOwned(u8, a, meta, "\"configuration\":{}", "\"configuration\":{\"delta.enableDeletionVectors\":\"true\",\"delta.enableChangeDataFeed\":\"true\"}"),
+        "\n",
+    }) });
+    try load(&tmp, "UPDATE '$B/t/' SET amt = -amt WHERE id > 2;", 1);
+    const v2 = try logFile(a, &tmp, "t", 2);
+    try testing.expect(std.mem.indexOf(u8, v2, "\"cardinality\":2}") != null);
+    try testing.expectEqual(@as(usize, 2), try actions(a, &tmp, "t", 2, "add"));
+    try testing.expectEqualStrings("id,amt\n1,0\n2,10\n3,-20\n4,-30\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+    try testing.expectEqualStrings("id,amt,_change_type\n3,-20,update_postimage\n3,20,update_preimage\n4,-30,update_postimage\n4,30,update_preimage\n", try rows(a, &tmp, "SELECT id, amt, _change_type FROM '$B/t/' WITH (changes_from = 2) ORDER BY id, _change_type"));
+}
+
+test "UPDATE a Delta table: a SET of a column it lacks, a FROM matched by other than equalities and a subquery beside a FROM are refused" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "s.csv", .data = "id\n1\n" });
+    try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT 1 AS id, 2 AS amt;", 1);
+    try harness.expectRefusedAlike(gpa, &tmp, "UPDATE '$B/t/' SET nope = 1;", "`UPDATE` sets column `nope`");
+    try harness.expectRefusedAlike(gpa, &tmp, "UPDATE '$B/t/' SET amt = nope;", "unknown field `nope`");
+    try harness.expectRefusedAlike(gpa, &tmp, "UPDATE '$B/t/' x SET amt = 0 FROM '$B/s.csv' s WHERE x.id > s.id;", "matches the source's rows to the table's by equalities");
+    try parseRefuses(a, "UPDATE 't/' x SET amt = 0 FROM 's.csv' s WHERE x.id = s.id AND x.id IN (SELECT id FROM 's.csv');", "not IN or EXISTS subqueries");
+    try parseRefuses(a, "UPDATE 't/' SET amt = 0, amt = 1;", "sets column `amt` twice");
+    try parseRefuses(a, "UPDATE 't/' x SET amt = 0 FROM 's.csv' s;", "matches the source's rows to the table's in a WHERE");
 }

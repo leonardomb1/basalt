@@ -521,10 +521,24 @@ pub const Write = struct {
     /// (the table read, its conditions, the IN and EXISTS subqueries as semi and anti
     /// joins), run as a delete on the table rather than read.
     delete: ?Delete = null,
+    /// Set for an `UPDATE`: the stages before the write are the rows to change (the
+    /// table read, joined to its FROM source when it has one, its conditions and
+    /// subqueries), each given the values `sets` computes from it.
+    update: ?Update = null,
 };
 
 /// A `DELETE`'s table as its conditions name it: `t` in `DELETE FROM pg.public.orders t`.
 pub const Delete = struct { alias: []const u8 };
+
+/// An `UPDATE`'s table as its expressions name it, the alias its FROM source goes
+/// by (null with no FROM), and each column it sets with the expression giving it.
+pub const Update = struct {
+    alias: []const u8,
+    from: ?[]const u8 = null,
+    sets: []const Set,
+
+    pub const Set = struct { column: []const u8, expr: *Expr, pos: Pos };
+};
 
 /// An `INSERT`'s column list: the names the query's columns take, in order; none
 /// when the query's own names are the table's.

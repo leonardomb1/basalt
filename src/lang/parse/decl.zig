@@ -164,7 +164,9 @@ pub fn parseFunction(self: *Parser, pos: Pos, replace: bool) Error!ast.FnDecl {
 fn atStmtStart(self: *Parser) bool {
     for ([_][]const u8{ "load", "for", "call", "print", "throw", "select", "with", "explain" }) |kw|
         if (self.isKw(kw)) return true;
-    return false;
+    if (self.isKw("insert") and self.peekKw("into")) return true;
+    if (self.isKw("delete") and self.peekKw("from")) return true;
+    return self.isKw("update") and (self.peekTag() == .string or self.peekTag() == .ident);
 }
 
 pub fn parseFnParam(self: *Parser) Error!ast.FnParam {

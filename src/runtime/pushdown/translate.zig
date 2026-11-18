@@ -181,6 +181,25 @@ pub fn wantsFacts(arena: std.mem.Allocator, dialect: Dialect, stages: []const as
 
 /// `translatePred` at `need = superset` with no catalog facts, as EXPLAIN and the
 /// tests use.
+/// The SQL of arithmetic operator `op`, sent as written where the database decides
+/// (`need = .source`); null for any other operator.
+fn arithSymbol(op: ast.BinOp) ?[]const u8 {
+    return switch (op) {
+        .add => "+",
+        .sub => "-",
+        .mul => "*",
+        .div => "/",
+        .mod => "%",
+        else => null,
+    };
+}
+
+/// `e` as a value in `dialect`'s SQL, null when some piece does not translate.
+pub fn translateValue(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dialect, opts: Opts) error{OutOfMemory}!?[]const u8 {
+    const tx = Tx{ .arena = arena, .dialect = dialect, .o = opts };
+    return tx.value(try folded(arena, e));
+}
+
 pub fn translateExpr(arena: std.mem.Allocator, e: *const ast.Expr, dialect: Dialect, schema: types.Schema, check_fields: bool) error{OutOfMemory}!?[]const u8 {
     return translatePred(arena, e, dialect, .{ .schema = schema, .check_fields = check_fields });
 }
@@ -457,6 +476,18 @@ const Tx = struct {
                 return try self.fmt("(CASE WHEN {s} THEN {s} ELSE {s} END)", .{ cnd, t, f });
             },
             .match => |m| return self.match(m),
+            .binary => |b| if (self.o.need == .source) if (arithSymbol(b.op)) |sym| {
+                const l = (try self.value(b.l)) orelse return null;
+                const r = (try self.value(b.r)) orelse return null;
+                return try self.fmt("({s} {s} {s})", .{ l, sym, r });
+            },
+            .unary => |u| if (self.o.need == .source and u.op == .neg) {
+                const v = (try self.value(u.e)) orelse return null;
+                return try self.fmt("(-{s})", .{v});
+            },
+            else => {},
+        }
+        switch (e.*) {
             .unary, .binary, .is_null => return if (self.dialect.hasBoolean()) self.pred(e, .exact) else null,
             else => return null,
         }

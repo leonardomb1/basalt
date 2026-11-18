@@ -186,6 +186,129 @@ pub fn parseDeleteFrom(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Er
     try out.append(.{ .output = .{ .stages = try all.toOwnedSlice(), .pos = pos } });
 }
 
+/// `UPDATE <table> [alias] SET col = expr, ... [FROM <source> [alias]] [WHERE ...]`,
+/// read as `SELECT * FROM <table> [alias] [JOIN <source> [alias] ON <where>]
+/// [WHERE ...]`: the rows to change, a write setting the columns. Under FROM the
+/// WHERE joins the source to the table, so it holds no subquery.
+pub fn parseUpdate(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
+    const pos = self.curPos();
+    const start = self.i;
+    const upd = self.cur();
+    var j = start + 1;
+    var depth: usize = 0;
+    const set_at = while (j < self.toks.len) : (j += 1) {
+        const t = self.toks[j];
+        switch (t.tag) {
+            .lparen => depth += 1,
+            .rparen => depth -|= 1,
+            .semi, .eof => return self.fail(pos, "`UPDATE` takes `table SET column = value, ...`", .{}),
+            .ident => if (depth == 0 and std.ascii.eqlIgnoreCase(t.text, "set")) break j,
+            else => {},
+        }
+    } else return self.fail(pos, "`UPDATE` takes `table SET column = value, ...`", .{});
+    if (set_at == start + 1) return self.fail(pos, "`UPDATE` takes `table SET column = value, ...`", .{});
+
+    self.i = set_at + 1;
+    var sets = std.array_list.Managed(ast.Update.Set).init(self.arena);
+    while (true) {
+        const cpos = self.curPos();
+        var col = try self.expectIdent();
+        if (self.eat(.dot)) col = try self.expectIdent();
+        for (sets.items) |x| if (std.ascii.eqlIgnoreCase(x.column, col))
+            return self.fail(cpos, "`UPDATE` sets column `{s}` twice", .{col});
+        _ = try self.expect(.assign);
+        try sets.append(.{ .column = col, .expr = try self.parseExpr(), .pos = cpos });
+        if (!self.eat(.comma)) break;
+    }
+
+    var from_at: ?usize = null;
+    var where_at: ?usize = null;
+    var end = self.i;
+    depth = 0;
+    while (end < self.toks.len) : (end += 1) {
+        const t = self.toks[end];
+        switch (t.tag) {
+            .lparen => depth += 1,
+            .rparen => depth -|= 1,
+            .semi, .eof => if (depth == 0) break,
+            .ident => if (depth == 0) {
+                if (from_at == null and where_at == null and end == self.i and std.ascii.eqlIgnoreCase(t.text, "from")) from_at = end;
+                if (where_at == null and std.ascii.eqlIgnoreCase(t.text, "where")) where_at = end;
+            },
+            else => {},
+        }
+    }
+    if (from_at == null and where_at == null and end != self.i)
+        return self.fail(self.curPos(), "`UPDATE ... SET` is followed by `FROM`, `WHERE` or the statement's end, found {s}", .{self.curTag().describe()});
+    if (from_at) |f| {
+        const fp = ast.Pos{ .line = self.toks[f].line, .col = self.toks[f].col, .file = self.toks[f].file };
+        if (where_at == null) return self.fail(fp, "`UPDATE ... FROM` matches the source's rows to the table's in a WHERE, `WHERE t.id = s.id`", .{});
+        if (where_at.? == f + 1) return self.fail(fp, "`UPDATE ... FROM` names its source before the WHERE", .{});
+        var k = where_at.? + 1;
+        while (k < end) : (k += 1) {
+            const t = self.toks[k];
+            const sub = t.tag == .ident and (std.ascii.eqlIgnoreCase(t.text, "exists") or std.ascii.eqlIgnoreCase(t.text, "in")) and k + 2 < end and self.toks[k + 1].tag == .lparen and self.toks[k + 2].tag == .ident and std.ascii.eqlIgnoreCase(self.toks[k + 2].text, "select");
+            if (sub) return self.fail(.{ .line = t.line, .col = t.col, .file = t.file }, "`UPDATE ... FROM` takes conditions and the source's match in its WHERE, not IN or EXISTS subqueries; join the subquery's rows into the FROM source", .{});
+        }
+    }
+
+    var toks = std.array_list.Managed(@TypeOf(upd)).init(self.arena);
+    try toks.appendSlice(self.toks[0..start]);
+    try toks.append(tokenAs(upd, .ident, "select"));
+    try toks.append(tokenAs(upd, .star, "*"));
+    try toks.append(tokenAs(upd, .ident, "from"));
+    try toks.appendSlice(self.toks[start + 1 .. set_at]);
+    if (from_at) |f| {
+        try toks.append(tokenAs(self.toks[f], .ident, "join"));
+        try toks.appendSlice(self.toks[f + 1 .. where_at.?]);
+        try toks.append(tokenAs(self.toks[where_at.?], .ident, "on"));
+        try toks.appendSlice(self.toks[where_at.? + 1 ..]);
+    } else try toks.appendSlice(self.toks[self.i..]);
+    self.toks = try toks.toOwnedSlice();
+    self.i = start;
+
+    if (self.query_depth >= max_query_depth)
+        return self.fail(pos, "queries nest more than {d} levels deep", .{max_query_depth});
+    self.query_depth += 1;
+    defer self.query_depth -= 1;
+    var uses = @import("textcols.zig").ColUses{ .parent = self.col_uses };
+    self.col_uses = &uses;
+    defer self.col_uses = uses.parent;
+    self.top_names = .load;
+    const core = try self.parseSelectCore();
+    if (self.pending_bindings.items.len > 0) {
+        try out.appendSlice(self.pending_bindings.items);
+        self.pending_bindings.clearRetainingCapacity();
+    }
+    if (core.group != null)
+        return self.fail(pos, "`UPDATE` takes a table, SET, FROM and WHERE, not GROUP BY or HAVING", .{});
+    const stages = core.stages;
+    if (stages.len == 0 or stages[0].node != .read)
+        return self.fail(pos, "`UPDATE` takes a table: `conn.schema.table` or a Delta table's folder", .{});
+    const rd = stages[0].node.read;
+    const target: []const u8 = switch (rd.form) {
+        .table => |q| try std.mem.join(self.arena, ".", q.parts),
+        .path => |p| p,
+        else => return self.fail(pos, "`UPDATE` takes a table: `conn.schema.table` or a Delta table's folder", .{}),
+    };
+    const alias: []const u8 = if (core.aliases.n > 0) core.aliases.names[0] else "";
+    const from: ?[]const u8 = if (from_at == null) null else if (core.aliases.n > 1) core.aliases.names[1] else "";
+    const write = ast.Write{ .connector = rd.connector, .form = null, .target = target, .mode = .default, .update = .{ .alias = alias, .from = from, .sets = try sets.toOwnedSlice() } };
+    var all = std.array_list.Managed(ast.Stage).init(self.arena);
+    try all.appendSlice(stages);
+    try all.append(.{ .node = .{ .write = write }, .hints = &.{}, .pos = pos });
+    try self.endStmt();
+    try out.append(.{ .output = .{ .stages = try all.toOwnedSlice(), .pos = pos } });
+}
+
+/// A token made in place of `at`, at its position, for a statement read as another.
+fn tokenAs(at: anytype, tag: @TypeOf(at.tag), text: []const u8) @TypeOf(at) {
+    var t = at;
+    t.tag = tag;
+    t.text = text;
+    return t;
+}
+
 /// A write's target, after `LOAD INTO` or `INSERT INTO` (`what`, for messages): a
 /// quoted path, `IDENTIFIER(<expr>)` ending in a literal extension, or
 /// `conn.[schema.]table`.

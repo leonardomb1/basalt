@@ -39,7 +39,8 @@ pub fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats
     defer env.endStatement(false);
     if (e.mode == .describe) return runDescribe(env, e.pipeline, stats);
     const ps = e.pipeline.stages;
-    if (e.mode == .analyze or (ps.len > 0 and ps[ps.len - 1].node == .write and ps[ps.len - 1].node.write.delete != null)) {
+    const dml = ps.len > 0 and ps[ps.len - 1].node == .write and (ps[ps.len - 1].node.write.delete != null or ps[ps.len - 1].node.write.update != null);
+    if (e.mode == .analyze or dml) {
         const outer = env.explain;
         env.explain = true;
         defer env.explain = outer;

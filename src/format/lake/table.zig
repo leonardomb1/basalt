@@ -400,7 +400,7 @@ test {
     _ = @import("delta_dv.zig");
     _ = @import("delta_log.zig");
     _ = @import("delta_merge.zig");
-    _ = @import("delta_delete.zig");
+    _ = @import("delta_dml.zig");
     _ = @import("delta_types.zig");
     _ = @import("delta_write.zig");
     _ = @import("roaring.zig");
