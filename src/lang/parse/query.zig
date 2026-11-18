@@ -134,6 +134,58 @@ pub fn parseInsertInto(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Er
     try out.append(.{ .output = .{ .stages = try stages.toOwnedSlice(), .pos = pos } });
 }
 
+/// `DELETE FROM table [[AS] alias] [WHERE <condition>]`: read as the query `SELECT *
+/// FROM table [alias] WHERE <condition>`, the rows it deletes, so its IN, EXISTS and
+/// correlated subqueries lower as a SELECT's do; the write ending the pipeline names
+/// the table, whose rows are then deleted rather than read.
+pub fn parseDeleteFrom(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
+    const pos = self.curPos();
+    const del = self.cur();
+    const toks = try self.arena.alloc(@TypeOf(del), self.toks.len + 1);
+    @memcpy(toks[0..self.i], self.toks[0..self.i]);
+    toks[self.i] = del;
+    toks[self.i].text = "select";
+    toks[self.i + 1] = del;
+    toks[self.i + 1].tag = .star;
+    toks[self.i + 1].text = "*";
+    @memcpy(toks[self.i + 2 ..], self.toks[self.i + 1 ..]);
+    self.toks = toks;
+    _ = self.advance();
+    if (!self.peekKw("from")) return self.fail(pos, "`DELETE` is followed by `FROM table`", .{});
+    self.i -= 1;
+    if (self.query_depth >= max_query_depth)
+        return self.fail(pos, "queries nest more than {d} levels deep", .{max_query_depth});
+    self.query_depth += 1;
+    defer self.query_depth -= 1;
+    var uses = @import("textcols.zig").ColUses{ .parent = self.col_uses };
+    self.col_uses = &uses;
+    defer self.col_uses = uses.parent;
+    self.top_names = .load;
+    const core = try self.parseSelectCore();
+    if (self.pending_bindings.items.len > 0) {
+        try out.appendSlice(self.pending_bindings.items);
+        self.pending_bindings.clearRetainingCapacity();
+    }
+    if (core.group != null)
+        return self.fail(pos, "`DELETE FROM` takes a table and a WHERE, not GROUP BY or HAVING", .{});
+    const stages = core.stages;
+    if (stages.len == 0 or stages[0].node != .read)
+        return self.fail(pos, "`DELETE FROM` takes a table: `conn.schema.table` or a Delta table's folder", .{});
+    const rd = stages[0].node.read;
+    const target: []const u8 = switch (rd.form) {
+        .table => |q| try std.mem.join(self.arena, ".", q.parts),
+        .path => |p| p,
+        else => return self.fail(pos, "`DELETE FROM` takes a table: `conn.schema.table` or a Delta table's folder", .{}),
+    };
+    const alias: []const u8 = if (core.aliases.n > 0) core.aliases.names[0] else "";
+    const write = ast.Write{ .connector = rd.connector, .form = null, .target = target, .mode = .default, .delete = .{ .alias = alias } };
+    var all = std.array_list.Managed(ast.Stage).init(self.arena);
+    try all.appendSlice(stages);
+    try all.append(.{ .node = .{ .write = write }, .hints = &.{}, .pos = pos });
+    try self.endStmt();
+    try out.append(.{ .output = .{ .stages = try all.toOwnedSlice(), .pos = pos } });
+}
+
 /// A write's target, after `LOAD INTO` or `INSERT INTO` (`what`, for messages): a
 /// quoted path, `IDENTIFIER(<expr>)` ending in a literal extension, or
 /// `conn.[schema.]table`.

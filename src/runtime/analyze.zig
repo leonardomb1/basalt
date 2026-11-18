@@ -76,6 +76,7 @@ const pathmod = @import("path.zig");
 const splitMayCut = @import("connect/sql_read.zig").splitMayCut;
 const connect = @import("connect.zig");
 const csv = @import("../format/csv.zig");
+const translate = @import("pushdown/translate.zig");
 
 pub const Diag = struct {
     buf: [512]u8 = undefined,
@@ -1486,6 +1487,10 @@ const Ctx = struct {
         }
 
         const w = stages[stages.len - 1].node.write;
+        if (w.delete != null) if (try deleteProblem(self.arena, w, stages[1 .. stages.len - 1], self.connections, self.params, true)) |why| {
+            self.diag.stamp(stages[stages.len - 1].pos);
+            return fail(self.diag, "{s}", .{why});
+        };
         const sink = self.resolveSink(w, stages[stages.len - 1].hints) catch |e| {
             self.diag.stamp(stages[stages.len - 1].pos);
             return e;
@@ -1991,6 +1996,103 @@ const Ctx = struct {
         return buf.toOwnedSlice();
     }
 };
+
+/// Why a `DELETE FROM` cannot run, from its table and the stages between its table
+/// read and its write: a table that is neither a database's nor a Delta folder, or a
+/// condition its one statement cannot carry. Null when it can run. `offline` (the
+/// analysis) leaves a condition reading a value only the run knows to the run.
+pub fn deleteProblem(arena: std.mem.Allocator, w: ast.Write, stages: []const ast.Stage, connections: *const std.StringHashMap(ast.Connection), params: *const ParamMap, offline: bool) !?[]const u8 {
+    if (connections.get(w.connector)) |conn| {
+        const info = connect.sqlConnInfo(conn) orelse return "`DELETE FROM` deletes from a database table (postgres, mysql, sqlserver) or a Delta table's folder";
+        if (info.dialect == .starrocks or info.dialect == .doris) return "`DELETE FROM` a StarRocks or Doris table is not supported yet";
+        if (deleteShapeProblem(stages)) |why| return why;
+        return switch (try deleteConds(arena, w, stages, info.dialect, params, offline)) {
+            .sql, .unbound => null,
+            .unsendable => |e| try msgfmt.allocPrint(arena, "DELETE FROM {s}: `{s}` cannot be sent to {s} as written; the condition runs in the database, so it takes the table's columns, constants and the functions {s} has", .{ w.target, try exprText(arena, e), @tagName(info.dialect), @tagName(info.dialect) }),
+        };
+    } else if (!folder.isFolder(w.target)) return "`DELETE FROM` deletes from a database table or a Delta table's folder (`'path/'`), not a file";
+    return deleteShapeProblem(stages);
+}
+
+pub const DeleteConds = union(enum) { sql: []const []const u8, unsendable: *const ast.Expr, unbound: []const u8 };
+
+/// A DELETE's conditions on its table as SQL in `d`, as the statement sends them
+/// (`pushdown/translate`, `need = .source`: the database decides its own text
+/// comparisons), each `$param` and LET its value and the table's alias or name
+/// dropped from its columns; or the first that cannot be sent as written, or a `$`
+/// that `params` does not bind. `offline`, a condition reading a value the analysis
+/// holds a NULL in place of (a query LET, an `env()`, a loop variable) is skipped.
+pub fn deleteConds(arena: std.mem.Allocator, w: ast.Write, stages: []const ast.Stage, d: sql.Dialect, params: *const ParamMap, offline: bool) !DeleteConds {
+    const table = deleteTable(w.target);
+    var out = std.array_list.Managed([]const u8).init(arena);
+    for (stages) |st| if (st.node == .filter) {
+        if (offline and try readsRunValue(arena, st.node.filter, params)) continue;
+        const bound = try substExpr(arena, st.node.filter, params);
+        if (try firstDollar(arena, bound)) |q| {
+            if (offline) continue;
+            return .{ .unbound = q.last() };
+        }
+        const own = try stripTableRef(arena, @constCast(bound), w.delete.?.alias, table);
+        try out.append((try translate.translatePred(arena, own, d, .{ .need = .source })) orelse return .{ .unsendable = st.node.filter });
+    };
+    return .{ .sql = out.items };
+}
+
+/// Whether `e` reads a `$` the analysis binds to a stand-in holding a NULL.
+fn readsRunValue(arena: std.mem.Allocator, e: *const ast.Expr, params: *const ParamMap) !bool {
+    const nul = struct {
+        fn f(_: void, n: *const ast.Expr) ?bool {
+            return if (n.* == .null_lit) true else null;
+        }
+    }.f;
+    for (try dollarRefs(arena, e)) |q| if (params.get(q.last())) |v| if (ast.anyExpr(v, {}, nul)) return true;
+    return false;
+}
+
+/// The table a DELETE's target names, its schema and database left off.
+pub fn deleteTable(target: []const u8) []const u8 {
+    return if (std.mem.lastIndexOfScalar(u8, target, '.')) |i| target[i + 1 ..] else target;
+}
+
+/// `e` with a reference to the table by its alias or name (`o.amount`) made bare
+/// (`amount`), as the DELETE's own statement names its columns.
+fn stripTableRef(arena: std.mem.Allocator, e: *ast.Expr, alias: []const u8, table: []const u8) !*ast.Expr {
+    const Cx = struct { arena: std.mem.Allocator, alias: []const u8, table: []const u8 };
+    const S = struct {
+        fn recur(cx: Cx, node: *const ast.Expr) error{OutOfMemory}!*ast.Expr {
+            if (node.* == .field and !node.field.dollar and node.field.parts.len == 2) {
+                const q = node.field.parts[0];
+                if ((cx.alias.len > 0 and std.ascii.eqlIgnoreCase(q, cx.alias)) or std.ascii.eqlIgnoreCase(q, cx.table))
+                    return ast.mk(cx.arena, .{ .field = .{ .parts = node.field.parts[1..], .span = node.field.span } });
+            }
+            return ast.rebuildExpr(cx.arena, node, cx, recur);
+        }
+    };
+    return S.recur(.{ .arena = arena, .alias = alias, .table = table }, e);
+}
+
+fn exprText(arena: std.mem.Allocator, e: *const ast.Expr) ![]const u8 {
+    var aw = std.Io.Writer.Allocating.init(arena);
+    @import("../lang/print.zig").expr(&aw.writer, e) catch return error.OutOfMemory;
+    return aw.written();
+}
+
+/// Why a DELETE's conditions cannot run as one statement: anything but conditions on
+/// the table's columns and IN / EXISTS subqueries matched on equalities. Null when
+/// they can.
+pub fn deleteShapeProblem(stages: []const ast.Stage) ?[]const u8 {
+    for (stages) |st| switch (st.node) {
+        .filter => {},
+        .select => |items| for (items) |it| if (it != .star) return "`DELETE FROM` takes an IN whose left side is a column of the table, not an expression",
+        .join => |j| {
+            if (j.kind != .semi and j.kind != .anti) return "`DELETE FROM` takes conditions on the table's columns and IN / EXISTS subqueries, not a scalar subquery compared in the WHERE";
+            if (j.residual != null or j.deferred.len > 0 or j.left_keys.len == 0 or j.left_keys.len != j.right_keys.len or (j.null_aware and j.left_keys.len != 1))
+                return "`DELETE FROM` takes IN / EXISTS subqueries correlated by equalities between their columns and the table's, not by other conditions";
+        },
+        else => return "`DELETE FROM` takes conditions on the table's columns and IN / EXISTS subqueries",
+    };
+    return null;
+}
 
 /// The rows' columns as an `INSERT` names them: its column list, in order, over the
 /// query's columns; the query's own names when it gives none; null when the list and

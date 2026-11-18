@@ -39,3 +39,42 @@ a Delta table the rows are one commit, as an `APPEND`.
 with `WITH` is its own: `INSERT INTO t WITH q AS (...) SELECT ...`. StarRocks and
 Doris tables, and CSV, Parquet and other files, are not `INSERT` targets yet;
 `LOAD INTO ... APPEND` adds to them.
+
+## DELETE
+
+```sql ignore
+DELETE FROM pg.public.orders WHERE status = 'cancelled' AND created < '2025-01-01';
+DELETE FROM pg.public.orders o WHERE o.id IN (SELECT order_id FROM 'refunds.csv');
+DELETE FROM pg.public.orders o
+ WHERE NOT EXISTS (SELECT 1 FROM erp.dbo.pedidos p WHERE p.id = o.id AND p.empresa = o.empresa);
+DELETE FROM pg.public.staging_orders;
+```
+
+The `WHERE` holds conditions on the table's columns, joined by `AND`, and `IN`,
+`NOT IN`, `EXISTS` and `NOT EXISTS` subqueries over any source: a file, another
+connection, the same database. The table may take an alias, as in a `SELECT`.
+Without a `WHERE` every row is deleted.
+
+The conditions on the table's columns go to the database as SQL, as they are
+written, so the database decides them as it would its own statement: its
+collation compares the text, its functions run. A `$param`, `LET` or loop
+variable in them is sent as its value. A condition that cannot be sent, such as
+one calling a function only basalt has, is an error naming it.
+Each subquery runs in basalt, and its key columns load, on the lanes as any load,
+into a staging table of the run's own on the target database. Then one statement,
+`DELETE FROM t WHERE ... AND [NOT] EXISTS (SELECT 1 FROM staging WHERE ...)`,
+deletes the rows, in the database's own transaction, and the staging tables are
+dropped whether it ran or failed. A subquery is matched to the table by
+equalities, written as `col IN (SELECT ...)` or in the `EXISTS`'s `WHERE`,
+`p.id = o.id AND p.empresa = o.empresa`; any other correlation, `p.id > o.id`, is
+refused, as is an `IN` whose left side is an expression.
+
+A `NOT IN` stays a `NOT IN` on the database, so SQL's rule holds: when the
+subquery returns a NULL, no row is deleted, and the run warns naming how many it
+returned. `WHERE col IS NOT NULL` in the subquery, or a `NOT EXISTS`, is the
+usual intent.
+
+The run log says how many rows were deleted. `check` and `EXPLAIN` connect to
+nothing, and `EXPLAIN ANALYZE` names the statement it would run without loading
+the subqueries or deleting a row. StarRocks and Doris tables, and Delta tables,
+are not `DELETE` targets yet.

@@ -517,7 +517,14 @@ pub const Write = struct {
     /// Set for an `INSERT INTO`: an APPEND to an existing table that lands whole or
     /// not at all, its columns matched by name.
     insert: ?Insert = null,
+    /// Set for a `DELETE FROM`: the stages before the write are the rows to delete
+    /// (the table read, its conditions, the IN and EXISTS subqueries as semi and anti
+    /// joins), run as a delete on the table rather than read.
+    delete: ?Delete = null,
 };
+
+/// A `DELETE`'s table as its conditions name it: `t` in `DELETE FROM pg.public.orders t`.
+pub const Delete = struct { alias: []const u8 };
 
 /// An `INSERT`'s column list: the names the query's columns take, in order; none
 /// when the query's own names are the table's.

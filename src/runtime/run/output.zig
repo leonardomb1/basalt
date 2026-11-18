@@ -117,6 +117,7 @@ pub fn runOutput(env: *Env, out: ast.Pipeline, opts_in: RunOptions, stats: *Stat
     if (stages.len == 0) return planErr(env.diag, "empty pipeline");
     const last = stages[stages.len - 1].node;
     if (last != .write) return planErr(env.diag, "a top-level query must be a `LOAD INTO` or a terminal `SELECT`");
+    if (last.write.delete != null) return @import("dml.zig").runDelete(env, out, opts_in, stats, lanes_used, batch_arena);
     env.sink_name = sinkLabel(env, last.write);
     if (!env.explain and !std.mem.eql(u8, last.write.connector, "stdout")) env.wrote_sink = true;
     const is_load = !env.explain and !std.mem.eql(u8, last.write.connector, "stdout");

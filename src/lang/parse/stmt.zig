@@ -89,6 +89,7 @@ pub fn parseStatement(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Err
     if (self.isKw("print")) return out.append(.{ .print = try self.parsePrintStmt() });
     if (self.isKw("load")) return self.parseLoadInto(out);
     if (self.isKw("insert")) return self.parseInsertInto(out);
+    if (self.isKw("delete") and self.peekKw("from")) return self.parseDeleteFrom(out);
     if (self.isKw("for")) {
         var pre = std.array_list.Managed(ast.Stmt).init(self.arena);
         const fe = try self.parseForEach(&pre);
@@ -213,10 +214,12 @@ pub fn parseExplainStmt(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) E
         try self.parseLoadInto(out);
     } else if (self.isKw("insert")) {
         try self.parseInsertInto(out);
+    } else if (self.isKw("delete") and self.peekKw("from")) {
+        try self.parseDeleteFrom(out);
     } else if (self.isKw("with") or self.isKw("select")) {
         try self.parseTerminalQuery(out);
     } else {
-        return self.fail(self.curPos(), "expected SELECT, WITH, LOAD INTO, INSERT INTO, CALL, FOR EACH or CASE after EXPLAIN, found {s}", .{self.curTag().describe()});
+        return self.fail(self.curPos(), "expected SELECT, WITH, LOAD INTO, INSERT INTO, DELETE FROM, CALL, FOR EACH or CASE after EXPLAIN, found {s}", .{self.curTag().describe()});
     }
 
     var i = out.items.len;

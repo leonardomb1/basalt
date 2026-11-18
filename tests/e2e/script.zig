@@ -2131,6 +2131,11 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "LET x = 1;\nPARAM x INT DEFAULT 2;\nLOAD INTO '$B/o.csv' AS SELECT $x AS a;", "`x` is declared twice: LET and PARAM share one name space" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT p.x FROM '$B/a.csv' p WHERE EXISTS (SELECT 1 FROM '$B/a.csv' q WHERE CAST(q.x AS string) = p.x);", "a correlated subquery compares `x` (int) with a column of its own (string)" },
         .{ "LOAD INTO '$B/o.csv' AS SELECT p.x, (SELECT count(*) FROM '$B/a.csv' q WHERE CAST(q.x AS string) = p.x) AS n FROM '$B/a.csv' p;", "a correlated subquery compares `x` (int) with a column of its own (string)" },
+        .{ "DELETE FROM '$B/a.csv' WHERE x = 1;", "`DELETE FROM` deletes from a database table or a Delta table's folder (`'path/'`), not a file" },
+        .{ "CREATE CONNECTION f TYPE sftp OPTIONS (host = 'h');\nDELETE FROM f.t WHERE x = 1;", "unsupported source connector `sftp`" },
+        .{ "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', database = 'd');\nDELETE FROM pg.t WHERE sha256(region) = 'x';", "DELETE FROM t: `sha256(region) = 'x'` cannot be sent to postgres as written" },
+        .{ "CREATE CONNECTION sr TYPE starrocks OPTIONS (host = '127.0.0.1', user = 'u', password = 'p', database = 'd');\nDELETE FROM sr.t WHERE x = 1;", "`DELETE FROM` a StarRocks or Doris table is not supported yet" },
+        .{ "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', database = 'd');\nDELETE FROM pg.t d WHERE EXISTS (SELECT 1 FROM '$B/a.csv' k WHERE k.x > d.x);", "`DELETE FROM` takes IN / EXISTS subqueries correlated by equalities between their columns and the table's" },
     };
     for (cases) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
 }

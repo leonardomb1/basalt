@@ -246,6 +246,42 @@ INSERT INTO db.it_ins (id, name) SELECT range + 10, 'r' FROM range(3);"; then
   $B run -q -c "$decl CALL execute_on('db', \$\$DROP TABLE it_ins\$\$);" >/dev/null 2>&1 || true
 }
 
+# DELETE FROM: conditions sent as SQL, an IN, NOT IN and correlated NOT EXISTS
+# over a file staged into the database, the NOT IN rule for a NULL (nothing
+# deleted, a warning), and no staging table left behind.
+delrt() { # $1 label, $2 CREATE CONNECTION db ..., $3 the table as the connection names it
+  local decl=$2 t=$3 got bad=0 w
+  printf 'id\n1\n2\n3\n' >"$out/del_keep.csv"
+  printf 'id\n1\n\n' >"$out/del_null.csv"
+  dset() {
+    brun run -c "$decl
+CALL execute_on('db', \$\$DROP TABLE IF EXISTS it_del; CREATE TABLE it_del (id INT, region VARCHAR(5), amount DECIMAL(10,2))\$\$);
+INSERT INTO db.$t SELECT range + 1 AS id, CASE WHEN (range + 1) % 3 = 0 THEN 'eu' ELSE 'us' END AS region, CAST((range + 1) * 1.5 AS DECIMAL(10,2)) AS amount FROM range(30);"
+  }
+  dcount() { $B run --format csv -q -c "$decl SELECT count(*) AS n FROM db.$t;" 2>&1 | tail -1 || true; }
+  if ! dset; then report "$1-delete (setup error)" bad; return; fi
+  $B run -q -c "$decl LET reg = 'eu'; DELETE FROM db.$t WHERE region = \$reg AND amount > 20;" >/dev/null 2>&1 || bad=1
+  got=$(dcount); [ "$got" = 24 ] || { echo "  simple: $got"; bad=1; }
+  $B run -q -c "$decl DELETE FROM db.$t d WHERE d.id IN (SELECT id FROM '$out/del_keep.csv');" >/dev/null 2>&1 || bad=1
+  got=$(dcount); [ "$got" = 21 ] || { echo "  in: $got"; bad=1; }
+  dset >/dev/null || bad=1
+  $B run -q -c "$decl DELETE FROM db.$t WHERE id NOT IN (SELECT id FROM '$out/del_keep.csv');" >/dev/null 2>&1 || bad=1
+  got=$(dcount); [ "$got" = 3 ] || { echo "  not in: $got"; bad=1; }
+  dset >/dev/null || bad=1
+  $B run -q -c "$decl DELETE FROM db.$t x WHERE region = 'us' AND NOT EXISTS (SELECT 1 FROM '$out/del_keep.csv' k WHERE k.id = x.id);" >/dev/null 2>&1 || bad=1
+  got=$(dcount); [ "$got" = 12 ] || { echo "  not exists: $got"; bad=1; }
+  w=$($B run -c "$decl DELETE FROM db.$t WHERE id NOT IN (SELECT id FROM '$out/del_null.csv');" 2>&1 || true)
+  got=$(dcount); [ "$got" = 12 ] && echo "$w" | grep -q "returned 1 NULL" || { echo "  not in null: $got $w"; bad=1; }
+  got=$($B run --format csv -q -c "$decl SELECT count(*) AS n FROM db.QUERY(\$\$SELECT table_name FROM information_schema.tables WHERE table_name LIKE '_basalt_stage_it_del%'\$\$);" 2>&1 | tail -1 || true)
+  [ "$got" = 0 ] || { echo "  staging left: $got"; bad=1; }
+  if [ $bad = 0 ]; then report "$1-delete" ok; else report "$1-delete" bad; fi
+  $B run -q -c "$decl CALL execute_on('db', \$\$DROP TABLE it_del\$\$);" >/dev/null 2>&1 || true
+}
+
+runs mysql     && delrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"     it.it_del
+runs postgres  && delrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"     public.it_del
+runs sqlserver && delrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);" dbo.it_del
+
 runs mysql     && insrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"
 runs postgres  && insrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"
 runs sqlserver && insrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);"

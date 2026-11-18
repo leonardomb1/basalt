@@ -897,6 +897,7 @@ pub const Parser = struct {
     pub const expectU8 = @import("parse/decl.zig").expectU8;
     pub const parseLoadInto = @import("parse/query.zig").parseLoadInto;
     pub const parseInsertInto = @import("parse/query.zig").parseInsertInto;
+    pub const parseDeleteFrom = @import("parse/query.zig").parseDeleteFrom;
     pub const parseWriteTarget = @import("parse/query.zig").parseWriteTarget;
     pub const parseLoadUsing = @import("parse/query.zig").parseLoadUsing;
     pub const changeStages = @import("parse/query.zig").changeStages;
