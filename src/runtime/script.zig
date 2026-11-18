@@ -224,14 +224,12 @@ fn renderMode(arena: std.mem.Allocator, mode: ast.WriteMode, lr: LoopRow) !ast.W
 }
 
 fn renderWrite(arena: std.mem.Allocator, w: ast.Write, lr: LoopRow) !ast.Write {
-    return .{
-        .connector = w.connector,
-        .form = if (w.form) |f| try interpAll(arena, f, lr) else null,
-        .target = try interpAll(arena, w.target, lr),
-        .mode = try renderMode(arena, w.mode, lr),
-        .split = if (w.split) |sp| .{ .col = try interpAll(arena, sp.col, lr), .jobs = sp.jobs, .pos = sp.pos } else null,
-        .changes = w.changes,
-    };
+    var out = w;
+    out.form = if (w.form) |f| try interpAll(arena, f, lr) else null;
+    out.target = try interpAll(arena, w.target, lr);
+    out.mode = try renderMode(arena, w.mode, lr);
+    out.split = if (w.split) |sp| .{ .col = try interpAll(arena, sp.col, lr), .jobs = sp.jobs, .pos = sp.pos } else null;
+    return out;
 }
 
 /// A query parameter whose whole value is a NULL (`a = $p` with `$p` NULL) is left

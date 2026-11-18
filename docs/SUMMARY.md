@@ -18,6 +18,7 @@
   - [Subqueries](language/subqueries.md)
   - [UNION, INTERSECT and EXCEPT](language/set-operations.md)
 - [LOAD INTO](language/load-into.md)
+- [INSERT, DELETE and UPDATE](language/insert-delete-update.md)
 - [FOR EACH and the CASE statement](language/for-each.md)
 - [User functions](language/user-functions.md)
 - [DESCRIBE, SHOW TABLES and EXPLAIN](language/explain.md)

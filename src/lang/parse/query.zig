@@ -43,31 +43,7 @@ pub fn parseLoadInto(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Erro
     try self.expectKw("load");
     try self.expectKw("into");
 
-    var write: ast.Write = undefined;
-    if (self.at(.string)) {
-        write = .{ .connector = "csv", .form = null, .target = self.advance().text, .mode = .default };
-    } else if (self.isKw("identifier") and self.peekTag() == .lparen) {
-        const ipos = self.curPos();
-        _ = self.advance();
-        _ = try self.expect(.lparen);
-        const e = try self.parseExpr();
-        _ = try self.expect(.rparen);
-        const tmpl = try self.exprToTemplate(e);
-        if (!hasLiteralExt(tmpl))
-            return self.fail(ipos, "dynamic target needs a literal extension (end it with `|| '.csv'`, `|| '.parquet'`, …)", .{});
-        write = .{ .connector = "csv", .form = null, .target = tmpl, .mode = .default };
-    } else {
-        const conn = try self.expectIdent();
-        if (!self.isConn(conn))
-            return self.fail(pos, "unknown connection `{s}` in LOAD INTO (declare it with CREATE CONNECTION first)", .{conn});
-        _ = try self.expect(.dot);
-        var parts = std.array_list.Managed([]const u8).init(self.arena);
-        try parts.append(try self.parseTargetSegment());
-        while (self.eat(.dot)) try parts.append(try self.parseTargetSegment());
-        const target = try std.mem.join(self.arena, ".", parts.items);
-        write = .{ .connector = conn, .form = null, .target = target, .mode = .default };
-    }
-
+    var write = try self.parseWriteTarget(pos, "LOAD INTO");
     var change_items: ?[]const ast.SelectItem = null;
     if (self.eatKw("using")) try self.parseLoadUsing(&write, &change_items);
 
@@ -126,6 +102,67 @@ pub fn parseLoadInto(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Erro
     try stages.append(.{ .node = .{ .write = write }, .hints = try whints.toOwnedSlice(), .pos = pos });
     try self.endStmt();
     try out.append(.{ .output = .{ .stages = try stages.toOwnedSlice(), .pos = pos } });
+}
+
+/// `INSERT INTO target [(c1, c2, ...)] [WITH (options)] <query>`: the query's rows
+/// added to a table that exists, whole or not at all, its columns matched by name; a
+/// column list gives the query's columns those names, in order.
+pub fn parseInsertInto(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
+    const pos = self.curPos();
+    try self.expectKw("insert");
+    try self.expectKw("into");
+    var write = try self.parseWriteTarget(pos, "INSERT INTO");
+    write.mode = .append;
+    var cols = std.array_list.Managed([]const u8).init(self.arena);
+    if (self.at(.lparen) and !self.peekKw("select") and !self.peekKw("with")) {
+        _ = self.advance();
+        try cols.append(try self.expectColName());
+        while (self.eat(.comma)) try cols.append(try self.expectColName());
+        _ = try self.expect(.rparen);
+    }
+    write.insert = .{ .columns = try cols.toOwnedSlice() };
+    var whints = std.array_list.Managed(ast.Hint).init(self.arena);
+    if (self.isKw("with") and self.peekTag() == .lparen) {
+        _ = self.advance();
+        try self.parseWithHints(&whints);
+    }
+    var stages = std.array_list.Managed(ast.Stage).init(self.arena);
+    self.top_names = .load;
+    try self.parseQuery(out, &stages);
+    try stages.append(.{ .node = .{ .write = write }, .hints = try whints.toOwnedSlice(), .pos = pos });
+    try self.endStmt();
+    try out.append(.{ .output = .{ .stages = try stages.toOwnedSlice(), .pos = pos } });
+}
+
+/// A write's target, after `LOAD INTO` or `INSERT INTO` (`what`, for messages): a
+/// quoted path, `IDENTIFIER(<expr>)` ending in a literal extension, or
+/// `conn.[schema.]table`.
+pub fn parseWriteTarget(self: *Parser, pos: ast.Pos, what: []const u8) Error!ast.Write {
+    var write: ast.Write = undefined;
+    if (self.at(.string)) {
+        write = .{ .connector = "csv", .form = null, .target = self.advance().text, .mode = .default };
+    } else if (self.isKw("identifier") and self.peekTag() == .lparen) {
+        const ipos = self.curPos();
+        _ = self.advance();
+        _ = try self.expect(.lparen);
+        const e = try self.parseExpr();
+        _ = try self.expect(.rparen);
+        const tmpl = try self.exprToTemplate(e);
+        if (!hasLiteralExt(tmpl))
+            return self.fail(ipos, "dynamic target needs a literal extension (end it with `|| '.csv'`, `|| '.parquet'`, …)", .{});
+        write = .{ .connector = "csv", .form = null, .target = tmpl, .mode = .default };
+    } else {
+        const conn = try self.expectIdent();
+        if (!self.isConn(conn))
+            return self.fail(pos, "unknown connection `{s}` in {s} (declare it with CREATE CONNECTION first)", .{ conn, what });
+        _ = try self.expect(.dot);
+        var parts = std.array_list.Managed([]const u8).init(self.arena);
+        try parts.append(try self.parseTargetSegment());
+        while (self.eat(.dot)) try parts.append(try self.parseTargetSegment());
+        const target = try std.mem.join(self.arena, ".", parts.items);
+        write = .{ .connector = conn, .form = null, .target = target, .mode = .default };
+    }
+    return write;
 }
 
 /// `USING <name> [ ( key = expr, ... ) ]`, after `USING`. A load path takes no

@@ -1332,3 +1332,22 @@ test "Delta write: a column name that is not UTF-8 is refused, at create and at 
     try testing.expect(!exists(&tmp, "n/_delta_log"));
     try runRefuses(a, &tmp, "LOAD INTO '$B/t/' AS SELECT id, grp AS \"s\xff\", amt FROM '$B/a.csv';", "has a name that is not UTF-8");
 }
+
+test "INSERT INTO a Delta table matches columns by name, leaves a nullable column it lacks NULL, and takes a column list" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_]usize{ 1, 4 }) |threads| {
+        tmp.dir.deleteTree("t") catch {};
+        try load(&tmp, "LOAD INTO '$B/t/' WITH (format = 'delta') AS SELECT 1 AS id, 'a' AS name, CAST(1.5 AS FLOAT) AS score;", threads);
+        try load(&tmp, "INSERT INTO '$B/t/' SELECT 'b' AS name, 2 AS id;", threads);
+        try load(&tmp, "INSERT INTO '$B/t/' (id, score) SELECT range + 10, CAST(range AS FLOAT) FROM range(2);", threads);
+        try load(&tmp, "INSERT INTO '$B/t/' WITH q AS (SELECT 20 AS id) SELECT id FROM q;", threads);
+        try testing.expectEqualStrings("id,name,score\n1,a,1.5\n2,b,\n10,,0\n11,,1\n20,,\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
+    }
+    try harness.expectRefusedAlike(gpa, &tmp, "INSERT INTO '$B/t/' (id) SELECT 1 AS id, 2 AS x;", "INSERT INTO");
+    try harness.expectRefusedAlike(gpa, &tmp, "INSERT INTO '$B/t/' SELECT 1 AS id, 'x' AS nope;", "the rows have column `nope`");
+    try harness.expectRefusedAlike(gpa, &tmp, "INSERT INTO '$B/t.csv' SELECT 1 AS id;", "`INSERT INTO` adds rows to a table");
+}

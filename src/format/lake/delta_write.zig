@@ -123,7 +123,10 @@ fn rowTrackingCol(name: []const u8) bool {
     return std.mem.eql(u8, name, delta.row_id_name) or std.mem.eql(u8, name, delta.row_version_name);
 }
 
-pub const Evolve = enum { keep, merge, overwrite };
+/// How a write's columns may differ from the table's: `keep` not at all, `fill` (an
+/// INSERT) a nullable column the rows lack written as NULL, `merge` that and columns
+/// the table lacks added, `overwrite` the schema replaced.
+pub const Evolve = enum { keep, fill, merge, overwrite };
 
 pub const RowPlan = struct {
     hwm: i64,
@@ -455,6 +458,7 @@ pub fn planEvolving(arena: std.mem.Allocator, root: []const u8, mode: Mode, crea
     const schema = schema_in orelse return p;
     const partial = mode == .upsert and mode.upsert.partial != null;
     const merge_cols = evolve == .merge;
+    const fill = merge_cols or evolve == .fill;
     var cols_list = std.array_list.Managed(Col).init(arena);
     try cols_list.resize(fields.len);
     const cols = cols_list.items;
@@ -462,8 +466,8 @@ pub fn planEvolving(arena: std.mem.Allocator, root: []const u8, mode: Mode, crea
     var tree = if (merge_cols) try std.json.parseFromSliceLeaky(std.json.Value, arena, st.schema_string.?, .{}) else std.json.Value.null;
     for (fields, cols, 0..) |f, *c, fi| {
         const src = indexOf(schema, f.name) orelse {
-            if (merge_cols) {
-                if (!f.nullable) return refuse("{s}'s column `{s}` is NOT NULL, and the rows lack it; `merge_schema` writes NULL for a column the rows lack, which it cannot hold", .{ name, f.name });
+            if (fill) {
+                if (!f.nullable) return refuse("{s}'s column `{s}` is NOT NULL, and the rows lack it; {s} writes NULL for a column the rows lack, which it cannot hold", .{ name, f.name, if (merge_cols) "`merge_schema`" else "an INSERT" });
                 var none = types.Type.init(.string);
                 none.unknown = true;
                 c.* = try tableCol(arena, name, f, none, absent);

@@ -222,6 +222,34 @@ EXPLAIN ANALYZE CALL execute_on('db', \$\$DROP TABLE it_exec\$\$);"; then
   $B run -q -c "$decl CALL execute_on('db', \$\$DROP TABLE it_exec\$\$);" >/dev/null 2>&1
 }
 
+# INSERT INTO: columns by name with the table's defaults for the rest, a column
+# list, and a batch with a NULL for a NOT NULL column landing none of its rows.
+insrt() { # $1 label, $2 CREATE CONNECTION db ...
+  local decl=$2 got
+  if ! brun run -c "$decl
+CALL execute_on('db', \$\$DROP TABLE IF EXISTS it_ins; CREATE TABLE it_ins (id INT NOT NULL, name VARCHAR(20), tag VARCHAR(10) DEFAULT 'd')\$\$);
+INSERT INTO db.it_ins SELECT 'x' AS name, 1 AS id;
+INSERT INTO db.it_ins (id, name) SELECT range + 10, 'r' FROM range(3);"; then
+    report "$1-insert (setup error)" bad
+    return
+  fi
+  if $B run -q -c "$decl INSERT INTO db.it_ins (id, name) SELECT CASE WHEN range = 1 THEN NULL ELSE range + 20 END, 'n' FROM range(3);" >/dev/null 2>&1; then
+    report "$1-insert (a NULL id was taken)" bad
+    return
+  fi
+  got=$($B run --format csv -q -c "$decl SELECT count(*) AS n, count(tag) AS t, max(id) AS hi FROM db.it_ins;" 2>&1 | tail -1 || true)
+  if [ "$got" = "4,4,12" ]; then
+    report "$1-insert" ok
+  else
+    report "$1-insert (got $got)" bad
+  fi
+  $B run -q -c "$decl CALL execute_on('db', \$\$DROP TABLE it_ins\$\$);" >/dev/null 2>&1 || true
+}
+
+runs mysql     && insrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"
+runs postgres  && insrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"
+runs sqlserver && insrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);"
+
 runs mysql     && execrt mysql     "CREATE CONNECTION db TYPE mysql OPTIONS ($MYSQL_OPTS);"
 runs postgres  && execrt postgres  "CREATE CONNECTION db TYPE postgres OPTIONS ($PG_OPTS);"
 runs sqlserver && execrt sqlserver "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);"

@@ -1626,11 +1626,14 @@ const Ctx = struct {
     /// A local Delta target planned as a run would, so `check` refuses a table it
     /// cannot write or rows that do not fit it; its label, or null when the target
     /// is remote, templated, or no Delta table.
-    fn offlineDelta(self: *Ctx, w: ast.Write, hints: []const ast.Hint, schema: ?types.Schema) !?[]const u8 {
+    fn offlineDelta(self: *Ctx, w: ast.Write, hints: []const ast.Hint, schema_in: ?types.Schema) !?[]const u8 {
         if (!deltaTarget(w, hints) or std.mem.indexOf(u8, w.target, "://") != null or std.mem.indexOf(u8, w.target, "${") != null) return null;
         const opts = try writeOptions(self.arena, w, hints, self.diag);
         const create = (formatFromHints(hints, self.diag) catch null) == .delta;
-        const p = delta_write.planEvolving(self.arena, w.target, delta_write.modeOf(w.mode), create, opts.delta.partition_by, opts.delta.codec, schema, opts.delta.evolve) catch |e| {
+        const schema = if (schema_in) |s| (try insertColumns(self.arena, w, s)) orelse
+            return fail(self.diag, "{s}", .{try insertCountMsg(self.arena, w, s)}) else null;
+        const evolve = if (w.insert != null and opts.delta.evolve == .keep) delta_write.Evolve.fill else opts.delta.evolve;
+        const p = delta_write.planEvolving(self.arena, w.target, delta_write.modeOf(w.mode), create, opts.delta.partition_by, opts.delta.codec, schema, evolve) catch |e| {
             if (e == lake.Error.LakeTableRefused) return fail(self.diag, "{s}", .{eval.takeFailure(e) orelse @errorName(e)});
             _ = eval.takeFailure(e);
             return null;
@@ -1989,6 +1992,23 @@ const Ctx = struct {
     }
 };
 
+/// The rows' columns as an `INSERT` names them: its column list, in order, over the
+/// query's columns; the query's own names when it gives none; null when the list and
+/// the query differ in count.
+pub fn insertColumns(arena: std.mem.Allocator, w: ast.Write, schema: types.Schema) !?types.Schema {
+    const ins = w.insert orelse return schema;
+    if (ins.columns.len == 0) return schema;
+    if (ins.columns.len != schema.fields.len) return null;
+    const fields = try arena.dupe(types.Schema.Field, schema.fields);
+    for (fields, ins.columns) |*f, name| f.name = name;
+    return .{ .fields = fields };
+}
+
+pub fn insertCountMsg(arena: std.mem.Allocator, w: ast.Write, schema: types.Schema) ![]const u8 {
+    const n = if (w.insert) |i| i.columns.len else 0;
+    return msgfmt.allocPrint(arena, "INSERT INTO {s} names {d} column{s}, and the query gives {d}", .{ w.target, n, if (n == 1) "" else "s", schema.fields.len });
+}
+
 pub const append_unsupported_fmt = "`APPEND` into `{s}` is not supported: {s}. Use `REPLACE`, or write each run to its own path";
 
 /// What a file or stdout sink is refused for, shared by `check` and the run's
@@ -2014,6 +2034,8 @@ pub fn checkFileSink(w: ast.Write, hints: []const ast.Hint, diag: *Diag) Error!v
         if (delta_write.storeProblem(w.target)) |why| return fail(diag, "cannot write Delta table `{s}`: {s}", .{ w.target, why });
         return;
     }
+    if (w.insert != null)
+        return fail(diag, "`INSERT INTO` adds rows to a table: a database table or a Delta folder (`'path/'`); `LOAD INTO '{s}' APPEND` adds rows to a CSV or NDJSON file", .{w.target});
     if (w.mode == .upsert)
         return fail(diag, "`UPSERT` needs a table to merge into; a file is written whole — use `REPLACE` (the default) or `APPEND`", .{});
     if (w.mode == .append) {

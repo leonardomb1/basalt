@@ -1603,7 +1603,9 @@ fn runUnionSplit(env: *Env, u: ast.Union, hints: []const ast.Hint, downstream: [
         try bstages.append(.{ .node = .{ .select = items }, .hints = &.{}, .pos = u.pos });
         try bstages.appendSlice(downstream);
         const bmode: ast.WriteMode = if (i == 0 or w.mode != .overwrite) w.mode else .append;
-        const bw = ast.Write{ .connector = w.connector, .form = w.form, .target = w.target, .mode = bmode, .changes = w.changes };
+        var bw = w;
+        bw.mode = bmode;
+        bw.split = null;
         try bstages.append(.{ .node = .{ .write = bw }, .hints = write_stage.hints, .pos = write_stage.pos });
         try runOutput(env, .{ .stages = try bstages.toOwnedSlice(), .pos = u.pos }, opts, stats, lanes_used, batch_arena);
     }

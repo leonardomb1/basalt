@@ -102,6 +102,53 @@ pub fn cutoverSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, stag
     return out.items;
 }
 
+/// The statements that make an INSERT's staging table `staging`: only the columns
+/// `schema` names, typed as the target types them, without its constraints,
+/// defaults or identity, so the rows load as given and the target applies its own
+/// defaults to the columns left out. A column the target lacks fails here, naming it.
+/// PostgreSQL's is UNLOGGED: it is thrown away after, so it need not reach the WAL
+/// or a replica. MySQL's takes its columns through a UNION with NULLs, which leaves
+/// every one nullable: a NOT NULL copied from the target would have `LOAD DATA`
+/// turn a NULL into 0 with only a warning, and the target take the 0 as given.
+pub fn insertSetupSql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, staging: []const u8, schema: types.Schema) ![]const []const u8 {
+    const qt = try sql.quoteIdent(a, d, target);
+    const qs = try sql.quoteIdent(a, d, staging);
+    const cols = try sql.colList(a, d, schema);
+    const out = try a.alloc([]const u8, 2);
+    out[0] = try dropSql(a, d, staging);
+    out[1] = switch (d) {
+        .postgres => try msgfmt.allocPrint(a, "CREATE UNLOGGED TABLE {s} AS SELECT {s} FROM {s} WITH NO DATA", .{ qs, cols, qt }),
+        .sqlserver => try msgfmt.allocPrint(a, "SELECT {s} INTO {s} FROM {s} WHERE 1 = 0 UNION ALL SELECT {s} FROM {s} WHERE 1 = 0", .{ cols, qs, qt, cols, qt }),
+        .mysql, .starrocks, .doris => blk: {
+            var nulls = std.array_list.Managed(u8).init(a);
+            for (schema.fields, 0..) |_, i| try nulls.appendSlice(if (i == 0) "NULL" else ", NULL");
+            break :blk try msgfmt.allocPrint(a, "CREATE TABLE {s} AS SELECT {s} FROM {s} WHERE 1 = 0 UNION ALL SELECT {s} FROM DUAL WHERE 1 = 0", .{ qs, cols, qt, nulls.items });
+        },
+    };
+    return out;
+}
+
+/// An INSERT's one step on the target: the staged rows copied in by column name in
+/// a single statement of a transaction, so they land all together or not at all.
+/// On SQL Server a loaded IDENTITY column takes the staged values, as a bulk APPEND
+/// keeps them.
+pub fn insertApplySql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, staging: []const u8, schema: types.Schema) ![]const []const u8 {
+    const in = intrinsics(d);
+    const qt = try sql.quoteIdent(a, d, target);
+    const qs = try sql.quoteIdent(a, d, staging);
+    const cols = try sql.colList(a, d, schema);
+    const insert = try msgfmt.allocPrint(a, "INSERT INTO {s} ({s}) SELECT {s} FROM {s}", .{ qt, cols, cols, qs });
+    var out = std.array_list.Managed([]const u8).init(a);
+    try out.append(in.begin);
+    if (d == .sqlserver) {
+        try out.append(try sql.identityInsertSql(a, qt, schema, true));
+        try out.append(insert);
+        try out.append(try sql.identityInsertSql(a, qt, schema, false));
+    } else try out.append(insert);
+    try out.append(in.commit);
+    return out.items;
+}
+
 pub fn dropSql(a: std.mem.Allocator, d: sql.Dialect, staging: []const u8) ![]const u8 {
     return msgfmt.allocPrint(a, "DROP TABLE IF EXISTS {s}", .{try sql.quoteIdent(a, d, staging)});
 }
@@ -146,4 +193,26 @@ test "the cutover clears and copies in one transaction, per dialect" {
     const my = try cutoverSql(a, .mysql, "t", "_basalt_stage_t_00000001", schema, .truncate);
     try std.testing.expectEqualStrings("START TRANSACTION", my[0]);
     try std.testing.expectEqualStrings("DELETE FROM `t`", my[1]);
+}
+
+test "an INSERT stages only its columns, typed by the target, and copies them in by name in one transaction" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = types.Schema{ .fields = &.{ .{ .name = "id", .ty = types.Type.init(.int) }, .{ .name = "v", .ty = types.Type.init(.string) } } };
+    const pg = try insertSetupSql(a, .postgres, "public.t", "public._basalt_stage_t_00000001", schema);
+    try std.testing.expectEqualStrings("DROP TABLE IF EXISTS \"public\".\"_basalt_stage_t_00000001\"", pg[0]);
+    try std.testing.expectEqualStrings("CREATE UNLOGGED TABLE \"public\".\"_basalt_stage_t_00000001\" AS SELECT \"id\",\"v\" FROM \"public\".\"t\" WITH NO DATA", pg[1]);
+    const ms = try insertSetupSql(a, .sqlserver, "dbo.t", "dbo._basalt_stage_t_00000001", schema);
+    try std.testing.expectEqualStrings("SELECT [id],[v] INTO [dbo].[_basalt_stage_t_00000001] FROM [dbo].[t] WHERE 1 = 0 UNION ALL SELECT [id],[v] FROM [dbo].[t] WHERE 1 = 0", ms[1]);
+    const my = try insertSetupSql(a, .mysql, "t", "_basalt_stage_t_00000001", schema);
+    try std.testing.expectEqualStrings("CREATE TABLE `_basalt_stage_t_00000001` AS SELECT `id`,`v` FROM `t` WHERE 1 = 0 UNION ALL SELECT NULL, NULL FROM DUAL WHERE 1 = 0", my[1]);
+    const apply = try insertApplySql(a, .postgres, "public.t", "public._basalt_stage_t_00000001", schema);
+    try std.testing.expectEqual(@as(usize, 3), apply.len);
+    try std.testing.expectEqualStrings("BEGIN", apply[0]);
+    try std.testing.expectEqualStrings("INSERT INTO \"public\".\"t\" (\"id\",\"v\") SELECT \"id\",\"v\" FROM \"public\".\"_basalt_stage_t_00000001\"", apply[1]);
+    try std.testing.expectEqualStrings("COMMIT", apply[2]);
+    const msa = try insertApplySql(a, .sqlserver, "dbo.t", "dbo._basalt_stage_t_00000001", schema);
+    try std.testing.expectEqual(@as(usize, 5), msa.len);
+    try std.testing.expectEqualStrings("INSERT INTO [dbo].[t] ([id],[v]) SELECT [id],[v] FROM [dbo].[_basalt_stage_t_00000001]", msa[2]);
 }

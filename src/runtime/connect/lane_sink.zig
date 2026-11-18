@@ -64,8 +64,9 @@ const SqlSinkSpec = struct {
     lock: bool = true,
 };
 
-/// A REPLACE's staging and cutover (see `db/replace.zig`), each step on a short
-/// connection of its own, so the lanes keep theirs and their redials.
+/// A REPLACE's or an INSERT's staging and the one step that applies it to the target
+/// (see `db/replace.zig`), each on a short connection of its own, so the lanes keep
+/// theirs and their redials.
 pub const ReplacePlan = struct {
     gpa: std.mem.Allocator,
     kind: SqlKind,
@@ -76,6 +77,8 @@ pub const ReplacePlan = struct {
     how: replace.Cutover,
     errctx: ?*op.ErrCtx,
     staging: []const u8 = "",
+    /// An INSERT: staged by its own columns, applied by one `INSERT … SELECT`.
+    insert: bool = false,
 
     pub fn stagingTarget(self: *const ReplacePlan) []const u8 {
         return self.staging;
@@ -86,38 +89,46 @@ pub const ReplacePlan = struct {
         self.staging = try replace.stagingName(arena, self.target, std.crypto.random.int(u32));
         var aa = std.heap.ArenaAllocator.init(self.gpa);
         defer aa.deinit();
-        try self.run(try replace.setupSql(aa.allocator(), self.dialect, self.target, self.staging), "staging");
+        const a = aa.allocator();
+        const setup = if (self.insert) try replace.insertSetupSql(a, self.dialect, self.target, self.staging, self.schema) else try replace.setupSql(a, self.dialect, self.target, self.staging);
+        try self.run(setup, "staging", true);
     }
 
     pub fn finish(self: *ReplacePlan) !void {
         var aa = std.heap.ArenaAllocator.init(self.gpa);
         defer aa.deinit();
         const a = aa.allocator();
-        self.run(try replace.cutoverSql(a, self.dialect, self.target, self.staging, self.schema, self.how), "cutover") catch |e| {
+        const apply = if (self.insert) try replace.insertApplySql(a, self.dialect, self.target, self.staging, self.schema) else try replace.cutoverSql(a, self.dialect, self.target, self.staging, self.schema, self.how);
+        self.run(apply, if (self.insert) "" else "cutover", !self.insert) catch |e| {
             self.abort();
             return e;
         };
-        self.run(&.{try replace.dropSql(a, self.dialect, self.staging)}, "staging cleanup") catch {};
+        self.run(&.{try replace.dropSql(a, self.dialect, self.staging)}, "staging cleanup", true) catch {};
     }
 
     pub fn abort(self: *ReplacePlan) void {
         var aa = std.heap.ArenaAllocator.init(self.gpa);
         defer aa.deinit();
         const drop = replace.dropSql(aa.allocator(), self.dialect, self.staging) catch return;
-        self.run(&.{drop}, "staging cleanup") catch {};
+        self.run(&.{drop}, "staging cleanup", true) catch {};
     }
 
     /// `stmts` on a connection of their own, run again from the start on a fresh one
-    /// (`net/retry.zig`) after a network failure or when the server says to (a
-    /// deadlock victim): each step may run twice, the setup dropping its own table
-    /// first, the cutover clearing the target and copying from staging again, and a
-    /// transaction the failure cut short rolls back as its connection closes.
-    fn run(self: *ReplacePlan, stmts: []const []const u8, step: []const u8) !void {
+    /// (`net/retry.zig`) when the connection could not be made, when the server says
+    /// it rolled them back (a deadlock victim), and, for a step that may run twice
+    /// (`again`), after a network failure: the setup drops its own table first, the
+    /// cutover clears the target and copies from staging again, and a transaction the
+    /// failure cut short rolls back as its connection closes. An INSERT's step may not:
+    /// sent once, it might have committed before the connection broke, so that
+    /// failure ends the run saying so rather than inserting the rows twice.
+    fn run(self: *ReplacePlan, stmts: []const []const u8, step: []const u8, again: bool) !void {
         const Try = struct {
             plan: *ReplacePlan,
             stmts: []const []const u8,
+            again: bool,
             msg: std.array_list.Managed(u8),
             rerun: bool = false,
+            unknown: bool = false,
 
             fn attempt(t: *@This()) !retry.Verdict {
                 const p = t.plan;
@@ -128,17 +139,26 @@ pub const ReplacePlan = struct {
                     try t.msg.appendSlice(conn.lastError());
                     t.rerun = conn.rerunnable();
                     if (t.rerun) return .{ .failed = .{ .code = 0, .err = e, .retriable = true } };
-                    if (netconn.transientNet(e)) return e;
+                    if (netconn.transientNet(e)) {
+                        if (t.again) return e;
+                        t.unknown = true;
+                    }
                     return .{ .failed = .{ .code = 0, .err = e, .retriable = false } };
                 };
                 return .done;
             }
         };
         var prng = retry.jitterPrng();
-        var t = Try{ .plan = self, .stmts = stmts, .msg = std.array_list.Managed(u8).init(self.gpa) };
+        var t = Try{ .plan = self, .stmts = stmts, .again = again, .msg = std.array_list.Managed(u8).init(self.gpa) };
         defer t.msg.deinit();
+        const what: []const u8 = if (self.insert) "INSERT" else "REPLACE";
         retry.retry(.{ .rand = prng.random(), .base_ms = 250 }, &t, Try.attempt) catch |e| {
-            if (self.errctx) |ec| if (t.msg.items.len > 0) ec.set("{s} refused the REPLACE {s}: {s}", .{ @tagName(self.dialect), step, t.msg.items });
+            if (self.errctx) |ec| {
+                if (t.unknown)
+                    ec.set("the connection to {s} broke while the {s} was applied, so whether its rows landed is unknown; check the table before running it again", .{ @tagName(self.dialect), what })
+                else if (t.msg.items.len > 0)
+                    ec.set("{s} refused the {s}{s}{s}: {s}", .{ @tagName(self.dialect), what, if (step.len > 0) " " else "", step, t.msg.items });
+            }
             return sql.rerunError(t.rerun, e);
         };
     }
@@ -226,7 +246,8 @@ fn openLaneSqlSink(ctx_ptr: *anyopaque, gpa: std.mem.Allocator, lane_idx: usize)
 /// shared-mutex path. Null under `EXPLAIN ANALYZE`, whose lanes write to the one
 /// discarding sink: a lane sink's setup alone creates the target table. Null too
 /// inside a union whose branches share one sink (`Env.union_sink`).
-pub fn buildParallelSink(env: *Env, w: ast.Write, schema: types.Schema) !?parallel.SinkMode {
+pub fn buildParallelSink(env: *Env, w: ast.Write, schema_in: types.Schema) !?parallel.SinkMode {
+    const schema = try @import("sink.zig").insertSchema(env, w, schema_in);
     try @import("sink.zig").uniqueTargetColumns(env, w, schema);
     if (env.explain or env.union_sink != null) return null;
     if (try buildStreamLoadSpec(env, w, schema)) |spec|
@@ -249,15 +270,17 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
     const dialect = info.dialect;
     const cfg = try resolveDbConfig(env, conn, info.port);
 
-    const setup_conn = connectSql(env.gpa, kind, cfg) catch |e|
-        return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} sink connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, e) }));
-    const setup = sql.Sink.open(env.gpa, setup_conn, dialect, w.target, schema, if (w.mode == .overwrite) .append else w.mode, null) catch |e| {
-        defer setup_conn.close();
-        const why = try netconn.connectorNoteAlloc(env.arena, "", e, setup_conn.lastError());
-        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} sink setup failed: {s}", .{ conn.connector, why }));
-    };
-    setup.sink().close() catch |e|
-        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} sink setup close failed: {s}", .{ conn.connector, @errorName(e) }));
+    if (w.insert == null) {
+        const setup_conn = connectSql(env.gpa, kind, cfg) catch |e|
+            return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "{s} sink connect failed: {s}", .{ conn.connector, try connectWhy(env.arena, e) }));
+        const setup = sql.Sink.open(env.gpa, setup_conn, dialect, w.target, schema, if (w.mode == .overwrite) .append else w.mode, null) catch |e| {
+            defer setup_conn.close();
+            const why = try netconn.connectorNoteAlloc(env.arena, "", e, setup_conn.lastError());
+            return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} sink setup failed: {s}", .{ conn.connector, why }));
+        };
+        setup.sink().close() catch |e|
+            return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} sink setup close failed: {s}", .{ conn.connector, @errorName(e) }));
+    }
 
     const spec = try env.arena.create(SqlSinkSpec);
     spec.* = .{
@@ -269,13 +292,15 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
         .lane_mode = if (w.mode == .overwrite) .append else w.mode,
         .redial = try redialFor(env.arena, kind, cfg),
         .errctx = env.errctx,
-        .lock = w.mode == .overwrite or env.table_lock,
+        .lock = w.mode == .overwrite or w.insert != null or env.table_lock,
     };
-    if (w.mode == .overwrite) {
+    if (w.mode == .overwrite or w.insert != null) {
         const plan = try env.arena.create(ReplacePlan);
-        plan.* = .{ .gpa = env.gpa, .kind = kind, .cfg = cfg, .dialect = dialect, .target = w.target, .schema = schema, .how = env.cutover, .errctx = env.errctx };
-        plan.prepare(env.arena) catch |e|
+        plan.* = .{ .gpa = env.gpa, .kind = kind, .cfg = cfg, .dialect = dialect, .target = w.target, .schema = schema, .how = env.cutover, .errctx = env.errctx, .insert = w.insert != null };
+        plan.prepare(env.arena) catch |e| {
+            if (w.insert != null) return planErr(env.diag, try @import("sink.zig").insertSetupFailed(env, conn.connector, w.target, e));
             return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} REPLACE staging failed ({s})", .{ conn.connector, @errorName(e) }));
+        };
         spec.target = plan.stagingTarget();
         spec.replace_plan = plan;
     }
@@ -285,6 +310,7 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
 fn buildStreamLoadSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*StreamLoadSpec {
     const conn = env.connections.get(w.connector) orelse return null;
     const flavor = streamload.Flavor.of(conn.connector) orelse return null;
+    if (w.insert != null) return planErr(env.diag, try msgfmt.allocPrint(env.arena, "INSERT INTO a {s} table is not supported yet; LOAD INTO … APPEND loads it", .{flavor.name()}));
 
     var cfg = try resolveStreamLoadConfig(env, conn, flavor);
     cfg.run_id = if (cfg.run_id != 0) cfg.run_id else @intCast(std.time.milliTimestamp());

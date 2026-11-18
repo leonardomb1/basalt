@@ -188,8 +188,24 @@ pub fn openSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         errdefer inner.abort();
         return StdoutSink.wrap(env, inner, info, cap);
     }
-    try uniqueTargetColumns(env, w, schema);
-    return openTargetSink(env, w, schema);
+    const cols = try insertSchema(env, w, schema);
+    try uniqueTargetColumns(env, w, cols);
+    return openTargetSink(env, w, cols);
+}
+
+/// Why an INSERT's staging could not be made: the server's words, a column the
+/// target lacks or a target that is not there.
+pub fn insertSetupFailed(env: *Env, connector: []const u8, target: []const u8, e: anyerror) ![]const u8 {
+    const ec = env.errctx;
+    const why = if (ec.msg.len > 0) try env.arena.dupe(u8, ec.msg) else @errorName(e);
+    ec.msg = "";
+    return msgfmt.allocPrint(env.arena, "INSERT INTO {s}: {s} ({s} needs an existing table with the query's columns)", .{ target, why, connector });
+}
+
+/// The rows' columns as an `INSERT` names them: its column list, in order, over the
+/// query's columns; the query's own names when it gives none.
+pub fn insertSchema(env: *Env, w: ast.Write, schema: types.Schema) !types.Schema {
+    return (try analyze.insertColumns(env.arena, w, schema)) orelse planErr(env.diag, try analyze.insertCountMsg(env.arena, w, schema));
 }
 
 /// `analyze.uniqueColumns` for a LOAD target; a shown result or an in-memory one may
@@ -308,6 +324,7 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         return planErr(env.diag, try options.unknownConnectionMsg(env.arena, w.connector, "write"));
     try checkUpsertTarget(env, conn, w, schema);
     if (streamload.Flavor.of(conn.connector)) |flavor| {
+        if (w.insert != null) return planErr(env.diag, try msgfmt.allocPrint(env.arena, "INSERT INTO a {s} table is not supported yet; LOAD INTO … APPEND loads it", .{flavor.name()}));
         const cfg = try resolveStreamLoadConfig(env, conn, flavor);
         if (streamload.unquotableName(flavor, cfg.database, w.target, schema)) |name|
             return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} cannot name a database, table or column `{s}`: it drops a backtick from a quoted name, so the rows would land under another name", .{ flavor.name(), name }));
@@ -340,6 +357,15 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                     };
                     target = p.stagingTarget();
                     mode = .append;
+                    plan = p;
+                } else if (w.insert != null) {
+                    const p = try env.arena.create(ReplacePlan);
+                    p.* = .{ .gpa = env.gpa, .kind = info.kind, .cfg = cfg, .dialect = info.dialect, .target = w.target, .schema = schema, .how = env.cutover, .errctx = env.errctx, .insert = true };
+                    p.prepare(env.arena) catch |e| {
+                        c.close();
+                        return planErr(env.diag, try insertSetupFailed(env, conn.connector, w.target, e));
+                    };
+                    target = p.stagingTarget();
                     plan = p;
                 }
                 const inner = openBulkOrInsert(env.gpa, c, SqlDriver(k).Bulk, info.dialect, target, schema, mode, try redialFor(env.arena, info.kind, cfg), env.errctx, plan != null or env.table_lock) catch |e| {

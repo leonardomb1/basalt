@@ -514,7 +514,14 @@ pub const Write = struct {
     mode: WriteMode,
     split: ?SplitBy = null,
     changes: ?Changes = null,
+    /// Set for an `INSERT INTO`: an APPEND to an existing table that lands whole or
+    /// not at all, its columns matched by name.
+    insert: ?Insert = null,
 };
+
+/// An `INSERT`'s column list: the names the query's columns take, in order; none
+/// when the query's own names are the table's.
+pub const Insert = struct { columns: []const []const u8 = &.{} };
 
 pub const Changes = struct {
     /// The column `position` names, kept in the table: `$since` is its largest value there.
