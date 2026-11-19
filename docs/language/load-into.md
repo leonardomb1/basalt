@@ -59,7 +59,9 @@ AS
   primary key or unique index on exactly those keys, as both match an upsert's
   rows by the table's unique keys rather than by the keys named — and on MySQL
   no other unique key whose columns the load writes, as it would match rows too;
-  otherwise the load is refused before a row is written.
+  otherwise the load is refused before a row is written. SQL Server needs no such
+  key: its rows are staged and merged in by one `MERGE`, and a key they hold more
+  than once is refused ([SQL Server](../connectors/databases.md#sql-server)).
 - `REPLACE` into PostgreSQL, MySQL or SQL Server loads a staging table
   (`_basalt_stage_<table>_<run tag>`, in the target's schema) from every lane, then in one
   transaction clears the target and copies the staged rows in, and drops the

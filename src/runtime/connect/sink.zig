@@ -375,6 +375,21 @@ fn openTargetSink(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
                     };
                     target = p.stagingTarget();
                     plan = p;
+                } else if (@import("lane_sink.zig").stagedUpsert(info.dialect, w)) {
+                    const qt = try sql.quoteIdent(env.arena, info.dialect, w.target);
+                    c.sqlConn().exec(try sql.createTableSql(env.arena, info.dialect, qt, schema, w.mode)) catch |e| {
+                        defer c.close();
+                        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} sink failed ({s}): {s}", .{ conn.connector, @errorName(e), c.wire.last_error }));
+                    };
+                    const p = try env.arena.create(ReplacePlan);
+                    p.* = .{ .gpa = env.gpa, .kind = info.kind, .cfg = cfg, .dialect = info.dialect, .target = w.target, .schema = schema, .how = env.cutover, .errctx = env.errctx, .upsert = w.mode.upsert.keys };
+                    p.prepare(env.arena) catch |e| {
+                        c.close();
+                        return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} UPSERT staging failed ({s})", .{ conn.connector, @errorName(e) }));
+                    };
+                    target = p.stagingTarget();
+                    mode = .append;
+                    plan = p;
                 }
                 const inner = openBulkOrInsert(env.gpa, c, SqlDriver(k).Bulk, info.dialect, target, schema, mode, try redialFor(env.arena, info.kind, cfg), env.errctx, plan != null or env.table_lock) catch |e| {
                     defer c.close();

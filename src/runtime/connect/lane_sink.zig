@@ -27,6 +27,8 @@ const replace = @import("../../db/replace.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const streamload = @import("../../db/streamload.zig");
 const types = @import("../../lang/types.zig");
+const cast = @import("../../exec/eval/cast.zig");
+const Value = @import("../../exec/value.zig").Value;
 
 const StreamLoadSpec = struct {
     cfg: streamload.Config,
@@ -89,9 +91,9 @@ const SqlSinkSpec = struct {
     lock: bool = true,
 };
 
-/// A REPLACE's or an INSERT's staging and the one step that applies it to the target
-/// (see `db/replace.zig`), each on a short connection of its own, so the lanes keep
-/// theirs and their redials.
+/// A REPLACE's, an INSERT's or a SQL Server UPSERT's staging and the one step that
+/// applies it to the target (see `db/replace.zig`), each on a short connection of
+/// its own, so the lanes keep theirs and their redials.
 pub const ReplacePlan = struct {
     gpa: std.mem.Allocator,
     kind: SqlKind,
@@ -104,6 +106,9 @@ pub const ReplacePlan = struct {
     staging: []const u8 = "",
     /// An INSERT: staged by its own columns, applied by one `INSERT … SELECT`.
     insert: bool = false,
+    /// A SQL Server UPSERT's keys: staged by its own columns, refused when a key is
+    /// staged twice, applied by one `MERGE`.
+    upsert: ?[]const []const u8 = null,
 
     pub fn stagingTarget(self: *const ReplacePlan) []const u8 {
         return self.staging;
@@ -115,7 +120,7 @@ pub const ReplacePlan = struct {
         var aa = std.heap.ArenaAllocator.init(self.gpa);
         defer aa.deinit();
         const a = aa.allocator();
-        const setup = if (self.insert) try replace.insertSetupSql(a, self.dialect, self.target, self.staging, self.schema) else try replace.setupSql(a, self.dialect, self.target, self.staging);
+        const setup = if (self.insert or self.upsert != null) try replace.insertSetupSql(a, self.dialect, self.target, self.staging, self.schema) else try replace.setupSql(a, self.dialect, self.target, self.staging);
         try self.run(setup, "staging", true);
     }
 
@@ -123,12 +128,42 @@ pub const ReplacePlan = struct {
         var aa = std.heap.ArenaAllocator.init(self.gpa);
         defer aa.deinit();
         const a = aa.allocator();
-        const apply = if (self.insert) try replace.insertApplySql(a, self.dialect, self.target, self.staging, self.schema) else try replace.cutoverSql(a, self.dialect, self.target, self.staging, self.schema, self.how);
-        self.run(apply, if (self.insert) "" else "cutover", !self.insert) catch |e| {
+        if (self.upsert) |keys| self.checkKeysOnce(a, keys) catch |e| {
+            self.abort();
+            return e;
+        };
+        const apply = if (self.upsert) |keys|
+            try replace.upsertApplySql(a, self.target, self.staging, self.schema, keys)
+        else if (self.insert)
+            try replace.insertApplySql(a, self.dialect, self.target, self.staging, self.schema)
+        else
+            try replace.cutoverSql(a, self.dialect, self.target, self.staging, self.schema, self.how);
+        self.run(apply, if (self.insert or self.upsert != null) "" else "cutover", !self.insert) catch |e| {
             self.abort();
             return e;
         };
         self.run(&.{try replace.dropSql(a, self.dialect, self.staging)}, "staging cleanup", true) catch {};
+    }
+
+    /// Refuses an UPSERT whose rows hold a key more than once, naming it: one `MERGE`
+    /// would update a row from two of them, or insert both.
+    fn checkKeysOnce(self: *ReplacePlan, a: std.mem.Allocator, keys: []const []const u8) !void {
+        const conn = try connectSql(self.gpa, self.kind, self.cfg);
+        const cur = conn.queryCursor(try replace.upsertDupSql(a, self.staging, keys)) catch |e| {
+            conn.close();
+            return e;
+        };
+        defer cur.close();
+        const b = (try cur.nextBatch(a)) orelse return;
+        if (b.len == 0) return;
+        var text = std.array_list.Managed(u8).init(a);
+        for (keys, 0..) |k, i| {
+            const v = cast.castValue(a, b.columns[i].getValue(0), .string) catch Value{ .string = "?" };
+            try text.writer().print("{s}{s} = {s}", .{ if (i > 0) ", " else "", k, v.string });
+        }
+        const n = b.columns[keys.len].getValue(0);
+        if (self.errctx) |ec| ec.set("UPSERT into {s}: the rows hold the key ({s}) {d} times; an upsert takes each key once, so give each once (the newest, by an aggregate or `USING changes`)", .{ self.target, text.items, if (n == .int) n.int else 2 });
+        return error.UpsertKeyRepeated;
     }
 
     pub fn abort(self: *ReplacePlan) void {
@@ -176,7 +211,7 @@ pub const ReplacePlan = struct {
         var prng = retry.jitterPrng();
         var t = Try{ .plan = self, .stmts = stmts, .again = again, .msg = std.array_list.Managed(u8).init(self.gpa) };
         defer t.msg.deinit();
-        const what: []const u8 = if (self.insert) "INSERT" else "REPLACE";
+        const what: []const u8 = if (self.insert) "INSERT" else if (self.upsert != null) "UPSERT" else "REPLACE";
         retry.retry(.{ .rand = prng.random(), .base_ms = 250 }, &t, Try.attempt) catch |e| {
             if (self.errctx) |ec| {
                 if (t.unknown)
@@ -282,6 +317,14 @@ pub fn buildParallelSink(env: *Env, w: ast.Write, schema_in: types.Schema) !?par
     return null;
 }
 
+/// Whether `w` is an UPSERT into SQL Server, whose rows are staged by a bulk load
+/// and merged in by one `MERGE` (`ReplacePlan.upsert`): its row-literal `MERGE`
+/// batches scanned the target once each, without an index on the keys for every
+/// row, and on lanes deadlocked against each other.
+pub fn stagedUpsert(dialect: sql.Dialect, w: ast.Write) bool {
+    return dialect == .sqlserver and w.mode == .upsert and w.mode.upsert.keys.len > 0 and w.insert == null;
+}
+
 /// Whether `w` goes to a target `buildParallelSink` opens one sink per lane for.
 pub fn opensPerLane(env: *Env, w: ast.Write) bool {
     const conn = env.connections.get(w.connector) orelse return false;
@@ -307,6 +350,7 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
             return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} sink setup close failed: {s}", .{ conn.connector, @errorName(e) }));
     }
 
+    const staged = stagedUpsert(dialect, w);
     const spec = try env.arena.create(SqlSinkSpec);
     spec.* = .{
         .kind = kind,
@@ -314,17 +358,17 @@ fn buildSqlSinkSpec(env: *Env, w: ast.Write, schema: types.Schema) !?*SqlSinkSpe
         .cfg = cfg,
         .target = w.target,
         .schema = schema,
-        .lane_mode = if (w.mode == .overwrite) .append else w.mode,
+        .lane_mode = if (w.mode == .overwrite or staged) .append else w.mode,
         .redial = try redialFor(env.arena, kind, cfg),
         .errctx = env.errctx,
-        .lock = w.mode == .overwrite or w.insert != null or env.table_lock,
+        .lock = w.mode == .overwrite or w.insert != null or staged or env.table_lock,
     };
-    if (w.mode == .overwrite or w.insert != null) {
+    if (w.mode == .overwrite or w.insert != null or staged) {
         const plan = try env.arena.create(ReplacePlan);
-        plan.* = .{ .gpa = env.gpa, .kind = kind, .cfg = cfg, .dialect = dialect, .target = w.target, .schema = schema, .how = env.cutover, .errctx = env.errctx, .insert = w.insert != null };
+        plan.* = .{ .gpa = env.gpa, .kind = kind, .cfg = cfg, .dialect = dialect, .target = w.target, .schema = schema, .how = env.cutover, .errctx = env.errctx, .insert = w.insert != null, .upsert = if (staged) w.mode.upsert.keys else null };
         plan.prepare(env.arena) catch |e| {
             if (w.insert != null) return planErr(env.diag, try @import("sink.zig").insertSetupFailed(env, conn.connector, w.target, e));
-            return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} REPLACE staging failed ({s})", .{ conn.connector, @errorName(e) }));
+            return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s} {s} staging failed ({s})", .{ conn.connector, if (staged) "UPSERT" else "REPLACE", @errorName(e) }));
         };
         spec.target = plan.stagingTarget();
         spec.replace_plan = plan;

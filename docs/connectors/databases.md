@@ -228,3 +228,15 @@ column (`varchar(max)`, `nvarchar(max)`) takes each value whole, a `NOT NULL`
 one is loaded as such, and an IDENTITY column the load carries keeps the values
 it brings, under `IDENTITY_INSERT`, for `APPEND`, `REPLACE` and `UPSERT` alike; a
 load that leaves the IDENTITY column out lets the table number its rows.
+
+An `UPSERT` into SQL Server bulk loads its rows, from every lane, into a staging
+table of the run's own holding only the loaded columns, typed as the table types
+them, then merges them in with one `MERGE ... WITH (HOLDLOCK)` in a transaction,
+matched by the keys: a row whose keys match one of the table's updates its other
+columns, any other is inserted (one with a NULL key matches nothing), and the
+staging table is dropped. The table is joined to the rows once, whether or not
+an index covers the keys, readers see the rows only once they are all there, and
+a failure anywhere leaves the table as it was. A key the rows hold more than
+once is refused before anything changes, naming it, as one `MERGE` would update
+a row from two of them: give each key once (the newest, by an aggregate or
+`USING changes`).

@@ -10,6 +10,9 @@
 //! one transaction, and the last to commit holds the target. A run killed before
 //! it could drop its staging table leaves it behind, named for its target.
 //!
+//! An INSERT stages only the columns it loads and lands in one `INSERT … SELECT`;
+//! an UPSERT into SQL Server stages the same way and lands in one `MERGE`.
+//!
 //! The sequence is written once here; what differs by database is `Intrinsics`, a
 //! few statements each dialect supplies. A `TRUNCATE` is the default clear, being
 //! transactional and cheap on PostgreSQL and SQL Server; `cutover = 'delete'`
@@ -21,6 +24,7 @@ const std = @import("std");
 const msgfmt = @import("../base/msgfmt.zig");
 const sql = @import("sql.zig");
 const types = @import("../lang/types.zig");
+const ast = @import("../lang/ast.zig");
 
 pub const Cutover = enum { truncate, delete };
 
@@ -150,6 +154,65 @@ pub fn insertApplySql(a: std.mem.Allocator, d: sql.Dialect, target: []const u8, 
     return out.items;
 }
 
+/// A SQL Server UPSERT's one step on the target: the staged rows merged in by the
+/// keys in a single `MERGE` of a transaction, a staged row whose keys match a row
+/// updating its other columns and any other inserted, so they land all together or
+/// not at all; one join of the two tables, not a scan of the target per batch of
+/// literal rows. `HOLDLOCK` keeps a concurrent writer from inserting a key between
+/// the match and the insert. A loaded IDENTITY column takes the staged values. Run
+/// again after a lost connection it ends the same: the rows already merged match
+/// and take the values they hold.
+pub fn upsertApplySql(a: std.mem.Allocator, target: []const u8, staging: []const u8, schema: types.Schema, keys: []const []const u8) ![]const []const u8 {
+    const d: sql.Dialect = .sqlserver;
+    const in = intrinsics(d);
+    const qt = try sql.quoteIdent(a, d, target);
+    const qs = try sql.quoteIdent(a, d, staging);
+    const cols = try sql.colList(a, d, schema);
+    var m = std.array_list.Managed(u8).init(a);
+    const w = m.writer();
+    try w.print("MERGE INTO {s} WITH (HOLDLOCK) AS T USING {s} AS S ON ", .{ qt, qs });
+    for (keys, 0..) |k, i| {
+        const qk = try sql.quoteName(a, d, k);
+        try w.print("{s}T.{s} = S.{s}", .{ if (i > 0) " AND " else "", qk, qk });
+    }
+    var first = true;
+    for (schema.fields) |f| {
+        if (ast.nameIn(keys, f.name)) continue;
+        const qn = try sql.quoteName(a, d, f.name);
+        try w.print("{s}T.{s} = S.{s}", .{ if (first) " WHEN MATCHED THEN UPDATE SET " else ", ", qn, qn });
+        first = false;
+    }
+    try w.print(" WHEN NOT MATCHED BY TARGET THEN INSERT ({s}) VALUES (", .{cols});
+    for (schema.fields, 0..) |f, i| try w.print("{s}S.{s}", .{ if (i > 0) ", " else "", try sql.quoteName(a, d, f.name) });
+    try w.writeAll(");");
+    var out = std.array_list.Managed([]const u8).init(a);
+    try out.append(in.begin);
+    try out.append(try sql.identityInsertSql(a, qt, schema, true));
+    try out.append(m.items);
+    try out.append(try sql.identityInsertSql(a, qt, schema, false));
+    try out.append(in.commit);
+    return out.items;
+}
+
+/// The first key the staged rows of a SQL Server UPSERT hold more than once, with
+/// its count: `MERGE` would update one target row from two of them, or insert both.
+/// A row with a NULL key matches no row and is inserted, so it is not counted.
+pub fn upsertDupSql(a: std.mem.Allocator, staging: []const u8, keys: []const []const u8) ![]const u8 {
+    const d: sql.Dialect = .sqlserver;
+    var ks = std.array_list.Managed(u8).init(a);
+    var nn = std.array_list.Managed(u8).init(a);
+    for (keys, 0..) |k, i| {
+        const qk = try sql.quoteName(a, d, k);
+        if (i > 0) {
+            try ks.appendSlice(", ");
+            try nn.appendSlice(" AND ");
+        }
+        try ks.appendSlice(qk);
+        try nn.writer().print("{s} IS NOT NULL", .{qk});
+    }
+    return msgfmt.allocPrint(a, "SELECT TOP 1 {s}, COUNT_BIG(*) AS n FROM {s} WHERE {s} GROUP BY {s} HAVING COUNT_BIG(*) > 1", .{ ks.items, try sql.quoteIdent(a, d, staging), nn.items, ks.items });
+}
+
 pub fn dropSql(a: std.mem.Allocator, d: sql.Dialect, staging: []const u8) ![]const u8 {
     return msgfmt.allocPrint(a, "DROP TABLE IF EXISTS {s}", .{try sql.quoteIdent(a, d, staging)});
 }
@@ -216,4 +279,18 @@ test "an INSERT stages only its columns, typed by the target, and copies them in
     const msa = try insertApplySql(a, .sqlserver, "dbo.t", "dbo._basalt_stage_t_00000001", schema);
     try std.testing.expectEqual(@as(usize, 5), msa.len);
     try std.testing.expectEqualStrings("INSERT INTO [dbo].[t] ([id],[v]) SELECT [id],[v] FROM [dbo].[_basalt_stage_t_00000001]", msa[2]);
+}
+
+test "a SQL Server UPSERT merges its staged rows by the keys in one transaction, and looks for a key staged twice" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const schema = types.Schema{ .fields = &.{ .{ .name = "id", .ty = types.Type.init(.int) }, .{ .name = "v", .ty = types.Type.init(.string) } } };
+    const ms = try upsertApplySql(a, "dbo.t", "dbo._basalt_stage_t_00000001", schema, &.{"id"});
+    try std.testing.expectEqualStrings("BEGIN TRANSACTION", ms[0]);
+    try std.testing.expectEqualStrings("MERGE INTO [dbo].[t] WITH (HOLDLOCK) AS T USING [dbo].[_basalt_stage_t_00000001] AS S ON T.[id] = S.[id] WHEN MATCHED THEN UPDATE SET T.[v] = S.[v] WHEN NOT MATCHED BY TARGET THEN INSERT ([id],[v]) VALUES (S.[id], S.[v]);", ms[2]);
+    try std.testing.expectEqualStrings("COMMIT TRANSACTION", ms[4]);
+    const keys_only = try upsertApplySql(a, "t", "s", .{ .fields = schema.fields[0..1] }, &.{"id"});
+    try std.testing.expectEqualStrings("MERGE INTO [t] WITH (HOLDLOCK) AS T USING [s] AS S ON T.[id] = S.[id] WHEN NOT MATCHED BY TARGET THEN INSERT ([id]) VALUES (S.[id]);", keys_only[2]);
+    try std.testing.expectEqualStrings("SELECT TOP 1 [a], [b], COUNT_BIG(*) AS n FROM [s] WHERE [a] IS NOT NULL AND [b] IS NOT NULL GROUP BY [a], [b] HAVING COUNT_BIG(*) > 1", try upsertDupSql(a, "s", &.{ "a", "b" }));
 }

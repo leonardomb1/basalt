@@ -1022,6 +1022,22 @@ LOAD INTO db.dbo.it_bulkcols APPEND AS SELECT 'z' AS v FROM RANGE(2);" >"$out/ms
      [ "$(msq -Q "SET NOCOUNT ON; SELECT COUNT(*), MAX(id) FROM master.dbo.it_bulkcols;" | tr -d '\r' | head -1)" = "5,44" ]; then
     report sqlserver-identity-numbered ok
   else report "sqlserver-identity-numbered ($(head -1 "$out/ms_bulkcols.log"))" bad; fi
+  # An UPSERT is staged by bulk and merged in by one MERGE: on lanes into a heap with
+  # no index on the key (row-literal MERGE batches scanned it once each, and the
+  # lanes deadlocked), and a key the rows hold twice refused with the table kept.
+  msq -Q "USE master; DROP TABLE IF EXISTS dbo.it_upheap; CREATE TABLE dbo.it_upheap (id bigint, v nvarchar(20));" >/dev/null 2>&1
+  if brun run -j 4 -c "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);
+LOAD INTO db.dbo.it_upheap UPSERT ON (id) AS SELECT range AS id, 'a' AS v FROM RANGE(200000);" &&
+     brun run -j 4 -c "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);
+LOAD INTO db.dbo.it_upheap UPSERT ON (id) AS SELECT range * 2 AS id, 'b' AS v FROM RANGE(150000);"; then
+    got=$(msq -Q "SET NOCOUNT ON; SELECT COUNT(*), SUM(CASE WHEN v = 'b' THEN 1 ELSE 0 END) FROM master.dbo.it_upheap;" | tr -d '\r' | head -1)
+    if [ "$got" = "250000,150000" ]; then report sqlserver-upsert-staged ok; else report "sqlserver-upsert-staged (got $got)" bad; fi
+  else report "sqlserver-upsert-staged (run error)" bad; fi
+  $B run -q -c "CREATE CONNECTION db TYPE sqlserver OPTIONS ($MSSQL_OPTS);
+LOAD INTO db.dbo.it_upheap UPSERT ON (id) AS SELECT 7 AS id, 'x' AS v UNION ALL SELECT 7 AS id, 'y' AS v;" >"$out/ms_updup.log" 2>&1 || true
+  got=$(msq -Q "SET NOCOUNT ON; SELECT COUNT(*) FROM master.dbo.it_upheap WHERE v IN ('x', 'y'); SELECT COUNT(*) FROM master.sys.tables WHERE name LIKE '_basalt_stage%';" | tr -d '\r' | tr '\n' ' ')
+  if grep -q "the rows hold the key (id = 7) 2 times" "$out/ms_updup.log" && [ "$got" = "0 0 " ]; then report sqlserver-upsert-key-twice-refused ok
+  else report "sqlserver-upsert-key-twice-refused (got $got)" bad; head -2 "$out/ms_updup.log"; fi
   # A batch longer than one TDS packet over TLS: each packet goes out as written,
   # or SQL Server drops the connection.
   long=$(printf 'x%.0s' $(seq 1 20000))
