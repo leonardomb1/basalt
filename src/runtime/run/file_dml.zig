@@ -16,7 +16,9 @@
 //!     as read and its updated ones in their places.
 //! Rows keep their order, and nothing is written when no row changes. A local file
 //! whose size, modification time or inode changed since it was read is not replaced,
-//! nor an object whose ETag did.
+//! nor an object whose ETag did. Both reads of the file are closed before the
+//! rewrite takes its place: a Windows or Azure Files share refuses to replace a file
+//! any handle holds open, this run's own included.
 
 const std = @import("std");
 const ast = @import("../../lang/ast.zig");
@@ -118,7 +120,8 @@ pub fn run(env: *Env, w: ast.Write, read: ast.Stage, between_in: []const ast.Sta
     scan.* = .{ .src = first.src };
     var current: op.Op = .{ .scan = scan };
     var schema = first.src.schema();
-    defer first.src.close();
+    var src_open = true;
+    defer if (src_open) first.src.close();
     for (stages.items) |st| {
         const r = try plan.buildStage(env, st, current, schema);
         current = r.op;
@@ -137,7 +140,10 @@ pub fn run(env: *Env, w: ast.Write, read: ast.Stage, between_in: []const ast.Sta
         env.log.script(try msgfmt.allocPrint(a, "{s}: would {s} {d} row{s}", .{ what, if (which == .delete) "delete" else "update", n, if (n == 1) "" else "s" }));
         return;
     }
-    const n = if (try hits.peek() == null) 0 else switch (kind) {
+    const any = try hits.peek() != null;
+    first.src.close();
+    src_open = false;
+    const n = if (!any) 0 else switch (kind) {
         .csv, .ndjson => try rewriteText(env, w, path, kind, which, read, data, &hits, guard, what),
         .sheet => try rewriteXlsx(env, path, first, which, &hits, guard, what),
         .whole => try rewriteWhole(env, w, format, want, first.array, which, read, data, &hits, guard, what, opts),
@@ -333,7 +339,8 @@ fn rewriteText(env: *Env, w: ast.Write, path: []const u8, kind: Kind, which: Op,
     const dialect = analyze.dialectFromHints(read.hints, &ddiag) catch |e| return env_mod.aErr(env, &ddiag, e);
     const in = stream.Stream.open(a, path) catch |e|
         return planErrT(env.diag, e, try msgfmt.allocPrint(a, "could not read `{s}` ({s})", .{ path, @errorName(e) }));
-    defer in.close();
+    var in_open = true;
+    defer if (in_open) in.close();
     const out = Output.open(a, path, if (kind == .csv) "text/csv" else "application/x-ndjson", .truncate) catch |e|
         return planErrT(env.diag, e, try msgfmt.allocPrint(a, "could not write `{s}` ({s})", .{ path, @errorName(e) }));
     var ok = false;
@@ -389,6 +396,8 @@ fn rewriteText(env: *Env, w: ast.Write, path: []const u8, kind: Kind, which: Op,
     }
     if (n == 0) return 0;
     try cp.rest();
+    in.close();
+    in_open = false;
     if (!guard.holds()) return planErr(env.diag, try msgfmt.allocPrint(a, "{s}: the file changed while it was rewritten, so the rewrite is not put in its place; run it again", .{what}));
     out.finish() catch |e| {
         const x = out.specific(e);
@@ -503,7 +512,8 @@ fn rewriteWhole(env: *Env, w: ast.Write, format: analyze.FileFormat, want: ?anal
     const a = env.arena;
     const src = try source.openSourceProjected(env, read.node.read, read.hints, null, &.{});
     const num = try Numbered.open(a, src);
-    defer num.close();
+    var num_open = true;
+    defer if (num_open) num.close();
     var target = w;
     target.update = null;
     target.delete = null;
@@ -585,8 +595,10 @@ fn rewriteWhole(env: *Env, w: ast.Write, format: analyze.FileFormat, want: ?anal
     }
     if (piped and n > 0) try up.finish();
     if (n == 0) return 0;
+    num.close();
+    num_open = false;
     if (!guard.holds()) return planErr(env.diag, try msgfmt.allocPrint(a, "{s}: the file changed while it was rewritten, so the rewrite is not put in its place; run it again", .{what}));
-    sink.close() catch |e| return planErrT(env.diag, e, try msgfmt.allocPrint(a, "{s}: could not write it ({s})", .{ what, @errorName(e) }));
+    sink.close() catch |e| return planErrT(env.diag, e, try msgfmt.allocPrint(a, "{s}: could not write it ({s})", .{ what, @import("../../exec/eval.zig").takeFailure(e) orelse @errorName(e) }));
     ok = true;
     return n;
 }

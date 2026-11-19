@@ -12,7 +12,10 @@
 //!
 //! The KDC is the connection's `kdc`, else what DNS lists for
 //! `_kerberos._tcp.<realm>`, else the realm's own name (an AD domain's name
-//! resolves to its domain controllers). The realm is kept upper-cased, as AD
+//! resolves to its domain controllers). DNS lists a domain's controllers in no
+//! order of distance, and each exchange is a connection of its own, so the first
+//! login of a process to a realm with several connects to all of them at once
+//! and goes to the one that answered first from then on (`fastestKdc`). The realm is kept upper-cased, as AD
 //! writes it. Tickets are kept in-process per principal and service until they
 //! expire, so a parallel read's lanes do not each go back to the KDC.
 //! A failure's words go to the thread's `conn.LoginNote`, never with a secret.
@@ -491,6 +494,7 @@ fn exchange(gpa: std.mem.Allocator, cred: Credential, req: []const u8) ![]u8 {
     } else {
         const n = srvLookup(gpa, cred.realm, &hosts_buf) catch 0;
         for (hosts_buf[0..n]) |h| try hosts.append(h);
+        if (nearestKdc(cred.realm, hosts.items)) |i| std.mem.swap([]const u8, &hosts.items[0], &hosts.items[i]);
         try hosts.append(try std.ascii.allocLowerString(gpa, cred.realm));
     }
     var last: anyerror = error.KrbKdcUnreachable;
@@ -533,6 +537,118 @@ fn exchange(gpa: std.mem.Allocator, cred: Credential, req: []const u8) ![]u8 {
     }
     return fail(error.KrbKdcUnreachable, "no KDC for {s} answered ({s}) — set `kdc` on the connection", .{ cred.realm, @errorName(last) });
 }
+
+/// The KDC of `hosts` (`host:port`, as DNS lists a realm's) that this process's
+/// logins to `realm` go to first: the one `fastestKdc` found, remembered per realm
+/// for the process, and found again when DNS no longer lists it. Null for a list of
+/// one or none, or when none answered.
+fn nearestKdc(realm: []const u8, hosts: []const []const u8) ?usize {
+    if (hosts.len < 2) return null;
+    nearest.mtx.lock();
+    defer nearest.mtx.unlock();
+    if (nearest.by_realm.get(realm)) |h| for (hosts, 0..) |x, i| if (std.mem.eql(u8, x, h)) return i;
+    const i = fastestKdc(hosts, race_wait_ms) orelse return null;
+    const pa = std.heap.page_allocator;
+    const key = pa.dupe(u8, realm) catch return i;
+    const val = pa.dupe(u8, hosts[i]) catch return i;
+    nearest.by_realm.put(pa, key, val) catch {};
+    return i;
+}
+
+var nearest: struct {
+    mtx: std.Thread.Mutex = .{},
+    by_realm: std.StringHashMapUnmanaged([]const u8) = .empty,
+} = .{};
+
+/// How long the first login waits for any KDC to answer a connect before trying
+/// them one by one in DNS's order.
+const race_wait_ms: u64 = 5000;
+
+/// The index of the first of `hosts` to accept a TCP connect, each dialed at once
+/// on a thread of its own; null when none did within `wait_ms`. The threads are
+/// detached and share `Race`, which the last of them and the caller to let go frees:
+/// a far KDC's connect may outlast the call.
+fn fastestKdc(hosts: []const []const u8, wait_ms: u64) ?usize {
+    const pa = std.heap.page_allocator;
+    const r = pa.create(Race) catch return null;
+    r.* = .{ .hosts = pa.alloc([]const u8, hosts.len) catch {
+        pa.destroy(r);
+        return null;
+    }, .pending = hosts.len, .refs = hosts.len + 1 };
+    var copied: usize = 0;
+    for (hosts, r.hosts) |h, *o| {
+        o.* = pa.dupe(u8, h) catch break;
+        copied += 1;
+    }
+    if (copied < hosts.len) {
+        for (r.hosts[0..copied]) |h| pa.free(h);
+        pa.free(r.hosts);
+        pa.destroy(r);
+        return null;
+    }
+    for (0..hosts.len) |i| {
+        const t = std.Thread.spawn(.{}, Race.dial, .{ r, i }) catch {
+            r.mtx.lock();
+            r.pending -= 1;
+            r.mtx.unlock();
+            r.release();
+            continue;
+        };
+        t.detach();
+    }
+    r.mtx.lock();
+    const deadline = std.time.nanoTimestamp() + @as(i128, wait_ms) * std.time.ns_per_ms;
+    while (r.winner == null and r.pending > 0) {
+        const left = deadline - std.time.nanoTimestamp();
+        if (left <= 0) break;
+        r.cv.timedWait(&r.mtx, @intCast(left)) catch {};
+    }
+    const w = r.winner;
+    r.mtx.unlock();
+    r.release();
+    return w;
+}
+
+const Race = struct {
+    mtx: std.Thread.Mutex = .{},
+    cv: std.Thread.Condition = .{},
+    hosts: [][]const u8,
+    winner: ?usize = null,
+    pending: usize,
+    refs: usize,
+
+    fn dial(self: *Race, i: usize) void {
+        const hp = self.hosts[i];
+        var host = hp;
+        var port: u16 = 88;
+        if (std.mem.lastIndexOfScalar(u8, hp, ':')) |c| {
+            host = hp[0..c];
+            port = std.fmt.parseInt(u16, hp[c + 1 ..], 10) catch 88;
+        }
+        const ok = if (conn.dial(std.heap.page_allocator, host, port, .{ .tune = false, .io_timeout_s = kdc_timeout_s })) |stream| blk: {
+            stream.close();
+            break :blk true;
+        } else |_| false;
+        self.mtx.lock();
+        if (ok and self.winner == null) self.winner = i;
+        self.pending -= 1;
+        self.cv.broadcast();
+        self.mtx.unlock();
+        self.release();
+    }
+
+    fn release(self: *Race) void {
+        self.mtx.lock();
+        self.refs -= 1;
+        const last = self.refs == 0;
+        self.mtx.unlock();
+        if (!last) return;
+        const pa = std.heap.page_allocator;
+        for (self.hosts) |h| pa.free(h);
+        pa.free(self.hosts);
+        pa.destroy(self);
+    }
+};
 
 /// Fills `buf`; a read the socket timeout cut short is ConnectionTimedOut.
 fn readFull(stream: std.net.Stream, buf: []u8) !void {
@@ -1237,4 +1353,17 @@ test "krb5: a KDC reply is taken only when its encrypted part carries back the r
             try std.testing.expectEqualSlices(u8, &sk, t.key.slice());
         } else try std.testing.expectError(error.KrbProtocol, kdcReply(gpa, cred, rep, &key, 3, "the login", c.sent));
     }
+}
+
+test "the first login to a realm goes to the KDC that answers a connect first, whatever DNS's order" {
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    var buf: [64]u8 = undefined;
+    const near = try std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{server.listen_address.getPort()});
+    const hosts = [_][]const u8{ "192.0.2.1:88", "kdc.invalid:88", near };
+    const t0 = std.time.milliTimestamp();
+    try std.testing.expectEqual(@as(?usize, 2), fastestKdc(&hosts, 5000));
+    try std.testing.expect(std.time.milliTimestamp() - t0 < 2000);
+    try std.testing.expectEqual(@as(?usize, null), fastestKdc(&.{ "kdc.invalid:88", "kdc2.invalid:88" }, 5000));
 }

@@ -32,6 +32,7 @@
 //! Not here: DFS referrals, oplocks and leases, multichannel.
 
 const std = @import("std");
+const retry = @import("../net/retry.zig");
 const msgfmt = @import("../base/msgfmt.zig");
 const driver = @import("../exec/driver.zig");
 const netconn = @import("../net/conn.zig");
@@ -936,7 +937,12 @@ pub const Session = struct {
         return m.status;
     }
 
-    /// Renames to `to`, relative to the share's root, replacing any file there.
+    /// Renames to `to`, relative to the share's root, replacing any file there. A
+    /// Windows or Azure Files share refuses to replace a file while any handle holds
+    /// it open (ACCESS_DENIED or SHARING_VIOLATION): another run's writer in the
+    /// instant between its own rename and close, or a reader. The rename is tried
+    /// again over about three seconds, which outlasts the first; a file held longer
+    /// (open in Excel, read by another run) fails saying so.
     pub fn rename(self: *Session, h: Handle, to: []const u8) Error!void {
         const name = utf16.encodeLeAlloc(self.gpa, to) catch return error.SmbFailure;
         defer self.gpa.free(name);
@@ -947,8 +953,33 @@ pub const Session = struct {
         put64(&b, 0);
         put32(&b, @intCast(name.len));
         b.appendSlice(name) catch return error.SmbFailure;
-        const st = try self.setInfo(h, 10, b.items);
-        if (st != Status.success) return fail(error.SmbFailure, "renaming to {s} failed (status 0x{x:0>8})", .{ to, st });
+        const Try = struct {
+            s: *Session,
+            h: Handle,
+            info: []const u8,
+            st: u32 = 0,
+
+            fn attempt(t: *@This()) !retry.Verdict {
+                t.st = try t.s.setInfo(t.h, 10, t.info);
+                if (t.st == Status.success) return .done;
+                return .{ .failed = .{ .code = 0, .err = error.SmbFailure, .retriable = held(t.st) } };
+            }
+
+            fn held(st: u32) bool {
+                return st == Status.access_denied or st == Status.sharing_violation;
+            }
+
+            fn never(_: anyerror) bool {
+                return false;
+            }
+        };
+        var t = Try{ .s = self, .h = h, .info = b.items };
+        var prng = retry.jitterPrng();
+        retry.retry(.{ .rand = prng.random(), .base_ms = 50, .max_attempts = 7, .budget_ms = 3000, .transient = Try.never }, &t, Try.attempt) catch |e| {
+            if (e != error.SmbFailure or t.st == Status.success) return @errorCast(e);
+            if (Try.held(t.st)) return fail(error.SmbSharingViolation, "{s} could not be replaced: it is open in another program (Excel, a reader, another run) or the login may not delete it; close it and run again", .{to});
+            return fail(error.SmbFailure, "renaming the written file over {s} failed (status 0x{x:0>8})", .{ to, t.st });
+        };
     }
 
     pub fn echo(self: *Session) bool {

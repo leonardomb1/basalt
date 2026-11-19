@@ -17,6 +17,7 @@ const deflate = @import("compress/deflate.zig");
 const driver = @import("../exec/driver.zig");
 const objstore = @import("../store/objstore.zig");
 const stream = @import("stream.zig");
+const eval = @import("../exec/eval.zig");
 const Part = @import("../store/part.zig").Part;
 
 /// The object version the next upload of `path` must replace (`expectVersion`).
@@ -202,9 +203,19 @@ pub const Output = struct {
                 }
                 try self.part.commit();
             },
-            .object => |o| o.finish() catch |e| return self.specific(e),
+            .object => |o| o.finish() catch |e| return remoteFailed(o, e),
             .memory => {},
         }
+    }
+
+    /// `e` from an upload, explained by the reason the store kept (an SMB or SFTP
+    /// status and path, an object store's reply) unless a failure already says why.
+    fn remoteFailed(o: objstore.Writer, e: anyerror) anyerror {
+        const x = o.specific(e);
+        if (eval.peekFailure(x) != null) return x;
+        const why = o.lastError();
+        if (why.len == 0) return x;
+        return stream.explainf(x, "{s}", .{why});
     }
 
     pub fn abort(self: *Output) void {

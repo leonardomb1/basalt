@@ -41,7 +41,11 @@ CREATE CONNECTION az TYPE smb OPTIONS (
 basalt asks the KDC for a ticket with the password itself — it holds no system
 ticket and reads no keytab — with pre-authentication and AES keys only (RC4 is
 refused). The KDC is `kdc = 'host[:port]'` when given, else the one DNS lists
-for `_kerberos._tcp.<realm>`, else the realm's own name; the service is
+for `_kerberos._tcp.<realm>`, else the realm's own name. DNS lists a domain's
+controllers in no order of distance, and a login takes three round trips to the
+KDC, so the first login of a run connects to every listed controller at once and
+uses the one that answered first, the nearest, for the rest of the run; naming
+one with `kdc` skips that step. The service is
 `cifs/<host>`, or `spn` when the server is known by another name (reach a
 private endpoint by IP, say, but name it by its DNS name). Tickets are reused
 until they expire. The user may be written `me@CORP.LOCAL` or `CORP\me`; it logs
@@ -62,3 +66,10 @@ the credits the server grants, and a parallel read gets a session per lane;
 sessions are pooled per server and login. A write goes to `name.<8 hex>.part`, a
 name of its own, and is renamed over `name` once complete; a failed load deletes
 the `.part` and leaves `name` as it was. `APPEND` is not supported, and a missing folder is an error.
+
+A Windows or Azure Files share refuses to replace a file that any handle holds
+open. A `DELETE`, `UPDATE` or `INSERT` closes its own reads of the file before the
+rename; the rename is tried again for about three seconds, which another run's
+write finishing at the same moment outlasts; a file held open longer, in Excel or
+by a run reading it, fails the write saying so, the file left as it was and no
+`.part` behind.
