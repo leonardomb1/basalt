@@ -835,6 +835,85 @@ test "PARAM: a FLOAT defaulting to 0.5 is a float, a DECIMAL one keeps its scale
     try std.testing.expectEqualStrings("id,r,f\n1,50,2.50\n", out);
 }
 
+test "a scalar subquery in a query of a FOR EACH body, a statement function or a CASE arm runs where that query does, once per row in a PARALLEL loop" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "n.csv", .data = "id\n1\n2\n3\n4\n5\n6\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.mem.replaceOwned(u8, alloc,
+        \\CREATE FUNCTION below(lim INT) AS BEGIN
+        \\  LOAD INTO '$B/f.csv' AS SELECT id FROM '$B/n.csv' WHERE id = (SELECT max(id) AS m FROM '$B/n.csv' WHERE id < $lim);
+        \\END;
+        \\FOR EACH ROW OF (SELECT id AS k FROM '$B/n.csv') AS (k INT) PARALLEL
+        \\  LOAD INTO '$B/l${k}.csv' AS SELECT $k AS k, (SELECT count(*) AS n FROM '$B/n.csv' WHERE id <= $k) AS n FROM RANGE(1);
+        \\END FOR;
+        \\CALL below(3);
+        \\CASE WHEN 1 = 1 THEN LOAD INTO '$B/c.csv' AS SELECT id FROM '$B/n.csv' WHERE id = (SELECT min(id) AS m FROM '$B/n.csv'); END CASE;
+    , "$B", base);
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var adiag = analyze.Diag{};
+    _ = analyze.analyze(parena.allocator(), prog, &adiag) catch |e| {
+        std.debug.print("check error: {s}\n", .{adiag.msg});
+        return e;
+    };
+    var rdiag: Diag = .{};
+    _ = try run(alloc, prog, .{ .threads = 4, .log = .{ .quiet = true } }, &rdiag);
+    for (1..7) |k| {
+        const name = try std.fmt.allocPrint(alloc, "l{d}.csv", .{k});
+        defer alloc.free(name);
+        const want = try std.fmt.allocPrint(alloc, "k,n\n{d},{d}\n", .{ k, k });
+        defer alloc.free(want);
+        try expectFile(&tmp, name, want);
+    }
+    try expectFile(&tmp, "f.csv", "id\n2\n");
+    try expectFile(&tmp, "c.csv", "id\n1\n");
+}
+
+test "IDENTIFIER names a join key, bare or after a table's alias, a quoted name's hole is filled there too, and a correlated NOT EXISTS reaches the outer table's computed column" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "a.csv", .data = "id,CT2_EMPRESA\n1,01\n2,02\n3,03\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "d.csv", .data = "id,CT2_EMPRESA\n1,01\n2,02\n3,03\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b.csv", .data = "CT2_EMPRESA,nome\n01,x\n02,y\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "b2.csv", .data = "EMP,nome\n01,x\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    const script = try std.mem.replaceOwned(u8, alloc,
+        \\PARAM name STRING DEFAULT 'CT2';
+        \\LOAD INTO '$B/j1.csv' AS SELECT a.id, b.nome FROM '$B/a.csv' a LEFT JOIN '$B/b2.csv' b ON b.EMP = IDENTIFIER($name || '_EMPRESA') ORDER BY a.id;
+        \\LOAD INTO '$B/j2.csv' AS SELECT a.id, b.nome FROM '$B/a.csv' a LEFT JOIN '$B/b.csv' b ON b.IDENTIFIER($name || '_EMPRESA') = a.IDENTIFIER($name || '_EMPRESA') ORDER BY a.id;
+        \\LOAD INTO '$B/j3.csv' AS SELECT a.id, b.nome FROM '$B/a.csv' a JOIN '$B/b2.csv' b ON b.EMP = a."${name}_EMPRESA";
+        \\FOR EACH ROW OF (SELECT 'CT2' AS t) AS (t)
+        \\  DELETE FROM '$B/d.csv' d WHERE NOT EXISTS (SELECT 1 FROM '$B/b2.csv' b WHERE b.EMP = d.IDENTIFIER($t || '_EMPRESA'));
+        \\END FOR;
+    , "$B", base);
+    defer alloc.free(script);
+
+    var parena = std.heap.ArenaAllocator.init(alloc);
+    defer parena.deinit();
+    var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    const prog = try parser.parseSource(parena.allocator(), script, &pdiag);
+    var adiag = analyze.Diag{};
+    _ = analyze.analyze(parena.allocator(), prog, &adiag) catch |e| {
+        std.debug.print("check error: {s}\n", .{adiag.msg});
+        return e;
+    };
+    var rdiag: Diag = .{};
+    _ = try run(alloc, prog, .{ .log = .{ .quiet = true } }, &rdiag);
+    try expectFile(&tmp, "j1.csv", "id,nome\n1,x\n2,\n3,\n");
+    try expectFile(&tmp, "j2.csv", "id,nome\n1,x\n2,y\n3,\n");
+    try expectFile(&tmp, "j3.csv", "id,nome\n1,x\n");
+    try expectFile(&tmp, "d.csv", "id,CT2_EMPRESA\n1,01\n");
+}
+
 test "IDENTIFIER path: a PARAM resolves outside any FOR EACH" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -2057,10 +2136,15 @@ test "check and run refuse alike: declarations out of place, bad connection opti
         .{ "SELECT * FROM nope.t;", "unknown connection `nope` in read" },
         .{ "CREATE CONNECTION sr TYPE starrocks OPTIONS (host = '127.0.0.1', user = 'u', password = 'p', database = 'd', port = 99999);\nLOAD INTO sr.t AS SELECT 1 AS a;", "starrocks connection `port` is out of range" },
         .{ "CREATE CONNECTION pg TYPE postgres OPTIONS (host = '127.0.0.1', user = 'u', password = 'p', database = 'd');\nLOAD INTO pg.t UPSERT AS SELECT * FROM '$B/a.csv';", "a bare `UPSERT` infers the primary key from the source" },
-        .{ "PARAM n INT DEFAULT 1;\nTHROW 'boom' WHEN $n > 'x';\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "THROW condition: type mismatch" },
+        .{ "PARAM n INT DEFAULT 1;\nTHROW 'boom' WHEN $n > 'x';\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "THROW condition: `x` is not a valid int literal" },
         .{ "THROW 1 / 0 WHEN true;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "THROW message: division by zero" },
-        .{ "PARAM n INT DEFAULT 1;\nCASE WHEN $n = 'x' THEN LOAD INTO '$B/o.csv' AS SELECT 1 AS a; END CASE;", "match guard: type mismatch" },
-        .{ "PARAM n INT DEFAULT 1;\nCASE $n WHEN 1 / 0 THEN LOAD INTO '$B/o.csv' AS SELECT 1 AS a; END CASE;", "match pattern: division by zero" },
+        .{ "PARAM n INT DEFAULT 1;\nCASE WHEN $n = 'x' THEN LOAD INTO '$B/o.csv' AS SELECT 1 AS a; END CASE;", "CASE guard: `x` is not a valid int literal" },
+        .{ "PARAM n INT DEFAULT 1;\nCASE $n WHEN 1 / 0 THEN LOAD INTO '$B/o.csv' AS SELECT 1 AS a; END CASE;", "CASE pattern: division by zero" },
+        .{ "PRINT 1 + 'a';\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "PRINT: arithmetic needs numeric operands, got 1 (int) and 'a' (string)" },
+        .{ "FOR EACH ROW OF (SELECT x FROM '$B/a.csv') AS (x)\n  THROW 'e' WHEN $x = 0;\n  LOAD INTO '$B/o.csv' AS SELECT 1 AS a;\nEND FOR;", "THROW condition: cannot compare `$x` (string) with 0 (int) — CAST one side to the other's type (`$x` is a loop variable, a STRING unless the loop declares its type, as `AS (x INT)`)" },
+        .{ "FOR EACH ROW OF (SELECT x FROM '$B/a.csv') AS (x)\n  CASE WHEN $x > 0 THEN LOAD INTO '$B/o.csv' AS SELECT 1 AS a; END CASE;\nEND FOR;", "CASE guard: cannot compare `$x` (string) with 0 (int)" },
+        .{ "CREATE FUNCTION p(v) AS BEGIN\n  PRINT $v + 1;\n  LOAD INTO '$B/o.csv' AS SELECT 1 AS a;\nEND;\nCALL p(1);", "PRINT: arithmetic needs numeric operands, got `$v` (string) and 1 (int); `||` joins text (`$v` is a parameter of the function, a STRING unless it declares its type, as `v INT`)" },
+        .{ "LOAD INTO '$B/o.csv' AS SELECT x FROM '$B/a.csv' a WHERE NOT EXISTS (SELECT 1 FROM '$B/a.csv' b WHERE b.x = y);", "unknown field `y` in a subquery: a name written without a table there is the subquery's own; if `y` is the outer query's, write it with that table's alias (`t.y`)" },
         .{ "PRINT 1 / 0;\nLOAD INTO '$B/o.csv' AS SELECT 1 AS a;", "PRINT: division by zero" },
         .{ "CREATE FUNCTION f(a) AS BEGIN\n  LOAD INTO '$B/o.csv' AS SELECT $a AS a;\nEND;\nCALL f(1 / 0);", "CALL f: argument `a`: division by zero" },
         .{ "PARAM n STRING DEFAULT upper('x');\nLOAD INTO '$B/o.csv' AS SELECT $n AS a;", "param default must be a literal" },

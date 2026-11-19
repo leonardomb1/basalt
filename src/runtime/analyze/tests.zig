@@ -183,7 +183,7 @@ test "check folds an expression LET over known values as the run does, and leave
     const a = ar.allocator();
     const cases = [_]struct { src: []const u8, cli: []const ParamOverride = &.{}, err: ?[]const u8 }{
         .{ .src = "LET m = 1 / 0;\nSELECT $m AS x;", .err = "LET `m`: division by zero" },
-        .{ .src = "LET m = CAST('abc' AS INT);\nSELECT $m AS x;", .err = "LET `m`: cast failed" },
+        .{ .src = "LET m = CAST('abc' AS INT);\nSELECT $m AS x;", .err = "LET `m`: CAST: 'abc' is not an INT" },
         .{ .src = "PARAM n INT DEFAULT 4;\nLET r = 100 / $n;\nLET s = $r + 1;\nSELECT $s AS x;", .err = null },
         .{ .src = "PARAM n INT DEFAULT 4;\nLET r = 100 / $n;\nSELECT $r AS x;", .cli = &.{.{ .name = "n", .value = "0" }}, .err = "LET `r`: division by zero" },
         .{ .src = "PARAM n INT;\nLET r = 100 / $n;\nSELECT $r AS x;", .err = null },

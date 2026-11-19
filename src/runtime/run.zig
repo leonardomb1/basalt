@@ -411,12 +411,12 @@ fn runStmtMatch(env: *Env, m: ast.StmtMatch, opts_in: RunOptions, stats: *Stats,
     defer env.explain = was_explain;
     const opts = explainedBy(env, m.explain, opts_in);
     const sc = try (LoopRow{ .names = &.{}, .cells = &.{} }).scope(env.arena, env.params);
-    const idx = (try matchArmIndex(env, m, sc.names, sc.values, "match")) orelse return;
+    const idx = (try matchArmIndex(env, m, sc.names, sc.values, "CASE")) orelse return;
     for (m.arms[idx].body) |*st| try runStmt(env, st, opts, stats, lanes_used, batch_arena);
 }
 
 /// A statement of a top-level CASE arm. `checkFirst` refused a LET, PARAM or function
-/// declared in one, so none reaches here.
+/// declared in one, so a LET here is a scalar subquery lifted out of the arm's query.
 fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     env.diag.pos = null;
     env.folder_memo.clearRetainingCapacity();
@@ -442,7 +442,8 @@ fn runStmt(env: *Env, s: *const ast.Stmt, opts: RunOptions, stats: *Stats, lanes
             try registerSmb(env, c);
             try registerFtp(env, c);
         },
-        .let_const, .param, .func, .kind => unreachable,
+        .let_const => |l| try runScalarLet(env, l, false, opts, lanes_used, batch_arena),
+        .param, .func, .kind => unreachable,
     }
 }
 
@@ -493,10 +494,18 @@ fn runScalarLet(env: *Env, l: ast.LetConst, of_explain: bool, opts: RunOptions, 
         try env.params_expr.put(l.name, try mkLit(env.arena, v));
         return;
     }
+    const v = try scalarCell(env, l, (try renderScriptScope(env, l.query.?)).stages, of_explain, opts, lanes_used, batch_arena);
+    try env.params.put(l.name, v);
+    try env.params_expr.put(l.name, try mkLit(env.arena, v));
+    if (!std.mem.startsWith(u8, l.name, "__scalar")) if (env.on_let) |h| h.f(h.ctx, l.name, v);
+    env.log.log(.debug, "LET {s} = scalar query result ({s})", .{ l.name, @tagName(std.meta.activeTag(v)) });
+}
+
+/// The single cell query LET `l`'s rendered `stages` give.
+fn scalarCell(env: *Env, l: ast.LetConst, stages: []const ast.Stage, of_explain: bool, opts: RunOptions, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) !Value {
     const what = try analyze.queryLetLabel(env.arena, l.name);
     const step = try explainStep.openStep(env, env.explain or of_explain, what);
     defer explainStep.closeStep(env, step);
-    const stages = (try renderScriptScope(env, l.query.?)).stages;
     if (step) |p| try explainStep.noteStep(env, p, stages);
     if (opts.lanes() > 1) {
         const ms = try runToMemory(env, opts, stages, what, lanes_used, batch_arena);
@@ -512,11 +521,7 @@ fn runScalarLet(env: *Env, l: ast.LetConst, of_explain: bool, opts: RunOptions, 
             n += b.len;
         }
         if (n > 1) return planErr(env.diag, try msgfmt.allocPrint(env.arena, "{s}: returned more than one row", .{what}));
-        try env.params.put(l.name, cell);
-        try env.params_expr.put(l.name, try mkLit(env.arena, cell));
-        if (!std.mem.startsWith(u8, l.name, "__scalar")) if (env.on_let) |h| h.f(h.ctx, l.name, cell);
-        env.log.log(.debug, "LET {s} = scalar query result ({s})", .{ l.name, @tagName(std.meta.activeTag(cell)) });
-        return;
+        return cell;
     }
     const pipe = try buildPipeline(env, stages);
     defer pipe.op.release();
@@ -542,11 +547,7 @@ fn runScalarLet(env: *Env, l: ast.LetConst, of_explain: bool, opts: RunOptions, 
         _ = scratch.reset(.retain_capacity);
     }
     if (step) |p| try p.absorbStep(pipe.op);
-
-    try env.params.put(l.name, v);
-    try env.params_expr.put(l.name, try mkLit(env.arena, v));
-    if (!std.mem.startsWith(u8, l.name, "__scalar")) if (env.on_let) |h| h.f(h.ctx, l.name, v);
-    env.log.log(.debug, "LET {s} = scalar query result ({s})", .{ l.name, @tagName(std.meta.activeTag(v)) });
+    return v;
 }
 
 /// Whether scalar subquery `l` was lifted out of an `EXPLAIN ANALYZE` among `rest`,
@@ -712,6 +713,9 @@ pub fn hasSort(stages: []const ast.Stage) bool {
 
 /// Run one row of a `for` body: each pipeline is rendered with the row's `${var}`
 /// values; a nested loop's source is rendered with the outer row and chains to it.
+/// A scalar subquery lifted out of a body query runs for this row, and its cell is
+/// one more variable of the row for the statements after it, so rows run in
+/// parallel never share it.
 pub fn runForBody(env: *Env, body: []const ast.Stmt, lr: LoopRow, opts: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     if (lr.badCell(env.arena)) |b|
         return planErr(env.diag, try msgfmt.allocPrint(env.arena, "loop variable `{s}`: `{s}` is not {s}", .{ b.name, b.cell, try b.ty.name(env.arena) }));
@@ -725,7 +729,21 @@ pub fn runForBody(env: *Env, body: []const ast.Stmt, lr: LoopRow, opts: RunOptio
             if (sv.prev) |p| env.bindings.put(sv.name, p) catch {} else _ = env.bindings.remove(sv.name);
         }
     }
-    for (body) |*st| try runForStmt(env, st, lr, opts, stats, lanes_used, batch_arena);
+    var row = lr;
+    for (body) |*st| {
+        if (st.* != .let_const) {
+            try runForStmt(env, st, row, opts, stats, lanes_used, batch_arena);
+            continue;
+        }
+        const l = st.let_const;
+        const v = blk: {
+            defer env.endStatement(false);
+            break :blk try scalarCell(env, l, (try renderBound(env, l.query.?, row)).stages, false, opts, lanes_used, batch_arena);
+        };
+        const outer = try env.arena.create(LoopRow);
+        outer.* = row;
+        row = .{ .names = try env.arena.dupe([]const u8, &.{l.name}), .cells = try env.arena.dupe([]const u8, &.{""}), .values = try env.arena.dupe(Value, &.{v}), .outer = outer };
+    }
 }
 
 /// A FOR EACH, CALL or nested CASE body statement; `checkFirst` refused every
@@ -757,7 +775,7 @@ fn runForMatch(env: *Env, m: ast.StmtMatch, lr: LoopRow, opts_in: RunOptions, st
     defer env.explain = was_explain;
     const opts = explainedBy(env, m.explain, opts_in);
     const sc = try lr.scope(env.arena, env.params);
-    const idx = (try matchArmIndex(env, m, sc.names, sc.values, "for/match")) orelse return;
+    const idx = (try matchArmIndex(env, m, sc.names, sc.values, "CASE")) orelse return;
     try runForBody(env, m.arms[idx].body, lr, opts, stats, lanes_used, batch_arena);
 }
 

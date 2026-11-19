@@ -143,7 +143,7 @@ fn evalHole(arena: std.mem.Allocator, text: []const u8, lr: LoopRow) !Hole {
     try lr.appendScope(arena, &names, &vals);
     const v = eval.constEval(arena, e, names.items, vals.items) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .fail = op.errLabel(err) };
+        return .{ .fail = if (eval.takeFailure(err)) |why| try arena.dupe(u8, why) else op.errLabel(err) };
     };
     return .{ .value = v };
 }
@@ -351,6 +351,38 @@ fn renderStage(arena: std.mem.Allocator, src: ast.Stage, lr: LoopRow) anyerror!a
             for (lk.args, args) |e, *o| o.* = try renderExpr(arena, e, lr);
             r.args = args;
             dst.node = .{ .lookup = r };
+        },
+        .join => |j| {
+            var r = j;
+            r.left_keys = try renderQuals(arena, j.left_keys, lr);
+            r.right_keys = try renderQuals(arena, j.right_keys, lr);
+            r.own_cols = try renderQuals(arena, j.own_cols, lr);
+            if (j.right_filter) |e| r.right_filter = try renderExpr(arena, e, lr);
+            if (j.residual) |e| r.residual = try renderExpr(arena, e, lr);
+            if (j.deferred.len > 0) {
+                const keys = try arena.alloc(ast.DeferredKey, j.deferred.len);
+                for (j.deferred, keys) |k, *o| {
+                    o.* = k;
+                    o.a = try renderExpr(arena, k.a, lr);
+                    o.b = try renderExpr(arena, k.b, lr);
+                }
+                r.deferred = keys;
+            }
+            dst.node = .{ .join = r };
+        },
+        .window => |w| {
+            var r = w;
+            r.partition_by = try renderQuals(arena, w.partition_by, lr);
+            const keys = try arena.alloc(ast.SortKey, w.order_by.len);
+            for (w.order_by, keys) |k, *o| o.* = .{ .field = try renderQual(arena, k.field, lr), .desc = k.desc, .nulls_first = k.nulls_first };
+            r.order_by = keys;
+            const funcs = try arena.alloc(ast.WindowFunc, w.funcs.len);
+            for (w.funcs, funcs) |f, *o| {
+                o.* = f;
+                if (f.arg) |q| o.arg = try renderQual(arena, q, lr);
+            }
+            r.funcs = funcs;
+            dst.node = .{ .window = r };
         },
         else => {},
     }

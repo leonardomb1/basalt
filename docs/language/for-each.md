@@ -23,7 +23,11 @@ END FOR;
   nested `FOR EACH ROW OF`, the `CASE` statement, `CALL`, `PRINT`, `EXPLAIN`
   and `THROW`. Declarations — `PARAM`, `LET`, `CREATE CONNECTION`, `CREATE
   FUNCTION` — belong at the top level; `check` and `run` refuse one in a body
-  alike. A top-level `CASE` arm may declare a connection, so a script can pick
+  alike. A scalar subquery inside a body's query runs where that query does,
+  for each row, so it may read the row's variables.
+- A loop variable is a STRING unless the loop declares its type, so a `THROW`,
+  `PRINT` or `CASE` that compares one with a number fails `check` naming it:
+  `AS (n INT)` makes `$n = 0` an INT comparison. A top-level `CASE` arm may declare a connection, so a script can pick
   its endpoint per environment; a `PARAM`, `LET` or function there is refused.
 - Loops nest. The inner loop's discovery source is rendered with the outer
   row (`FOR EACH ROW OF (erp.QUERY($$SELECT ... WHERE t = '${name}'$$))`), and
@@ -62,10 +66,12 @@ or object reference (the precedent is Snowflake / Databricks `IDENTIFIER`).
 | a raw predicate text | `FROM conn.QUERY($$SELECT * FROM ${name} WHERE ${where}$$)` |
 | a conditional key | `UPSERT ON (IDENTIFIER(if($pk = '', $name \|\| 'id', $pk)))` |
 | a per-row column *name* | `SELECT IDENTIFIER($col), COUNT(*) ... GROUP BY IDENTIFIER($col) ORDER BY IDENTIFIER($col)` |
+| a computed column of one table | `a.IDENTIFIER($name \|\| '_EMPRESA')`, also as a `JOIN ... ON` key and from a correlated subquery |
 | a per-row column value | `SELECT $name AS empresa` — a plain expression, no quoting |
 
 In an expression or a name position (`SELECT` list, `WHERE`, `GROUP BY`,
-`ORDER BY`, `DISTINCT ON`) `IDENTIFIER(<string-expr>)` is a **column** whose
+`ORDER BY`, `DISTINCT ON`, a join's `ON`, a window's `PARTITION BY` and `ORDER
+BY`) `IDENTIFIER(<string-expr>)`, or `t.IDENTIFIER(...)` for table `t`'s, is a **column** whose
 name is computed per row — or once, from a `PARAM`, outside any loop. The
 column is only known when the row renders it, so `check` validates the stages
 before the first dynamic name and leaves the rest to `run`, which reports an

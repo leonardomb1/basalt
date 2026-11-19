@@ -653,7 +653,8 @@ pub fn parseQualNameField(self: *Parser) Error!ast.QualName {
 }
 
 /// A qualified name from its `first` part on: each `.x` or `?.x` after it, taken only
-/// when an identifier follows if `checked`.
+/// when an identifier follows if `checked`; `t.IDENTIFIER(<expr>)` names the column
+/// the expression computes, as `IDENTIFIER(<expr>)` alone does.
 pub fn qualRest(self: *Parser, start: Pos, first: []const u8, comptime checked: bool) Error!ast.QualName {
     var parts = std.array_list.Managed([]const u8).init(self.arena);
     var safes = std.array_list.Managed(bool).init(self.arena);
@@ -661,7 +662,10 @@ pub fn qualRest(self: *Parser, start: Pos, first: []const u8, comptime checked: 
     while ((self.at(.dot) or self.at(.qdot)) and (!checked or self.peekTag() == .ident or self.peekTag() == .qident)) {
         const safe = self.at(.qdot);
         _ = self.advance();
-        try parts.append(try self.expectIdent());
+        if (self.isKw("identifier") and self.peekTag() == .lparen) {
+            if (self.col_uses) |u| u.opaqueUse(true);
+            try parts.append(try self.parseNameSegment());
+        } else try parts.append(try self.expectIdent());
         try safes.append(safe);
     }
     var any_safe = false;

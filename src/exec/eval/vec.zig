@@ -19,6 +19,7 @@ const decimalArithType = @import("../decimal_ops.zig").decimalArithType;
 const decimalOp = @import("../decimal_ops.zig").decimalOp;
 const evalRow = @import("row.zig").evalRow;
 const fieldColumn = @import("support.zig").fieldColumn;
+const support = @import("support.zig");
 const forgetFailure = @import("support.zig").forgetFailure;
 const rescaleTo = @import("../../base/decimal.zig").rescaleTo;
 const addAtScale = @import("../decimal_ops.zig").addAtScale;
@@ -1531,7 +1532,15 @@ pub fn constEval(arena: std.mem.Allocator, expr: *const ast.Expr, names: []const
     }
     const schema = types.Schema{ .fields = fields };
     const batch = Batch{ .schema = &schema, .columns = cols, .len = 1 };
-    return evalRow(arena, expr, batch, 0);
+    return evalRow(arena, expr, batch, 0) catch |e| {
+        if (e != error.TypeMismatch or support.peekFailure(e) != null) return e;
+        var tc = TypeCtx{ .schema = schema, .arena = arena, .dollar_fields = true };
+        _ = tc.typeOf(expr) catch |te| {
+            if (te == error.OutOfMemory) return error.OutOfMemory;
+            return support.failWith(error.TypeMismatch, "{s}", .{tc.msg});
+        };
+        return e;
+    };
 }
 
 fn scalarType(v: Value) Type {

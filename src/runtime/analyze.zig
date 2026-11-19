@@ -471,7 +471,8 @@ pub fn fold(arena: std.mem.Allocator, e: *const ast.Expr, sc: Scope) Error!Folde
     if (readsFiles(e)) return .{ .failed = "reads a file, which only a run does" };
     const v = eval.constEval(arena, e, sc.names, sc.values) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        return .{ .failed = env_mod.errLabel(err) };
+        const why = eval.takeFailure(err) orelse return .{ .failed = env_mod.errLabel(err) };
+        return .{ .failed = try arena.dupe(u8, why) };
     };
     return .{ .value = v };
 }
@@ -601,7 +602,7 @@ fn checkScriptStmt(arena: std.mem.Allocator, s: ast.Stmt, program: ast.Program, 
                 try exprs.append(arm.guard);
             }
             if (!try foldsHere(arena, exprs.items, sc)) return checkMatchPatterns(arena, m, params, diag);
-            switch (try matchArm(arena, m, sc, "match")) {
+            switch (try matchArm(arena, m, sc, "CASE")) {
                 .problem => |why| return failPos(diag, m.pos, "{s}", .{why}),
                 .arm => {},
             }
@@ -663,6 +664,22 @@ pub fn paramDefaultValue(e: *const ast.Expr) ?Value {
         },
         else => null,
     };
+}
+
+/// Whether `l` is a scalar subquery the parser lifted out of a query, which runs
+/// where that query does, in a body too, rather than a LET the script declares.
+pub fn isScalarSubquery(l: ast.LetConst) bool {
+    return l.query != null and std.mem.startsWith(u8, l.name, "__scalar");
+}
+
+/// An unknown column inside a subquery, told that a name without a table there is
+/// the subquery's own, as an outer column is the usual meaning.
+fn subqueryHint(arena: std.mem.Allocator, diag: *Diag) Error!void {
+    const head = "unknown field `";
+    if (!std.mem.startsWith(u8, diag.msg, head)) return;
+    const end = std.mem.indexOfScalarPos(u8, diag.msg, head.len, '`') orelse return;
+    const name = diag.msg[head.len..end];
+    diag.msg = try msgfmt.allocPrint(arena, "{s} in a subquery: a name written without a table there is the subquery's own; if `{s}` is the outer query's, write it with that table's alias (`t.{s}`)", .{ diag.msg[0 .. end + 1], name, name });
 }
 
 /// How a query LET is named in its errors; a desugared WHERE subquery is a
@@ -1034,7 +1051,7 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
             if (all_known and !readsFiles(le)) {
                 const v = eval.constEval(arena, le, known_names.items, known_values.items) catch |err| {
                     if (err == error.OutOfMemory) return error.OutOfMemory;
-                    const e = fail(diag, "LET `{s}`: {s}", .{ l.name, env_mod.errLabel(err) });
+                    const e = fail(diag, "LET `{s}`: {s}", .{ l.name, eval.takeFailure(err) orelse env_mod.errLabel(err) });
                     diag.pos = l.pos;
                     return e;
                 };
@@ -1104,6 +1121,17 @@ fn hasDynamicName(node: ast.Stage.Node) bool {
         } else false,
         .aggregate => |ag| anyDynamicName(ag.by) or for (ag.aggs) |a| {
             if (a.arg) |e| if (exprHasDynamicName(e)) break true;
+        } else false,
+        .join => |j| anyDynamicName(j.left_keys) or anyDynamicName(j.right_keys) or anyDynamicName(j.own_cols) or
+            (if (j.residual) |e| exprHasDynamicName(e) else false) or
+            (if (j.right_filter) |e| exprHasDynamicName(e) else false) or
+            for (j.deferred) |d| {
+                if (exprHasDynamicName(d.a) or exprHasDynamicName(d.b)) break true;
+            } else false,
+        .window => |w| anyDynamicName(w.partition_by) or for (w.order_by) |k| {
+            if (isDynamicName(k.field)) break true;
+        } else for (w.funcs) |f| {
+            if (f.arg) |q| if (isDynamicName(q)) break true;
         } else false,
         else => false,
     };
@@ -1219,6 +1247,25 @@ pub fn analyzeOne(
     return .{ .outputs = outs };
 }
 
+/// A variable a body binds per row or call, typed as the run binds it
+/// (`env.loopValue`), and what declares it, for the hint an untyped one gets.
+const BodyVar = struct { name: []const u8, ty: types.Type, untyped: enum { no, loop, param } };
+
+/// A loop variable's or statement-function parameter's type as the run binds its
+/// text: an INT, FLOAT or BOOL as declared, anything else a STRING.
+fn boundVar(name: []const u8, declared: ?types.Type, kind: @FieldType(BodyVar, "untyped")) BodyVar {
+    const t = declared orelse return .{ .name = name, .ty = types.Type.init(.string), .untyped = kind };
+    return switch (t.kind) {
+        .int, .float, .bool => .{ .name = name, .ty = t.asNullable(), .untyped = .no },
+        else => .{ .name = name, .ty = types.Type.init(.string), .untyped = .no },
+    };
+}
+
+fn hasField(fields: []const types.Schema.Field, name: []const u8) bool {
+    for (fields) |f| if (std.mem.eql(u8, f.name, name)) return true;
+    return false;
+}
+
 const Ctx = struct {
     arena: std.mem.Allocator,
     bindings: *std.StringHashMap(ast.Pipeline),
@@ -1234,6 +1281,9 @@ const Ctx = struct {
     tables: ?*lake.Memo = null,
     /// The lanes the run takes; past one, a pipeline may fan out.
     lanes: usize = 2,
+    /// The loop variables and statement-function parameters of the body being
+    /// checked, innermost first.
+    body_vars: []const BodyVar = &.{},
 
     /// A table function's body, typed where it is declared with each parameter a null
     /// of its declared type, so one nothing calls is checked too. A problem a call
@@ -1288,7 +1338,10 @@ const Ctx = struct {
         const stages = try self.arena.alloc(ast.Stage, q.stages.len + 1);
         @memcpy(stages[0..q.stages.len], q.stages);
         stages[q.stages.len] = .{ .node = .{ .write = .{ .connector = "stdout", .form = null, .target = "", .mode = .default } }, .hints = &.{}, .pos = q.pos };
-        const o = try self.attempt(self.analyzeOutput(.{ .stages = stages, .pos = q.pos })) orelse return;
+        const o = self.analyzeOutput(.{ .stages = stages, .pos = q.pos }) catch |e| {
+            if (e != error.OutOfMemory and isScalarSubquery(l)) try subqueryHint(self.arena, self.diag);
+            return self.note(e);
+        };
         if (o.stages.len == 0) return;
         const schema = o.stages[o.stages.len - 1].out_schema orelse return;
         if (try queryLetColumnsProblem(self.arena, l.name, schema.fields.len)) |why|
@@ -1338,13 +1391,20 @@ const Ctx = struct {
             .explain => |e| if (try self.attempt(self.analyzeOutput(e.pipeline))) |o| try outs.append(o),
             .for_each => |fe| {
                 try self.checkLoopSource(fe);
-                try self.checkBody(fe.body, outs);
+                try self.checkLoopBody(fe, outs);
             },
             .match => |m| for (m.arms) |arm| try self.checkStmts(arm.body, outs, false),
             .func => |fd| if (!top)
                 try self.note(self.failNear(fd.pos, "function `{s}` must be declared at the top level of the script", .{fd.name}))
-            else if (fd.body == .stmts) try self.checkBody(fd.body.stmts, outs),
-            .let_const => |l| if (!top)
+            else if (fd.body == .stmts) {
+                const outer = self.body_vars;
+                defer self.body_vars = outer;
+                var vars = std.array_list.Managed(BodyVar).init(self.arena);
+                for (fd.params) |p| try vars.append(boundVar(p.name, p.ty, .param));
+                self.body_vars = vars.items;
+                try self.checkBody(fd.body.stmts, outs);
+            },
+            .let_const => |l| if (!top and !isScalarSubquery(l))
                 try self.note(self.failNear(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name}))
             else
                 try self.checkQueryLet(l),
@@ -1375,13 +1435,86 @@ const Ctx = struct {
             .explain => |e| if (try self.attempt(self.analyzeOutput(e.pipeline))) |o| try outs.append(o),
             .for_each => |fe| {
                 try self.checkLoopSource(fe);
-                try self.checkBody(fe.body, outs);
+                try self.checkLoopBody(fe, outs);
             },
-            .match => |m| for (m.arms) |arm| try self.checkBody(arm.body, outs),
-            .call, .throw, .print => {},
-            .let_const => |l| try self.note(self.failNear(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name})),
+            .match => |m| {
+                if (m.subject) |e| try self.checkBodyExpr(e, "CASE", m.pos);
+                for (m.arms) |arm| {
+                    for (arm.pats) |e| try self.checkBodyExpr(if (m.subject) |sub| try mk(self.arena, .{ .binary = .{ .op = .eq, .l = sub, .r = e } }) else e, "CASE", m.pos);
+                    if (arm.guard) |g| try self.checkBodyExpr(g, "CASE guard", m.pos);
+                    try self.checkBody(arm.body, outs);
+                }
+            },
+            .throw => |t| {
+                if (t.when) |w| try self.checkBodyExpr(w, "THROW condition", t.pos);
+                try self.checkBodyExpr(t.message, "THROW message", t.pos);
+            },
+            .print => |p| try self.checkBodyExpr(p.expr, "PRINT", p.pos),
+            .call => {},
+            .let_const => |l| if (isScalarSubquery(l))
+                try self.checkQueryLet(l)
+            else
+                try self.note(self.failNear(l.pos, "LET `{s}` must be declared at the top level of the script", .{l.name})),
             .param, .kind, .connection, .func => try self.note(self.failNear(stmtPos(s).?, "{s}", .{body_stmt_rule})),
         };
+    }
+
+    /// A FOR EACH's body with its variables in scope, each a STRING unless the loop
+    /// declares its type, as the run binds them.
+    fn checkLoopBody(self: *Ctx, fe: ast.ForEach, outs: *std.array_list.Managed(Output)) Error!void {
+        const outer = self.body_vars;
+        defer self.body_vars = outer;
+        var vars = std.array_list.Managed(BodyVar).init(self.arena);
+        for (fe.var_names, 0..) |n, i| try vars.append(boundVar(n, if (i < fe.var_types.len) fe.var_types[i] else null, .loop));
+        try vars.appendSlice(outer);
+        self.body_vars = vars.items;
+        try self.checkBody(fe.body, outs);
+    }
+
+    /// A body's THROW, PRINT or CASE expression `e` typed over the body's variables and
+    /// the script's PARAMs and LETs, so a comparison the run would refuse on every row
+    /// fails `check` too; one reading anything else is left to the run.
+    fn checkBodyExpr(self: *Ctx, e: *const ast.Expr, what: []const u8, pos: ast.Pos) Error!void {
+        if (self.body_vars.len == 0 or readsFiles(e)) return;
+        var fields = std.array_list.Managed(types.Schema.Field).init(self.arena);
+        for (self.body_vars) |v| try fields.append(.{ .name = v.name, .ty = v.ty });
+        for ([_]?*const ParamMap{ self.params, self.lets }) |maybe| {
+            const m = maybe orelse continue;
+            var it = m.iterator();
+            while (it.next()) |kv| {
+                if (hasField(fields.items, kv.key_ptr.*)) continue;
+                var tc = eval.TypeCtx{ .schema = .{ .fields = &.{} }, .arena = self.arena };
+                const ty = tc.typeOf(kv.value_ptr.*) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.TypeError => continue,
+                };
+                if (!ty.unknown) try fields.append(.{ .name = kv.key_ptr.*, .ty = ty });
+            }
+        }
+        var refs = std.array_list.Managed(ast.QualName).init(self.arena);
+        try ast.fieldsOf(e, &refs);
+        for (refs.items) |q| if (!q.dollar or q.parts.len != 1 or !hasField(fields.items, q.parts[0])) return;
+        var tc = eval.TypeCtx{ .schema = .{ .fields = fields.items }, .arena = self.arena, .dollar_fields = true };
+        _ = tc.typeOf(e) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TypeError => {
+                const hint = try self.untypedHint(refs.items);
+                return self.note(self.failNear(pos, "{s}: {s}{s}", .{ what, tc.msg, hint }));
+            },
+        };
+    }
+
+    /// The note that an untyped variable among `refs` is a STRING, or "".
+    fn untypedHint(self: *Ctx, refs: []const ast.QualName) Error![]const u8 {
+        for (refs) |q| for (self.body_vars) |v| {
+            if (!std.mem.eql(u8, v.name, q.parts[0])) continue;
+            return switch (v.untyped) {
+                .no => break,
+                .loop => msgfmt.allocPrint(self.arena, " (`${s}` is a loop variable, a STRING unless the loop declares its type, as `AS ({s} INT)`)", .{ v.name, v.name }),
+                .param => msgfmt.allocPrint(self.arena, " (`${s}` is a parameter of the function, a STRING unless it declares its type, as `{s} INT`)", .{ v.name, v.name }),
+            };
+        };
+        return "";
     }
 
     /// A FOR EACH's rows as the run discovers them: `$name` must be a JSON PARAM, and
@@ -1849,7 +1982,10 @@ const Ctx = struct {
     /// not known before the run.
     fn joinOf(self: *Ctx, in: types.Schema, j: ast.Join) Error!?JoinResolved {
         const right = if (self.bindings.get(j.binding)) |b|
-            (try self.bindingSchema(b)) orelse return null
+            (self.bindingSchema(b) catch |e| {
+                if (e != error.OutOfMemory and std.mem.startsWith(u8, j.binding, "__sq")) try subqueryHint(self.arena, self.diag);
+                return e;
+            }) orelse return null
         else if (self.knownTable(j.binding)) |k|
             k.schema orelse return null
         else

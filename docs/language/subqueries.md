@@ -57,7 +57,8 @@ WHERE EXISTS (SELECT 1 FROM 't.csv' WHERE k > 100);
 A subquery in the `SELECT` list or `WHERE` may reference columns of the query
 directly around it, by that query's table name or alias. A name without a table
 is always the subquery's own column, so an outer column is always written
-qualified. The correlation is lifted out of the subquery's `WHERE` and the
+qualified — a computed one as `d.IDENTIFIER($name || '_EMPRESA')`, and a name
+the subquery's table lacks is refused with that advice. The correlation is lifted out of the subquery's `WHERE` and the
 subquery becomes one join — never a query per row:
 
 ```sql

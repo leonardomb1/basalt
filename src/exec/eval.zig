@@ -98,7 +98,7 @@ fn joinSpans(a: ?ast.Span, b: ?ast.Span) ?ast.Span {
 /// (a column the parser named `__…` stands for an expression the query wrote).
 fn operandText(arena: std.mem.Allocator, e: *const ast.Expr) error{OutOfMemory}![]const u8 {
     return switch (e.*) {
-        .field => |q| if (std.mem.startsWith(u8, lastPart(q), "__")) "an expression" else try std.fmt.allocPrint(arena, "`{s}`", .{lastPart(q)}),
+        .field => |q| if (std.mem.startsWith(u8, lastPart(q), "__")) "an expression" else try std.fmt.allocPrint(arena, "`{s}{s}`", .{ if (q.dollar) "$" else "", lastPart(q) }),
         .str_lit => |v| try std.fmt.allocPrint(arena, "'{s}'", .{v}),
         .int_lit => |v| try std.fmt.allocPrint(arena, "{d}", .{v}),
         .float_lit => |v| try std.fmt.allocPrint(arena, "{e}", .{v}),
@@ -114,6 +114,8 @@ pub const TypeCtx = struct {
     arena: std.mem.Allocator,
     msg: []const u8 = "",
     span: ?ast.Span = null,
+    /// `$name` is a field of `schema`, as when plan-time values are typed by name.
+    dollar_fields: bool = false,
 
     pub fn typeOf(self: *TypeCtx, expr: *const ast.Expr) TypeError!Type {
         switch (expr.*) {
@@ -125,7 +127,7 @@ pub const TypeCtx = struct {
             .str_lit => return Type.init(.string),
             .field => |q| {
                 self.span = q.span;
-                if (q.dollar) return self.err("unknown `${s}`: no PARAM, LET or loop variable of that name", .{q.parts[0]});
+                if (q.dollar and !self.dollar_fields) return self.err("unknown `${s}`: no PARAM, LET or loop variable of that name", .{q.parts[0]});
                 if (q.safe.len > 0) return self.err("`?.` (safe navigation) only applies to JSON-param paths, not column `{s}`", .{lastPart(q)});
                 if (q.parts.len == 1 and (self.schema.ambiguous(q.parts[0]) or self.schema.clashes(q.parts[0], q.sides))) return self.err("column reference `{s}` is ambiguous", .{q.parts[0]});
                 const idx = fieldIndex(self.schema, q) orelse {
@@ -222,7 +224,10 @@ pub const TypeCtx = struct {
                     const dated = lt.kind == .date or lt.kind == .timestamp or rt.kind == .date or rt.kind == .timestamp;
                     if (dated and (b.op == .add or b.op == .sub))
                         return self.err("a date moves by an INTERVAL (`d + INTERVAL 30 DAY`) or date_add('day', 30, d), and two dates part by date_diff('day', a, b)", .{});
-                    return self.err("arithmetic needs numeric operands", .{});
+                    self.span = joinSpans(exprSpan(b.l), exprSpan(b.r));
+                    return self.err("arithmetic needs numeric operands, got {s} ({s}) and {s} ({s}); `||` joins text", .{
+                        try operandText(self.arena, b.l), try lt.name(self.arena), try operandText(self.arena, b.r), try rt.name(self.arena),
+                    });
                 }
                 if (decimalArithType(b.op, lt, rt)) |dt| return dt.withNull(nn);
                 const k: types.TypeKind = if (lt.kind == .float or rt.kind == .float or lt.kind == .decimal or rt.kind == .decimal) .float else .int;
