@@ -29,8 +29,16 @@ pub const LINE_BUF = 64 * 1024;
 
 pub const Codec = enum { none, gzip, zstd };
 
+/// `path` without an HTTP URL's query and fragment, which name no part of the file.
+/// Any other path (local, SMB, SFTP, an object's key) may hold `?` and `#` in a name:
+/// a Windows folder named `Nº #1` is one.
+fn withoutQuery(path: []const u8) []const u8 {
+    if (!scheme.of(path).has(.http)) return path;
+    return path[0 .. std.mem.indexOfAny(u8, path, "?#") orelse path.len];
+}
+
 pub fn splitCodec(path: []const u8) struct { codec: Codec, rest: []const u8 } {
-    const bare = path[0 .. std.mem.indexOfAny(u8, path, "?#") orelse path.len];
+    const bare = withoutQuery(path);
     if (std.ascii.endsWithIgnoreCase(bare, ".gz")) return .{ .codec = .gzip, .rest = bare[0 .. bare.len - 3] };
     if (std.ascii.endsWithIgnoreCase(bare, ".gzip")) return .{ .codec = .gzip, .rest = bare[0 .. bare.len - 5] };
     if (std.ascii.endsWithIgnoreCase(bare, ".zst")) return .{ .codec = .zstd, .rest = bare[0 .. bare.len - 4] };
@@ -52,7 +60,7 @@ pub fn splitArchive(path: []const u8) ?ArchiveRef {
 }
 
 pub fn isArchive(path: []const u8) bool {
-    const bare = path[0 .. std.mem.indexOfAny(u8, path, "?#") orelse path.len];
+    const bare = withoutQuery(path);
     return std.ascii.endsWithIgnoreCase(bare, ".zip");
 }
 
@@ -297,6 +305,14 @@ pub fn explainf(e: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
     @branchHint(.cold);
     var buf: [480]u8 = undefined;
     return eval.explain(e, msgfmt.clipPrint(&buf, fmt, args));
+}
+
+test "a query or fragment is cut from an HTTP URL alone; elsewhere `#` and `?` are part of a name" {
+    try std.testing.expectEqualStrings("https://h/a.csv", dataName("https://h/a.csv?sig=1#f"));
+    try std.testing.expectEqualStrings("smb://fs/TI/Nº #1/arq #2.csv", dataName("smb://fs/TI/Nº #1/arq #2.csv"));
+    try std.testing.expectEqualStrings("/d#x/q?b.csv", dataName("/d#x/q?b.csv"));
+    try std.testing.expectEqual(Codec.gzip, splitCodec("s3://b/k#1.csv.gz").codec);
+    try std.testing.expect(isArchive("/x/pacote #3.zip"));
 }
 
 test "splitCodec / splitArchive / dataName walk the container chain" {

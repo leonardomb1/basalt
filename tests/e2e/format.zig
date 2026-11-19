@@ -72,6 +72,18 @@ test "an unreadable extension is refused by run, not just check" {
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "cannot read") != null);
 }
 
+test "a `#` or `?` in a file's or folder's name is part of the name, not a URL's fragment or query" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("Nº #1");
+    try tmp.dir.writeFile(.{ .sub_path = "Nº #1/a#b.csv", .data = "a\n1\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "q?b.csv", .data = "a\n2\n" });
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/w#1.parquet' AS SELECT * FROM '$B/Nº #1/a#b.csv' UNION ALL SELECT * FROM '$B/q?b.csv';", 1, &.{});
+    try checkAndRun(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT a FROM '$B/w#1.parquet' ORDER BY a;", 1, &.{});
+    try @import("harness.zig").expectFile(&tmp, "out.csv", "a\n1\n2\n");
+}
+
 test "WITH (format = 'csv') reads a file whose extension says nothing" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
