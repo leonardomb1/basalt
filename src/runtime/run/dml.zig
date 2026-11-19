@@ -141,6 +141,9 @@ pub fn runUpdate(env: *Env, out: ast.Pipeline, opts: RunOptions, stats: *Stats, 
             const items = try a.alloc(ast.SelectItem, built.src_cols.len);
             for (items, built.src_cols) |*it, c| it.* = .{ .computed = .{ .name = try update_rules.stagedName(a, c), .expr = try ast.mk(a, .{ .field = .{ .parts = try a.dupe([]const u8, &.{c}) } }) } };
             try stageRows(env, w, j.binding, items, staging, opts, lanes_used, batch_arena);
+            const keys = try a.alloc([]const u8, j.right_keys.len);
+            for (keys, j.right_keys) |*k, rk| k.* = try update_rules.stagedName(a, rk.last());
+            try indexStaging(env, w, staging, keys);
             try checkFromKeys(env, info, conn, what, w.target, j, staging, built.conds[built.keys.len .. built.keys.len + sh.pre.len]);
         }
         break :blk staging;
@@ -425,8 +428,34 @@ fn lakeFailed(env: *Env, e: anyerror) anyerror {
 /// DELETE's database, as an APPEND that creates the table.
 fn stageMember(env: *Env, w: ast.Write, m: Member, opts: RunOptions, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) !void {
     const keys = try env.arena.alloc(ast.SelectItem, m.join.right_keys.len);
-    for (keys, m.join.right_keys) |*k, rk| k.* = .{ .field = .{ .parts = try env.arena.dupe([]const u8, &.{rk.last()}), .span = rk.span } };
+    const names = try env.arena.alloc([]const u8, m.join.right_keys.len);
+    for (keys, names, m.join.right_keys) |*k, *n, rk| {
+        k.* = .{ .field = .{ .parts = try env.arena.dupe([]const u8, &.{rk.last()}), .span = rk.span } };
+        n.* = rk.last();
+    }
     try stageRows(env, w, m.join.binding, keys, m.staging, opts, lanes_used, batch_arena);
+    try indexStaging(env, w, m.staging, names);
+}
+
+/// An index on staging table `staging`'s key columns `cols`, on MySQL alone: it
+/// plans a `[NOT] EXISTS` or a join over a table without one as a scan of the whole
+/// staging table for each of the target's rows, where the other databases hash it.
+/// An index that cannot be made leaves the statement to run without it.
+fn indexStaging(env: *Env, w: ast.Write, staging: []const u8, cols: []const []const u8) !void {
+    const conn = env.connections.get(w.connector) orelse return;
+    const info = connect.sqlConnInfo(conn) orelse return;
+    if (info.dialect != .mysql) return;
+    const a = env.arena;
+    const quoted = try a.alloc([]const u8, cols.len);
+    for (quoted, cols) |*q, c| q.* = try sql.quoteIdent(a, .mysql, c);
+    const stmt = try msgfmt.allocPrint(a, "CREATE INDEX basalt_keys ON {s} ({s})", .{ try sql.quoteIdent(a, .mysql, staging), try std.mem.join(a, ", ", quoted) });
+    const cfg = dbconfig.resolveDbConfig(env, conn, info.port) catch return;
+    const c = connect.SqlDriver(.mysql).connect(env.gpa, cfg) catch return;
+    defer c.close();
+    _ = c.execBatch(stmt) catch |e| {
+        if (e == error.OutOfMemory) return e;
+        env.log.log(.debug, "{s}: no index on staging table {s} ({s}); the statement runs without it", .{ w.target, staging, if (c.wire.last_error.len > 0) c.wire.last_error else @errorName(e) });
+    };
 }
 
 /// Loads the rows of binding `binding` as `items` name them into table `staging` on

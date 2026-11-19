@@ -442,7 +442,9 @@ const Tx = struct {
         };
     }
 
-    /// TRY_CAST and text-to-number casts of unprovable input stay engine-side.
+    /// TRY_CAST stays engine-side, and so do the casts whose conversion the engine
+    /// and the source could make differently (text to a number, a value to text, a
+    /// date from a string) unless the source decides (`.source`).
     fn value(self: Tx, e: *const ast.Expr) Err!?[]const u8 {
         switch (e.*) {
             .bool_lit => |b| return self.dialect.boolLit(b),
@@ -461,9 +463,11 @@ const Tx = struct {
             },
             .cast => |c| {
                 if (c.safe) return null;
-                if (numericKind(c.ty.kind) and !provablyNumeric(c.e, self.o.schema)) return null;
-                if (c.ty.kind == .string and !provablyText(c.e, self.o.schema)) return null;
-                if ((c.ty.kind == .date or c.ty.kind == .timestamp or c.ty.kind == .time) and c.e.* == .str_lit and !everySourceText(c.e.str_lit)) return null;
+                if (self.o.need != .source) {
+                    if (numericKind(c.ty.kind) and !provablyNumeric(c.e, self.o.schema)) return null;
+                    if (c.ty.kind == .string and !provablyText(c.e, self.o.schema)) return null;
+                    if ((c.ty.kind == .date or c.ty.kind == .timestamp or c.ty.kind == .time) and c.e.* == .str_lit and !everySourceText(c.e.str_lit)) return null;
+                }
                 const inner = (try self.value(c.e)) orelse return null;
                 const ty = (try self.dialect.castType(self.arena, c.ty)) orelse return null;
                 return try self.fmt("CAST({s} AS {s})", .{ inner, ty });
@@ -499,14 +503,17 @@ const Tx = struct {
         return if (self.o.need == .source) .source else .exact;
     }
 
-    /// A `from_one` call descends only from position 1 (a UTF-8 SQL Server varchar counts
+    /// A text function descends over text the source holds as the engine does, a
+    /// `from_one` call only from position 1 (a UTF-8 SQL Server varchar counts
     /// bytes), a `byte_order` one only under a byte-order collation (others compare
-    /// case-insensitively).
+    /// case-insensitively); where the source decides (`.source`) none of that
+    /// holds it back, the function being the source's own.
     fn call(self: Tx, c: ast.Expr.Call) Err!?[]const u8 {
         const p = lookupPushable(c.name) orelse return null;
         if (p.like != .none) return self.likePred(c, p.like, .exact);
         if (!p.descends) return null;
         if (c.args.len < p.min_args or c.args.len > p.max_args) return null;
+        if (self.o.need == .source) return self.callAsWritten(c, p);
         if ((p.text == .every or p.text == .first) and !self.textArgs(c, p)) return null;
         if (p.from_one) {
             if (c.args[1].* != .int_lit or c.args[1].int_lit != 1) return null;
@@ -518,6 +525,11 @@ const Tx = struct {
             };
             if (!f.byte_order) return null;
         }
+        return self.callAsWritten(c, p);
+    }
+
+    /// The call rendered over its arguments' SQL, null when one has none.
+    fn callAsWritten(self: Tx, c: ast.Expr.Call, p: *const Pushable) Err!?[]const u8 {
         const args = try self.arena.alloc([]const u8, c.args.len);
         for (c.args, args) |a, *out| out.* = (try self.value(a)) orelse return null;
         return p.render(self.arena, p, c, args, self.dialect);
@@ -1029,6 +1041,24 @@ test "translateValue: arithmetic, and a CASE's text guard, go as written only wh
     const case = try ast.mk(a, .{ .match = .{ .subject = null, .arms = arms } });
     try testing.expectEqualStrings("(CASE WHEN (\"region\" = 'eu') THEN 5 ELSE 0 END)", (try translateValue(a, case, .postgres, .{ .need = .source })).?);
     try testing.expect((try translateValue(a, case, .postgres, .{ .need = .exact })) == null);
+}
+
+test "translateValue: where the database decides, a text function or a cast to text goes over a column of any type, the database converting it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const sqlp = @import("../../lang/sql_parser.zig");
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "upper(note)", .want = "UPPER(\"note\")" },
+        .{ .src = "CAST(id AS STRING)", .want = "CAST(\"id\" AS TEXT)" },
+        .{ .src = "substr(note, 3, 2)", .want = "SUBSTRING(\"note\", 3, 2)" },
+    };
+    for (cases) |c| {
+        var diag: sqlp.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+        const e = try sqlp.parseExprStr(a, c.src, &diag);
+        try testing.expectEqualStrings(c.want, (try translateValue(a, e, .postgres, .{ .need = .source })).?);
+        try testing.expect((try translateValue(a, e, .postgres, .{ .need = .exact })) == null);
+    }
 }
 
 test "translateExpr: AND of comparisons, per-dialect quoting" {
