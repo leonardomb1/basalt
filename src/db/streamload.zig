@@ -257,8 +257,13 @@ pub fn columnList(arena: std.mem.Allocator, schema: types.Schema) ![]const u8 {
 const NULL_MARKER = "\\N";
 
 /// Appends each cell's text straight into `out`: the batch's worst-case size is
-/// reserved once, so no cell allocates or checks capacity.
+/// reserved once, so no cell allocates or checks capacity. A list, struct or map
+/// has no bound short of rendering it, so a batch holding one grows `out` per cell.
 pub fn appendBatchTsv(out: *std.array_list.Managed(u8), batch: Batch) !void {
+    for (batch.columns) |*c| switch (c.ty.kind) {
+        .array, .@"struct", .map => return appendBatchTsvGrowing(out, batch),
+        else => {},
+    };
     var bound: usize = batch.len;
     for (batch.columns) |*c| {
         bound += batch.len * (1 + cellBound(c.ty.kind));
@@ -274,8 +279,32 @@ pub fn appendBatchTsv(out: *std.array_list.Managed(u8), batch: Batch) !void {
     }
 }
 
+/// `appendBatchTsv` for a batch with a nested column: each cell is written into the
+/// room `out` has, and when it does not fit, written again into twice the room.
+fn appendBatchTsvGrowing(out: *std.array_list.Managed(u8), batch: Batch) !void {
+    for (0..batch.len) |r| {
+        for (batch.columns, 0..) |*c, i| {
+            if (i > 0) try out.append(0x01);
+            var want = cellBound(c.ty.kind);
+            while (true) {
+                try out.ensureUnusedCapacity(want);
+                var w = std.Io.Writer.fixed(out.unusedCapacitySlice());
+                celltext.write(&w, c, r, TsvText{}) catch |e| {
+                    if (e != error.WriteFailed) return e;
+                    want = 2 * out.unusedCapacitySlice().len;
+                    continue;
+                };
+                out.items.len += w.end;
+                break;
+            }
+        }
+        try out.append(0x02);
+    }
+}
+
 /// The longest text a non-null cell of the kind renders to, besides a string's
-/// own bytes; a float in plain notation is the widest, at 5e-324.
+/// own bytes (a nested cell's is only its null); a float in plain notation is the
+/// widest, at 5e-324.
 fn cellBound(kind: types.TypeKind) usize {
     return switch (kind) {
         .string, .bytes, .array, .@"struct", .map => NULL_MARKER.len,
@@ -1239,6 +1268,48 @@ test "stream-load TSV body of a few rows sliced from a long string column reserv
     try appendBatchTsv(&out, part);
     try std.testing.expectEqual(@as(usize, 8 * (cell.len + 1)), out.items.len);
     try std.testing.expect(out.capacity < 16 * 1024);
+}
+
+test "stream-load TSV body of a list longer than any reserve, an embedding, beside flat columns" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const columnmod = @import("../exec/column.zig");
+    const int_ty = types.Type.init(.int);
+    const elem = try a.create(types.Type);
+    elem.* = types.Type.init(.float).asNullable();
+    const list_ty = types.Type{ .kind = .array, .nullable = true, .elem = elem };
+
+    var text = std.array_list.Managed(u8).init(a);
+    try text.append('[');
+    for (0..1536) |k| {
+        if (k > 0) try text.append(',');
+        try text.writer().print("{d}", .{@as(f64, @floatFromInt(k)) / 7.0 - 100.0});
+    }
+    try text.append(']');
+
+    var ids = columnmod.Builder.init(a, int_ty);
+    var embs = columnmod.Builder.init(a, list_ty);
+    const rows = 40;
+    for (0..rows) |r| {
+        try ids.append(.{ .int = @intCast(r) });
+        try embs.append(if (r == 3) .null else .{ .string = text.items });
+    }
+    const cols = try a.alloc(columnmod.Column, 2);
+    cols[0] = try ids.finish();
+    cols[1] = try embs.finish();
+    var schema = types.Schema{ .fields = &.{ .{ .name = "id", .ty = int_ty }, .{ .name = "emb", .ty = list_ty } } };
+
+    var out = std.array_list.Managed(u8).init(a);
+    try appendBatchTsv(&out, .{ .schema = &schema, .columns = cols, .len = rows });
+
+    var one = std.Io.Writer.Allocating.init(a);
+    try celltext.write(&one.writer, &cols[1], 0, TsvText{});
+    const cell = one.written();
+    try std.testing.expect(cell.len > 20_000);
+    var want = std.array_list.Managed(u8).init(a);
+    for (0..rows) |r| try want.writer().print("{d}\x01{s}\x02", .{ r, if (r == 3) "\\N" else cell });
+    try std.testing.expectEqualStrings(want.items, out.items);
 }
 
 test "a value that is literally the null marker is refused, not written as null" {

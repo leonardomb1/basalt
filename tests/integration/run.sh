@@ -314,6 +314,24 @@ INSERT INTO db.$t SELECT range + 1 AS id, CASE WHEN range % 2 = 0 THEN 'a' ELSE 
 # into a NOT NULL column refused with nothing landed, SET with a LET, a FROM file
 # and an IN subquery, NOT IN and NOT EXISTS deletes, a FROM key on two rows
 # refused, and no staging table left behind.
+embrt() { # $1 label, $2 CREATE CONNECTION db ... (starrocks or doris), $3 its array length function
+  # A list longer than the Stream Load body reserved for it (an embedding) used to
+  # fail with WriteFailed; every row must land with all its elements.
+  local decl=$2
+  awk 'BEGIN { print "id,k,v"; for (r = 1; r <= 50; r++) for (k = 0; k < 1536; k++) printf "%d,%d,%g\n", r, k, ((k * r) % 97) / 8 - 6 }' >"$out/emb_$1.csv"
+  awk 'BEGIN { print "id,n,s"; for (r = 1; r <= 50; r++) { s = 0; for (k = 0; k < 1536; k++) s += ((k * r) % 97) / 8 - 6; printf "%d,1536,%d\n", r, s * 1000 } }' >"$out/emb_$1_expected.csv"
+  $B run -q -c "$decl SELECT * FROM db.QUERY(\$\$DROP TABLE IF EXISTS it_emb\$\$);" >/dev/null 2>&1 || true
+  $B run -q -c "$decl SELECT * FROM db.QUERY(\$\$CREATE TABLE it_emb (id INT, emb ARRAY<FLOAT>) DUPLICATE KEY(id) DISTRIBUTED BY HASH(id) BUCKETS 1 PROPERTIES('replication_num' = '1')\$\$);" >/dev/null 2>&1 || true
+  if brun run -c "$decl
+LOAD INTO db.it_emb APPEND AS SELECT id, array_agg(CAST(v AS FLOAT) ORDER BY k) AS emb FROM '$out/emb_$1.csv' GROUP BY id;" &&
+     brun run -c "$decl
+LOAD INTO '$out/emb_$1_out.csv' AS SELECT * FROM db.QUERY(\$\$SELECT id, $3(emb) AS n, CAST(array_sum(emb) * 1000 AS BIGINT) AS s FROM it_emb ORDER BY id\$\$);"; then
+    check "$1-embedding" "$out/emb_$1_out.csv" "$out/emb_$1_expected.csv"
+  else
+    report "$1-embedding (run error)" bad
+  fi
+}
+
 olapdmlrt() { # $1 label, $2 CREATE CONNECTION db ..., $3 the table's key and distribution clause
   local decl=$2 keyed=$3 got bad=0 w
   printf 'id,v\n1,x\n2,y\n9,z\n' >"$out/od_src.csv"
@@ -1289,6 +1307,7 @@ LOAD INTO sr.it_replace_nc REPLACE AS SELECT 7 AS range;"; then
   olapdmlrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "PRIMARY KEY (id) DISTRIBUTED BY HASH(id) BUCKETS 2"
   boolrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" "db.it_bool" lossy
   catalogrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" it
+  embrt starrocks "CREATE CONNECTION db TYPE starrocks OPTIONS (fe_host = '127.0.0.1', fe_port = 39030, be_url = 'http://127.0.0.1:38040', database = 'it', user = 'root', password = '');" array_length
 fi
 
 # DELETE, UPDATE and INSERT on a CSV, a Parquet and an Excel file under the remote
@@ -1536,6 +1555,7 @@ LOAD INTO '$out/dr_up_out.csv' AS SELECT k, v FROM dr.it_upsert ORDER BY k;"; th
   olapdmlrt doris "$DB" "UNIQUE KEY (id) DISTRIBUTED BY HASH(id) BUCKETS 2 PROPERTIES ('replication_num' = '1', 'enable_unique_key_merge_on_write' = 'true')"
   boolrt doris "$DB" "db.it_bool" lossy
   catalogrt doris "$DB" it
+  embrt doris "$DB" array_size
 fi
 
 # A Delta table in an object store: found by listing `_delta_log/`, a Hive-escaped
