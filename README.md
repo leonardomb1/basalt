@@ -316,7 +316,7 @@ getting data out of the systems that hold it and into the ones that need it:
 - **Scripts, not just queries.** `PARAM`, `LET`, `FOR EACH` (a load per row, to a
   target named per row), `CASE`, functions and table functions (an API endpoint
   is one), libraries pinned by hash.
-- **Easy to run anywhere.** One static 8.2 MB binary, no runtime, starting in a millisecond;
+- **Easy to run anywhere.** One static binary, no runtime, starting in a millisecond;
   logins from environment variables; `EXPLAIN ANALYZE` shows every request each
   source was sent.
 
