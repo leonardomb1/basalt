@@ -61,3 +61,9 @@ a `$name` that no PARAM or LET declares.
 
 A second `CREATE CONNECTION` of a name replaces the first from that statement
 on; `CREATE OR REPLACE CONNECTION` says the same thing explicitly.
+
+A connection is its file's own: `EXPORT CONNECTION` (in place of `CREATE`)
+shares it with the files that `@include` this one, by its name, or as
+`st.erp.dbo.t` and `'smb://st.share/...'` through a library included `AS st`
+([Scripts](scripts.md)). Two files may each keep a private `erp`; both read
+`ERP_USER` / `ERP_PASS` unless their options say otherwise.

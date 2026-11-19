@@ -377,9 +377,9 @@ pub fn parseWriteTarget(self: *Parser, pos: ast.Pos, what: []const u8) Error!ast
             return self.fail(ipos, "dynamic target needs a literal extension (end it with `|| '.csv'`, `|| '.parquet'`, …)", .{});
         write = .{ .connector = "csv", .form = null, .target = tmpl, .mode = .default };
     } else {
-        const conn = try self.expectIdent();
-        if (!self.isConn(conn))
-            return self.fail(pos, "unknown connection `{s}` in {s} (declare it with CREATE CONNECTION first)", .{ conn, what });
+        const written = try self.expectIdent();
+        const conn = (try self.connRef(written)) orelse
+            return self.fail(pos, "unknown connection `{s}` in {s} (declare it with CREATE CONNECTION first)", .{ written, what });
         _ = try self.expect(.dot);
         var parts = std.array_list.Managed([]const u8).init(self.arena);
         try parts.append(try self.parseTargetSegment());
@@ -682,7 +682,11 @@ pub fn parseOptionValue(self: *Parser) Error!ast.HintVal {
             return .{ .int = std.fmt.parseInt(i64, t.text, 10) catch return self.fail(pos, "bad number `{s}`", .{t.text}) };
         },
         .ident => return .{ .ident = self.advance().text },
-        .dollar_ident => return .{ .ident = try std.mem.concat(self.arena, u8, &.{ "$", self.advance().text }) },
+        .dollar_ident => {
+            const vpos = self.curPos();
+            const parts = try self.scopedVar(&.{self.advance().text}, vpos);
+            return .{ .ident = try std.mem.concat(self.arena, u8, &.{ "$", parts[0] }) };
+        },
         else => {},
     };
     if (self.at(.rparen) or self.at(.comma)) return self.fail(pos, "expected an option value, found {s}", .{self.curTag().describe()});
@@ -1499,6 +1503,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             self.eatAliasAs();
             const has_alias = self.at(.lparen) or self.atAlias();
             if (self.at(.lparen)) {
+                binding = try self.scopedFn(binding, bpos);
                 const call = try self.callTableFn(binding, bpos, if (lateral) .lateral else .join);
                 if (call.lookup) |lk| {
                     self.eatAliasAs();

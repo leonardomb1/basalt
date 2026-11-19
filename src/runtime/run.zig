@@ -42,6 +42,7 @@
 //! `env.space` with `env.op_memory`, and removed when the run ends.
 
 const std = @import("std");
+const scope = @import("../lang/scope.zig");
 const builtins = @import("../exec/builtins.zig");
 const pagecache = @import("../exec/pagecache.zig");
 const msgfmt = @import("../base/msgfmt.zig");
@@ -116,15 +117,17 @@ const Scratch = @import("scratch.zig").Scratch;
 /// allocate from it alongside the reading thread, so an `ArenaAllocator` will not do.
 pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions, diag: *Diag) !Stats {
     driver.installRangedOpener(@import("../format/bytes.zig").openRanged);
-    const opts = opts_in;
+    var opts = opts_in;
     pagecache.setCap(opts.op_memory);
     ftp.beginRun();
     defer {
         if (diag.msg.len > 0) {
             var tmp: [diag.buf.len]u8 = undefined;
             const m = ftp.unlocalize(&tmp, diag.msg);
-            @memcpy(diag.buf[0..m.len], m);
-            diag.msg = diag.buf[0..m.len];
+            var shown_buf: [diag.buf.len]u8 = undefined;
+            const shown = scope.unmangleInto(&shown_buf, m);
+            @memcpy(diag.buf[0..shown.len], shown);
+            diag.msg = diag.buf[0..shown.len];
         }
         ftp.endRun();
     }
@@ -134,6 +137,11 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
     var plan_arena = std.heap.ArenaAllocator.init(gpa);
     defer plan_arena.deinit();
     const arena = plan_arena.allocator();
+    if (raw_program.modular) {
+        const bound = try arena.alloc(ParamArg, opts.params.len);
+        for (opts.params, bound) |kv, *b| b.* = .{ .key = raw_program.inputName(kv.key) orelse kv.key, .val = kv.val };
+        opts.params = bound;
+    }
 
     var tables = lake.Memo.init(gpa);
     defer tables.deinit();

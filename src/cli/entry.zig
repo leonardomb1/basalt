@@ -97,6 +97,11 @@ pub fn declOf(stmt_in: []const u8) ?DeclId {
     const stmt = pastComments(stmt_in);
     var i: usize = 0;
     var w = nextWord(stmt, &i) orelse return null;
+    if (std.ascii.eqlIgnoreCase(w, "export")) {
+        const at = i;
+        const next = nextWord(stmt, &i) orelse return null;
+        if (std.ascii.eqlIgnoreCase(next, "param") or std.ascii.eqlIgnoreCase(next, "let")) w = next else i = at;
+    }
     if (std.ascii.eqlIgnoreCase(w, "param")) {
         const n = identPrefix(nextWord(stmt, &i) orelse return null);
         return if (n.len == 0) null else .{ .kind = .param, .name = n };
@@ -268,6 +273,16 @@ test "declOf names session declarations" {
     try std.testing.expectEqualStrings("norm", declOf("-- helper\nCREATE FUNCTION norm(s) AS trim(s)").?.name);
     try std.testing.expectEqualStrings("p", declOf("/* a */ -- b\n  /* c */ PARAM p BOOL DEFAULT false").?.name);
     try std.testing.expect(declOf("-- PARAM p INT\nSELECT 1") == null);
+    for ([_][3][]const u8{
+        .{ "EXPORT FUNCTION f(x) AS x", "f", "function" },
+        .{ "export or replace connection pg TYPE postgres", "pg", "connection" },
+        .{ "EXPORT PARAM env STRING DEFAULT 'dev'", "env", "param" },
+        .{ "EXPORT LET dir = 'out'", "dir", "let" },
+    }) |c| {
+        const d = declOf(c[0]).?;
+        try std.testing.expectEqualStrings(c[1], d.name);
+        try std.testing.expectEqualStrings(c[2], @tagName(d.kind));
+    }
 
     try std.testing.expect(declOf("SELECT 1") == null);
     try std.testing.expect(declOf("CREATE TABLE t") == null);

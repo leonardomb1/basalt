@@ -783,6 +783,7 @@ pub const Param = struct {
     default: ?*Expr,
     pos: Pos,
     is_json: bool = false,
+    exported: bool = false,
 };
 
 pub const Attr = struct { key: []const u8, value: *Expr, pos: Pos };
@@ -793,11 +794,12 @@ pub const Connection = struct {
     config: []const Attr,
     pos: Pos,
     hints: []const Hint = &.{},
+    exported: bool = false,
 };
 
 pub const Let = struct { name: []const u8, pipeline: Pipeline, pos: Pos };
 
-pub const LetConst = struct { name: []const u8, expr: ?*Expr, query: ?Pipeline = null, pos: Pos };
+pub const LetConst = struct { name: []const u8, expr: ?*Expr, query: ?Pipeline = null, pos: Pos, exported: bool = false };
 
 pub const Print = struct { expr: *Expr, pos: Pos };
 
@@ -919,11 +921,29 @@ pub const ExplainStmt = struct {
 
 pub const Note = struct { pos: Pos, msg: []const u8 };
 
+pub const Input = struct { external: []const u8, internal: []const u8 };
+
 pub const Program = struct {
     stmts: []const Stmt,
     explain: ExplainMode = .none,
     files: []const []const u8 = &.{},
     notes: []const Note = &.{},
+    /// Whether the program's files are modules (it has `@include`s), whose PARAMs a
+    /// run binds through `inputs` alone.
+    modular: bool = false,
+    /// The PARAMs a run may bind (`-p`, a kernel's params): those in the root
+    /// script's scope, by the name it reads them by (`x`, or `lib.x` through an
+    /// alias), each with the program's name for it.
+    inputs: []const Input = &.{},
+
+    /// The program's name for the PARAM a run binds as `name` (`-p`, a kernel's
+    /// params): one of `inputs` in a modular program, else `name` itself; null
+    /// when the root script cannot bind that name.
+    pub fn inputName(self: Program, name: []const u8) ?[]const u8 {
+        if (!self.modular) return name;
+        for (self.inputs) |in| if (std.mem.eql(u8, in.external, name)) return in.internal;
+        return null;
+    }
 
     /// The file a position lies in, or null for the script itself.
     pub fn fileOf(self: Program, pos: ?Pos) ?[]const u8 {

@@ -26,8 +26,7 @@ pub fn parseForEach(self: *Parser, pre: *std.array_list.Managed(ast.Stmt)) Error
         try pre.appendSlice(self.pending_bindings.items);
         self.pending_bindings.clearRetainingCapacity();
     } else if (self.at(.ident)) {
-        const conn = try self.expectIdent();
-        if (!self.isConn(conn))
+        const conn = (try self.connRef(try self.expectIdent())) orelse
             return self.fail(pos, "FOR EACH ROW OF: expected `SELECT ...`, `$param.path`, or `<conn>.QUERY($$...$$)`", .{});
         _ = try self.expect(.dot);
         try self.expectKw("query");
@@ -95,6 +94,7 @@ pub fn parseDollarPath(self: *Parser) Error!ast.QualName {
     const start = self.curPos();
     var q = try self.qualRest(start, (try self.expect(.dollar_ident)).text, false);
     q.dollar = true;
+    q.parts = try self.scopedVar(q.parts, start);
     return q;
 }
 

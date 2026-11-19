@@ -7,6 +7,7 @@ const s3 = @import("../../store/s3.zig");
 const sftp = @import("../../store/sftp.zig");
 const smb = @import("../../store/smb.zig");
 const std = @import("std");
+const scope = @import("../../lang/scope.zig");
 const types = @import("../../lang/types.zig");
 const targets = @import("targets.zig");
 const mem_lane_rows = @import("../path.zig").mem_lane_rows;
@@ -34,14 +35,22 @@ pub fn render(plan: Plan, w: anytype) !void {
 }
 
 /// `text` without the NUL that starts a hidden column's name (`Changes.seq_col`
-/// and the like), which a terminal shows as nothing or garbage.
+/// and the like), which a terminal shows as nothing or garbage, and with each
+/// included file's names as the file wrote them (`lang/scope.zig`).
 pub fn writeShown(w: anytype, text: []const u8) !void {
-    var rest = text;
-    while (std.mem.indexOfScalar(u8, rest, 0)) |i| {
-        try w.writeAll(rest[0..i]);
-        rest = rest[i + 1 ..];
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        const skip: ?usize = if (text[i] == 0) 1 else scope.prefixAt(text, i);
+        if (skip) |n| {
+            try w.writeAll(text[start..i]);
+            i += n;
+            start = i;
+            continue;
+        }
+        i += 1;
     }
-    try w.writeAll(rest);
+    try w.writeAll(text[start..]);
 }
 
 fn renderRaw(plan: Plan, w: *std.Io.Writer) !void {

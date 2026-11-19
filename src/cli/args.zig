@@ -9,6 +9,7 @@ const env = @import("../runtime/env.zig");
 const parseByteSize = @import("../runtime/env.zig").parseByteSize;
 const jsontext = @import("../exec/jsontext.zig");
 const std = @import("std");
+const scope = @import("../lang/scope.zig");
 const msgfmt = @import("../base/msgfmt.zig");
 
 const Source = struct { label: []const u8, text: []const u8, dir: []const u8 = "." };
@@ -97,6 +98,16 @@ pub const ParamVia = enum { flag, request };
 /// Why a binding of `name` cannot bind in `prog`: a LET, or no such PARAM (a typo would
 /// otherwise run on the default). Null when a PARAM of that name is declared.
 pub fn paramProblem(arena: std.mem.Allocator, prog: ast.Program, name: []const u8, via: ParamVia) !?[]const u8 {
+    if (prog.modular) {
+        if (prog.inputName(name) != null) return null;
+        const bare = if (std.mem.indexOfScalar(u8, name, '.')) |dot| name[dot + 1 ..] else name;
+        for (prog.stmts) |s| if (s == .param and std.mem.eql(u8, scope.shown(s.param.name), bare)) {
+            for (prog.inputs) |in| if (std.mem.eql(u8, in.internal, s.param.name))
+                return try msgfmt.allocPrint(arena, "`{s}`: this script binds that PARAM as `{s}`", .{ name, in.external });
+            const where = prog.fileOf(s.param.pos) orelse "an included file";
+            return try msgfmt.allocPrint(arena, "`{s}`: PARAM `{s}` is declared in `{s}`, which the script does not expose; declare it `EXPORT PARAM` there and include that file from the script to bind it", .{ name, bare, where });
+        };
+    }
     for (prog.stmts) |s| switch (s) {
         .param => |p| if (std.mem.eql(u8, p.name, name)) return null,
         .let_const => |l| if (std.mem.eql(u8, l.name, name))
@@ -386,6 +397,27 @@ test "paramProblem and repeatedKey: -p must name a declared PARAM, once" {
     try std.testing.expectEqualStrings("`params.zz`: neither the script nor the session declares a PARAM `zz`", (try paramProblem(a, prog, "zz", .request)).?);
     try std.testing.expectEqualStrings("d", repeatedKey(&.{ "d", "e", "d" }).?);
     try std.testing.expect(repeatedKey(&.{ "d", "e" }) == null);
+}
+
+test "paramProblem: an included PARAM binds by the name the script sees it under, and a private one not at all" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "lib.sql", .data = "EXPORT PARAM env STRING DEFAULT 'dev';\nPARAM key STRING DEFAULT 'k';\nEXPORT FUNCTION f() AS $key;\n" });
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    var diag: include.Diag = .{};
+    const plain = try include.loadProgram(a, "@include 'lib.sql';\nSELECT $env AS e;", "t.sql", base, &diag);
+    const lib = try include.loadProgram(a, "@include 'lib.sql' AS l;\nSELECT $l.env AS e;", "t.sql", base, &diag);
+    try std.testing.expect((try paramProblem(a, plain, "env", .flag)) == null);
+    try std.testing.expect((try paramProblem(a, lib, "l.env", .flag)) == null);
+    try std.testing.expectEqualStrings("`env`: this script binds that PARAM as `l.env`", (try paramProblem(a, lib, "env", .flag)).?);
+    for ([_]ast.Program{ plain, lib }, [_][]const u8{ "key", "l.key" }) |p, n| {
+        const msg = (try paramProblem(a, p, n, .flag)).?;
+        try std.testing.expect(std.mem.indexOf(u8, msg, "PARAM `key` is declared in `") != null);
+        try std.testing.expect(std.mem.endsWith(u8, msg, "lib.sql`, which the script does not expose; declare it `EXPORT PARAM` there and include that file from the script to bind it"));
+    }
 }
 
 test "a streaming writer appends to a file others also write" {

@@ -29,6 +29,7 @@ const runOutput = @import("output.zig").runOutput;
 const resolveFolder = @import("../connect.zig").resolveFolder;
 const isFolderRead = @import("../connect.zig").isFolderRead;
 const std = @import("std");
+const scope = @import("../../lang/scope.zig");
 const types = @import("../../lang/types.zig");
 
 /// `EXPLAIN [ANALYZE] <query>;` against what the statements above put in scope.
@@ -62,7 +63,7 @@ pub fn runExplain(env: *Env, e: ast.ExplainStmt, opts: RunOptions, stats: *Stats
         if (env.on_result) |h| h.call(.{ .info = info, .rows = n });
         return;
     }
-    std.fs.File.stderr().writeAll(aw.writer.buffered()) catch {};
+    toStderr(aw.writer.buffered());
 }
 
 pub fn printPlanArrow(gpa: std.mem.Allocator, text: []const u8, info: arrow.ResultInfo) !usize {
@@ -121,7 +122,7 @@ pub fn say(env: *Env, comptime fmt: []const u8, args: anytype) void {
     var aw = std.Io.Writer.Allocating.init(env.gpa);
     defer aw.deinit();
     aw.writer.print(fmt ++ "\n", args) catch return;
-    std.fs.File.stderr().writeAll(aw.writer.buffered()) catch {};
+    toStderr(aw.writer.buffered());
 }
 
 /// Prints what `openStep`'s profile saw, if it saw anything, and ends it. A failed
@@ -141,7 +142,7 @@ pub fn closeStep(env: *Env, step: ?*Profile) void {
     var aw = std.Io.Writer.Allocating.init(env.gpa);
     defer aw.deinit();
     renderSteps(env.arena, p, &aw.writer) catch return;
-    std.fs.File.stderr().writeAll(aw.writer.buffered()) catch {};
+    toStderr(aw.writer.buffered());
 }
 
 fn noteStages(env: *Env, prof: *Profile, stages: []const ast.Stage, depth: usize) !void {
@@ -354,7 +355,7 @@ pub const LoopReport = struct {
         var aw = std.Io.Writer.Allocating.init(self.gpa);
         defer aw.deinit();
         self.render(arena, &aw.writer) catch return;
-        std.fs.File.stderr().writeAll(aw.writer.buffered()) catch {};
+        toStderr(aw.writer.buffered());
     }
 
     const Group = struct { shape: u64, lead: Entry, facts: RunFacts, rows: std.ArrayListUnmanaged(usize) = .empty, elsewhere: usize = 0 };
@@ -454,7 +455,7 @@ pub fn printProfile(env: *Env, prof: *Profile, facts: RunFacts) !void {
     defer aw.deinit();
     const color = std.posix.isatty(std.fs.File.stderr().handle) and !std.process.hasEnvVarConstant("NO_COLOR");
     try renderProfile(env.arena, prof, facts, color, &aw.writer);
-    std.fs.File.stderr().writeAll(aw.writer.buffered()) catch {};
+    toStderr(aw.writer.buffered());
 }
 
 const Ordered = struct { ids: []const profile.Id, total_own: u64 };
@@ -975,4 +976,12 @@ test "the profile's text clips through jsontext.clipUtf8 as its own clip did on 
     }
     try testing.expectEqualStrings("", old.clip("\x80\x80\x80\x80\x80", 4));
     try testing.expectEqualStrings("\x80\x80\x80\x80", jsontext.clipUtf8("\x80\x80\x80\x80\x80", 4));
+}
+
+/// Writes `text` to stderr, every program-internal name shown as its file wrote it.
+fn toStderr(text: []const u8) void {
+    var buf: [4096]u8 = undefined;
+    var fw = std.fs.File.stderr().writerStreaming(&buf);
+    scope.writeShown(&fw.interface, text) catch return;
+    fw.interface.flush() catch {};
 }

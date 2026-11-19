@@ -13,6 +13,7 @@ const eqlNoCase = @import("../sql_parser.zig").eqlNoCase;
 const max_expr_depth = Parser.max_expr_depth;
 const max_paren_depth = Parser.max_paren_depth;
 const std = @import("std");
+const scope = @import("../scope.zig");
 const msgfmt = @import("../../base/msgfmt.zig");
 
 /// One call argument: an expression, or a lambda `x -> body` / `(acc, x) -> body`,
@@ -438,7 +439,7 @@ fn decimalLiteral(text: []const u8) ?ast.Expr.DecLit {
 /// An aggregate refuses arguments past its maximum: extras were once dropped, so
 /// `SUM(x, id)` answered `SUM(x)`.
 pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
-    const t = self.cur();
+    var t = self.cur();
     switch (t.tag) {
         .int, .float => return numberLiteral(self),
         .string => {
@@ -561,6 +562,15 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                 const body = try self.parseExpr();
                 return self.mk(.{ .let_in = .{ .name = name, .value = value, .body = body } });
             }
+            var lib_fn: ?*const scope.Lib = null;
+            if (self.scopes.len > 0 and self.peekTag() == .dot and self.i + 3 < self.toks.len and self.toks[self.i + 2].tag == .ident and self.toks[self.i + 3].tag == .lparen) {
+                if (self.libOf(t.text, t.file)) |lib| {
+                    lib_fn = lib;
+                    _ = self.advance();
+                    _ = self.advance();
+                    t = self.cur();
+                }
+            }
             if (self.peekTag() == .lparen) {
                 _ = self.advance();
                 _ = self.advance();
@@ -580,6 +590,7 @@ pub fn parsePrimary(self: *Parser) Error!*ast.Expr {
                 try self.moreNullTreatment(&nulls);
                 const tpos: Pos = .{ .line = t.line, .col = t.col, .file = t.file };
                 var lower: []const u8 = try std.ascii.allocLowerString(self.arena, t.text);
+                lower = if (lib_fn) |lib| try self.libName(lib, .func, lower, tpos) else try self.scopedFn(lower, tpos);
                 const packing: ?aggregates.AggFunc = if (aggregates.lookup(lower)) |f| (if (aggregates.spec(f).packs or f == .percentile_cont or f == .percentile_disc) f else null) else null;
                 var agg_order: []const Window.OrderExpr = &.{};
                 if (packing != null and self.eatKw("order")) {

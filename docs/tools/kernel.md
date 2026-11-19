@@ -48,7 +48,8 @@ everything read from it (any type a `PARAM` takes: `int`, `decimal(10,2)`,
 of the same name wins. Nothing runs and nothing connects, and the session is
 left as it was: a `check`ed script's declarations are checked, not kept.
 `params` binds the script's `PARAM`s for that script only, as `-p` does for a
-run, and a key that names no `PARAM` of the script or the session is refused
+run — those its `@include`s export to it too, a library's as `"st.name"`
+([Scripts](../language/scripts.md)) — and a key that names no `PARAM` of the script or the session is refused
 (`check` lists it); `format` overrides `--format` (default `arrow`) and `max_rows` overrides
 `--max-rows` for that script. A `cancel`
 acts at once, even mid-script; one naming a different `id` than the running

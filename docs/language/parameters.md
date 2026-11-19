@@ -27,6 +27,13 @@ PARAM job    JSON;                       -- -p job='{"tables":[...]}', a documen
   rather than running on the default, and a name given twice is a malformed
   command line. A kernel's `params` may carry names a script does not
   declare; those are ignored.
+- A PARAM or LET is its file's own. `EXPORT PARAM` and `EXPORT LET` share one
+  with the files that `@include` this one, by its name, or as `$st.name`
+  through a library included `AS st`. A run binds only the PARAMs the root
+  script sees — its own and those its includes export to it, a library's as
+  `-p st.name=...` — and every other PARAM takes its `DEFAULT`, so one without
+  a `DEFAULT` in a file the script does not expose it from is an error
+  ([Scripts](scripts.md)).
 
 **`LET name = <expr>;`** declares a variable, as JavaScript's `let` does: its
 expression is evaluated once, when the statement runs (in declaration order; it

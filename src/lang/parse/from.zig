@@ -51,7 +51,23 @@ pub fn parseFromSource(self: *Parser, aliases: *AliasSet, read_hints: *std.array
         node = .{ .read = try parseTableBuiltin(self) };
     } else {
         const pos = self.curPos();
-        const head = try self.expectIdent();
+        var head = try self.expectIdent();
+        if (self.scopes.len > 0) {
+            if (self.at(.lparen)) {
+                head = try self.scopedFn(head, pos);
+            } else if (self.at(.dot)) {
+                if (self.libOf(head, pos.file)) |lib| {
+                    if (self.peekTag() == .ident or self.peekTag() == .qident) {
+                        const calls = self.i + 2 < self.toks.len and self.toks[self.i + 2].tag == .lparen;
+                        _ = self.advance();
+                        const second = self.advance();
+                        head = try self.libName(lib, if (calls) .func else .conn, second.text, pos);
+                    }
+                } else if (self.resolveName(.conn, head, pos.file)) |n| {
+                    head = n;
+                } else try self.refuseHidden(.conn, head, pos.file, pos);
+            }
+        }
         if (self.at(.lparen)) {
             const bname = (try self.callTableFn(head, pos, .from)).binding;
             if (!try claimFromAlias(self, aliases)) try self.claimAlias(aliases, head, pos, .left);
@@ -175,9 +191,9 @@ pub fn parseEachTableOf(self: *Parser, hints: *std.array_list.Managed(ast.Hint))
             if (self.isConn(c)) u.discover_conn = c;
         }
     } else {
-        const conn = try self.expectIdent();
-        if (!self.isConn(conn))
-            return self.fail(pos, "unknown connection `{s}` in EACH TABLE OF", .{conn});
+        const written = try self.expectIdent();
+        const conn = (try self.connRef(written)) orelse
+            return self.fail(pos, "unknown connection `{s}` in EACH TABLE OF", .{written});
         _ = try self.expect(.dot);
         try self.expectKw("query");
         _ = try self.expect(.lparen);
@@ -190,9 +206,9 @@ pub fn parseEachTableOf(self: *Parser, hints: *std.array_list.Managed(ast.Hint))
 
     if (u.discover_json.len > 0 or (u.discover_pipeline != null and self.isKw("in"))) {
         try self.expectKw("in");
-        const conn = try self.expectIdent();
-        if (!self.isConn(conn))
-            return self.fail(pos, "unknown connection `{s}` in EACH TABLE OF ... IN", .{conn});
+        const written = try self.expectIdent();
+        const conn = (try self.connRef(written)) orelse
+            return self.fail(pos, "unknown connection `{s}` in EACH TABLE OF ... IN", .{written});
         u.discover_conn = conn;
     }
     if (u.discover_pipeline != null and u.discover_conn.len == 0)

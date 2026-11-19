@@ -12,7 +12,8 @@ const table_builtins = @import("../table_builtins.zig");
 const types = @import("../types.zig");
 
 pub fn parseConnection(self: *Parser, pos: Pos) Error!ast.Connection {
-    const name = try self.expectIdent();
+    const written = try self.expectIdent();
+    const name = try self.ownName(.conn, written);
     try self.expectKw("type");
     const connector_raw = try self.expectIdent();
     const connector = try std.ascii.allocLowerString(self.arena, connector_raw);
@@ -38,8 +39,8 @@ pub fn parseConnection(self: *Parser, pos: Pos) Error!ast.Connection {
     if (hints.items.len > 0 and !std.mem.eql(u8, connector, "http"))
         return self.fail(hints.items[0].pos, "PAGINATE / RETRY / WITH on a connection are for `http` connections only", .{});
     try self.endStmt();
-    if (!has_user) try attrs.append(.{ .key = "user", .value = try self.envCall(name, "_USER"), .pos = pos });
-    if (!has_pass) try attrs.append(.{ .key = "password", .value = try self.envCall(name, "_PASS"), .pos = pos });
+    if (!has_user) try attrs.append(.{ .key = "user", .value = try self.envCall(written, "_USER"), .pos = pos });
+    if (!has_pass) try attrs.append(.{ .key = "password", .value = try self.envCall(written, "_PASS"), .pos = pos });
     return .{ .name = name, .connector = connector, .config = try attrs.toOwnedSlice(), .pos = pos, .hints = try hints.toOwnedSlice() };
 }
 
@@ -108,7 +109,7 @@ pub fn envCall(self: *Parser, conn_name: []const u8, suffix: []const u8) Error!*
 /// A statement function's parameters are script constants inside it, like loop
 /// variables. A body of statements without `BEGIN` is refused naming it.
 pub fn parseFunction(self: *Parser, pos: Pos, replace: bool) Error!ast.FnDecl {
-    const name = try self.expectIdent();
+    const name = try self.ownName(.func, try self.expectIdent());
     _ = try self.expect(.lparen);
     var params = std.array_list.Managed(ast.FnParam).init(self.arena);
     if (!self.at(.rparen)) {
@@ -183,7 +184,12 @@ pub fn parseFnParam(self: *Parser) Error!ast.FnParam {
 pub fn parseCallStmt(self: *Parser) Error!ast.CallStmt {
     const pos = self.curPos();
     try self.expectKw("call");
-    const name = try self.expectIdent();
+    const written = try self.expectIdent();
+    const npos = self.prevPos();
+    const name = if (self.scopes.len == 0) written else if (self.libOf(written, npos.file)) |lib| blk: {
+        _ = try self.expect(.dot);
+        break :blk try self.libName(lib, .func, try self.expectIdent(), npos);
+    } else try self.scopedFn(written, npos);
     _ = try self.expect(.lparen);
     var args = std.array_list.Managed(*ast.Expr).init(self.arena);
     if (!self.at(.rparen)) {
@@ -192,6 +198,11 @@ pub fn parseCallStmt(self: *Parser) Error!ast.CallStmt {
     }
     _ = try self.expect(.rparen);
     try self.endStmt();
+    if (self.scopes.len > 0 and std.ascii.eqlIgnoreCase(name, "execute_on") and args.items.len > 0 and args.items[0].* == .str_lit) {
+        const conn = args.items[0].str_lit;
+        const internal = if (std.mem.indexOfScalar(u8, conn, '.')) |dot| (if (self.libOf(conn[0..dot], npos.file)) |lib| try self.libName(lib, .conn, conn[dot + 1 ..], npos) else null) else self.resolveName(.conn, conn, npos.file);
+        if (internal) |n| args.items[0] = try self.mk(.{ .str_lit = n }) else try self.refuseHidden(.conn, conn, npos.file, npos);
+    }
     return .{ .name = name, .args = try args.toOwnedSlice(), .pos = pos };
 }
 
@@ -208,7 +219,7 @@ pub fn parseThrowStmt(self: *Parser) Error!ast.Throw {
 pub fn parseParam(self: *Parser) Error!ast.Param {
     const pos = self.curPos();
     try self.expectKw("param");
-    const name = try self.expectIdent();
+    const name = try self.ownName(.variable, try self.expectIdent());
     var is_json = false;
     var ty = types.Type.init(.string);
     if (self.isKw("json")) {

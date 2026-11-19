@@ -176,7 +176,7 @@ test "an entry's @include runs after the session has declarations, its lines kee
     const a = ar.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "lib.sql", .data = "CREATE FUNCTION twice(x) AS x * 2;\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "lib.sql", .data = "EXPORT FUNCTION twice(x) AS x * 2;\n" });
     const lib = try std.fs.path.join(a, &.{ try tmp.dir.realpathAlloc(a, "."), "lib.sql" });
 
     var decls = DeclStore.init(std.testing.allocator);

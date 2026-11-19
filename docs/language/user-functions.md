@@ -1,10 +1,10 @@
 # User functions
 
 `CREATE FUNCTION` names an expression, a block of statements or a query, so a
-script — or a library it `@include`s — can reuse it. A library included `AS st`
-exposes the functions it declares `EXPORT FUNCTION` as `st.name`, the others
-private to it ([Scripts](scripts.md)). A table function's
-body may call scalar functions, declared before or after it.
+script can reuse it. A function is its file's own: a file that `@include`s it
+sees it only when it is declared `EXPORT FUNCTION` — by its plain name, or as
+`st.name` through a library included `AS st` ([Scripts](scripts.md)). A table
+function's body may call scalar functions, declared before or after it.
 
 ## Scalar and statement functions
 
@@ -35,7 +35,8 @@ function's name qualifies its columns (`paid.id`). Arguments are plan-time
 constants — literals, `$params`, loop variables, and expressions over them —
 except under `JOIN LATERAL` (below). Arity, defaults and literal-argument
 types are checked as for a scalar function, the body is checked where it is
-declared, and an `@include`d table function is called like a local one. A
+declared, and an exported table function of an `@include`d file is called like a
+local one, its body seeing its own file's names. A
 built-in table source's name (`range`, `lines`, `fixed`, `split`, `chunks`) cannot be taken, `OR REPLACE` or not. A body
 may call table functions declared before it; a call that reaches its own
 function (possible only through `OR REPLACE`) stops at 16 levels. A discovery

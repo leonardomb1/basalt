@@ -3,10 +3,10 @@
 A script is a sequence of `;`-terminated statements:
 
 ```sql ignore
-@include 'lib.sql';               -- top of file only; C-style, relative to this file
-@include 'lib/stats.sql' AS st;   -- a library: its EXPORT FUNCTIONs as st.f(...)
+@include 'lib.sql';               -- top of file only; runs it, its EXPORTs by name
+@include 'lib/stats.sql' AS st;   -- a library: its EXPORTs as st.f(...), st.pg, $st.x
 @include 'github.com/org/repo/sql/kit.sql@v1.2.0' AS kit;  -- remote, pinned in basalt.sum
-PARAM ...;                        -- CLI inputs
+PARAM ...;                        -- CLI inputs (EXPORT PARAM: shared with includers)
 LET name = <expr>;                -- a variable, evaluated when it runs
 THROW 'msg' WHEN <condition>;     -- fail the plan on the script's own invariant
 CREATE CONNECTION ...;            -- named data endpoints
@@ -23,40 +23,72 @@ CASE ... END CASE;                -- plan-time dispatch
 PRINT <expr>;                     -- progress line on stderr, via the run log
 ```
 
-`@include 'file.sql';` splices another script's declarations ahead of this one
-at plan time. It stands on a line of its own — nothing may follow it there but a
-`--` comment. Each included file is parsed separately (errors report the
-included file's own path and line), includes may nest (depth 16, cycles
-rejected), and paths resolve relative to the including file, by the path it was
-included as — a symlinked folder is not followed to its target, and the working
-directory plays no part: `mods/m/fns.sql` including `'lib/sys.sql'` reads
-`mods/m/lib/sys.sql`. A file is spliced
-in **once**, at its first include, like C's `#pragma once`: when `outliers.sql`
-and `dispersion.sql` both include `stats.sql` and a script includes both,
-`stats.sql` is in the program one time — its `CREATE FUNCTION`s are not defined
-twice — and each library still sees what it declares. That holds for every
-statement in it, so an included file's `LOAD INTO` runs once however many paths
-reach it.
+`@include 'file.sql';` brings another script into this one at plan time. It
+stands on a line of its own — nothing may follow it there but a `--` comment.
+Each included file is parsed separately (errors report the included file's own
+path and line), includes may nest (depth 16, cycles rejected), and paths resolve
+relative to the including file, by the path it was included as — a symlinked
+folder is not followed to its target, and the working directory plays no part:
+`mods/m/fns.sql` including `'lib/sys.sql'` reads `mods/m/lib/sys.sql`.
 
-`@include 'lib/stats.sql' AS st;` includes a **library**: it may only declare
-functions — scalar, statement and table — and any other statement in it (a
-`LOAD INTO`, `SELECT`, `PARAM`, `LET`, connection or `CALL`) is an error naming
-it, so including a library never runs anything. A library shares only what it
-declares `EXPORT FUNCTION` (in place of `CREATE FUNCTION`, `OR REPLACE` too), and
-one that exports nothing is an error at its `@include`. Its exported functions are
-namespaced under the alias: `st.median(x)`, `CALL st.refresh(...)`, `FROM
-st.orders($since)`; a function it declares with `CREATE FUNCTION` is private to it,
-and `st.helper(...)` from outside is an error naming what it exports. Inside the
-library every function calls the others by their plain names, private or not, and
-outside it the plain names do not exist, so two libraries may each define
-`clean()`. An
-alias is private to the file that writes it, as a Go import is: a library's own
-`@include 'util.sql' AS u` makes `u.f(...)` callable there and nowhere else, so
-two libraries may each use `u` for different files, and a file it includes
-without `AS` shares its namespace, as if written in it. One file may not give
-two includes the same alias, nor use a connection's name as one. Without `AS`, a file is spliced whole, as above,
-statements and all: the choice between running a file's statements and only
-taking its functions is written at each include.
+**Every file is a module.** The functions, connections, PARAMs and LETs a file
+declares are its own. Another file sees one only when it is declared `EXPORT` —
+`EXPORT FUNCTION`, `EXPORT CONNECTION`, `EXPORT PARAM`, `EXPORT LET`, and
+`EXPORT OR REPLACE ...` — and only when it includes that file itself: an export
+does not pass through a file in between. When `main.sql` includes `a.sql`, which
+includes `b.sql`, `main.sql` sees what `a.sql` exports and nothing of `b.sql`'s;
+to use `b.sql`'s, it includes `b.sql` too. Naming what an included file declares
+without `EXPORT`, or what reaches the file only through another, is an error
+saying which file to change. So two files may each keep a private `pg` or
+`clean()` without meeting, and a helper inside a library is never called, or
+replaced, by accident from outside it. Messages, logs and `EXPLAIN` show every
+name as its file wrote it, and a connection's default credentials (`PG_USER`,
+`PG_PASS`) keep its declared name.
+
+```sql ignore
+-- lib/warehouse.sql
+CREATE CONNECTION staging TYPE postgres OPTIONS (host = 'stg');   -- this file's own
+EXPORT CONNECTION dw TYPE postgres OPTIONS (host = 'dw');
+EXPORT FUNCTION cents(x) AS CAST(round(x * 100) AS BIGINT);
+
+-- main.sql
+@include 'lib/warehouse.sql';
+LOAD INTO dw.public.sales AS SELECT id, cents(amount) AS amount FROM 'sales.csv';
+```
+
+What a file included without `AS` exports is used by its plain name. A name the
+including file declares too, or that two such includes both export, is an error
+at the `@include`, as which one a reference meant could not be told: include one
+of them `AS` an alias. Such a file is also **run**: its statements — a `LOAD
+INTO`, a `SELECT`, a `CALL` — are part of the program, ahead of the includer's.
+A file is in the program **once**, at its first include, like C's `#pragma
+once`: when `outliers.sql` and `dispersion.sql` both include `stats.sql` and a
+script includes both, `stats.sql`'s functions are declared one time, its `LOAD
+INTO` runs once however many paths reach it, and each includer still sees what
+`stats.sql` exports.
+
+`@include 'lib/stats.sql' AS st;` includes a **library**: it may only declare —
+functions (scalar, statement and table), connections, PARAMs and LETs of a value
+— and a statement that would run (a `LOAD INTO`, `SELECT`, `CALL`, `FOR EACH`, a
+`LET` of a query) is an error naming it, so including a library never runs
+anything. One that exports nothing is an error at its `@include`. Its exports
+are used through the alias: `st.median(x)`, `CALL st.refresh(...)`, `FROM
+st.orders($since)`, `st.dw.public.t`, `$st.region`, `${st.median(x)}` in a
+string, `'smb://st.share/dir/f.csv'`; naming one it keeps private
+(`st.helper(...)`) is an error listing what it exports. An alias is private to
+the file that writes it, as a Go import is: a library's own `@include 'util.sql'
+AS u` makes `u.f(...)` usable there and nowhere else, so two libraries may each
+use `u` for different files. One file may not give two includes the same alias,
+nor use a connection's name as one. The choice between running a file's
+statements and only taking its declarations is written at each include.
+
+A run binds the PARAMs the **root script** sees, as a Terraform root module's
+variables: its own, those exported by the files it includes without `AS`, by
+their names, and those its libraries export, as `alias.name` (`-p st.region=eu`).
+Any other PARAM — private to its file, or exported only to a file in between —
+takes its `DEFAULT`, and one without a `DEFAULT` is an error at check, as nothing
+could bind it. `-p` for a PARAM the script does not expose is refused, naming the
+file that declares it.
 
 A path written as a repository — `github.com/owner/repo/path/file.sql@ref`,
 `gitlab.com/group/repo/path/file.sql@ref`, or `host/group/repo.git/path/file.sql@ref`

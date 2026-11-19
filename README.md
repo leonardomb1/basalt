@@ -201,9 +201,12 @@ has the details.
 ## Reuse
 
 `CREATE FUNCTION` names an expression, a block of statements or a parameterized
-query (a table function, read with `FROM name(...)`). A file of them is a
-library: `@include 'lib/finance.sql' AS fin;` makes them `fin.name(...)`, and a
-library can live in a repository, pinned to a version and a hash:
+query (a table function, read with `FROM name(...)`). Every file is a module:
+what it declares is its own until it says `EXPORT FUNCTION` (or `EXPORT
+CONNECTION`, `PARAM`, `LET`), and only a file that includes it directly sees
+that. A file of declarations is a library: `@include 'lib/finance.sql' AS fin;`
+makes its exports `fin.name(...)`, and a library can live in a repository,
+pinned to a version and a hash:
 
 ```sql ignore
 @include 'github.com/acme/sql-kit/finance.sql@v1.2.0' AS fin;

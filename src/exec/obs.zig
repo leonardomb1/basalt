@@ -25,6 +25,7 @@
 //! rows into four once reported `11 rows/s`.
 
 const std = @import("std");
+const scope = @import("../lang/scope.zig");
 const builtin = @import("builtin");
 const driver = @import("driver.zig");
 const msgfmt = @import("../base/msgfmt.zig");
@@ -85,7 +86,15 @@ pub const Logger = struct {
         w.print(",\"rows\":{d},\"rows_per_sec\":{d},\"elapsed_ms\":{d}", .{ ev.rows, ev.rows_per_sec, ev.elapsed_ms }) catch return;
         if (ev.loop_total > 0) w.print(",\"loop_done\":{d},\"loop_total\":{d}", .{ ev.loop_done, ev.loop_total }) catch return;
         w.writeAll("}\n") catch return;
-        self.file.writeAll(w.buffered()) catch {};
+        self.put(w.buffered()) catch {};
+    }
+
+    /// Writes a log line, every program-internal name in it shown as its file wrote it.
+    fn put(self: *Logger, bytes: []const u8) !void {
+        var buf: [4096]u8 = undefined;
+        var fw = self.file.writerStreaming(&buf);
+        try scope.writeShown(&fw.interface, bytes);
+        try fw.interface.flush();
     }
 
     fn eraseProgress(self: *Logger) void {
@@ -117,7 +126,7 @@ pub const Logger = struct {
             w.print("{s}\n", .{msg}) catch return;
         }
         self.eraseProgress();
-        self.file.writeAll(w.buffered()) catch return;
+        self.put(w.buffered()) catch return;
     }
 
     pub fn summary(self: *Logger, s: Summary) void {
@@ -132,7 +141,7 @@ pub const Logger = struct {
             s.renderText(&w) catch return;
         }
         self.eraseProgress();
-        self.file.writeAll(w.buffered()) catch return;
+        self.put(w.buffered()) catch return;
     }
 
     /// One finished `LOAD` of several, printed above the live progress line when
@@ -147,7 +156,7 @@ pub const Logger = struct {
         var w = std.Io.Writer.fixed(&lbuf);
         if (self.json) it.renderJson(&w, self.run_id) catch return false else it.renderText(&w) catch return false;
         self.eraseProgress();
-        self.file.writeAll(w.buffered()) catch return false;
+        self.put(w.buffered()) catch return false;
         return true;
     }
 
@@ -174,7 +183,7 @@ pub const Logger = struct {
             w.print("{s}: {s}\n", .{ level.label(), msg }) catch return;
         }
         self.eraseProgress();
-        self.file.writeAll(w.buffered()) catch return;
+        self.put(w.buffered()) catch return;
     }
 };
 

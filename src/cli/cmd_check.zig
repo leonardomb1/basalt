@@ -15,6 +15,7 @@ const paramProblem = @import("args.zig").paramProblem;
 const parser = @import("../lang/sql_parser.zig");
 const repeatedKey = @import("args.zig").repeatedKey;
 const std = @import("std");
+const scope = @import("../lang/scope.zig");
 const unknownOption = @import("args.zig").unknownOption;
 const types = @import("../lang/types.zig");
 
@@ -52,8 +53,10 @@ pub fn checkText(a: std.mem.Allocator, text: []const u8, label: []const u8, dir:
 
     var found = std.array_list.Managed(analyze.Issue).init(a);
     var adiag = analyze.Diag{};
+    const overrides = try a.alloc(analyze.ParamOverride, opts.overrides.len);
+    for (opts.overrides, overrides) |o, *b| b.* = .{ .name = prog.inputName(o.name) orelse o.name, .value = o.value };
     _ = try analyze.analyzeOpts(a, prog, .{
-        .overrides = opts.overrides,
+        .overrides = overrides,
         .known_tables = opts.known,
         .issues = &found,
         .declarations_only = opts.declarations_only or perrs.items.len > 0,
@@ -67,6 +70,7 @@ pub fn checkText(a: std.mem.Allocator, text: []const u8, label: []const u8, dir:
             return px.line < py.line or (px.line == py.line and px.col < py.col);
         }
     }.lt);
+    for (issues.items) |*i| i.msg = try scope.unmangle(a, i.msg);
     return issues.toOwnedSlice();
 }
 
@@ -217,7 +221,7 @@ test "checkText: an error inside an included table function's body, reached from
     const a = ar.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    try tmp.dir.writeFile(.{ .sub_path = "lib.sql", .data = "CREATE FUNCTION g() RETURNS TABLE AS SELECT * FROM 'x.csv';\n\nCREATE OR REPLACE FUNCTION g() RETURNS TABLE AS SELECT * FROM g();\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "lib.sql", .data = "EXPORT FUNCTION g() RETURNS TABLE AS SELECT * FROM 'x.csv';\n\nEXPORT OR REPLACE FUNCTION g() RETURNS TABLE AS SELECT * FROM g();\n" });
     const base = try tmp.dir.realpathAlloc(a, ".");
     const issues = try checkText(a, "@include 'lib.sql';\nSELECT * FROM g();", "main.sql", base, .{});
     try std.testing.expectEqual(@as(usize, 1), issues.len);

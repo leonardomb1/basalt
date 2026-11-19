@@ -64,6 +64,7 @@
 const std = @import("std");
 const token = @import("token.zig");
 const lexer = @import("sql_lexer.zig");
+const scope = @import("scope.zig");
 const ast = @import("ast.zig");
 pub const ColUses = @import("parse/textcols.zig").ColUses;
 const quote = @import("quote.zig");
@@ -105,32 +106,21 @@ pub const Options = struct {
     known_names: []const []const u8 = &.{},
     errors: ?*std.array_list.Managed(Diagnostic) = null,
     file: u16 = 0,
-    aliases: []const []const u8 = &.{},
-    libraries: []const Library = &.{},
-    namespace: ?[]const u8 = null,
-    own: []const []const u8 = &.{},
-};
-
-/// A library this file includes `AS alias`: the functions it exports, which
-/// `alias.f(...)` may call, and the ones private to it, which it may not.
-pub const Library = struct {
-    alias: []const u8,
-    path: []const u8,
-    exports: []const []const u8,
-    private: []const []const u8,
+    /// Every file's scope by file number, this one's included (`lang/scope.zig`);
+    /// empty for a program of one file, whose names are all its own.
+    scopes: []const scope.Scope = &.{},
 };
 
 pub fn parseSourceOpts(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic, opts: Options) Error!ast.Program {
-    var toks = lexer.tokenize(arena, src) catch return error.OutOfMemory;
+    const toks = lexer.tokenize(arena, src) catch return error.OutOfMemory;
     for (toks) |*t| t.file = opts.file;
-    var p = Parser{ .arena = arena, .toks = toks, .diag = diag };
-    if (opts.aliases.len > 0 or opts.namespace != null) {
-        toks = try qualify(&p, toks, opts.aliases, opts.libraries, opts.namespace, opts.own);
-        p.toks = toks;
-    }
+    var p = Parser{ .arena = arena, .toks = toks, .diag = diag, .scopes = opts.scopes, .derived_n = @as(usize, opts.file) * 1_000_000 };
     for (toks) |t| {
         if (t.tag == .invalid) return p.failInvalid(t);
     }
+    if (p.scopes.len > 0) for (toks) |*t| if (t.tag == .string) {
+        t.text = try p.scopedText(t.text, t.file);
+    };
     p.known_conns = opts.known_conns;
     p.known_fns = opts.known_fns;
     p.known_tables = opts.known_tables;
@@ -138,61 +128,6 @@ pub fn parseSourceOpts(arena: std.mem.Allocator, src: []const u8, diag: *Diagnos
     p.known_names = opts.known_names;
     p.errors = opts.errors;
     return p.parseProgram();
-}
-
-/// Names functions across `@include ... AS alias`, on tokens, so a table function's
-/// body, kept as tokens and parsed again at each call, resolves alike. A file in
-/// namespace `ns` (a library, or a file it includes without `AS`) has each of its
-/// functions, declared or called (`f(`), as `ns.f`, as are the plain names in
-/// `extra` its unaliased includes declared; and `alias.f(`, calling into a library
-/// this file includes, is joined to one name, `ns.alias.f`. An alias is private to
-/// the file that writes it, so two libraries may each use the same one. A call of a
-/// function a library keeps private is refused, naming what it exports.
-fn qualify(p: *Parser, toks: []Token, aliases: []const []const u8, libraries: []const Library, namespace: ?[]const u8, extra: []const []const u8) Error![]Token {
-    const arena = p.arena;
-    var own = std.array_list.Managed([]const u8).init(arena);
-    try own.appendSlice(extra);
-    if (namespace != null) for (toks, 0..) |t, i| {
-        if (t.tag == .ident and eqlNoCase(t.text, "function") and i + 2 < toks.len and toks[i + 1].tag == .ident and toks[i + 2].tag == .lparen)
-            try own.append(toks[i + 1].text);
-    };
-    var out = std.array_list.Managed(Token).init(arena);
-    var i: usize = 0;
-    while (i < toks.len) : (i += 1) {
-        var t = toks[i];
-        const after_dot = i > 0 and toks[i - 1].tag == .dot;
-        if (t.tag == .ident and !after_dot and i + 3 < toks.len and toks[i + 1].tag == .dot and toks[i + 2].tag == .ident and toks[i + 3].tag == .lparen) {
-            if (containsNoCase(aliases, t.text)) {
-                for (libraries) |l| if (eqlNoCase(l.alias, t.text) and containsNoCase(l.private, toks[i + 2].text) and !containsNoCase(l.exports, toks[i + 2].text)) {
-                    const shown = try std.mem.join(arena, ", ", l.exports);
-                    return p.fail(.{ .line = t.line, .col = t.col, .file = t.file }, "`{s}.{s}` is private to `{s}`, which exports {s}; declare it `EXPORT FUNCTION` there to call it here", .{ t.text, toks[i + 2].text, l.path, shown });
-                };
-                const lib = if (namespace) |ns| try qualified(arena, ns, t.text) else t.text;
-                t.text = try qualified(arena, lib, toks[i + 2].text);
-                t.end_line = toks[i + 2].end_line;
-                t.end_col = toks[i + 2].end_col;
-                try out.append(t);
-                i += 2;
-                continue;
-            }
-        }
-        if (namespace) |ns| if (t.tag == .ident and !after_dot and i + 1 < toks.len and toks[i + 1].tag == .lparen and containsNoCase(own.items, t.text)) {
-            t.text = try qualified(arena, ns, t.text);
-        };
-        try out.append(t);
-    }
-    return out.items;
-}
-
-fn qualified(arena: std.mem.Allocator, ns: []const u8, name: []const u8) Error![]const u8 {
-    const s = msgfmt.allocPrint(arena, "{s}.{s}", .{ ns, name }) catch return error.OutOfMemory;
-    for (s) |*c| c.* = std.ascii.toLower(c.*);
-    return s;
-}
-
-fn containsNoCase(list: []const []const u8, s: []const u8) bool {
-    for (list) |x| if (eqlNoCase(x, s)) return true;
-    return false;
 }
 
 /// `text` as a message can carry it: bytes that are not UTF-8 become `\xNN`, so a
@@ -238,6 +173,59 @@ pub fn parseExprStr(arena: std.mem.Allocator, src: []const u8, diag: *Diagnostic
 
 pub fn eqlNoCase(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
+}
+
+/// Whether two names of kind `kind` are one: a function's ignoring case, as calls
+/// are lower-cased; a connection's and a variable's exactly.
+fn sameName(kind: scope.Kind, a: []const u8, b: []const u8) bool {
+    return if (kind == .func) eqlNoCase(a, b) else std.mem.eql(u8, a, b);
+}
+
+/// The declaration that would share `n`: `EXPORT FUNCTION`, `EXPORT CONNECTION`,
+/// `EXPORT PARAM` or `EXPORT LET`'s keyword.
+fn declWord(n: scope.Name) []const u8 {
+    return switch (n.kind) {
+        .func => "FUNCTION",
+        .conn => "CONNECTION",
+        .variable => if (n.param) "PARAM" else "LET",
+    };
+}
+
+fn kindNoun(k: scope.Kind) []const u8 {
+    return switch (k) {
+        .func => "function",
+        .conn => "connection",
+        .variable => "PARAM or LET",
+    };
+}
+
+/// Whether `name` is local to a block of the file `sc` scopes (a FOR EACH
+/// variable, a function's parameter), which a module variable does not shadow.
+fn local(sc: *const scope.Scope, name: []const u8) bool {
+    for (sc.locals) |l| if (std.mem.eql(u8, l, name)) return true;
+    return false;
+}
+
+/// The index of the `}` closing a `${` hole whose body starts at `text[from]`,
+/// across nested braces and quoted text; null when it never closes.
+fn holeEnd(text: []const u8, from: usize) ?usize {
+    var depth: usize = 0;
+    var i = from;
+    while (i < text.len) : (i += 1) {
+        switch (text[i]) {
+            '\'' => {
+                i += 1;
+                while (i < text.len and text[i] != '\'') i += 1;
+            },
+            '{' => depth += 1,
+            '}' => {
+                if (depth == 0) return i;
+                depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 const MAX_ALIASES = 32;
@@ -506,6 +494,7 @@ pub const Parser = struct {
     is_builtin: ?*const fn ([]const u8) bool = null,
     known_names: []const []const u8 = &.{},
     errors: ?*std.array_list.Managed(Diagnostic) = null,
+    scopes: []const scope.Scope = &.{},
     table_fns: std.array_list.Managed(ast.FnDecl) = undefined,
     tvf: ?*TableFrame = null,
     tvf_depth: usize = 0,
@@ -857,6 +846,196 @@ pub const Parser = struct {
         }
         return false;
     }
+    /// The scope of file `file`, whose tokens these are; null in a program of one
+    /// file, where every name is the file's own and none needs resolving.
+    pub fn scopeOf(self: *const Parser, file: u16) ?*const scope.Scope {
+        if (file >= self.scopes.len) return null;
+        return &self.scopes[file];
+    }
+
+    /// `name`, of kind `kind`, as file `file` sees it: one it declares, or one a file
+    /// it includes without `AS` exports; null when neither, or in a one-file program.
+    pub fn resolveName(self: *const Parser, kind: scope.Kind, name: []const u8, file: u16) ?[]const u8 {
+        const sc = self.scopeOf(file) orelse return null;
+        for (sc.own) |n| if (n.kind == kind and sameName(kind, n.name, name)) return n.internal;
+        for (sc.imports) |h| if (h.name.kind == kind and sameName(kind, h.name.name, name)) return h.name.internal;
+        return null;
+    }
+
+    /// The program's name for `name`, of kind `kind`, which the file being parsed
+    /// declares (its just-read token's): an included file's internal name, the
+    /// root's as written; in a one-file program, the name itself.
+    pub fn ownName(self: *Parser, kind: scope.Kind, name: []const u8) Error![]const u8 {
+        if (self.scopes.len == 0) return name;
+        const file = self.prevPos().file;
+        if (self.scopeOf(file)) |sc| for (sc.own) |n| if (n.kind == kind and sameName(kind, n.name, name)) return n.internal;
+        return scope.internalName(self.arena, file, kind, name);
+    }
+
+    /// The library file `file` includes `AS alias`, if `alias` is one.
+    pub fn libOf(self: *const Parser, alias: []const u8, file: u16) ?*const scope.Lib {
+        const sc = self.scopeOf(file) orelse return null;
+        for (sc.libs) |*l| if (eqlNoCase(l.alias, alias)) return l;
+        return null;
+    }
+
+    /// `alias.name`, of kind `kind`, in library `lib`: its program name, or a refusal
+    /// saying it is private there or not declared, with what the library exports.
+    pub fn libName(self: *Parser, lib: *const scope.Lib, kind: scope.Kind, name: []const u8, pos: Pos) Error![]const u8 {
+        var exports = std.array_list.Managed(u8).init(self.arena);
+        for (lib.names) |n| if (n.exported) {
+            if (exports.items.len > 0) try exports.appendSlice(", ");
+            try exports.appendSlice(n.name);
+        };
+        const shown = if (exports.items.len > 0) exports.items else "nothing";
+        for (lib.names) |n| if (n.kind == kind and sameName(kind, n.name, name)) {
+            if (n.exported) return n.internal;
+            return self.fail(pos, "`{s}.{s}` is private to `{s}`, which exports {s}; declare it `EXPORT {s}` there to use it here", .{ lib.alias, name, lib.path, shown, declWord(n) });
+        };
+        return self.fail(pos, "`{s}.{s}`: `{s}` exports no {s} `{s}`; it exports {s}", .{ lib.alias, name, lib.path, kindNoun(kind), name, shown });
+    }
+
+    /// Refuses `name`, which nothing in file `file`'s scope has, when a file it
+    /// includes declares it without `EXPORT`: the fix is to export it there.
+    pub fn refuseHidden(self: *Parser, kind: scope.Kind, name: []const u8, file: u16, pos: Pos) Error!void {
+        const sc = self.scopeOf(file) orelse return;
+        for (sc.hidden) |h| if (h.name.kind == kind and sameName(kind, h.name.name, name)) {
+            if (h.via.len > 0)
+                return self.fail(pos, "`{s}` is exported by `{s}`, which this file includes only through `{s}`; a file sees the exports of the files it includes itself — include `{s}` here", .{ name, h.path, h.via, h.path });
+            return self.fail(pos, "`{s}` is declared in `{s}` without EXPORT, so only that file sees it; declare it `EXPORT {s}` there to use it here", .{ name, h.path, declWord(h.name) });
+        };
+    }
+
+    /// The connection the identifier `name`, just read, names, as the program knows
+    /// it: one of this file's, one an include exports, or, written `alias.name`, one
+    /// its library exports (the `.name` is read here); null when it names none.
+    pub fn connRef(self: *Parser, name: []const u8) Error!?[]const u8 {
+        const pos = self.prevPos();
+        if (self.scopes.len == 0) return if (self.isConn(name)) name else null;
+        if (self.resolveName(.conn, name, pos.file)) |n| return n;
+        if (self.libOf(name, pos.file)) |lib| if (self.at(.dot) and (self.peekTag() == .ident or self.peekTag() == .qident)) {
+            _ = self.advance();
+            const c = self.advance();
+            return try self.libName(lib, .conn, c.text, .{ .line = c.line, .col = c.col, .file = c.file });
+        };
+        try self.refuseHidden(.conn, name, pos.file, pos);
+        return null;
+    }
+
+    /// A variable reference `$name...` (its parts) as file `file`'s scope makes it:
+    /// the first part a module variable's program name, or `$alias.x` one its library
+    /// exports; a block's own name (a loop variable, a parameter) and `$since` as is.
+    pub fn scopedVar(self: *Parser, parts: []const []const u8, pos: Pos) Error![]const []const u8 {
+        if (self.scopes.len == 0 or parts.len == 0) return parts;
+        const sc = self.scopeOf(pos.file) orelse return parts;
+        const first = parts[0];
+        if (std.mem.eql(u8, first, "since") or local(sc, first)) return parts;
+        if (self.resolveName(.variable, first, pos.file)) |n| {
+            const out = try self.arena.dupe([]const u8, parts);
+            out[0] = n;
+            return out;
+        }
+        if (parts.len > 1) if (self.libOf(first, pos.file)) |lib| {
+            const out = try self.arena.alloc([]const u8, parts.len - 1);
+            out[0] = try self.libName(lib, .variable, parts[1], pos);
+            @memcpy(out[1..], parts[2..]);
+            return out;
+        };
+        try self.refuseHidden(.variable, first, pos.file, pos);
+        return parts;
+    }
+
+    /// A function call's name as file `file` sees it: one of its own or an export of
+    /// a file it includes; a builtin or one nothing declares stays as written.
+    pub fn scopedFn(self: *Parser, name: []const u8, pos: Pos) Error![]const u8 {
+        if (self.scopes.len == 0) return name;
+        if (self.resolveName(.func, name, pos.file)) |n| return n;
+        const builtin = if (self.is_builtin) |f| f(name) else false;
+        if (!builtin) try self.refuseHidden(.func, name, pos.file, pos);
+        return name;
+    }
+
+    /// A string literal of file `file` as its scope makes it: the `${...}` holes'
+    /// variables and functions by their program names, and an `sftp://`, `smb://` or
+    /// `ftp://` URL whose host names a connection (or `alias.conn`) by its.
+    fn scopedText(self: *Parser, text: []const u8, file: u16) Error![]const u8 {
+        var out = text;
+        if (std.mem.indexOf(u8, out, "${") != null) out = try self.scopedHoles(out, file);
+        return self.scopedUrl(out, file);
+    }
+
+    fn scopedUrl(self: *Parser, text: []const u8, file: u16) Error![]const u8 {
+        const schemes = [_][]const u8{ "sftp://", "smb://", "ftp://" };
+        for (schemes) |sch| {
+            if (text.len <= sch.len or !std.ascii.startsWithIgnoreCase(text, sch)) continue;
+            const rest = text[sch.len..];
+            const end = std.mem.indexOfAny(u8, rest, "/:@") orelse rest.len;
+            const host = rest[0..end];
+            const name = if (std.mem.indexOfScalar(u8, host, '.')) |dot| blk: {
+                const lib = self.libOf(host[0..dot], file) orelse break :blk null;
+                for (lib.names) |n| if (n.kind == .conn and n.exported and std.mem.eql(u8, n.name, host[dot + 1 ..])) break :blk n.internal;
+                break :blk null;
+            } else self.resolveName(.conn, host, file);
+            const n = name orelse return text;
+            return std.mem.concat(self.arena, u8, &.{ text[0..sch.len], n, rest[end..] });
+        }
+        return text;
+    }
+
+    /// Each `${...}` hole of `text` with its names resolved in file `file`'s scope;
+    /// a hole that does not lex is left for the run to report.
+    fn scopedHoles(self: *Parser, text: []const u8, file: u16) Error![]const u8 {
+        const sc = self.scopeOf(file) orelse return text;
+        var out = std.array_list.Managed(u8).init(self.arena);
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, text, i, "${")) |open| {
+            const close = holeEnd(text, open + 2) orelse break;
+            try out.appendSlice(text[i .. open + 2]);
+            const inner = text[open + 2 .. close];
+            const toks = lexer.tokenize(self.arena, inner) catch return error.OutOfMemory;
+            var copied: usize = 0;
+            var k: usize = 0;
+            while (k < toks.len) : (k += 1) {
+                const t = toks[k];
+                if (t.tag != .ident and t.tag != .dollar_ident) continue;
+                const start = @intFromPtr(t.text.ptr) - @intFromPtr(inner.ptr);
+                if (start > inner.len) continue;
+                const after_dot = k > 0 and toks[k - 1].tag == .dot;
+                if (after_dot) continue;
+                const calls = k + 1 < toks.len and toks[k + 1].tag == .lparen;
+                const dotted = k + 2 < toks.len and toks[k + 1].tag == .dot and (toks[k + 2].tag == .ident);
+                var repl: ?[]const u8 = null;
+                var span_end = start + t.text.len;
+                if (dotted) if (self.libOf(t.text, file)) |lib| {
+                    const second = toks[k + 2];
+                    const kind: scope.Kind = if (t.tag == .ident and k + 3 < toks.len and toks[k + 3].tag == .lparen) .func else .variable;
+                    for (lib.names) |n| if (n.kind == kind and n.exported and sameName(kind, n.name, second.text)) {
+                        repl = n.internal;
+                    };
+                    if (repl != null) {
+                        span_end = @intFromPtr(second.text.ptr) - @intFromPtr(inner.ptr) + second.text.len;
+                        k += 2;
+                    }
+                };
+                if (repl == null) {
+                    if (calls) {
+                        repl = self.resolveName(.func, t.text, file);
+                    } else if (!std.mem.eql(u8, t.text, "since") and !local(sc, t.text)) {
+                        repl = self.resolveName(.variable, t.text, file);
+                    }
+                }
+                const r = repl orelse continue;
+                try out.appendSlice(inner[copied..start]);
+                try out.appendSlice(r);
+                copied = span_end;
+            }
+            try out.appendSlice(inner[copied..]);
+            i = close;
+        }
+        try out.appendSlice(text[i..]);
+        return out.items;
+    }
+
     pub fn isLet(self: *Parser, name: []const u8) bool {
         for (self.let_names.items) |c| {
             if (std.mem.eql(u8, c, name)) return true;

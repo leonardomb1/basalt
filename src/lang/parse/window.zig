@@ -42,6 +42,7 @@ const stats = @import("stats.zig");
 const ast = @import("../ast.zig");
 const civil = @import("../../base/civil.zig");
 const std = @import("std");
+const scope = @import("../scope.zig");
 
 pub const OrderExpr = struct { e: *ast.Expr, desc: bool, nulls_first: bool };
 
@@ -547,6 +548,8 @@ fn unknownCall(self: *Parser, e: *ast.Expr) Error!?ast.Expr.Call {
         fn known(cx: Ctx, name: []const u8) bool {
             if (cx.is_builtin(name) or aggregates.lookup(name) != null or stats.isStat(name)) return true;
             for (cx.p.known_names) |k| if (std.ascii.eqlIgnoreCase(k, name)) return true;
+            if (!std.mem.eql(u8, scope.shown(name), name)) return true;
+            for (cx.p.scopes) |sc| for (sc.own) |n| if (n.kind == .func and std.ascii.eqlIgnoreCase(n.internal, name)) return true;
             const toks = cx.p.toks;
             for (toks, 0..) |t, i| {
                 if (t.tag == .ident and std.ascii.eqlIgnoreCase(t.text, "function") and i + 1 < toks.len and std.ascii.eqlIgnoreCase(toks[i + 1].text, name)) return true;

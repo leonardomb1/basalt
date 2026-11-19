@@ -27,6 +27,8 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const parser = @import("sql_parser.zig");
+const lexer = @import("sql_lexer.zig");
+const scope = @import("scope.zig");
 const remote = @import("remote.zig");
 const msgfmt = @import("../base/msgfmt.zig");
 
@@ -77,12 +79,12 @@ pub fn loadProgramOpts(
         .arena = arena,
         .diag = diag,
         .stack = std.array_list.Managed(Frame).init(arena),
-        .memo = std.StringHashMap(ast.Program).init(arena),
+        .memo = std.StringHashMap(Module).init(arena),
         .known_tables = opts.parse.known_tables,
         .is_builtin = opts.parse.is_builtin,
         .errors = opts.parse.errors,
         .files = std.array_list.Managed([]const u8).init(arena),
-        .aliases = std.StringHashMap([]const u8).init(arena),
+        .scopes = std.array_list.Managed(scope.Scope).init(arena),
         .remote = opts.remote,
         .fetch = opts.fetch,
         .root_dir = base_dir,
@@ -91,7 +93,8 @@ pub fn loadProgramOpts(
         try ctx.stack.append(.{ .canon = canon, .shown = label });
     } else |_| {}
     try ctx.files.append(label);
-    var prog = try load(&ctx, text, label, .{ .dir = base_dir }, 0, null);
+    try ctx.scopes.append(.{ .path = label });
+    var prog = (try load(&ctx, text, label, .{ .dir = base_dir }, 0)).program;
     if (ctx.files.items.len > 1) prog.files = ctx.files.items;
     return prog;
 }
@@ -108,14 +111,14 @@ const Ctx = struct {
     arena: std.mem.Allocator,
     diag: *Diag,
     stack: std.array_list.Managed(Frame),
-    memo: std.StringHashMap(ast.Program),
+    memo: std.StringHashMap(Module),
     depth: u32 = 0,
     stmt_budget: usize = max_total_stmts,
     known_tables: []const []const u8 = &.{},
     is_builtin: ?*const fn ([]const u8) bool = null,
     errors: ?*std.array_list.Managed(parser.Diagnostic) = null,
     files: std.array_list.Managed([]const u8),
-    aliases: std.StringHashMap([]const u8),
+    scopes: std.array_list.Managed(scope.Scope),
     remote: ?*remote.Resolver,
     fetch: ?remote.Fetch,
     root_dir: []const u8,
@@ -142,110 +145,101 @@ const Ctx = struct {
     }
 };
 
-/// What the library `sub`, included `AS alias` into namespace `ns` from `resolved`,
-/// shares: its own functions (`ns.f`, not a nested library's `ns.u.f`) declared
-/// `EXPORT FUNCTION`. One that exports none is refused at the directive `d`.
-fn library(ctx: *Ctx, sub: ast.Program, alias: []const u8, ns: []const u8, resolved: []const u8, label: []const u8, d: Directive) Error!parser.Library {
-    var exports = std.array_list.Managed([]const u8).init(ctx.arena);
-    var private = std.array_list.Managed([]const u8).init(ctx.arena);
-    for (stmtsOf(sub)) |st| if (st == .func) {
-        const n = st.func.name;
-        if (n.len <= ns.len + 1 or !std.ascii.eqlIgnoreCase(n[0..ns.len], ns) or n[ns.len] != '.') continue;
-        const own = n[ns.len + 1 ..];
-        if (std.mem.indexOfScalar(u8, own, '.') != null) continue;
-        try (if (st.func.exported) &exports else &private).append(own);
-    };
-    if (exports.items.len == 0)
-        return ctx.fail(label, d.line, d.col, "`{s}` is included AS {s}, a library, but exports no function: declare the ones it shares `EXPORT FUNCTION`", .{ resolved, alias });
-    return .{ .alias = alias, .path = resolved, .exports = exports.items, .private = private.items };
+/// A file loaded once: its program, with what its own includes spliced in, and the
+/// names it declares (`scope.prescan`).
+const Module = struct { program: ast.Program, names: []const scope.Name, file: u16 = 0 };
+
+/// An export a file brings in by including another without `AS`, and the
+/// directive that brought it, for a clash's message.
+const Import = struct { h: scope.Hidden, d: Directive };
+
+/// Refuses a file included `AS alias` that would run something, a query LET among
+/// it (including a library never runs anything), or that exports nothing.
+fn checkLibrary(ctx: *Ctx, m: Module, alias: []const u8, resolved: []const u8, label: []const u8, d: Directive) Error!void {
+    for (stmtsOf(m.program)) |st| {
+        const ok = switch (st) {
+            .func, .connection, .param => true,
+            .let_const => |l| l.query == null,
+            else => false,
+        };
+        if (ok) continue;
+        const pos = ast.stmtPos(st) orelse ast.Pos{ .line = 0, .col = 0 };
+        const shown = if (pos.file < ctx.files.items.len) ctx.files.items[pos.file] else resolved;
+        return ctx.fail(shown, pos.line, pos.col, "`{s}` is included AS {s}, a library, so it may only declare functions, connections, PARAMs and LETs of a value; this {s} would run — include it without AS to run its statements", .{ resolved, alias, stmtWord(st) });
+    }
+    for (m.names) |n| if (n.exported) return;
+    return ctx.fail(label, d.line, d.col, "`{s}` is included AS {s}, a library, but exports nothing: declare what it shares with EXPORT (FUNCTION, CONNECTION, PARAM or LET)", .{ resolved, alias });
 }
 
-fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, namespace: ?[]const u8) Error!ast.Program {
+fn sameName(kind: scope.Kind, a: []const u8, b: []const u8) bool {
+    return if (kind == .func) std.ascii.eqlIgnoreCase(a, b) else std.mem.eql(u8, a, b);
+}
+
+/// Loads file `file` (`text`, shown as `label`): its includes first, each a module
+/// loaded once however many files include it, then its own body, parsed in its
+/// scope — its own names, the exports of the files it includes without `AS`, its
+/// libraries — when the program has more than one file. The root (file 0) without
+/// includes is parsed as it always was.
+fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16) Error!Module {
     var incs = std.array_list.Managed(Directive).init(ctx.arena);
     const body_at = try scanDirectives(ctx, text, label, &incs);
     const skipped: u32 = @intCast(std.mem.count(u8, text[0..body_at], "\n"));
     try rejectLateIncludes(ctx, text[body_at..], label, skipped + 1);
 
     var subs = std.array_list.Managed(ast.Program).init(ctx.arena);
-    var seen = std.array_list.Managed(ast.Program).init(ctx.arena);
+    var seen = std.array_list.Managed(Module).init(ctx.arena);
     var my_aliases = std.array_list.Managed([]const u8).init(ctx.arena);
-    var libs = std.array_list.Managed(parser.Library).init(ctx.arena);
-    var same_ns = std.array_list.Managed(ast.Program).init(ctx.arena);
+    var libs = std.array_list.Managed(scope.Lib).init(ctx.arena);
+    var imports = std.array_list.Managed(Import).init(ctx.arena);
+    var hidden = std.array_list.Managed(scope.Hidden).init(ctx.arena);
     for (incs.items) |d| {
         const at = try locate(ctx, base, d, label);
         const resolved = at.shown;
-        const canon = at.canon;
-        const canonical = at.canonical;
         for (ctx.stack.items, 0..) |f, i| {
-            if (!std.mem.eql(u8, f.canon, canon)) continue;
+            if (!std.mem.eql(u8, f.canon, at.canon)) continue;
             return ctx.fail(label, d.line, d.col, "include cycle: {s}", .{try cycleTrail(ctx, i, resolved)});
         }
-        const sub_ns: ?[]const u8 = if (d.alias) |a| (if (namespace) |ns| try msgfmt.allocPrint(ctx.arena, "{s}.{s}", .{ ns, a }) else a) else namespace;
         if (d.alias) |a| {
             for (my_aliases.items) |m| if (std.ascii.eqlIgnoreCase(m, a))
                 return ctx.fail(label, d.line, d.col, "alias `{s}` names two includes here; give each its own", .{a});
             try my_aliases.append(a);
-            const gop = try ctx.aliases.getOrPut(try std.ascii.allocLowerString(ctx.arena, sub_ns.?));
-            if (gop.found_existing and !std.mem.eql(u8, gop.value_ptr.*, canon))
-                return ctx.fail(label, d.line, d.col, "`{s}` already names the library `{s}`, reached through another include; its functions would collide — choose another alias", .{ sub_ns.?, gop.value_ptr.* });
-            gop.value_ptr.* = canon;
         }
-        const memo_key = try msgfmt.allocPrint(ctx.arena, "{s}\x00{s}", .{ canon, sub_ns orelse "" });
-        if (canonical) if (ctx.memo.get(memo_key)) |cached| {
-            try seen.append(cached);
-            if (d.alias == null) try same_ns.append(cached);
-            if (d.alias) |a| try libs.append(try library(ctx, cached, a, sub_ns.?, resolved, label, d));
-            continue;
-        };
-        const src = at.text orelse std.fs.cwd().readFileAlloc(ctx.arena, resolved, max_file_bytes) catch |e| {
-            if (e == error.OutOfMemory) return error.OutOfMemory;
-            return ctx.fail(label, d.line, d.col, "cannot read include `{s}`: {s}", .{ resolved, @errorName(e) });
-        };
-        if (ctx.depth + 1 > max_depth)
-            return ctx.fail(label, d.line, d.col, "include nesting deeper than {d} files at `{s}`", .{ max_depth, resolved });
-
-        try ctx.stack.append(.{ .canon = canon, .shown = resolved });
-        ctx.depth += 1;
-        const id = std.math.cast(u16, ctx.files.items.len) orelse
-            return ctx.fail(label, d.line, d.col, "more than {d} @include files", .{std.math.maxInt(u16)});
-        try ctx.files.append(resolved);
-        const sub = try load(ctx, src, resolved, at.base, id, sub_ns);
-        ctx.depth -= 1;
-        _ = ctx.stack.pop();
-        if (d.alias) |a| for (stmtsOf(sub)) |st| {
-            if (st == .func) continue;
-            const pos = ast.stmtPos(st) orelse ast.Pos{ .line = 0, .col = 0 };
-            return ctx.fail(resolved, pos.line, pos.col, "`{s}` is included AS {s}, a library, so it may only declare functions; this {s} would run — include it without AS to run its statements", .{ resolved, a, stmtWord(st) });
-        };
-        if (d.alias) |a| try libs.append(try library(ctx, sub, a, sub_ns.?, resolved, label, d));
-        if (canonical) try ctx.memo.put(memo_key, sub);
-        try subs.append(sub);
-        try seen.append(sub);
-        if (d.alias == null) try same_ns.append(sub);
-
-        const n = stmtsOf(sub).len;
-        if (n > ctx.stmt_budget)
-            return ctx.fail(label, d.line, d.col, "@include tree expands to more than {d} statements at `{s}`", .{ max_total_stmts, resolved });
-        ctx.stmt_budget -= n;
+        const m: Module = if (at.canonical) (ctx.memo.get(at.canon) orelse try loadSub(ctx, at, d, label, &subs)) else try loadSub(ctx, at, d, label, &subs);
+        try seen.append(m);
+        if (d.alias) |a| {
+            try checkLibrary(ctx, m, a, resolved, label, d);
+            try libs.append(.{ .alias = a, .path = resolved, .names = m.names });
+        } else {
+            for (m.names) |n| {
+                if (n.exported) try imports.append(.{ .h = .{ .name = n, .path = resolved }, .d = d }) else try hidden.append(.{ .name = n, .path = resolved });
+            }
+            if (m.file < ctx.scopes.items.len) for (ctx.scopes.items[m.file].imports) |deep|
+                try hidden.append(.{ .name = deep.name, .path = deep.path, .via = resolved });
+        }
     }
 
     const rest = try blankPrefix(ctx, text, body_at, incs.items.len);
+    const modular = file > 0 or incs.items.len > 0;
+    const scanned = try scope.prescan(ctx.arena, lexer.tokenize(ctx.arena, rest) catch return error.OutOfMemory, file);
+    if (modular) {
+        try checkClashes(ctx, label, scanned.names, imports.items);
+        var flat = std.array_list.Managed(scope.Hidden).init(ctx.arena);
+        for (imports.items) |im| try flat.append(im.h);
+        ctx.scopes.items[file] = .{ .path = label, .own = scanned.names, .imports = flat.items, .libs = libs.items, .hidden = hidden.items, .locals = scanned.locals };
+    }
+    for (scanned.names) |n| if (n.kind == .conn) for (my_aliases.items) |a| if (std.ascii.eqlIgnoreCase(a, n.name))
+        return ctx.fail(label, 1, 1, "connection `{s}` has the name of an include's alias; rename one, as `{s}.x` would be ambiguous", .{ a, a });
+
     const has_body = incs.items.len == 0 or std.mem.trim(u8, rest, " \t\r\n").len > 0;
     var main: ?ast.Program = null;
     if (has_body) {
         var known = std.array_list.Managed(ast.Connection).init(ctx.arena);
         var known_fns = std.array_list.Managed(ast.FnDecl).init(ctx.arena);
         var known_names = std.array_list.Managed([]const u8).init(ctx.arena);
-        for (seen.items) |sp| for (stmtsOf(sp)) |st| {
+        for (seen.items) |sm| for (stmtsOf(sm.program)) |st| {
             if (st == .connection) try known.append(st.connection);
             if (st == .func and st.func.body == .table) try known_fns.append(st.func);
             if (st == .func) try known_names.append(st.func.name);
-        };
-        var own = std.array_list.Managed([]const u8).init(ctx.arena);
-        if (namespace) |ns| for (same_ns.items) |sp| for (stmtsOf(sp)) |st| if (st == .func) {
-            const n = st.func.name;
-            if (n.len > ns.len + 1 and std.ascii.eqlIgnoreCase(n[0..ns.len], ns) and n[ns.len] == '.')
-                try own.append(n[ns.len + 1 ..]);
         };
         var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
         main = parser.parseSourceOpts(ctx.arena, rest, &pdiag, .{
@@ -256,10 +250,7 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
             .known_names = known_names.items,
             .errors = if (ctx.depth == 0) ctx.errors else null,
             .file = file,
-            .aliases = my_aliases.items,
-            .libraries = libs.items,
-            .namespace = namespace,
-            .own = own.items,
+            .scopes = if (modular) ctx.scopes.items else &.{},
         }) catch |e| switch (e) {
             error.OutOfMemory => return e,
             error.ParseFailed => {
@@ -269,11 +260,11 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
             },
         };
     }
-    if (main) |m| for (stmtsOf(m)) |st| if (st == .connection) for (my_aliases.items) |a| if (std.ascii.eqlIgnoreCase(a, st.connection.name)) {
-        const pos = st.connection.pos;
-        return ctx.fail(label, pos.line, pos.col, "connection `{s}` has the name of an include's alias; rename one, as `{s}.x(...)` would be ambiguous", .{ a, a });
-    };
-    if (incs.items.len == 0) return main.?;
+    if (incs.items.len == 0) {
+        var only = main.?;
+        if (file == 0) only.modular = false;
+        return .{ .program = only, .names = scanned.names, .file = file };
+    }
 
     var kind: ?ast.KindDecl = if (main) |m| leadKind(m) else null;
     var out = std.array_list.Managed(ast.Stmt).init(ctx.arena);
@@ -286,7 +277,74 @@ fn load(ctx: *Ctx, text: []const u8, label: []const u8, base: Base, file: u16, n
     var notes = std.array_list.Managed(ast.Note).init(ctx.arena);
     for (subs.items) |sp| try notes.appendSlice(sp.notes);
     if (main) |m| try notes.appendSlice(m.notes);
-    return .{ .stmts = try out.toOwnedSlice(), .explain = if (main) |m| m.explain else .none, .notes = notes.items };
+    var prog = ast.Program{ .stmts = try out.toOwnedSlice(), .explain = if (main) |m| m.explain else .none, .notes = notes.items };
+    if (file == 0) {
+        prog.modular = true;
+        prog.inputs = try inputsOf(ctx, scanned.names, imports.items, libs.items);
+        for (prog.stmts) |st| if (st == .param and st.param.default == null) {
+            const p = st.param;
+            for (prog.inputs) |in| {
+                if (std.mem.eql(u8, in.internal, p.name)) break;
+            } else {
+                const shown = if (p.pos.file < ctx.files.items.len) ctx.files.items[p.pos.file] else label;
+                return ctx.fail(shown, p.pos.line, p.pos.col, "PARAM `{s}` has no DEFAULT and the script cannot bind it: give it a DEFAULT, or declare it `EXPORT PARAM` and include its file from the script", .{scope.shown(p.name)});
+            }
+        };
+    }
+    return .{ .program = prog, .names = scanned.names, .file = file };
+}
+
+/// Reads and loads the file a directive names, the first time the program meets
+/// it, under a file number of its own; its program joins `subs`, to be spliced in.
+fn loadSub(ctx: *Ctx, at: Located, d: Directive, label: []const u8, subs: *std.array_list.Managed(ast.Program)) Error!Module {
+    const resolved = at.shown;
+    const src = at.text orelse std.fs.cwd().readFileAlloc(ctx.arena, resolved, max_file_bytes) catch |e| {
+        if (e == error.OutOfMemory) return error.OutOfMemory;
+        return ctx.fail(label, d.line, d.col, "cannot read include `{s}`: {s}", .{ resolved, @errorName(e) });
+    };
+    if (ctx.depth + 1 > max_depth)
+        return ctx.fail(label, d.line, d.col, "include nesting deeper than {d} files at `{s}`", .{ max_depth, resolved });
+    try ctx.stack.append(.{ .canon = at.canon, .shown = resolved });
+    ctx.depth += 1;
+    const id = std.math.cast(u16, ctx.files.items.len) orelse
+        return ctx.fail(label, d.line, d.col, "more than {d} @include files", .{std.math.maxInt(u16)});
+    try ctx.files.append(resolved);
+    try ctx.scopes.append(.{ .path = resolved });
+    const sub = try load(ctx, src, resolved, at.base, id);
+    ctx.depth -= 1;
+    _ = ctx.stack.pop();
+    if (at.canonical) try ctx.memo.put(at.canon, sub);
+    try subs.append(sub.program);
+    const n = stmtsOf(sub.program).len;
+    if (n > ctx.stmt_budget)
+        return ctx.fail(label, d.line, d.col, "@include tree expands to more than {d} statements at `{s}`", .{ max_total_stmts, resolved });
+    ctx.stmt_budget -= n;
+    return sub;
+}
+
+/// Refuses a name a file both declares and brings in from an include, or brings in
+/// from two: which one a reference meant could not be told. An alias keeps them
+/// apart.
+fn checkClashes(ctx: *Ctx, label: []const u8, own: []const scope.Name, imports: []const Import) Error!void {
+    for (imports, 0..) |im, i| {
+        const n = im.h.name;
+        for (own) |o| if (o.kind == n.kind and sameName(n.kind, o.name, n.name))
+            return ctx.fail(label, im.d.line, im.d.col, "`{s}` is declared here and exported by `{s}`, included without AS; include it AS an alias to tell them apart, or rename one", .{ n.name, im.h.path });
+        for (imports[0..i]) |prev| if (prev.h.name.kind == n.kind and sameName(n.kind, prev.h.name.name, n.name) and !std.mem.eql(u8, prev.h.name.internal, n.internal))
+            return ctx.fail(label, im.d.line, im.d.col, "`{s}` is exported both by `{s}` and by `{s}`, each included without AS; include one of them AS an alias", .{ n.name, prev.h.path, im.h.path });
+    }
+}
+
+/// The PARAMs a run binds (`-p`, a kernel's params): the root's own, those the files
+/// it includes without `AS` export, by their names, and its libraries' exported
+/// ones as `alias.name`. Any other PARAM keeps its DEFAULT.
+fn inputsOf(ctx: *Ctx, own: []const scope.Name, imports: []const Import, libs: []const scope.Lib) Error![]const ast.Input {
+    var out = std.array_list.Managed(ast.Input).init(ctx.arena);
+    for (own) |n| if (n.param) try out.append(.{ .external = n.name, .internal = n.internal });
+    for (imports) |im| if (im.h.name.param) try out.append(.{ .external = im.h.name.name, .internal = im.h.name.internal });
+    for (libs) |l| for (l.names) |n| if (n.param and n.exported)
+        try out.append(.{ .external = try msgfmt.allocPrint(ctx.arena, "{s}.{s}", .{ l.alias, n.name }), .internal = n.internal });
+    return out.items;
 }
 
 const Located = struct { shown: []const u8, canon: []const u8, canonical: bool, base: Base, text: ?[]const u8 };
@@ -473,7 +531,7 @@ test "@include prepends a decls file to the including script" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try tmp.dir.realpathAlloc(a, ".");
-    try writeFile(&tmp, "lib/fns.sql", "CREATE FUNCTION dbl(x) AS x * 2;\n");
+    try writeFile(&tmp, "lib/fns.sql", "EXPORT FUNCTION dbl(x) AS x * 2;\n");
 
     var diag: Diag = .{};
     const prog = try loadProgram(a,
@@ -484,8 +542,46 @@ test "@include prepends a decls file to the including script" {
 
     try testing.expectEqual(@as(usize, 3), prog.stmts.len);
     try testing.expect(prog.stmts[0] == .kind);
-    try testing.expectEqualStrings("dbl", prog.stmts[1].func.name);
+    try testing.expectEqualStrings("__m1_dbl", prog.stmts[1].func.name);
     try testing.expect(prog.stmts[2] == .output);
+    try testing.expect(prog.modular);
+}
+
+test "@include: a file's functions, connections, PARAMs and LETs are its own until it exports them" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try writeFile(&tmp, "lib.sql",
+        \\CREATE FUNCTION f(x) AS x;
+        \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h');
+        \\PARAM p INT DEFAULT 1;
+        \\LET v = 2;
+        \\EXPORT FUNCTION g(x) AS f(x) + $v;
+    );
+
+    var diag: Diag = .{};
+    const cases = [_][3][]const u8{
+        .{ "SELECT f(1) AS a;", "f", "FUNCTION" },
+        .{ "SELECT * FROM pg.public.t;", "pg", "CONNECTION" },
+        .{ "SELECT $p AS a;", "p", "PARAM" },
+        .{ "SELECT $v AS a;", "v", "LET" },
+    };
+    for (cases) |c| {
+        const script = try msgfmt.allocPrint(a, "@include 'lib.sql';\n{s}\n", .{c[0]});
+        try testing.expectError(error.ParseFailed, loadProgram(a, script, "main.sql", base, &diag));
+        try testing.expectEqualStrings("main.sql", diag.label);
+        try testing.expectEqual(@as(u32, 2), diag.parse.line);
+        try testing.expect(std.mem.startsWith(u8, diag.parse.msg, try msgfmt.allocPrint(a, "`{s}` is declared in `", .{c[1]})));
+        try testing.expect(std.mem.endsWith(u8, diag.parse.msg, try msgfmt.allocPrint(a, "lib.sql` without EXPORT, so only that file sees it; declare it `EXPORT {s}` there to use it here", .{c[2]})));
+    }
+    const prog = try loadProgram(a, "@include 'lib.sql';\nSELECT g(1) AS a;\n", "main.sql", base, &diag);
+    const g = prog.stmts[5].func;
+    try testing.expectEqualStrings("__m1_g", g.name);
+    try testing.expectEqualStrings("__m1_f", g.body.expr.binary.l.call.name);
+    try testing.expectEqualStrings("__m1_v", g.body.expr.binary.r.field.last());
 }
 
 test "@include: an included PARAM may sit beside an aggregate, as a local one may" {
@@ -495,7 +591,7 @@ test "@include: an included PARAM may sit beside an aggregate, as a local one ma
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try tmp.dir.realpathAlloc(a, ".");
-    try writeFile(&tmp, "lib/params.sql", "PARAM tag STRING DEFAULT 'x';\n");
+    try writeFile(&tmp, "lib/params.sql", "EXPORT PARAM tag STRING DEFAULT 'x';\n");
 
     var diag: Diag = .{};
     const included = try loadProgram(a,
@@ -506,9 +602,9 @@ test "@include: an included PARAM may sit beside an aggregate, as a local one ma
         \\PARAM tag STRING DEFAULT 'x';
         \\SELECT $tag AS t, g, COUNT(*) AS n FROM 'in.csv' GROUP BY g;
     , "main.sql", base, &diag);
-    for ([_]ast.Program{ included, local }) |prog| {
+    for ([_]ast.Program{ included, local }, [_][]const u8{ "__m1_tag", "tag" }) |prog, tag_name| {
         try testing.expect(prog.stmts[1] == .param);
-        try testing.expectEqualStrings("tag", prog.stmts[1].param.name);
+        try testing.expectEqualStrings(tag_name, prog.stmts[1].param.name);
         try testing.expect(prog.stmts[2] == .output);
         const stages = prog.stmts[2].output.stages;
         try testing.expect(stages[1].node == .aggregate);
@@ -525,7 +621,7 @@ test "@include: an included PARAM may sit beside an aggregate, as a local one ma
         const tag = items[0].computed.expr;
         try testing.expect(tag.* == .field);
         try testing.expect(tag.field.dollar);
-        try testing.expectEqualStrings("tag", tag.field.last());
+        try testing.expectEqualStrings(tag_name, tag.field.last());
     }
 }
 
@@ -536,7 +632,7 @@ test "@include: a table function declared in a library is called in the includer
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try tmp.dir.realpathAlloc(a, ".");
-    try writeFile(&tmp, "lib/tables.sql", "CREATE FUNCTION paid(minx INT) RETURNS TABLE AS SELECT id FROM 'o.csv' WHERE x >= $minx;\n");
+    try writeFile(&tmp, "lib/tables.sql", "EXPORT FUNCTION paid(minx INT) RETURNS TABLE AS SELECT id FROM 'o.csv' WHERE x >= $minx;\n");
 
     var diag: Diag = .{};
     const prog = try loadProgram(a,
@@ -548,7 +644,7 @@ test "@include: a table function declared in a library is called in the includer
     try testing.expect(prog.stmts[3] == .output);
 }
 
-test "nested @include resolves relative to the including file" {
+test "nested @include resolves relative to the including file, and its exports stop at that file" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -557,21 +653,30 @@ test "nested @include resolves relative to the including file" {
     const base = try tmp.dir.realpathAlloc(a, ".");
     try writeFile(&tmp, "sub/a.sql",
         \\@include 'b.sql';
-        \\CREATE FUNCTION dbl(x) AS x * 2;
+        \\EXPORT FUNCTION dbl(x) AS inc(x) * 2;
     );
-    try writeFile(&tmp, "sub/b.sql", "CREATE FUNCTION inc(x) AS x + 1;\n");
+    try writeFile(&tmp, "sub/b.sql", "EXPORT FUNCTION inc(x) AS x + 1;\n");
 
     var diag: Diag = .{};
     const prog = try loadProgram(a,
         \\@include 'sub/a.sql';
-        \\SELECT dbl(inc(id)) AS y FROM 'in.csv';
+        \\SELECT dbl(id) AS y FROM 'in.csv';
     , "main.sql", base, &diag);
 
     try testing.expectEqual(@as(usize, 4), prog.stmts.len);
     try testing.expect(prog.stmts[0] == .kind);
-    try testing.expectEqualStrings("inc", prog.stmts[1].func.name);
-    try testing.expectEqualStrings("dbl", prog.stmts[2].func.name);
+    try testing.expectEqualStrings("__m2_inc", prog.stmts[1].func.name);
+    try testing.expectEqualStrings("__m1_dbl", prog.stmts[2].func.name);
+    try testing.expectEqualStrings("__m2_inc", prog.stmts[2].func.body.expr.binary.l.call.name);
     try testing.expect(prog.stmts[3] == .output);
+
+    try testing.expectError(error.ParseFailed, loadProgram(a,
+        \\@include 'sub/a.sql';
+        \\SELECT dbl(inc(id)) AS y FROM 'in.csv';
+    , "main.sql", base, &diag));
+    try testing.expect(std.mem.startsWith(u8, diag.parse.msg, "`inc` is exported by `"));
+    try testing.expect(std.mem.indexOf(u8, diag.parse.msg, "sub/b.sql`, which this file includes only through `") != null);
+    try testing.expect(std.mem.endsWith(u8, diag.parse.msg, "sub/b.sql` here"));
 }
 
 test "@include cycle is reported with the file trail" {
@@ -603,21 +708,22 @@ test "a diamond @include DAG is parsed and spliced once per file, not once per p
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try tmp.dir.realpathAlloc(a, ".");
-    try writeFile(&tmp, "c.sql", "CREATE FUNCTION inc(x) AS x + 1;\n");
-    try writeFile(&tmp, "a.sql", "@include 'c.sql';\n");
-    try writeFile(&tmp, "b.sql", "@include 'c.sql';\n");
+    try writeFile(&tmp, "c.sql", "EXPORT FUNCTION inc(x) AS x + 1;\n");
+    try writeFile(&tmp, "a.sql", "@include 'c.sql';\nEXPORT FUNCTION ia(x) AS inc(x);\n");
+    try writeFile(&tmp, "b.sql", "@include 'c.sql';\nEXPORT FUNCTION ib(x) AS inc(x);\n");
 
     var diag: Diag = .{};
     const prog = try loadProgram(a,
         \\@include 'a.sql';
         \\@include 'b.sql';
-        \\SELECT inc(id) AS y FROM 'in.csv';
+        \\SELECT ia(id) AS y, ib(id) AS z FROM 'in.csv';
     , "main.sql", base, &diag);
 
-    try testing.expectEqual(@as(usize, 3), prog.stmts.len);
+    try testing.expectEqual(@as(usize, 5), prog.stmts.len);
     try testing.expect(prog.stmts[0] == .kind);
-    try testing.expectEqualStrings("inc", prog.stmts[1].func.name);
-    try testing.expect(prog.stmts[2] == .output);
+    for ([_][]const u8{ "__m2_inc", "__m1_ia", "__m3_ib" }, prog.stmts[1..4]) |w, st| try testing.expectEqualStrings(w, st.func.name);
+    try testing.expectEqualStrings("__m2_inc", prog.stmts[3].func.body.expr.call.name);
+    try testing.expect(prog.stmts[4] == .output);
 }
 
 test "a fan-out @include tree is spliced once per file, so it neither hangs nor blows the budget" {
@@ -649,8 +755,8 @@ test "@include: a library sees a connection its own @include declares, though an
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const base = try tmp.dir.realpathAlloc(a, ".");
-    try writeFile(&tmp, "lib/stats.sql", "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');\nCREATE FUNCTION sd(x) AS x * 2;\n");
-    try writeFile(&tmp, "lib/outliers.sql", "@include 'stats.sql';\nCREATE FUNCTION outl(x) AS sd(x) + 1;\n");
+    try writeFile(&tmp, "lib/stats.sql", "EXPORT CONNECTION pg TYPE postgres OPTIONS (host = 'h', database = 'd');\nEXPORT FUNCTION sd(x) AS x * 2;\n");
+    try writeFile(&tmp, "lib/outliers.sql", "@include 'stats.sql';\nEXPORT FUNCTION outl(x) AS sd(x) + 1;\n");
     try writeFile(&tmp, "lib/dispersion.sql", "@include 'stats.sql';\nLET n = (SELECT COUNT(*) AS n FROM pg.public.t);\n");
 
     var diag: Diag = .{};
@@ -662,11 +768,124 @@ test "@include: a library sees a connection its own @include declares, though an
     var sds: usize = 0;
     var conns: usize = 0;
     for (prog.stmts) |st| {
-        if (st == .func and std.mem.eql(u8, st.func.name, "sd")) sds += 1;
-        if (st == .connection) conns += 1;
+        if (st == .func and std.mem.eql(u8, st.func.name, "__m2_sd")) sds += 1;
+        if (st == .connection) {
+            conns += 1;
+            try testing.expectEqualStrings("__m2_pg", st.connection.name);
+        }
     }
     try testing.expectEqual(@as(usize, 1), sds);
     try testing.expectEqual(@as(usize, 1), conns);
+}
+
+test "@include: two files may each keep a private name, and a clash with an import is refused at the @include" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try writeFile(&tmp, "x.sql", "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'hx');\nLET v = 1;\nEXPORT FUNCTION fx() AS $v;\nEXPORT LET n = 10;\n");
+    try writeFile(&tmp, "y.sql", "CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'hy');\nLET v = 2;\nEXPORT FUNCTION fy() AS $v;\nEXPORT LET n = 20;\n");
+    try writeFile(&tmp, "z.sql", "EXPORT FUNCTION fz() AS 3;\n");
+
+    var diag: Diag = .{};
+    const prog = try loadProgram(a,
+        \\@include 'x.sql';
+        \\@include 'z.sql';
+        \\CREATE CONNECTION pg TYPE postgres OPTIONS (host = 'hm');
+        \\SELECT fx() AS a FROM pg.public.t;
+    , "main.sql", base, &diag);
+    var conns = std.array_list.Managed([]const u8).init(a);
+    for (prog.stmts) |st| if (st == .connection) try conns.append(st.connection.name);
+    for ([_][]const u8{ "__m1_pg", "pg" }, conns.items) |w, g| try testing.expectEqualStrings(w, g);
+    try testing.expectEqual(@as(usize, 2), conns.items.len);
+
+    const both = try loadProgram(a, "@include 'x.sql' AS x;\n@include 'y.sql' AS y;\nSELECT x.fx() + y.fy() + $x.n + $y.n AS s;\n", "main.sql", base, &diag);
+    var vs = std.array_list.Managed([]const u8).init(a);
+    for (both.stmts) |st| if (st == .let_const) try vs.append(st.let_const.name);
+    for ([_][]const u8{ "__m1_v", "__m1_n", "__m2_v", "__m2_n" }, vs.items) |w, g| try testing.expectEqualStrings(w, g);
+
+    try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'x.sql';\n@include 'y.sql';\nSELECT fx() AS a;\n", "main.sql", base, &diag));
+    try testing.expectEqual(@as(u32, 2), diag.parse.line);
+    try testing.expect(std.mem.startsWith(u8, diag.parse.msg, "`n` is exported both by `"));
+    try testing.expect(std.mem.endsWith(u8, diag.parse.msg, "y.sql`, each included without AS; include one of them AS an alias"));
+
+    try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'z.sql';\nCREATE FUNCTION FZ() AS 4;\nSELECT fz() AS a;\n", "main.sql", base, &diag));
+    try testing.expectEqual(@as(u32, 1), diag.parse.line);
+    try testing.expect(std.mem.startsWith(u8, diag.parse.msg, "`fz` is declared here and exported by `"));
+    try testing.expect(std.mem.endsWith(u8, diag.parse.msg, "z.sql`, included without AS; include it AS an alias to tell them apart, or rename one"));
+}
+
+test "@include AS: a library's exports are used through its prefix — connections, variables, URL hosts, holes and run inputs" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try writeFile(&tmp, "lib.sql",
+        \\EXPORT CONNECTION pg TYPE postgres OPTIONS (host = 'h');
+        \\EXPORT CONNECTION share TYPE smb OPTIONS (host = 'files');
+        \\EXPORT PARAM env STRING DEFAULT 'dev';
+        \\PARAM secret STRING DEFAULT 's';
+        \\EXPORT LET dir = 'out';
+        \\EXPORT FUNCTION path(f) AS '${$dir}/' || f;
+    );
+
+    var diag: Diag = .{};
+    const prog = try loadProgram(a,
+        \\@include 'lib.sql' AS l;
+        \\PARAM day STRING DEFAULT 'mon';
+        \\LOAD INTO 'smb://l.share/${$l.dir}/${l.path($day)}.csv' AS SELECT $l.env AS e FROM l.pg.public.t;
+    , "main.sql", base, &diag);
+    try testing.expect(prog.modular);
+    var ins = std.array_list.Managed([2][]const u8).init(a);
+    for (prog.inputs) |in| try ins.append(.{ in.external, in.internal });
+    try testing.expectEqual(@as(usize, 2), ins.items.len);
+    try testing.expectEqualStrings("day", ins.items[0][0]);
+    try testing.expectEqualStrings("day", ins.items[0][1]);
+    try testing.expectEqualStrings("l.env", ins.items[1][0]);
+    try testing.expectEqualStrings("__m1_env", ins.items[1][1]);
+    try testing.expectEqualStrings("__m1_env", prog.inputName("l.env").?);
+    try testing.expect(prog.inputName("secret") == null);
+    try testing.expect(prog.inputName("l.secret") == null);
+
+    const out = prog.stmts[prog.stmts.len - 1].output;
+    try testing.expectEqualStrings("smb://__m1_share/${$__m1_dir}/${__m1_path($day)}.csv", out.stages[out.stages.len - 1].node.write.target);
+    const fn_path = prog.stmts[6].func;
+    try testing.expectEqualStrings("__m1_path", fn_path.name);
+
+    try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'lib.sql' AS l;\nSELECT $l.secret AS s;\n", "main.sql", base, &diag));
+    try testing.expect(std.mem.startsWith(u8, diag.parse.msg, "`l.secret` is private to `"));
+    try testing.expect(std.mem.endsWith(u8, diag.parse.msg, "lib.sql`, which exports pg, share, env, dir, path; declare it `EXPORT PARAM` there to use it here"));
+    try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'lib.sql' AS l;\nSELECT * FROM l.mysql.public.t;\n", "main.sql", base, &diag));
+    try testing.expect(std.mem.endsWith(u8, diag.parse.msg, "lib.sql` exports no connection `mysql`; it exports pg, share, env, dir, path"));
+}
+
+test "@include: a PARAM the root cannot bind needs a DEFAULT" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    try writeFile(&tmp, "req.sql", "PARAM tenant STRING;\nEXPORT FUNCTION t() AS $tenant;\n");
+    try writeFile(&tmp, "inner.sql", "EXPORT PARAM tenant STRING;\nEXPORT FUNCTION t() AS $tenant;\n");
+    try writeFile(&tmp, "outer.sql", "@include 'inner.sql';\nEXPORT FUNCTION u() AS t();\n");
+    try writeFile(&tmp, "pub.sql", "EXPORT PARAM tenant STRING;\nEXPORT FUNCTION t() AS $tenant;\n");
+
+    var diag: Diag = .{};
+    for ([_][]const u8{ "req.sql", "outer.sql" }) |f| {
+        const s = try msgfmt.allocPrint(a, "@include '{s}';\nSELECT 1 AS a;\n", .{f});
+        try testing.expectError(error.ParseFailed, loadProgram(a, s, "main.sql", base, &diag));
+        try testing.expect(std.mem.startsWith(u8, diag.parse.msg, "PARAM `tenant` has no DEFAULT and the script cannot bind it"));
+        try testing.expectEqual(@as(u32, 1), diag.parse.line);
+    }
+    const prog = try loadProgram(a, "@include 'pub.sql';\nSELECT t() AS a;\n", "main.sql", base, &diag);
+    try testing.expectEqualStrings("__m1_tenant", prog.inputName("tenant").?);
+    const lib = try loadProgram(a, "@include 'pub.sql' AS p;\nSELECT p.t() AS a;\n", "main.sql", base, &diag);
+    try testing.expectEqualStrings("__m1_tenant", lib.inputName("p.tenant").?);
 }
 
 test "@include after a statement is rejected" {
@@ -742,8 +961,8 @@ test "an error inside an included table function's body names that file, where t
         \\-- lib
         \\
         \\
-        \\CREATE FUNCTION g() RETURNS TABLE AS SELECT * FROM 'x.csv';
-        \\CREATE OR REPLACE FUNCTION g() RETURNS TABLE AS SELECT * FROM g();
+        \\EXPORT FUNCTION g() RETURNS TABLE AS SELECT * FROM 'x.csv';
+        \\EXPORT OR REPLACE FUNCTION g() RETURNS TABLE AS SELECT * FROM g();
     );
 
     var diag: Diag = .{};
@@ -821,7 +1040,7 @@ test "an include-only script contributes just the included statements" {
     const prog = try loadProgram(a, "@include 'fns.sql';\n", "main.sql", base, &diag);
     try testing.expectEqual(@as(usize, 2), prog.stmts.len);
     try testing.expect(prog.stmts[0] == .kind);
-    try testing.expectEqualStrings("dbl", prog.stmts[1].func.name);
+    try testing.expectEqualStrings("__m1_dbl", prog.stmts[1].func.name);
 }
 
 test "@include AS: a library's functions are namespaced, call each other private or exported, and only the exported reach its includer" {
@@ -839,30 +1058,35 @@ test "@include AS: a library's functions are namespaced, call each other private
     var names = std.array_list.Managed([]const u8).init(a);
     for (prog.stmts) |s| if (s == .func) try names.append(s.func.name);
     try testing.expectEqual(@as(usize, 4), names.items.len);
-    for ([_][]const u8{ "st.sq", "st.hyp", "st.nums", "ot.sq" }, names.items) |w, g| try testing.expectEqualStrings(w, g);
+    for ([_][]const u8{ "__m1_sq", "__m1_hyp", "__m1_nums", "__m2_sq" }, names.items) |w, g| try testing.expectEqualStrings(w, g);
     const hyp = prog.stmts[2].func.body.expr;
-    try testing.expectEqualStrings("st.sq", hyp.call.args[0].binary.l.call.name);
+    try testing.expectEqualStrings("__m1_sq", hyp.call.args[0].binary.l.call.name);
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'lib/s.sql' AS st;\nSELECT * FROM nums(2);\n", "main.sql", base, &diag));
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'lib/s.sql' AS st;\nSELECT st.sq(2) AS v;\n", "main.sql", base, &diag));
     try testing.expect(std.mem.startsWith(u8, diag.parse.msg, "`st.sq` is private to `"));
-    try testing.expect(std.mem.endsWith(u8, diag.parse.msg, "lib/s.sql`, which exports hyp, nums; declare it `EXPORT FUNCTION` there to call it here"));
+    try testing.expect(std.mem.endsWith(u8, diag.parse.msg, "lib/s.sql`, which exports hyp, nums; declare it `EXPORT FUNCTION` there to use it here"));
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'lib/none.sql' AS n;\nSELECT 1 AS v;\n", "main.sql", base, &diag));
-    try testing.expect(std.mem.endsWith(u8, diag.parse.msg, "lib/none.sql` is included AS n, a library, but exports no function: declare the ones it shares `EXPORT FUNCTION`"));
+    try testing.expect(std.mem.endsWith(u8, diag.parse.msg, "lib/none.sql` is included AS n, a library, but exports nothing: declare what it shares with EXPORT (FUNCTION, CONNECTION, PARAM or LET)"));
 }
 
-test "@include AS: a library declares functions only; aliases are one per library and not a connection's name" {
+test "@include AS: a library only declares; aliases are one per library and not a connection's name" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try writeFile(&tmp, "run.sql", "CREATE FUNCTION f(x) AS x;\nLOAD INTO 'o.csv' AS SELECT 1 AS a;\n");
+    try writeFile(&tmp, "run.sql", "EXPORT FUNCTION f(x) AS x;\nLOAD INTO 'o.csv' AS SELECT 1 AS a;\n");
+    try writeFile(&tmp, "q.sql", "EXPORT FUNCTION f(x) AS x;\nEXPORT LET n = (SELECT COUNT(*) AS n FROM 'in.csv');\n");
     try writeFile(&tmp, "f.sql", "EXPORT FUNCTION f(x) AS x;\n");
     try writeFile(&tmp, "g.sql", "EXPORT FUNCTION g(x) AS x;\n");
     const base = try tmp.dir.realpathAlloc(a, ".");
     var diag: Diag = .{};
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'run.sql' AS r;\nSELECT 1 AS a;\n", "m.sql", base, &diag));
-    try testing.expect(std.mem.indexOf(u8, diag.parse.msg, "may only declare functions") != null);
+    try testing.expect(std.mem.indexOf(u8, diag.parse.msg, "may only declare functions, connections, PARAMs and LETs of a value; this LOAD INTO or SELECT would run") != null);
+    try testing.expect(std.mem.endsWith(u8, diag.label, "run.sql"));
+    try testing.expectEqual(@as(u32, 2), diag.parse.line);
+    try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'q.sql' AS q;\nSELECT 1 AS a;\n", "m.sql", base, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.parse.msg, "this LET would run") != null);
     _ = try loadProgram(a, "@include 'run.sql';\nSELECT f(1) AS a;\n", "m.sql", base, &diag);
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'f.sql' AS x;\n@include 'g.sql' AS x;\nSELECT 1 AS a;\n", "m.sql", base, &diag));
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'f.sql' AS pg;\nCREATE CONNECTION pg TYPE postgres OPTIONS (host = 'h');\nSELECT 1 AS a;\n", "m.sql", base, &diag));
@@ -912,7 +1136,8 @@ test "remote @include: refused until pinned, pinned by check, verified, its own 
     var pinned = try remote.Resolver.init(a, base, fetch, false);
     pinned.cache_dir = null;
     const prog = try loadProgramOpts(a, script, "m.sql", base, &diag, .{ .remote = &pinned });
-    try testing.expectEqualStrings("kit.twice", prog.stmts[2].func.name);
+    try testing.expectEqualStrings("__m1_twice", prog.stmts[2].func.name);
+    try testing.expectEqualStrings("__m2_inc", prog.stmts[2].func.body.expr.call.name);
 
     host.files = &.{.{ "https://raw.githubusercontent.com/acme/kit/v1/sql/lib.sql", "CREATE FUNCTION twice(x) AS x;\n" }};
     var moved = try remote.Resolver.init(a, base, fetch, false);
@@ -942,7 +1167,7 @@ test "@include AS: an alias is private to its file, so two libraries may both us
     defer tmp.cleanup();
     try writeFile(&tmp, "a/lib.sql", "@include 'util.sql' AS u;\n@include 'help.sql';\nEXPORT FUNCTION f(x) AS u.g(h(x));\n");
     try writeFile(&tmp, "a/util.sql", "EXPORT FUNCTION g(x) AS x + 1;\n");
-    try writeFile(&tmp, "a/help.sql", "CREATE FUNCTION h(x) AS x * 10;\n");
+    try writeFile(&tmp, "a/help.sql", "EXPORT FUNCTION h(x) AS x * 10;\n");
     try writeFile(&tmp, "b/lib.sql", "@include 'util.sql' AS u;\nEXPORT FUNCTION f(x) AS u.g(x);\n");
     try writeFile(&tmp, "b/util.sql", "EXPORT FUNCTION g(x) AS x - 1;\n");
     const base = try tmp.dir.realpathAlloc(a, ".");
@@ -950,13 +1175,14 @@ test "@include AS: an alias is private to its file, so two libraries may both us
     const prog = try loadProgram(a, "@include 'a/lib.sql' AS a;\n@include 'b/lib.sql' AS b;\nSELECT a.f(1) AS x, b.f(1) AS y;\n", "m.sql", base, &diag);
     var names = std.array_list.Managed([]const u8).init(a);
     for (prog.stmts) |s| if (s == .func) try names.append(s.func.name);
-    for ([_][]const u8{ "a.u.g", "a.h", "a.f", "b.u.g", "b.f" }, names.items) |w, g| try testing.expectEqualStrings(w, g);
+    for ([_][]const u8{ "__m2_g", "__m3_h", "__m1_f", "__m5_g", "__m4_f" }, names.items) |w, g| try testing.expectEqualStrings(w, g);
     try testing.expectEqual(@as(usize, 5), names.items.len);
-    try testing.expectEqualStrings("a.u.g", prog.stmts[3].func.body.expr.call.name);
-    try testing.expectEqualStrings("a.h", prog.stmts[3].func.body.expr.call.args[0].call.name);
+    try testing.expectEqualStrings("__m2_g", prog.stmts[3].func.body.expr.call.name);
+    try testing.expectEqualStrings("__m3_h", prog.stmts[3].func.body.expr.call.args[0].call.name);
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'a/lib.sql' AS a;\nSELECT u.g(1) AS x;\n", "m.sql", base, &diag));
     try testing.expectError(error.ParseFailed, loadProgram(a, "@include 'a/lib.sql' AS a;\nSELECT a.h(1) AS x;\n", "m.sql", base, &diag));
-    try testing.expect(std.mem.startsWith(u8, diag.parse.msg, "`a.h` is private to `"));
+    try testing.expect(std.mem.startsWith(u8, diag.parse.msg, "`a.h`: `"));
+    try testing.expect(std.mem.endsWith(u8, diag.parse.msg, "a/lib.sql` exports no function `h`; it exports f"));
 }
 
 test "a grouped query's unknown function is told from one an included file declares" {
@@ -965,7 +1191,7 @@ test "a grouped query's unknown function is told from one an included file decla
     const a = ar.allocator();
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    try writeFile(&tmp, "fns.sql", "CREATE FUNCTION shared(x) AS x + 1;\n");
+    try writeFile(&tmp, "fns.sql", "EXPORT FUNCTION shared(x) AS x + 1;\n");
     const base = try tmp.dir.realpathAlloc(a, ".");
     const Builtins = struct {
         fn is(_: []const u8) bool {
@@ -978,4 +1204,29 @@ test "a grouped query's unknown function is told from one an included file decla
     try testing.expect(std.mem.startsWith(u8, diag.parse.msg, "`v` is neither an aggregate"));
     try testing.expectError(error.ParseFailed, loadProgramOpts(a, "@include 'fns.sql';\nSELECT g, sharde(v) AS x FROM 'in.csv' GROUP BY g;\n", "m.sql", base, &diag, opts));
     try testing.expectEqualStrings("unknown function `sharde`: no builtin, aggregate or function of this script has that name", diag.parse.msg);
+}
+
+test "@include: names the parser makes up stay apart across files" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const body = "LET a = (SELECT COUNT(*) AS n FROM 'in.csv' WHERE x IN (SELECT x FROM 'k.csv'));\nEXPORT FUNCTION {s}() RETURNS TABLE AS SELECT * FROM 'in.csv' WHERE v > $a;\n";
+    try writeFile(&tmp, "x.sql", try msgfmt.allocPrint(a, body, .{"fx"}));
+    try writeFile(&tmp, "y.sql", try msgfmt.allocPrint(a, body, .{"fy"}));
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    var diag: Diag = .{};
+    const prog = try loadProgram(a, "@include 'x.sql';\n@include 'y.sql';\nSELECT * FROM fx() UNION ALL SELECT * FROM fy();\n", "m.sql", base, &diag);
+    var names = std.array_list.Managed([]const u8).init(a);
+    for (prog.stmts) |st| switch (st) {
+        .binding => |b| try names.append(b.name),
+        .let_const => |l| try names.append(l.name),
+        else => {},
+    };
+    try testing.expect(names.items.len >= 4);
+    for (names.items, 0..) |n, i| for (names.items[i + 1 ..]) |m| {
+        if (std.mem.eql(u8, n, m)) std.debug.print("repeated name {s}\n", .{n});
+        try testing.expect(!std.mem.eql(u8, n, m));
+    };
 }

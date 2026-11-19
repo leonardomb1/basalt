@@ -140,7 +140,8 @@ pub fn parseShow(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!vo
     try self.expectKw("show");
     try self.expectKw("tables");
     try self.expectKw("from");
-    const conn = try self.expectIdent();
+    const written = try self.expectIdent();
+    const conn = (try self.connRef(written)) orelse written;
     const kind = self.connType(conn) orelse
         return self.fail(pos, "SHOW TABLES FROM: `{s}` is not a connection", .{conn});
     var schema: ?[]const u8 = null;
@@ -241,7 +242,7 @@ pub fn parseExplainStmt(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) E
 pub fn parseLetStmt(self: *Parser) Error!ast.LetConst {
     const pos = self.curPos();
     try self.expectKw("let");
-    const name = try self.expectIdent();
+    const name = try self.ownName(.variable, try self.expectIdent());
     _ = try self.expect(.assign);
     if (self.at(.lparen) and (self.peekKw("select") or self.peekKw("with"))) {
         _ = self.advance();
@@ -262,27 +263,43 @@ pub fn parsePrintStmt(self: *Parser) Error!ast.Print {
     return .{ .expr = expr, .pos = pos };
 }
 
-/// `CREATE [OR REPLACE] CONNECTION | FUNCTION ...`, or `EXPORT [OR REPLACE] FUNCTION
-/// ...`, a function a library included `AS` shares with its includer.
+/// `CREATE [OR REPLACE] CONNECTION | FUNCTION ...`, or `EXPORT` before a function,
+/// a connection, a PARAM or a LET, which a file that includes this one may then use
+/// (`lang/scope.zig`): every other name a file declares is its own.
 pub fn parseCreate(self: *Parser, out: *std.array_list.Managed(ast.Stmt)) Error!void {
     const pos = self.curPos();
     const exported = self.eatKw("export");
     if (!exported) try self.expectKw("create");
+    if (exported and self.isKw("param")) {
+        var p = try self.parseParam();
+        p.exported = true;
+        return out.append(.{ .param = p });
+    }
+    if (exported and self.isKw("let")) {
+        var l = try self.parseLetStmt();
+        l.exported = true;
+        if (self.pending_bindings.items.len > 0) {
+            try out.appendSlice(self.pending_bindings.items);
+            self.pending_bindings.clearRetainingCapacity();
+        }
+        return out.append(.{ .let_const = l });
+    }
     const replace = if (self.eatKw("or")) blk: {
         try self.expectKw("replace");
         break :blk true;
     } else false;
-    if (exported) {
-        if (!self.eatKw("function")) return self.fail(self.curPos(), "EXPORT declares a function a library shares: `EXPORT FUNCTION name(...) AS ...`", .{});
-        var fd = try self.parseFunction(pos, replace);
-        fd.exported = true;
-        return out.append(.{ .func = fd });
-    }
     if (self.eatKw("connection")) {
-        const conn = try self.parseConnection(pos);
+        var conn = try self.parseConnection(pos);
+        conn.exported = exported;
         try self.conn_names.append(conn.name);
         try self.conn_types.append(conn.connector);
         return out.append(.{ .connection = conn });
+    }
+    if (exported) {
+        if (!self.eatKw("function")) return self.fail(self.curPos(), "EXPORT shares a declaration with the files that include this one: `EXPORT FUNCTION`, `EXPORT CONNECTION`, `EXPORT PARAM` or `EXPORT LET`", .{});
+        var fd = try self.parseFunction(pos, replace);
+        fd.exported = true;
+        return out.append(.{ .func = fd });
     }
     if (self.eatKw("function")) {
         return out.append(.{ .func = try self.parseFunction(pos, replace) });
