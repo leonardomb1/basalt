@@ -59,6 +59,6 @@ it: AES-128-GCM on SMB 3.1.1, AES-128-CCM on 3.0.
 Reads are by offset, as on SFTP: a Parquet file or an Excel workbook is read
 without fetching what the query does not need, several reads in flight within
 the credits the server grants, and a parallel read gets a session per lane;
-sessions are pooled per server and login. A write goes to `name.part` and is
-renamed over `name` once complete; a failed load deletes the `.part` and leaves
-`name` as it was. `APPEND` is not supported, and a missing folder is an error.
+sessions are pooled per server and login. A write goes to `name.<8 hex>.part`, a
+name of its own, and is renamed over `name` once complete; a failed load deletes
+the `.part` and leaves `name` as it was. `APPEND` is not supported, and a missing folder is an error.

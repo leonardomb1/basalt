@@ -84,14 +84,15 @@ AS
   `TRUNCATE` copies under the lock the `TRUNCATE` already holds.
 - Dispositions on a **file target** — the omissible default is *not* `APPEND`:
   a bare `LOAD INTO 'x.csv'`, like `REPLACE`, replaces the file, so a rerun
-  replaces it. A local file is written whole: the rows go to `x.csv.part`,
-  renamed over `x.csv` once the write completes and deleted if it fails or is
-  interrupted, so a reader never sees a torn file and a failed `LOAD` leaves the
-  previous one in place. The `.part` takes an existing file's permission bits
+  replaces it. A local file is written whole: the rows go to `x.csv.<8 hex>.part`,
+  a name of this write's own, renamed over `x.csv` once the write completes and
+  deleted if it fails or is interrupted, so a reader never sees a torn file, a
+  failed `LOAD` leaves the previous one in place, and two runs writing one file at
+  once each write their own copy, the last to finish holding the file. The `.part` takes an existing file's permission bits
   and, where the user may set them, its owner and group; ACLs and extended
   attributes are not carried over. A target that is a device, a FIFO or a
   symlink, has more than one hard link (so every name sees the new rows), or
-  sits in a directory where `x.csv.part` cannot be created is instead truncated
+  sits in a directory where the `.part` cannot be created is instead truncated
   and written in place, keeping its inode, links and attributes but not the
   guarantee: a reader may see it half written, and a failed `LOAD` leaves it
   truncated. Explicit `APPEND` accumulates for CSV and NDJSON only (an NDJSON

@@ -7,10 +7,10 @@
 //! process-wide session pool keyed by the full login (a session idle 15 s or more
 //! is probed before reuse, since a server or NAT may have dropped it; a transport
 //! error retires it, a file error does not), `File` for ranged reads, `Stream`, an
-//! `Upload` that writes `name.part` and only on `finish` puts it over `name`, and
-//! `listPrefix`. `P` supplies the protocol: its types (`Link` the session, `Login`,
-//! `Target` with a `cfg`, `Handle` with a `size`), the buffer sizes, and the
-//! primitives `resolve`, `poolKey`, `clearNotes`, `connect`, `ping`, `destroy`,
+//! `Upload` that writes `name.<8 hex>.part` and only on `finish` puts it over
+//! `name`, and `listPrefix`. `P` supplies the protocol: its types (`Link` the
+//! session, `Login`, `Target` with a `cfg`, `Handle` with a `size`), the buffer
+//! sizes, and the primitives `resolve`, `poolKey`, `clearNotes`, `connect`, `ping`, `destroy`,
 //! `protocolOk`, `why`, `openRead`, `openWrite`, `readAt`, `writeAt`,
 //! `closeHandle`, `freeHandle`, `commit`, `discard` and `listDir`.
 
@@ -201,8 +201,10 @@ pub fn RemoteFs(comptime P: type) type {
 
         pub const Stream = objstore.ChunkStream(File, P.stream_chunk);
 
-        /// Writes `path.part`; `finish` puts it over `path`, and `abort` or any failure
-        /// removes it, so a reader polling the folder never sees half a file.
+        /// Writes `path.<8 hex>.part`, a name of its own, so two runs writing one file
+        /// at once do not write into each other; `finish` puts it over `path`, and
+        /// `abort` or any failure removes it, so a reader polling the folder never
+        /// sees half a file.
         pub const Upload = struct {
             const upload_vtable = std.Io.Writer.VTable{ .drain = objstore.drain(Upload) };
 
@@ -219,7 +221,7 @@ pub fn RemoteFs(comptime P: type) type {
 
             pub fn open(arena: std.mem.Allocator, url: []const u8) !*Upload {
                 const t = try P.resolve(arena, url);
-                const part = try msgfmt.allocPrint(arena, "{s}.part", .{t.path});
+                const part = try msgfmt.allocPrint(arena, "{s}.{x:0>8}.part", .{ t.path, std.crypto.random.int(u32) });
                 const self = try arena.create(Upload);
                 const buffer = try arena.alloc(u8, P.upload_buffer);
                 const l = try checkout(arena, t.cfg);

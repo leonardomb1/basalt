@@ -1382,7 +1382,7 @@ if runs sftp; then
   # a rename that cannot happen (the target is a folder) fails the load and leaves no .part
   docker exec $SC sh -c 'mkdir -p /config/out/isdir/x && chown -R 1000:1000 /config/out'
   if $B run -q -c "$KEY LOAD INTO 'sftp://box/~/out/isdir' AS SELECT * FROM 'tests/integration/seed.csv';" >/dev/null 2>&1 ||
-     docker exec $SC sh -c 'ls /config/out' | grep -q "isdir.part"; then
+     docker exec $SC sh -c 'ls /config/out' | grep -q 'isdir\..*part$'; then
     report "sftp-failed-rename-leaves-nothing" bad
   else report "sftp-failed-rename-leaves-nothing" ok; fi
   filedml sftp "sftp://box/~/out/" "$KEY"

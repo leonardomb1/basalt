@@ -5,7 +5,8 @@
 //! A format writer renders into `writer()` and never learns where its bytes go.
 //!
 //! On failure a local file is left as it was: an append is cut back to where the
-//! file ended, a whole write's `.part` deleted; an upload is never committed, so its
+//! file ended, a whole write's `.part` deleted, and an append whose file another run
+//! replaced meanwhile fails rather than report rows that went to the old one; an upload is never committed, so its
 //! staged blocks or multipart parts stay invisible. A local file this opened is
 //! synced to disk before `finish` closes it, and before its `.part` is renamed over
 //! the target, so a crash after the rename cannot leave the target torn.
@@ -41,6 +42,7 @@ pub const Output = struct {
     part: Part = .{},
     end: u64 = 0,
     appending: bool = false,
+    path: []const u8 = "",
 
     const Backend = union(enum) {
         file: std.fs.File,
@@ -68,6 +70,7 @@ pub const Output = struct {
                 errdefer self.backend.file.close();
                 self.end = try self.backend.file.getEndPos();
                 self.appending = true;
+                self.path = path;
                 try self.fw.seekTo(self.end);
             }
         }
@@ -191,6 +194,10 @@ pub const Output = struct {
                         self.dropFile();
                         return e;
                     };
+                    if (self.appending and !stillAt(f, self.path)) {
+                        f.close();
+                        return stream.explainf(error.FileReplaced, "`{s}` was written again by another run while rows were added to it, so they went to the file it replaced; run it again", .{self.path});
+                    }
                     f.close();
                 }
                 try self.part.commit();
@@ -212,6 +219,15 @@ pub const Output = struct {
         }
     }
 
+    /// Whether `path` still names the file `f` is open on: a rename over it in the
+    /// meantime (another run writing it again whole) leaves `f` on a file no name
+    /// reaches.
+    fn stillAt(f: std.fs.File, path: []const u8) bool {
+        const open_st = std.posix.fstat(f.handle) catch return false;
+        const now = std.posix.fstatat(std.fs.cwd().fd, path, 0) catch return false;
+        return open_st.ino == now.ino and open_st.dev == now.dev;
+    }
+
     fn dropFile(self: *Output) void {
         if (self.owns_file) {
             if (self.appending) self.backend.file.setEndPos(self.end) catch {};
@@ -221,7 +237,7 @@ pub const Output = struct {
     }
 };
 
-test "an append that fails is cut back to where the file ended; one that finishes keeps its rows" {
+test "an append that fails is cut back to where the file ended; one that finishes keeps its rows; one whose file another run replaced fails" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -238,4 +254,11 @@ test "an append that fails is cut back to where the file ended; one that finishe
     try kept.writer().writeAll("2\n");
     try kept.finish();
     try std.testing.expectEqualStrings("id\n1\n2\n", try tmp.dir.readFileAlloc(a, "t.csv", 1 << 10));
+
+    const lost = try Output.open(a, path, "text/csv", .append);
+    try lost.writer().writeAll("3\n");
+    try tmp.dir.writeFile(.{ .sub_path = "new.csv", .data = "id\n9\n" });
+    try tmp.dir.rename("new.csv", "t.csv");
+    try std.testing.expectError(error.FileReplaced, lost.finish());
+    try std.testing.expectEqualStrings("id\n9\n", try tmp.dir.readFileAlloc(a, "t.csv", 1 << 10));
 }

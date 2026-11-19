@@ -35,7 +35,8 @@ with OpenSSH's strict key exchange.
 Reads are by offset, so a Parquet file or an Excel workbook on the server is
 read without fetching what the query does not need, and a parallel read gets a
 session per lane; sessions are pooled per server and user. A write goes to
-`name.part` and is renamed over `name` once complete, so a partner polling the
-folder never picks up half a file; a failed load removes the `.part`. `APPEND`
+`name.<8 hex>.part`, a name of its own, and is renamed over `name` once complete,
+so a partner polling the folder never picks up half a file and two runs writing
+one file at once never write into each other; a failed load removes the `.part`. `APPEND`
 is not supported, and a missing folder is an error rather than created on
 someone else's server.
