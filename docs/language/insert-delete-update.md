@@ -214,7 +214,9 @@ format:
 `INSERT` adds rows to a file that exists; one that does not is an error, and
 `LOAD INTO` makes it. The rows' columns are matched to the file's by name: a
 column the rows lack is left empty, one the file lacks is an error, and the
-file's own columns do not change. A local CSV or NDJSON file takes the rows at
+file's own columns do not change. Each value becomes the type its column is read
+as from the file, so the file reads back whole: `40.00` goes into a CSV column
+that reads as INT as `40`, and `40.5` is refused rather than rounded. A local CSV or NDJSON file takes the rows at
 its end, in place: a CSV's in its own delimiter, encoding and line ending, a
 gzipped one's as a gzip member of their own, which gzip readers read on into.
 If the write fails, the file is cut back to where it ended. A file whose last

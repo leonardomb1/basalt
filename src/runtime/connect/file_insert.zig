@@ -2,7 +2,8 @@
 //! at its end, appended in place when local (`format/output.zig`'s append, cut back
 //! to where the file ended when the write fails), or, remote, written whole as the
 //! old bytes and then the new ones in one upload: a CSV's rows matched to its header
-//! by name and written in its delimiter, encoding and line ending. Any other format
+//! by name and written in its delimiter, encoding and line ending, each value the
+//! type its column reads as from the file, refused when not exactly. Any other format
 //! (Parquet, Avro, Arrow IPC, a JSON array) cannot be added to, so the file is
 //! written again whole, its rows first, then the new ones, each matched to the file's
 //! columns by name and cast to their types, a column it lacks refused and one the
@@ -17,6 +18,8 @@ const column = @import("../../exec/column.zig");
 const driver = @import("../../exec/driver.zig");
 const Batch = @import("../../exec/batch.zig").Batch;
 const cast = @import("../../exec/eval/cast.zig");
+const support = @import("../../exec/eval/support.zig");
+const Value = @import("../../exec/value.zig").Value;
 const csvfmt = @import("../../format/csv.zig");
 const jsonwrite = @import("../../format/json/write.zig");
 const stream = @import("../../format/stream.zig");
@@ -28,6 +31,7 @@ const source = @import("source.zig");
 const xlsxread = @import("../../format/xlsx/read.zig");
 const xlsxedit = @import("../../format/xlsx/edit.zig");
 const Output = @import("../../format/output.zig").Output;
+const UnitPipeline = @import("../lanes/map.zig").UnitPipeline;
 
 const Env = env_mod.Env;
 const planErr = env_mod.planErr;
@@ -53,10 +57,10 @@ pub fn open(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
     switch (formats.of(format).write.change) {
         .text => if (format == .csv) {
             const cw = csvfmt.CsvWriter.openInsert(a, path, schema, env.csv_out) catch |e| return failed(env, path, e);
-            return cw.sink();
+            return Typed.wrap(env, cw.sink(), path, format, schema);
         } else if (!try isArray(a, path)) {
             const jw = jsonwrite.Writer.openInsert(a, path, schema) catch |e| return failed(env, path, e);
-            return jw.sink();
+            return Typed.wrap(env, jw.sink(), path, format, schema);
         } else {
             const saved = env.write_opts;
             defer env.write_opts = saved;
@@ -67,6 +71,98 @@ pub fn open(env: *Env, w: ast.Write, schema: types.Schema) !driver.Sink {
         .whole, .refused => return Rewrite.open(env, w, format, schema),
     }
 }
+
+/// The rows of an INSERT into a CSV or NDJSON file, each value made the type its
+/// column is read as from the file (as a read sniffs or samples it), so the file
+/// reads back whole: 40.00 goes in as 40 where the column reads as INT. A value
+/// that type cannot hold exactly, 40.5 there, is refused rather than rounded.
+const Typed = struct {
+    inner: driver.Sink,
+    to: []const ?types.Type,
+    schema: types.Schema,
+    path: []const u8,
+
+    fn wrap(env: *Env, inner: driver.Sink, path: []const u8, format: analyze.FileFormat, rows: types.Schema) !driver.Sink {
+        errdefer inner.abort();
+        const a = env.arena;
+        const file = (try fileTypes(env, path, format)) orelse return inner;
+        const to = try a.alloc(?types.Type, rows.fields.len);
+        const fields = try a.dupe(types.Schema.Field, rows.fields);
+        var any = false;
+        for (to, fields) |*t, *f| {
+            t.* = null;
+            const i = file.indexOf(f.name) orelse continue;
+            const want = file.fields[i].ty;
+            if (want.asNullable().eql(f.ty.asNullable())) continue;
+            t.* = want;
+            f.ty = want.asNullable();
+            any = true;
+        }
+        if (!any) return inner;
+        const self = try a.create(Typed);
+        self.* = .{ .inner = inner, .to = to, .schema = .{ .fields = fields }, .path = path };
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// The columns of the file at `path` as a read of it types them, in the INSERT's
+    /// delimiter and encoding; null for a file holding no byte, which has none.
+    fn fileTypes(env: *Env, path: []const u8, format: analyze.FileFormat) !?types.Schema {
+        const a = env.arena;
+        if (!stream.isUrl(path)) {
+            const st = std.posix.fstatat(std.fs.cwd().fd, path, 0) catch return null;
+            if (st.size == 0) return null;
+        }
+        const at: ast.Pos = .{ .line = 0, .col = 0 };
+        var hints = std.array_list.Managed(ast.Hint).init(a);
+        if (env.fmt_out) |f| try hints.append(.{ .key = "format", .value = .{ .str = formats.of(f).names[0] }, .pos = at });
+        if (format == .csv) {
+            try hints.append(.{ .key = "delimiter", .value = .{ .str = try a.dupe(u8, &.{env.csv_out.delim}) }, .pos = at });
+            try hints.append(.{ .key = "encoding", .value = .{ .str = @tagName(env.csv_out.encoding) }, .pos = at });
+        }
+        const src = try source.openSourceProjected(env, .{ .connector = "csv", .form = .{ .path = path } }, hints.items, null, &.{});
+        defer src.close();
+        const got = src.schema();
+        return .{ .fields = try a.dupe(types.Schema.Field, got.fields) };
+    }
+
+    pub fn writeBatch(self: *Typed, arena: std.mem.Allocator, b: Batch) !void {
+        const cols = try arena.alloc(column.Column, b.columns.len);
+        for (cols, b.columns, self.to, self.schema.fields) |*c, src, to, f| {
+            const ty = to orelse {
+                c.* = src;
+                continue;
+            };
+            var bd = try column.Builder.initCapacity(arena, ty.asNullable(), b.len);
+            for (0..b.len) |r| try bd.append(try self.exact(arena, src.getValue(r), ty, src.ty, f.name));
+            c.* = try bd.finish();
+        }
+        return self.inner.writeBatch(arena, .{ .schema = &self.schema, .columns = cols, .len = b.len });
+    }
+
+    /// `v` as `to`, when it casts there and back to `from` unchanged.
+    fn exact(self: *Typed, arena: std.mem.Allocator, v: Value, to: types.Type, from: types.Type, name: []const u8) !Value {
+        if (v == .null) return .null;
+        const fits = blk: {
+            const w = cast.castValueTyped(arena, v, to) catch break :blk null;
+            const back = cast.castValueTyped(arena, w, from) catch break :blk null;
+            const o = support.compareValues(back, v) orelse break :blk null;
+            break :blk if (o == .eq) w else null;
+        };
+        if (fits) |w| return w;
+        const text = cast.castValue(arena, v, .string) catch Value{ .string = "?" };
+        return support.failWith(error.CastFailed, "INSERT INTO {s}: column `{s}` reads as {s} from the file, and {s} is not one exactly; CAST it in the query, or write the rows to a new file with LOAD INTO", .{ self.path, name, try to.name(arena), support.clip(text.string) });
+    }
+
+    pub fn close(self: *Typed) !void {
+        return self.inner.close();
+    }
+
+    pub fn abort(self: *Typed) void {
+        self.inner.abort();
+    }
+
+    const vtable = driver.sinkVTable(Typed);
+};
 
 /// Whether the JSON file `path` is one top-level array rather than NDJSON: its name
 /// says NDJSON (`.ndjson`, `.jsonl`), else its first byte past blanks is `[`.
@@ -162,7 +258,8 @@ const XlsxInsert = struct {
     const vtable = driver.sinkVTable(XlsxInsert);
 };
 
-/// A file written again whole: its own rows, then the INSERT's.
+/// A file written again whole: its own rows, their row groups encoded on the lanes
+/// where the format encodes units (Parquet), then the INSERT's.
 const Rewrite = struct {
     inner: driver.Sink,
     file: types.Schema,
@@ -194,7 +291,17 @@ const Rewrite = struct {
         errdefer sink.abort();
         var mem = std.heap.ArenaAllocator.init(env.gpa);
         defer mem.deinit();
-        while (try src.next(mem.allocator())) |b| {
+        const lanes = env.pipe.threads;
+        if (sink.unitRows() > 0 and lanes > 1) {
+            var up: UnitPipeline = undefined;
+            try up.start(a, env.gpa, sink, lanes - 1);
+            defer up.shutdown();
+            while (try src.next(mem.allocator())) |b| {
+                try up.submit(.{ .schema = &file, .columns = b.columns, .len = b.len });
+                _ = mem.reset(.retain_capacity);
+            }
+            try up.finish();
+        } else while (try src.next(mem.allocator())) |b| {
             try sink.writeBatch(mem.allocator(), .{ .schema = &file, .columns = b.columns, .len = b.len });
             _ = mem.reset(.retain_capacity);
         }

@@ -64,7 +64,21 @@ test "DELETE and UPDATE of a Parquet, Avro, Arrow or JSON-array file write it ag
     try harness.expectFile(&tmp, "arr.json", "[\n{\"id\":2,\"v\":\"b\"}\n]\n");
 }
 
-test "INSERT into a file: a CSV's columns by name in its delimiter, encoding and line ending; NDJSON, gzip, Parquet and a JSON array" {
+test "DELETE, UPDATE and INSERT of a Parquet file on lanes encode its row groups in parallel, rows in their places" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/big.parquet' AS SELECT range AS id, range % 7 AS g, 'r' || range AS v FROM range(300000);");
+    try harness.checkAndRun(gpa, &tmp, "DELETE FROM '$B/big.parquet' WHERE g = 3;", 4, &.{});
+    try harness.checkAndRun(gpa, &tmp, "UPDATE '$B/big.parquet' SET v = upper(v) WHERE id % 1000 = 0;", 4, &.{});
+    try harness.checkAndRun(gpa, &tmp, "INSERT INTO '$B/big.parquet' SELECT 999999 AS id, 'z' AS v;", 4, &.{});
+    try testing.expectEqualStrings("n,s,u,first,last\n257144,38572342856,257,R0,z\n", try rows(a, &tmp, "SELECT count(*) AS n, sum(id) AS s, count(CASE WHEN v LIKE 'R%' THEN 1 END) AS u, min(v) AS first, max(v) AS last FROM '$B/big.parquet'"));
+    try testing.expectEqualStrings("id,v\n0,R0\n1,r1\n2,r2\n4,r4\n", try rows(a, &tmp, "SELECT id, v FROM '$B/big.parquet' LIMIT 4"));
+}
+
+test "INSERT into a file: a CSV's columns by name in its delimiter, encoding and line ending, each value the type the file's column reads as; NDJSON, gzip, Parquet and a JSON array" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
     const a = ar.allocator();
@@ -73,6 +87,12 @@ test "INSERT into a file: a CSV's columns by name in its delimiter, encoding and
     try tmp.dir.writeFile(.{ .sub_path = "i.csv", .data = "\xef\xbb\xbfid;nome;valor\r\n1;Jo\xe3o;1.50\r\n" });
     try load(&tmp, "INSERT INTO '$B/i.csv' WITH (delimiter = ';', encoding = 'latin1') SELECT 'Concei\u{00e7}\u{00e3}o' AS nome, 2 AS id;");
     try harness.expectFile(&tmp, "i.csv", "\xef\xbb\xbfid;nome;valor\r\n1;Jo\xe3o;1.50\r\n2;Concei\xe7\xe3o;\r\n");
+    try tmp.dir.writeFile(.{ .sub_path = "q.csv", .data = "id,q,d\n1,17,2024-01-01\n" });
+    try load(&tmp, "INSERT INTO '$B/q.csv' SELECT 2 AS id, CAST(40.00 AS DECIMAL(10,2)) AS q, CAST('2024-02-01 00:00:00' AS TIMESTAMP) AS d;");
+    try harness.expectFile(&tmp, "q.csv", "id,q,d\n1,17,2024-01-01\n2,40,2024-02-01\n");
+    try tmp.dir.writeFile(.{ .sub_path = "q.ndjson", .data = "{\"id\":1,\"q\":17}\n" });
+    try load(&tmp, "INSERT INTO '$B/q.ndjson' SELECT 2 AS id, CAST(40.00 AS DECIMAL(10,2)) AS q;");
+    try harness.expectFile(&tmp, "q.ndjson", "{\"id\":1,\"q\":17}\n{\"id\":2,\"q\":40}\n");
     try tmp.dir.writeFile(.{ .sub_path = "i.ndjson", .data = "{\"id\":1}\n" });
     try load(&tmp, "INSERT INTO '$B/i.ndjson' SELECT 2 AS id, 'x' AS v;");
     try harness.expectFile(&tmp, "i.ndjson", "{\"id\":1}\n{\"id\":2,\"v\":\"x\"}\n");
@@ -87,7 +107,7 @@ test "INSERT into a file: a CSV's columns by name in its delimiter, encoding and
     try testing.expectEqualStrings("id,valor\n1,1.50\n2,2.25\n", try rows(a, &tmp, "SELECT * FROM '$B/p.parquet'"));
 }
 
-test "INSERT into a file refuses a file that is not there, one cut short, a column it lacks and a format a rewrite would lose" {
+test "INSERT into a file refuses a file that is not there, one cut short, a column it lacks, a value its column's type cannot hold exactly and a format a rewrite would lose" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.writeFile(.{ .sub_path = "torn.csv", .data = "id,v\n1,a" });
@@ -97,6 +117,9 @@ test "INSERT into a file refuses a file that is not there, one cut short, a colu
     try harness.expectRunRefuses(gpa, &tmp, "INSERT INTO '$B/torn.csv' SELECT 2 AS id;", 1, "does not end in a line break");
     try harness.expectFile(&tmp, "torn.csv", "id,v\n1,a");
     try harness.expectRunRefuses(gpa, &tmp, "INSERT INTO '$B/p.parquet' SELECT 2 AS id, 3 AS extra;", 1, "the rows have column `extra`, which the file lacks");
+    try tmp.dir.writeFile(.{ .sub_path = "q.csv", .data = "id,q\n1,17\n" });
+    try harness.expectRunRefuses(gpa, &tmp, "INSERT INTO '$B/q.csv' SELECT 3 AS id, 40.5 AS q;", 1, "column `q` reads as int from the file, and 40.5 is not one exactly");
+    try harness.expectFile(&tmp, "q.csv", "id,q\n1,17\n");
     try harness.expectRefusedAlike(gpa, &tmp, "INSERT INTO '$B/x.xml' SELECT 1 AS id;", "an XML file is written in basalt's own shape");
     try harness.expectRefusedAlike(gpa, &tmp, "DELETE FROM '$B/x.xml' WHERE id = 1;", "an XML file is written in basalt's own shape");
 }

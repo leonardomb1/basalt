@@ -41,6 +41,7 @@ const update_rules = @import("../analyze/update.zig");
 const formats = @import("../../format/formats.zig");
 const xlsxread = @import("../../format/xlsx/read.zig");
 const xlsxedit = @import("../../format/xlsx/edit.zig");
+const UnitPipeline = @import("../lanes/map.zig").UnitPipeline;
 
 const Env = env_mod.Env;
 const RunOptions = env_mod.RunOptions;
@@ -76,7 +77,7 @@ pub fn run(env: *Env, w: ast.Write, read: ast.Stage, between_in: []const ast.Sta
         .sheet => .sheet,
         .whole, .refused => .whole,
     };
-    const first = try openRead(env, read, format, &kind);
+    var first = try openRead(env, read, format, &kind);
     const data = first.data;
     const dry = env.explain or opts.explain;
     if (dry and !opts.explain) {
@@ -93,7 +94,8 @@ pub fn run(env: *Env, w: ast.Write, read: ast.Stage, between_in: []const ast.Sta
     var stages = std.array_list.Managed(ast.Stage).init(a);
     for (between) |st| if (!(st.node == .select and st.node.select.len > 0 and st.node.select[0] == .star)) try stages.append(st);
     const at = if (between.len > 0) between[between.len - 1].pos else read.pos;
-    if (which == .update) try stages.append(.{ .node = .{ .select = try projection(env, w, data, ids, kind == .whole) }, .hints = &.{}, .pos = at });
+    if (which == .update) try stages.append(.{ .node = .{ .select = if (kind == .whole) try setProjection(env, w, data, ids) else try projection(env, w, data, ids) }, .hints = &.{}, .pos = at });
+    if (which == .delete and kind == .whole) try stages.append(.{ .node = .{ .select = try idsOnly(a, ids) }, .hints = &.{}, .pos = at });
     if (kind == .sheet) if (try xlsxedit.problem(a, path, first.loc.?)) |why| {
         first.src.close();
         return planErr(env.diag, try msgfmt.allocPrint(a, "{s}: {s}", .{ what, why }));
@@ -102,6 +104,16 @@ pub fn run(env: *Env, w: ast.Write, read: ast.Stage, between_in: []const ast.Sta
     key[0] = .{ .field = .{ .parts = try a.dupe([]const u8, &.{ids[0]}) }, .desc = false, .nulls_first = false };
     try stages.append(.{ .node = .{ .sort = .{ .keys = key } }, .hints = &.{}, .pos = at });
 
+    if (kind == .whole) if (try plan.projectedColumns(env, stages.items)) |cols| {
+        var keep = std.array_list.Managed([]const u8).init(a);
+        for (cols) |c| if (data.indexOf(c) != null) try keep.append(c);
+        if (keep.items.len == 0) try keep.append(data.fields[0].name);
+        if (keep.items.len < data.fields.len) {
+            first.src.close();
+            const src = try source.openSourceProjected(env, read.node.read, read.hints, keep.items, &.{});
+            first.src = (try Numbered.open(a, src)).source();
+        }
+    };
     const scan = try a.create(op.Scan);
     scan.* = .{ .src = first.src };
     var current: op.Op = .{ .scan = scan };
@@ -125,10 +137,10 @@ pub fn run(env: *Env, w: ast.Write, read: ast.Stage, between_in: []const ast.Sta
         env.log.script(try msgfmt.allocPrint(a, "{s}: would {s} {d} row{s}", .{ what, if (which == .delete) "delete" else "update", n, if (n == 1) "" else "s" }));
         return;
     }
-    const n = switch (kind) {
+    const n = if (try hits.peek() == null) 0 else switch (kind) {
         .csv, .ndjson => try rewriteText(env, w, path, kind, which, read, data, &hits, guard, what),
         .sheet => try rewriteXlsx(env, path, first, which, &hits, guard, what),
-        .whole => try rewriteWhole(env, w, format, want, first.array, which, read, data, &hits, guard, what),
+        .whole => try rewriteWhole(env, w, format, want, first.array, which, read, data, &hits, guard, what, opts),
     };
     stats.rows_out += n;
     const ms = std.time.milliTimestamp() - t0;
@@ -227,9 +239,49 @@ fn openRead(env: *Env, read: ast.Stage, format: analyze.FileFormat, kind: *Kind)
     return .{ .src = num.source(), .data = src.schema() };
 }
 
-/// The UPDATE's new rows: every column of the file, a SET one its expression (cast to
-/// the column's type where the format keeps types), then the identity columns.
-fn projection(env: *Env, w: ast.Write, data: types.Schema, ids: []const []const u8, typed: bool) ![]ast.SelectItem {
+/// An UPDATE's new values in a file written again whole: each column a SET names, in
+/// the file's order, its expression cast to the column's type, then the row's place;
+/// the rewrite takes the other columns from the row as it reads it again, so the
+/// first read decodes only the columns the conditions and the SETs read.
+fn setProjection(env: *Env, w: ast.Write, data: types.Schema, ids: []const []const u8) ![]ast.SelectItem {
+    const a = env.arena;
+    const u = w.update.?;
+    var items = std.array_list.Managed(ast.SelectItem).init(a);
+    for (data.fields) |f| for (u.sets) |set| if (std.ascii.eqlIgnoreCase(set.column, f.name)) {
+        const e = @constCast(try analyze.dmlOwn(a, w, try analyze.substExpr(a, set.expr, env.params_expr)));
+        try items.append(.{ .computed = .{ .name = f.name, .expr = try ast.mk(a, .{ .cast = .{ .e = e, .ty = f.ty } }) } });
+    };
+    for (ids) |id| try items.append(.{ .field = .{ .parts = try a.dupe([]const u8, &.{id}) } });
+    return items.toOwnedSlice();
+}
+
+/// A DELETE's rows as the rewrite takes them, their places alone, so the first read
+/// decodes only the columns the conditions read.
+fn idsOnly(a: std.mem.Allocator, ids: []const []const u8) ![]ast.SelectItem {
+    const items = try a.alloc(ast.SelectItem, ids.len);
+    for (items, ids) |*it, id| it.* = .{ .field = .{ .parts = try a.dupe([]const u8, &.{id}) } };
+    return items;
+}
+
+/// Where a file written again whole finds each column's new value in the UPDATE's
+/// changed rows (`setProjection`): its place there, or null for one no SET names.
+fn setPlaces(a: std.mem.Allocator, w: ast.Write, data: types.Schema) ![]const ?usize {
+    const out = try a.alloc(?usize, data.fields.len);
+    var k: usize = 0;
+    for (out, data.fields) |*o, f| {
+        o.* = null;
+        for (w.update.?.sets) |set| if (std.ascii.eqlIgnoreCase(set.column, f.name)) {
+            o.* = k;
+            k += 1;
+            break;
+        };
+    }
+    return out;
+}
+
+/// The UPDATE's new rows in a text file or a sheet: every column of the file, a SET
+/// one its expression, then the identity columns.
+fn projection(env: *Env, w: ast.Write, data: types.Schema, ids: []const []const u8) ![]ast.SelectItem {
     const a = env.arena;
     const u = w.update.?;
     const items = try a.alloc(ast.SelectItem, data.fields.len + ids.len);
@@ -237,7 +289,7 @@ fn projection(env: *Env, w: ast.Write, data: types.Schema, ids: []const []const 
         it.* = .{ .field = .{ .parts = try a.dupe([]const u8, &.{f.name}) } };
         for (u.sets) |set| if (std.ascii.eqlIgnoreCase(set.column, f.name)) {
             const e = @constCast(try analyze.dmlOwn(a, w, try analyze.substExpr(a, set.expr, env.params_expr)));
-            it.* = .{ .computed = .{ .name = f.name, .expr = if (typed) try ast.mk(a, .{ .cast = .{ .e = e, .ty = f.ty } }) else e } };
+            it.* = .{ .computed = .{ .name = f.name, .expr = e } };
         };
     }
     for (items[data.fields.len..], ids) |*it, id| it.* = .{ .field = .{ .parts = try a.dupe([]const u8, &.{id}) } };
@@ -447,7 +499,7 @@ const Copy = struct {
 
 /// Reads `path` again and writes it whole through its format's writer, each row the
 /// changes leave in its place; the rows changed.
-fn rewriteWhole(env: *Env, w: ast.Write, format: analyze.FileFormat, want: ?analyze.FileFormat, array: bool, which: Op, read: ast.Stage, data: types.Schema, hits: *Hits, guard: Guard, what: []const u8) !u64 {
+fn rewriteWhole(env: *Env, w: ast.Write, format: analyze.FileFormat, want: ?analyze.FileFormat, array: bool, which: Op, read: ast.Stage, data: types.Schema, hits: *Hits, guard: Guard, what: []const u8, opts: RunOptions) !u64 {
     const a = env.arena;
     const src = try source.openSourceProjected(env, read.node.read, read.hints, null, &.{});
     const num = try Numbered.open(a, src);
@@ -472,49 +524,66 @@ fn rewriteWhole(env: *Env, w: ast.Write, format: analyze.FileFormat, want: ?anal
     var ok = false;
     defer if (!ok) sink.abort();
 
+    const places: []const ?usize = if (which == .update) try setPlaces(a, w, data) else blk: {
+        const none = try a.alloc(?usize, data.fields.len);
+        @memset(none, null);
+        break :blk none;
+    };
+    const piped = sink.unitRows() > 0 and opts.lanes() > 1;
+    var up: UnitPipeline = undefined;
+    if (piped) try up.start(a, env.gpa, sink, opts.lanes() - 1);
+    defer if (piped) up.shutdown();
     var mem = std.heap.ArenaAllocator.init(env.gpa);
     defer mem.deinit();
     var n: u64 = 0;
     var last: ?u64 = null;
+    const twice = "{s}: a row matches more than one row of the FROM source, so it would take one of several values; give each key once";
     while (try num.next(mem.allocator())) |b| {
         defer _ = mem.reset(.retain_capacity);
         const ma = mem.allocator();
         const first: u64 = num.n - b.len;
         const top: u64 = num.n;
-        const next_hit = try hits.peek();
-        const cols = b.columns[0..data.fields.len];
-        if (next_hit == null or next_hit.? >= top) {
-            try sink.writeBatch(ma, .{ .schema = &data, .columns = cols, .len = b.len });
-            continue;
-        }
-        const builders = try ma.alloc(column.Builder, cols.len);
-        for (builders, data.fields) |*bd, f| bd.* = try column.Builder.initCapacity(ma, f.ty, b.len);
-        var rows: usize = 0;
-        for (0..b.len) |r| {
-            const ord = first + r;
-            const h = try hits.peek();
-            if (h != null and h.? == ord) {
-                if (last) |l| if (l == ord)
-                    return planErr(env.diag, try msgfmt.allocPrint(a, "{s}: a row matches more than one row of the FROM source, so it would take one of several values; give each key once", .{what}));
-                last = ord;
-                n += 1;
-                if (which == .update) {
-                    for (builders, 0..) |*bd, c| try bd.append(hits.b.?.columns[c].getValue(hits.i));
-                    rows += 1;
+        var out = b.columns[0..data.fields.len];
+        var len = b.len;
+        if (try hits.peek()) |h| if (h < top) {
+            out = try ma.dupe(column.Column, out);
+            const keep = try ma.alloc(bool, b.len);
+            @memset(keep, true);
+            const builders = try ma.alloc(column.Builder, places.len);
+            for (builders, places, data.fields) |*bd, at, f| if (at != null) {
+                bd.* = try column.Builder.initCapacity(ma, f.ty, b.len);
+            };
+            for (0..b.len) |r| {
+                const ord = first + r;
+                const hit = if (try hits.peek()) |x| x == ord else false;
+                if (hit) {
+                    if (last) |l| if (l == ord) return planErr(env.diag, try msgfmt.allocPrint(a, twice, .{what}));
+                    last = ord;
+                    n += 1;
+                    keep[r] = false;
                 }
-                hits.i += 1;
-                if (try hits.peek()) |again| if (again == ord)
-                    return planErr(env.diag, try msgfmt.allocPrint(a, "{s}: a row matches more than one row of the FROM source, so it would take one of several values; give each key once", .{what}));
-                continue;
+                for (builders, places, out) |*bd, at, c| if (at) |i|
+                    try bd.append(if (hit) hits.b.?.columns[i].getValue(hits.i) else c.getValue(r));
+                if (hit) {
+                    hits.i += 1;
+                    if (try hits.peek()) |again| if (again == ord) return planErr(env.diag, try msgfmt.allocPrint(a, twice, .{what}));
+                }
             }
-            for (builders, cols) |*bd, c| try bd.append(c.getValue(r));
-            rows += 1;
-        }
-        if (rows == 0) continue;
-        const out = try ma.alloc(column.Column, cols.len);
-        for (builders, out) |*bd, *o| o.* = try bd.finish();
-        try sink.writeBatch(ma, .{ .schema = &data, .columns = out, .len = rows });
+            if (which == .update) {
+                for (builders, places, out) |*bd, at, *o| if (at != null) {
+                    o.* = try bd.finish();
+                };
+            } else {
+                len = 0;
+                for (keep) |k| len += @intFromBool(k);
+                if (len == 0) continue;
+                for (out) |*o| o.* = try column.gather(ma, o.*, keep, len);
+            }
+        };
+        const batch = Batch{ .schema = &data, .columns = out, .len = len };
+        if (piped) try up.submit(batch) else try sink.writeBatch(ma, batch);
     }
+    if (piped and n > 0) try up.finish();
     if (n == 0) return 0;
     if (!guard.holds()) return planErr(env.diag, try msgfmt.allocPrint(a, "{s}: the file changed while it was rewritten, so the rewrite is not put in its place; run it again", .{what}));
     sink.close() catch |e| return planErrT(env.diag, e, try msgfmt.allocPrint(a, "{s}: could not write it ({s})", .{ what, @errorName(e) }));
