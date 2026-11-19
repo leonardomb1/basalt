@@ -1379,7 +1379,7 @@ test "DELETE FROM a Delta table: conditions and IN / NOT IN / NOT EXISTS subquer
     }
 }
 
-test "DELETE FROM a partitioned Delta table removes a partition's files unread, and a table taking deletion vectors marks rows in them, with their change data" {
+test "DELETE FROM a partitioned Delta table removes a partition's files unread, and a table taking deletion vectors marks rows in them, with their change data, which a later statement of the script reads" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
     const a = ar.allocator();
@@ -1414,6 +1414,8 @@ test "DELETE FROM a partitioned Delta table removes a partition's files unread, 
     try testing.expect(std.mem.indexOf(u8, try logFile(a, &tmp, "t", 3), "\"cardinality\":3}") != null);
     try testing.expectEqualStrings("id,grp\n1,a\n4,b\n6,b\n", try rows(a, &tmp, "SELECT * FROM '$B/t/' ORDER BY id"));
     try testing.expectEqualStrings("id,_change_type,_commit_version\n3,delete,2\n5,delete,2\n2,delete,3\n", try rows(a, &tmp, "SELECT id, _change_type, _commit_version FROM '$B/t/' WITH (changes_from = 2) ORDER BY _commit_version, id"));
+    try load(&tmp, "DELETE FROM '$B/t/' WHERE id = 4; LOAD INTO '$B/feed.csv' AS SELECT id, _change_type, _commit_version FROM '$B/t/' WITH (changes_from = 4);", 1);
+    try harness.expectFile(&tmp, "feed.csv", "id,_change_type,_commit_version\n4,delete,4\n");
 }
 
 test "DELETE FROM a Delta table: a folder holding none, an append-only table and a correlation by other than equalities are refused" {

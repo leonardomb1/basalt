@@ -1063,10 +1063,11 @@ fn analyzeInner(arena: std.mem.Allocator, raw_program: ast.Program, opts: Option
     try bindBodyVars(arena, program.stmts, &params_map);
 
     var written = std.array_list.Managed([]const u8).init(arena);
-    try writtenFiles(arena, program.stmts[1..], &written);
+    var changed = std.array_list.Managed([]const u8).init(arena);
+    try writtenFiles(arena, program.stmts[1..], &written, &changed);
     var json_params = std.array_list.Managed([]const u8).init(arena);
     for (program.stmts) |s| if (s == .param and s.param.is_json) try json_params.append(s.param.name);
-    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .lets = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues, .written = written.items, .json_params = json_params.items, .tables = opts.tables, .lanes = opts.lanes };
+    var ctx = Ctx{ .arena = arena, .bindings = &bindings, .connections = &connections, .params = &params_map, .lets = &params_map, .diag = diag, .known = opts.known_tables, .issues = opts.issues, .written = written.items, .changed = changed.items, .json_params = json_params.items, .tables = opts.tables, .lanes = opts.lanes };
 
     var out_plans = std.array_list.Managed(Output).init(arena);
     try ctx.checkStmts(program.stmts[1..], &out_plans, true);
@@ -1175,24 +1176,28 @@ pub fn checkJoinHints(arena: std.mem.Allocator, stages: []const ast.Stage, diag:
     };
 }
 
-/// Every file the script writes, in any statement or body. A read of one is typed
-/// by the run, not from what is on disk now: a copy left by an earlier run may have
-/// other columns than the one this script writes before it reads.
-fn writtenFiles(arena: std.mem.Allocator, stmts: []const ast.Stmt, out: *std.array_list.Managed([]const u8)) Error!void {
+/// Every file the script writes, in any statement or body, and apart (`changed`)
+/// every one a DELETE or UPDATE changes. A read of a written one is typed by the
+/// run, not from what is on disk now: a copy left by an earlier run may have other
+/// columns than the one this script writes before it reads. A changed one keeps its
+/// columns, but a read of one of its versions is left to the run too, the version
+/// being one the change may make.
+fn writtenFiles(arena: std.mem.Allocator, stmts: []const ast.Stmt, out: *std.array_list.Managed([]const u8), changed: *std.array_list.Managed([]const u8)) Error!void {
     for (stmts) |s| switch (s) {
-        .output => |p| try writtenFile(p, out),
-        .explain => |e| try writtenFile(e.pipeline, out),
-        .for_each => |fe| try writtenFiles(arena, fe.body, out),
-        .match => |m| for (m.arms) |arm| try writtenFiles(arena, arm.body, out),
-        .func => |fd| if (fd.body == .stmts) try writtenFiles(arena, fd.body.stmts, out),
+        .output => |p| try writtenFile(p, out, changed),
+        .explain => |e| try writtenFile(e.pipeline, out, changed),
+        .for_each => |fe| try writtenFiles(arena, fe.body, out, changed),
+        .match => |m| for (m.arms) |arm| try writtenFiles(arena, arm.body, out, changed),
+        .func => |fd| if (fd.body == .stmts) try writtenFiles(arena, fd.body.stmts, out, changed),
         else => {},
     };
 }
 
-fn writtenFile(p: ast.Pipeline, out: *std.array_list.Managed([]const u8)) Error!void {
+fn writtenFile(p: ast.Pipeline, out: *std.array_list.Managed([]const u8), changed: *std.array_list.Managed([]const u8)) Error!void {
     if (p.stages.len == 0) return;
     const last = p.stages[p.stages.len - 1];
-    if (last.node != .write or !std.mem.eql(u8, last.node.write.connector, "csv") or last.node.write.delete != null or last.node.write.update != null) return;
+    if (last.node != .write or !std.mem.eql(u8, last.node.write.connector, "csv")) return;
+    if (last.node.write.delete != null or last.node.write.update != null) return changed.append(last.node.write.target);
     try out.append(last.node.write.target);
 }
 
@@ -1224,6 +1229,7 @@ const Ctx = struct {
     known: []const KnownTable = &.{},
     issues: ?*std.array_list.Managed(Issue) = null,
     written: []const []const u8 = &.{},
+    changed: []const []const u8 = &.{},
     json_params: ?[]const []const u8 = null,
     tables: ?*lake.Memo = null,
     /// The lanes the run takes; past one, a pipeline may fan out.
@@ -1727,7 +1733,8 @@ const Ctx = struct {
                 const later = for (lead.hints) |h| {
                     if (h.value == .later) break true;
                 } else false;
-                const unread_offline = later or (rd.form == .path and ast.nameIn(self.written, rd.form.path));
+                const unread_offline = later or (rd.form == .path and (ast.nameIn(self.written, rd.form.path) or
+                    (ast.nameIn(self.changed, rd.form.path) and (try lakeAt(lead.hints, self.diag)).pinned())));
                 if (!unread_offline and rd.form == .path and std.mem.eql(u8, connector, "csv")) {
                     const t = offlineTable(self.arena, rd.form.path, lead.hints, self.tables) catch |e|
                         return fail(self.diag, "{s}", .{eval.takeFailure(e) orelse @errorName(e)});
