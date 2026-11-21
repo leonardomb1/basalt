@@ -17,8 +17,10 @@ const std = @import("std");
 const msgfmt = @import("../../base/msgfmt.zig");
 const noteStep = @import("../run/explain.zig").noteStep;
 
-/// Append a discovery batch's first `ncols` columns as text (null → ""), shared by
-/// every discovery form so all agree on coercion and the column-count error.
+/// Append a discovery batch's first `ncols` columns as text (null → ""), each value
+/// as a cell renders it (a DATE as `2026-01-31`), shared by every discovery form so
+/// all agree on coercion and the column-count error. A typed loop variable reads its
+/// type back from that text (`env.loopValue`).
 fn appendDiscoveryRows(env: *Env, rows: *std.array_list.Managed(Row), b: Batch, ncols: usize) !void {
     if (b.columns.len == 0) return;
     if (try analyze.loopColumnsProblem(env.arena, b.columns.len, ncols)) |why| return planErr(env.diag, why);
@@ -28,8 +30,7 @@ fn appendDiscoveryRows(env: *Env, rows: *std.array_list.Managed(Row), b: Batch, 
             row[j] = switch (b.columns[j].getValue(r)) {
                 .null => "",
                 .string, .bytes => |s| try env.arena.dupe(u8, s),
-                .int => |x| try msgfmt.allocPrint(env.arena, "{d}", .{x}),
-                else => return planErr(env.diag, "for-each values must be string or int"),
+                else => |v| try @import("../../exec/eval.zig").valueToString(env.arena, v),
             };
         }
         try rows.append(row);

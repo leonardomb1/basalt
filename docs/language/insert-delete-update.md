@@ -196,9 +196,11 @@ format:
 - A CSV or NDJSON file is copied byte for byte. Every record the statement does
   not change stays exactly as it was, with its quoting and line ending, and so do
   a byte order mark, blank lines and the file's text encoding. A deleted record
-  goes with its line ending. An updated CSV record is written as `LOAD INTO`
-  writes a row, in the file's delimiter and encoding; an updated NDJSON object
-  keeps its other keys as they were and changes only the ones set.
+  goes with its line ending. An updated CSV record keeps every field the SET does
+  not name as its bytes, so a FLOAT column keeps all its digits and `21168.20`
+  its zero, and the fields set are written as `LOAD INTO` writes them, in the
+  file's delimiter and encoding; an updated NDJSON object likewise keeps its other
+  keys as they were and changes only the ones set.
 - An Excel workbook keeps every part but the sheet as it was: the other sheets,
   the shared strings, the styles. In the sheet each row kept is copied as it
   is, moved up past the rows deleted above it, and an updated row is written as

@@ -769,7 +769,8 @@ fn runForStmt(env: *Env, s: *const ast.Stmt, lr: LoopRow, opts: RunOptions, stat
 }
 
 /// The loop variables are bound over same-named params. Untyped ones bind as strings;
-/// a `name:type` one binds the coerced value, so `port >= 1000` compares numerically.
+/// a typed one (`AS (port INT)`) binds the coerced value, so `port >= 1000` compares
+/// numerically.
 fn runForMatch(env: *Env, m: ast.StmtMatch, lr: LoopRow, opts_in: RunOptions, stats: *Stats, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) anyerror!void {
     const was_explain = env.explain;
     defer env.explain = was_explain;

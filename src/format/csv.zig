@@ -932,6 +932,20 @@ const Field = struct {
 
 /// The field at `line[i.*]`, moving `i` past its delimiter, so `i` passes `line.len`
 /// once the last field is taken; a quote left open runs to the end of the line.
+/// The bytes of each field of `record` (one record, its line ending cut) as written,
+/// quotes and all, split as the reader splits it; the encodings CSV reads keep the
+/// delimiter and the quote as their ASCII bytes, so a split on those bytes is exact.
+pub fn rawFields(arena: std.mem.Allocator, record: []const u8, delim: u8) ![]const []const u8 {
+    var out = std.array_list.Managed([]const u8).init(arena);
+    var i: usize = 0;
+    while (i <= record.len) {
+        const start = i;
+        _ = takeField(record, &i, delim);
+        try out.append(record[start..@min(i - 1, record.len)]);
+    }
+    return out.items;
+}
+
 fn takeField(line: []const u8, i: *usize, delim: u8) Field {
     const start = i.*;
     if (start >= line.len or line[start] != '"') {

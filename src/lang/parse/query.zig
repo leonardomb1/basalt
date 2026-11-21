@@ -2150,6 +2150,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             }
             try needed.appendSlice(real_keys);
             for (needed.items) |q0| {
+                if (q0.dollar) continue;
                 const q = stripQual(q0, &aliases);
                 const have = for (kept.items) |it| {
                     if (it == .field and qualEql(it.field, q)) break true;

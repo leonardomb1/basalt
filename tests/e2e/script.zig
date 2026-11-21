@@ -793,6 +793,37 @@ test "for-each: a typed loop var used as a value binds as its declared type" {
     try std.testing.expect(std.mem.indexOf(u8, rdiag.msg, "loop variable `n`: `ana` is not int") != null);
 }
 
+test "a PARAM or LET read inside an aggregate beside a computed GROUP BY key is a value, not a column" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "v.csv", .data = "id,valor\n1,10\n2,30\n3,40\n" });
+    try checkAndRun(alloc, &tmp,
+        \\PARAM corte INT DEFAULT 25;
+        \\LET peso = 2;
+        \\LOAD INTO '$B/o.csv' AS SELECT valor > 25 AS f, sum(CASE WHEN valor > $corte THEN $peso ELSE 0 END) AS n FROM '$B/v.csv' GROUP BY f ORDER BY f;
+    , 1, &.{});
+    try expectFile(&tmp, "o.csv", "f,n\nfalse,0\ntrue,4\n");
+}
+
+test "for-each: a DATE or DECIMAL loop var binds as its type, from text or a typed discovery column, and an untyped one takes any column as text" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try checkAndRun(alloc, &tmp,
+        \\FOR EACH ROW OF (SELECT '2026-01-31' AS d, CAST('2026-02-28' AS DATE) AS e, CAST('12.50' AS DECIMAL(10,2)) AS m) AS (d DATE, e DATE, m DECIMAL(10,2))
+        \\  THROW 'old' WHEN $d < CAST('2020-01-01' AS DATE);
+        \\  LOAD INTO '$B/o.csv' AS SELECT date_add('day', 1, $d) AS d1, date_add('day', 1, $e) AS e1, $m * 2 AS m2;
+        \\END FOR;
+        \\FOR EACH ROW OF (SELECT CAST('2026-02-28' AS DATE) AS d, 1.5 AS x, true AS b) AS (d, x, b)
+        \\  LOAD INTO '$B/u.csv' AS SELECT $d || ' ' || $x || ' ' || $b AS t;
+        \\END FOR;
+    , 1, &.{});
+    try expectFile(&tmp, "o.csv", "d1,e1,m2\n2026-02-01,2026-03-01,25.00\n");
+    try expectFile(&tmp, "u.csv", "t\n2026-02-28 1.5 true\n");
+    try expectRunRefuses(alloc, &tmp, "FOR EACH ROW OF (SELECT 'nope' AS d) AS (d DATE)\n  LOAD INTO '$B/n.csv' AS SELECT $d AS d;\nEND FOR;", 1, "loop variable `d`: `nope` is not date");
+}
+
 test "param substitution filters by a CLI-bound value" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

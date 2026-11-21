@@ -674,6 +674,8 @@ pub const LoopRow = struct {
             switch (t.kind) {
                 .int, .float, .bool => _ = eval.castValue(arena, .{ .string = cell }, t.kind) catch
                     return .{ .name = nm, .cell = cell, .ty = t },
+                .date, .time, .timestamp, .decimal => _ = eval.castValueTyped(arena, .{ .string = cell }, t) catch
+                    return .{ .name = nm, .cell = cell, .ty = t },
                 else => {},
             }
         }
@@ -859,6 +861,7 @@ pub fn loopValue(arena: std.mem.Allocator, cell: []const u8, ty: ?types.Type) Va
     if (cell.len == 0) return .null;
     return switch (t.kind) {
         .int, .float, .bool => eval.castValue(arena, .{ .string = cell }, t.kind) catch .null,
+        .date, .time, .timestamp, .decimal => eval.castValueTyped(arena, .{ .string = cell }, t) catch .null,
         else => .{ .string = cell },
     };
 }

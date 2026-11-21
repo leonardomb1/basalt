@@ -37,6 +37,16 @@ test "DELETE and UPDATE of a CSV file keep every byte outside the records they c
     try harness.expectFile(&tmp, "t.csv", "id,nome\n1,a\n2,x\n3,c\n");
 }
 
+test "UPDATE of a CSV file writes only the fields its SET names: a FLOAT keeps all its digits, a decimal its trailing zero, a quoted field its quotes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "u.csv", .data = "id,status,f,big,note\r\n1,a,0.1234567890123456789,12345678901234567890,\"x, y\"\r\n2,b,21168.20,1,\"\"\r\n3,c,1e5,2,plain" });
+    try load(&tmp, "UPDATE '$B/u.csv' SET status = 'x, z' WHERE id <= 2;");
+    try harness.expectFile(&tmp, "u.csv", "id,status,f,big,note\r\n1,\"x, z\",0.1234567890123456789,12345678901234567890,\"x, y\"\r\n2,\"x, z\",21168.20,1,\"\"\r\n3,c,1e5,2,plain");
+    try load(&tmp, "UPDATE '$B/u.csv' SET big = big + 1, status = 'q' WHERE id = 3;");
+    try harness.expectFile(&tmp, "u.csv", "id,status,f,big,note\r\n1,\"x, z\",0.1234567890123456789,12345678901234567890,\"x, y\"\r\n2,\"x, z\",21168.20,1,\"\"\r\n3,q,1e5,3,plain");
+}
+
 test "DELETE and UPDATE of an NDJSON file: a deleted line goes with its indent and ending, an update changes only the keys it sets" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();

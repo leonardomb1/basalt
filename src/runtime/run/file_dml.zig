@@ -358,39 +358,31 @@ fn rewriteText(env: *Env, w: ast.Write, path: []const u8, kind: Kind, which: Op,
         last = start;
         const end = hits.spanEnd();
         try cp.copyTo(start);
-        if (kind == .ndjson and which == .update) {
+        if (which == .update) {
             _ = line.reset(.retain_capacity);
             const la = line.allocator();
             const orig = try cp.take(la, end);
             const row = try op.sliceBatch(la, hits.b.?, hits.i, 1);
             const one = Batch{ .schema = &data, .columns = row.columns[0..hits.width], .len = 1 };
-            try cp.out.writeAll(try patchObject(la, orig, try jsonwrite.renderLines(la, data, one), w.update.?.sets, data));
+            if (kind == .ndjson) {
+                try cp.out.writeAll(try patchObject(la, orig, try jsonwrite.renderLines(la, data, one), w.update.?.sets, data));
+            } else {
+                var aw = std.Io.Writer.Allocating.init(la);
+                try csvfmt.renderRows(&aw.writer, one, dialect.delim);
+                var text: []const u8 = aw.written();
+                if (text.len > 0 and text[text.len - 1] == '\n') text = text[0 .. text.len - 1];
+                text = csvfmt.encodeField(la, dialect.encoding, text) catch
+                    return planErr(env.diag, try msgfmt.allocPrint(a, "{s}: an updated row holds a character {s} cannot hold", .{ what, @tagName(dialect.encoding) }));
+                const ending = lineEnding(orig);
+                try cp.out.writeAll(try patchRecord(la, orig[0 .. orig.len - ending.len], text, w.update.?.sets, data, dialect.delim));
+                try cp.out.writeAll(ending);
+            }
             n += 1;
             hits.i += 1;
             continue;
         }
-        const tail = try cp.skipTo(end);
-        if (kind == .ndjson and which == .delete) try cp.skipLineEnd();
-        if (which == .update) {
-            _ = line.reset(.retain_capacity);
-            const la = line.allocator();
-            const row = try op.sliceBatch(la, hits.b.?, hits.i, 1);
-            const cols = row.columns[0..hits.width];
-            const one = Batch{ .schema = &data, .columns = cols, .len = 1 };
-            var text = switch (kind) {
-                .csv => blk: {
-                    var aw = std.Io.Writer.Allocating.init(la);
-                    try csvfmt.renderRows(&aw.writer, one, dialect.delim);
-                    break :blk aw.written();
-                },
-                else => try jsonwrite.renderLines(la, data, one),
-            };
-            if (text.len > 0 and text[text.len - 1] == '\n') text = text[0 .. text.len - 1];
-            if (kind == .csv) text = csvfmt.encodeField(la, dialect.encoding, text) catch
-                return planErr(env.diag, try msgfmt.allocPrint(a, "{s}: an updated row holds a character {s} cannot hold", .{ what, @tagName(dialect.encoding) }));
-            try cp.out.writeAll(text);
-            if (kind == .csv) try cp.out.writeAll(tail.ending());
-        }
+        _ = try cp.skipTo(end);
+        if (kind == .ndjson) try cp.skipLineEnd();
         n += 1;
         hits.i += 1;
     }
@@ -414,13 +406,17 @@ const Tail = struct {
     len: usize = 0,
 
     fn ending(self: *const Tail) []const u8 {
-        const t = self.b[0..self.len];
-        if (std.mem.endsWith(u8, t, "\r\n")) return "\r\n";
-        if (std.mem.endsWith(u8, t, "\n")) return "\n";
-        if (std.mem.endsWith(u8, t, "\r")) return "\r";
-        return "";
+        return lineEnding(self.b[0..self.len]);
     }
 };
+
+/// The line ending `record` closes with, or "" for a last record without one.
+fn lineEnding(record: []const u8) []const u8 {
+    if (std.mem.endsWith(u8, record, "\r\n")) return "\r\n";
+    if (std.mem.endsWith(u8, record, "\n")) return "\n";
+    if (std.mem.endsWith(u8, record, "\r")) return "\r";
+    return "";
+}
 
 /// A decoded stream copied to the rewrite up to a byte, or passed over.
 const Copy = struct {
@@ -658,6 +654,26 @@ fn patchObject(a: std.mem.Allocator, orig: []const u8, fresh: []const u8, sets: 
     try out.appendSlice(obj[at..close]);
     try out.appendSlice(added.items);
     try out.appendSlice(obj[close..]);
+    return out.items;
+}
+
+/// CSV record `orig` (its line ending cut) with the fields of the columns `sets` name
+/// taken from `fresh`, the updated row as the writer renders it, and every other field
+/// kept as its bytes, so a column the SET does not name is never written again from
+/// the value it was read as (a FLOAT column keeps all its digits). A record whose
+/// fields do not line up with the columns is written as `fresh`.
+fn patchRecord(a: std.mem.Allocator, orig: []const u8, fresh: []const u8, sets: []const ast.Update.Set, data: types.Schema, delim: u8) ![]const u8 {
+    const old = try csvfmt.rawFields(a, orig, delim);
+    const new = try csvfmt.rawFields(a, fresh, delim);
+    if (old.len != data.fields.len or new.len != data.fields.len) return fresh;
+    var out = std.array_list.Managed(u8).init(a);
+    for (data.fields, old, new, 0..) |f, o, n, i| {
+        if (i > 0) try out.append(delim);
+        const set = for (sets) |st| {
+            if (std.ascii.eqlIgnoreCase(st.column, f.name)) break true;
+        } else false;
+        try out.appendSlice(if (set) n else o);
+    }
     return out.items;
 }
 

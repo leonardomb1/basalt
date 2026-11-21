@@ -1252,11 +1252,11 @@ pub fn analyzeOne(
 const BodyVar = struct { name: []const u8, ty: types.Type, untyped: enum { no, loop, param } };
 
 /// A loop variable's or statement-function parameter's type as the run binds its
-/// text: an INT, FLOAT or BOOL as declared, anything else a STRING.
+/// text (`env.loopValue`): a scalar type as declared, anything else a STRING.
 fn boundVar(name: []const u8, declared: ?types.Type, kind: @FieldType(BodyVar, "untyped")) BodyVar {
     const t = declared orelse return .{ .name = name, .ty = types.Type.init(.string), .untyped = kind };
     return switch (t.kind) {
-        .int, .float, .bool => .{ .name = name, .ty = t.asNullable(), .untyped = .no },
+        .int, .float, .bool, .date, .time, .timestamp, .decimal => .{ .name = name, .ty = t.asNullable(), .untyped = .no },
         else => .{ .name = name, .ty = types.Type.init(.string), .untyped = .no },
     };
 }

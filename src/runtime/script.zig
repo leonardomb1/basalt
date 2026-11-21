@@ -796,6 +796,7 @@ pub fn runForEach(env: *Env, fe: ast.ForEach, opts_in: RunOptions, stats: *Stats
         .stop;
 
     const rows = blk: {
+        errdefer env.diag.stamp(fe.pos);
         const step = try explain.openStep(env, env.explain, "FOR EACH discovery");
         defer explain.closeStep(env, step);
         break :blk switch (fe.source) {
