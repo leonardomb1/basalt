@@ -99,12 +99,13 @@ fn findIn(arena: std.mem.Allocator, path: []const u8, name: []const u8, pats: []
 pub fn rewrite(arena: std.mem.Allocator, path: []const u8, plan: Plan, out: *std.Io.Writer) !void {
     const z = try zipwrite.Writer.init(arena, out);
     defer z.deinit();
-    var styles = write.Styles{};
+    var styles = write.Styles{ .date1904 = plan.loc.date1904 };
     var new_styles: ?[]const u8 = null;
     if (temporal(plan)) if (plan.loc.styles) |sp| {
         const patched = try addStyles(arena, path, sp);
         new_styles = patched.text;
         styles = patched.ids;
+        styles.date1904 = plan.loc.date1904;
     };
     for (try zipsrc.names(arena, path)) |name| {
         if (std.mem.eql(u8, name, plan.loc.sheet_part)) {
@@ -140,49 +141,10 @@ fn temporal(plan: Plan) bool {
     return false;
 }
 
-const Patched = struct { text: []const u8, ids: write.Styles };
-
-/// The styles part with three cell formats added at the end of `cellXfs`, Excel's
-/// built-in date (14), date and time (22) and time (21) number formats, and their
-/// indices.
-fn addStyles(arena: std.mem.Allocator, path: []const u8, part: []const u8) !Patched {
-    const m = try zipsrc.openMember(arena, path, part);
-    defer m.close();
-    var aw = std.Io.Writer.Allocating.init(arena);
-    _ = try m.reader.streamRemaining(&aw.writer);
-    const text = aw.written();
-    const open = std.mem.indexOf(u8, text, "<cellXfs") orelse return error.BadXml;
-    const close = std.mem.indexOfPos(u8, text, open, "</cellXfs>") orelse return error.BadXml;
-    var n: usize = 0;
-    var at = open;
-    while (std.mem.indexOfPos(u8, text, at + 1, "<xf")) |i| {
-        if (i >= close) break;
-        n += 1;
-        at = i;
-    }
-    const xf = "<xf numFmtId=\"{d}\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/>";
-    var o = std.array_list.Managed(u8).init(arena);
-    const head_end = (std.mem.indexOfScalarPos(u8, text, open, '>') orelse return error.BadXml) + 1;
-    const head = text[open..head_end];
-    try o.appendSlice(text[0..open]);
-    if (std.mem.indexOf(u8, head, "count=\"")) |c| {
-        const vs = c + "count=\"".len;
-        const ve = std.mem.indexOfScalarPos(u8, head, vs, '"') orelse return error.BadXml;
-        try o.appendSlice(head[0..vs]);
-        try o.writer().print("{d}", .{n + 3});
-        try o.appendSlice(head[ve..]);
-    } else try o.appendSlice(head);
-    try o.appendSlice(text[head_end..close]);
-    for ([_]u16{ 14, 22, 21 }) |id| try o.writer().print(xf, .{id});
-    try o.appendSlice(text[close..]);
-    return .{
-        .text = o.items,
-        .ids = .{
-            .date = try msgfmt.allocPrint(arena, "{d}", .{n}),
-            .timestamp = try msgfmt.allocPrint(arena, "{d}", .{n + 1}),
-            .time = try msgfmt.allocPrint(arena, "{d}", .{n + 2}),
-        },
-    };
+/// The styles part `part` of the workbook at `path` with three temporal formats
+/// added (`write.withTemporalStyles`).
+fn addStyles(arena: std.mem.Allocator, path: []const u8, part: []const u8) !write.Patched {
+    return write.withTemporalStyles(arena, try write.memberText(arena, path, part));
 }
 
 /// The sheet's XML with the plan's changes, streamed from the old into `w`.

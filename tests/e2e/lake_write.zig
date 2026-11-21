@@ -338,6 +338,30 @@ test "Delta USING changes into a table without its position: read whole, the key
     try testing.expect(!exists(&tmp, "t/_delta_log/00000000000000000003.json"));
 }
 
+test "Delta USING changes: a run with nothing new reads no row, whether $since comes from the files' statistics or, for a timestamp position, from reading the table" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    for ([_][]const u8{ "lsn", "ts" }) |pos| {
+        const script = try std.mem.replaceOwned(u8, a, try std.fmt.allocPrint(a,
+            \\LOAD INTO '$B/t_{s}/' WITH (format = 'delta') UPSERT ON (id)
+            \\  USING changes (sequence_by = lsn, delete_when = op = 'd', position = {s})
+            \\AS SELECT * FROM (SELECT *, date_add('second', lsn, CAST('2026-01-01 00:00:00' AS TIMESTAMP)) AS ts FROM '$B/c.csv') c WHERE $since IS NULL OR {s} > $since;
+        , .{ pos, pos, pos }), "$B", base);
+        try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,v,lsn,op\n1,a,1,i\n2,b,2,i\n3,c,3,i\n" });
+        var d1: Diag = .{};
+        try testing.expectEqual(@as(usize, 3), (try harness.exec(gpa, script, .{ .log = .{ .quiet = true } }, &d1)).rows_read);
+        try tmp.dir.writeFile(.{ .sub_path = "c.csv", .data = "id,v,lsn,op\n" });
+        var d2: Diag = .{};
+        const st = try harness.exec(gpa, script, .{ .log = .{ .quiet = true } }, &d2);
+        try testing.expectEqual(@as(usize, 0), st.rows_read);
+        try testing.expectEqual(@as(usize, 0), st.rows_out);
+    }
+}
+
 test "Delta USING changes: each run applies the changes past the table's largest position, the latest per key, a delete kept as _deleted, once" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();

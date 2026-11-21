@@ -231,9 +231,9 @@ fn openRead(env: *Env, read: ast.Stage, format: analyze.FileFormat, kind: *Kind)
             const o = analyze.xlsxOptions(read.hints, &odiag) catch |e| return env_mod.aErr(env, &odiag, e);
             if (o.range != null) return planErr(env.diag, try msgfmt.allocPrint(a, "`{s}`: a sheet read through `range` cannot have its rows changed; drop `range`", .{path}));
             const x = xlsxread.Reader.open(a, env.gpa, path, o) catch |e|
-                return planErrT(env.diag, e, try msgfmt.allocPrint(a, "could not read Excel workbook `{s}` ({s})", .{ path, @errorName(e) }));
+                return planErrT(env.diag, e, try msgfmt.allocPrint(a, "could not read Excel workbook `{s}` ({s})", .{ path, try formats_open.workbookFail(env, path, o.sheet, e) }));
             const loc = xlsxread.locate(a, env.gpa, path, o.sheet) catch |e|
-                return planErrT(env.diag, e, try msgfmt.allocPrint(a, "could not read Excel workbook `{s}` ({s})", .{ path, @errorName(e) }));
+                return planErrT(env.diag, e, try msgfmt.allocPrint(a, "could not read Excel workbook `{s}` ({s})", .{ path, try formats_open.workbookFail(env, path, o.sheet, e) }));
             const num = try Numbered.open(a, x.source());
             return .{ .src = num.source(), .data = x.schema, .loc = loc, .first_row = x.first_row, .c0 = x.c0 };
         },

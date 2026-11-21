@@ -554,7 +554,7 @@ row named like one of its children is `@attr`. Text directly inside the row,
 beside its children, is a column named for the row.
 
 Columns come from the first 1,024 rows, in the order first met; a name first met
-later is dropped, as a JSON key is. Values are typed as a CSV's cells are (INT,
+later is dropped (a JSON key first met past its sample fails the read instead). Values are typed as a CSV's cells are (INT,
 FLOAT, DATE, else text, a leading zero keeping a code text), and a later value
 its typed column cannot read is an error naming the row, not a NULL; read the
 column with `CAST(col AS VARCHAR)` to keep it text. An empty element (`<a/>`)
@@ -643,7 +643,22 @@ of column names, then the rows. It streams in constant memory, to a local file
 ```sql
 LOAD INTO 'fechamento.xlsx' WITH (sheet = 'Vendas') AS
 SELECT loja, dia, SUM(valor) AS total FROM 'vendas.csv' GROUP BY loja, dia;
+LOAD INTO 'fechamento.xlsx' WITH (sheet = 'Resumo') AS
+SELECT loja, SUM(valor) AS total FROM 'vendas.csv' GROUP BY loja;
 ```
+
+With `sheet` named and a workbook already at the target, the load writes that
+sheet and keeps the rest: a sheet of that name (case aside) is written anew in
+its place, and otherwise one is added after the others, so a report of several
+sheets is built one `LOAD INTO` at a time. Every other part of the workbook is
+copied as it is: its other sheets, shared strings, styles (with three date formats
+added when the rows hold dates), charts and defined names. Its calculation chain
+is dropped, as Excel rebuilds it on opening, and dates follow the workbook's own
+calendar, the 1904 one included. A sheet with parts of its own (a table, a drawing,
+comments, a pivot table) is refused rather than written over, and so is the name of
+a chart sheet. With no file there, or no `sheet` named, the load writes a new
+workbook. A file there that cannot be read as a workbook fails the load rather
+than lose its sheets: remove it to write a new one.
 
 A null is an empty cell; booleans are booleans; numbers are numbers — but Excel
 holds a number as a double, so an `INT` beyond 2^53 or a `DECIMAL` of more than

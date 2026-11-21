@@ -759,6 +759,52 @@ fn ownJson(arena: std.mem.Allocator, v: std.json.Value, depth: u8) !std.json.Val
     }
 }
 
+pub const Largest = union(enum) { found: Value, unknown };
+
+/// The largest value of column `col` in the table `st` holds, from its live files'
+/// statistics alone, when they give it exactly: every file with rows has a maximum
+/// for `col` (or says every value there is NULL), no file carries a deletion vector
+/// (its statistics would count rows it deletes), `col` is no partition column, the
+/// table maps no column names (statistics key the physical names), and `col`'s type
+/// keeps an exact maximum (an integer, a decimal, a date, a string shorter than the
+/// cut a writer makes; not a timestamp, kept to milliseconds). `.found` holds NULL
+/// when no row has a value; `.unknown` means the files must be read.
+pub fn largestFromStats(arena: std.mem.Allocator, st: *const State, name: []const u8, col: []const u8) !Largest {
+    if (st.mapping != null or hasName(st.part_cols, col)) return .unknown;
+    const schema = try schemaOf(arena, name, st.schema_string orelse return .unknown);
+    const ty = for (schema.fields) |f| {
+        if (std.mem.eql(u8, f.name, col)) break f.ty;
+    } else return .unknown;
+    switch (ty.kind) {
+        .int, .decimal, .date, .string => {},
+        else => return .unknown,
+    }
+    var best: Value = .null;
+    for (st.files.values()) |add| {
+        if (add.dv != null) return .unknown;
+        const s = dtypes.parseStats(arena, add.stats orelse return .unknown) orelse return .unknown;
+        const n = s.get("numRecords") orelse return .unknown;
+        const rows = switch (n) {
+            .number_string, .string => |t| std.fmt.parseInt(u64, t, 10) catch return .unknown,
+            else => return .unknown,
+        };
+        if (rows == 0 or dtypes.allNull(s, col)) continue;
+        const v = (try dtypes.statValue(arena, s, .max, col, ty)) orelse return .unknown;
+        if (best == .null) {
+            best = v;
+            continue;
+        }
+        const ord = eval.compareValues(v, best) orelse return .unknown;
+        if (ord == .gt) best = v;
+    }
+    return .{ .found = best };
+}
+
+fn hasName(names: []const []const u8, n: []const u8) bool {
+    for (names) |x| if (std.mem.eql(u8, x, n)) return true;
+    return false;
+}
+
 /// `schemaString` as the reader's columns: each top-level field one column, a
 /// struct, array or map one nested column of that type, every column nullable.
 fn schemaOf(arena: std.mem.Allocator, name: []const u8, text: []const u8) !types.Schema {

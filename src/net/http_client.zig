@@ -871,10 +871,11 @@ pub const HttpSource = struct {
     pages_done: i64 = 0,
     last_progress_ms: i64 = 0,
 
-    const SlotState = enum(u8) { running, done, abandoned };
+    const SlotState = enum(u32) { running, done, abandoned };
 
     const Slot = struct {
-        state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(SlotState.running)),
+        /// A futex word: the worker wakes its waiter as it sets `done`.
+        state: std.atomic.Value(u32) = std.atomic.Value(u32).init(@intFromEnum(SlotState.running)),
         gpa: std.mem.Allocator,
         snap: std.heap.ArenaAllocator,
         client: *HttpClient,
@@ -1325,11 +1326,16 @@ pub const HttpSource = struct {
             .acquire,
         ) != null) {
             freeSlot(slot);
+            return;
         }
+        // The waiter may already have seen `done` and freed the slot; a futex wake
+        // takes only the address, and the std tolerates one gone stale (EFAULT).
+        std.Thread.Futex.wake(&slot.state, 1);
     }
 
-    /// Waits under the page deadline, polling so Ctrl+C interrupts within ~25ms. On
-    /// timeout or abort the slot is abandoned to its worker and counted as a zombie.
+    /// Waits under the page deadline, woken as the reply lands and at least every 25 ms
+    /// so Ctrl+C interrupts. On timeout or abort the slot is abandoned to its worker and
+    /// counted as a zombie.
     fn awaitSlot(self: *HttpSource, slot: *Slot) !void {
         return self.awaitSlotUntil(slot, deadlineAfter(self.opts.timeout_ms));
     }
@@ -1341,12 +1347,14 @@ pub const HttpSource = struct {
         };
     }
 
-    /// Waits until `deadline`, polling so Ctrl+C interrupts within ~25ms. On timeout or
-    /// abort the slot is abandoned to its worker, which frees it.
+    /// Waits until `deadline`, woken by the worker as it finishes, and at least every
+    /// 25 ms to see Ctrl+C. On timeout or abort the slot is abandoned to its worker,
+    /// which frees it.
     fn waitSlot(slot: *Slot, deadline: i64) !void {
         while (true) {
             if (slot.state.load(.acquire) == @intFromEnum(SlotState.done)) return;
-            if (driver.aborting() or std.time.milliTimestamp() >= deadline) {
+            const now = std.time.milliTimestamp();
+            if (driver.aborting() or now >= deadline) {
                 if (slot.state.cmpxchgStrong(
                     @intFromEnum(SlotState.running),
                     @intFromEnum(SlotState.abandoned),
@@ -1357,7 +1365,8 @@ pub const HttpSource = struct {
                 }
                 return;
             }
-            std.Thread.sleep(25 * std.time.ns_per_ms);
+            const nap_ms: u64 = @intCast(@min(deadline - now, 25));
+            std.Thread.Futex.timedWait(&slot.state, @intFromEnum(SlotState.running), nap_ms * std.time.ns_per_ms) catch {};
         }
     }
 

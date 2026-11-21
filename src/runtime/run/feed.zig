@@ -111,11 +111,27 @@ fn field(a: std.mem.Allocator, name: []const u8) !*ast.Expr {
     return expr(a, .{ .field = .{ .parts = try a.dupe([]const u8, &.{name}) } });
 }
 
-/// The largest `col` in the target: a database computes it (`SELECT MAX`), a
-/// Delta table is read for it.
+/// The largest `col` in the target: a database computes it (`SELECT MAX`); a Delta
+/// table takes it from its files' statistics when they give it exactly, and is read
+/// for it otherwise. A read for it is the target's, not the source's, so its rows
+/// are not counted among the rows the run read.
 fn largest(env: *Env, w: ast.Write, pos: ast.Pos, col: []const u8, opts: RunOptions, lanes_used: *usize, batch_arena: *std.heap.ArenaAllocator) !Value {
     const a = env.arena;
     var rd = try targetRead(w, a);
+    if (rd.form != .table) if (try lake.detect(a, w.target)) |found| if (found.kind == .delta) {
+        const st = try delta.snapshot(a, w.target, .{}, found.listed);
+        switch (try delta.largestFromStats(a, st, w.target, col)) {
+            .found => |v| {
+                env.log.log(.debug, "$since: the largest `{s}` in {s} from its files' statistics", .{ col, w.target });
+                return v;
+            },
+            .unknown => {},
+        }
+    };
+    var own_rows = @import("../../exec/obs.zig").RowCounter{};
+    const counted = env.rows_read;
+    env.rows_read = &own_rows;
+    defer env.rows_read = counted;
     const stages = if (rd.form == .table) blk: {
         const dialect = sqlConnInfo(env.connections.get(w.connector).?).?.dialect;
         const table = try sql.quoteParts(a, dialect, rd.form.table.parts);

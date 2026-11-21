@@ -1331,6 +1331,21 @@ filedml() { # $1 label, $2 the remote folder, ending `/`, $3 a connection statem
       report "$1-file-dml-$ext (run error)" bad
     fi
   done
+  # a second sheet loaded into the remote workbook keeps the first, read back as a
+  # local workbook written the same way reads
+  if brun run -c "$c LOAD INTO '$2sheets.xlsx' WITH (sheet = 'Um') AS SELECT * FROM 'tests/integration/seed.csv';" &&
+     brun run -c "$c LOAD INTO '$2sheets.xlsx' WITH (sheet = 'Dois') AS SELECT 7 AS n;" &&
+     brun run -c "LOAD INTO '$out/$1_sheets.xlsx' WITH (sheet = 'Um') AS SELECT * FROM 'tests/integration/seed.csv';" &&
+     brun run -c "$c LOAD INTO '$out/$1_sheets_got.csv' AS SELECT * FROM '$2sheets.xlsx' WITH (sheet = 'Um');" &&
+     brun run -c "LOAD INTO '$out/$1_sheets_want.csv' AS SELECT * FROM '$out/$1_sheets.xlsx' WITH (sheet = 'Um');"; then
+    if [ "$($B run --format csv -q -c "$c SELECT n FROM '$2sheets.xlsx' WITH (sheet = 'Dois');" 2>&1 | tail -1)" = 7 ]; then
+      check "$1-xlsx-second-sheet" "$out/$1_sheets_got.csv" "$out/$1_sheets_want.csv"
+    else
+      report "$1-xlsx-second-sheet (sheet Dois not read back)" bad
+    fi
+  else
+    report "$1-xlsx-second-sheet (run error)" bad
+  fi
 }
 
 # SFTP: an OpenSSH server, reached with a password and with an Ed25519 key, its

@@ -38,6 +38,7 @@ const Output = @import("../output.zig").Output;
 const zipwrite = @import("../compress/zipwrite.zig");
 const read = @import("read.zig");
 const serial = @import("serial.zig");
+const zipsrc = @import("../compress/zip.zig");
 const utf16 = @import("../../base/utf16.zig");
 const escape = @import("../xml/escape.zig");
 const msgfmt = @import("../../base/msgfmt.zig");
@@ -69,24 +70,107 @@ pub const Writer = struct {
     sheet: *std.Io.Writer,
     refs: []const []const u8,
     row: u32 = 1,
+    styles: Styles = .{},
 
     /// Refuses a schema Excel cannot hold before anything is written.
     pub fn open(arena: std.mem.Allocator, path: []const u8, schema: types.Schema, sheet_name: []const u8) !*Writer {
+        try refuse(schema, sheet_name);
+        const self = try begin(arena, path, schema);
+        errdefer self.abort();
+        self.start(arena, schema, sheet_name) catch |e| return self.out.specific(e);
+        return self;
+    }
+
+    /// `open` into the workbook already at `path`, laid out as `lay`: the worksheet
+    /// `sheet_name` is written anew in its place, or added after the others when the
+    /// workbook has none of that name, and every other part is copied as it is. The
+    /// styles gain three temporal formats when the rows hold dates or times, and the
+    /// calculation chain is dropped, as Excel rebuilds it and a stale one names cells
+    /// the new sheet no longer has. A sheet with parts of its own (a table, a drawing,
+    /// comments, a pivot table) is refused, as writing it anew would leave them
+    /// behind, and so is a name a chart sheet holds.
+    pub fn openInto(arena: std.mem.Allocator, path: []const u8, schema: types.Schema, sheet_name: []const u8, lay: read.Layout) !*Writer {
+        try refuse(schema, sheet_name);
+        if (lay.taken) return explainf(error.XlsxBadSheetName, "sheet `{s}`: a chart sheet of the workbook has that name", .{sheet_name});
+        const names = try zipsrc.names(arena, path);
+        if (lay.sheet_part) |sp| if (hasName(names, try read.relsOf(arena, sp)))
+            return explainf(error.XlsxSheetHasParts, "sheet `{s}` has parts of its own (a table, a drawing, comments or a pivot table), which writing it anew would leave behind; write the rows to another sheet", .{lay.sheet_name});
+        const temporal = for (schema.fields) |f| switch (f.ty.kind) {
+            .date, .time, .timestamp => break true,
+            else => {},
+        } else false;
+        var st = Styles{ .date1904 = lay.date1904 };
+        var styles_text: ?[]const u8 = null;
+        if (temporal) {
+            const sp = lay.styles orelse return explainf(error.XlsxNoStyles, "the workbook has no styles part, which its new dates and times need; write them to a new workbook", .{});
+            const p = try withTemporalStyles(arena, try memberText(arena, path, sp));
+            styles_text = p.text;
+            st = p.ids;
+            st.date1904 = lay.date1904;
+        }
+        const added: ?[]const u8 = if (lay.sheet_part == null) try freshSheetPart(arena, names, lay.workbook) else null;
+        const part = lay.sheet_part orelse added.?;
+        var types_text = try dropEmpty(arena, try memberText(arena, path, "[Content_Types].xml"), "calcChain");
+        var rels_text = try dropEmpty(arena, try memberText(arena, path, lay.workbook_rels), "calcChain");
+        var wb_text: ?[]const u8 = null;
+        if (added) |np| {
+            const rid = try msgfmt.allocPrint(arena, "rId{d}", .{maxAfter(rels_text, "Id=\"rId") + 1});
+            types_text = try insertBeforeClose(arena, types_text, "Types", try msgfmt.allocPrint(arena, "<Override PartName=\"/{s}\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>", .{np}));
+            rels_text = try insertBeforeClose(arena, rels_text, "Relationships", try msgfmt.allocPrint(arena, "<Relationship Id=\"{s}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"{s}\"/>", .{ rid, relTarget(lay.workbook, np) }));
+            wb_text = try addSheetEntry(arena, try memberText(arena, path, lay.workbook), sheet_name, rid);
+        }
+
+        const self = try begin(arena, path, schema);
+        errdefer self.abort();
+        self.styles = st;
+        self.copyInto(arena, path, names, part, lay, types_text, rels_text, wb_text, styles_text) catch |e| return self.out.specific(e);
+        self.startSheet(schema, part) catch |e| return self.out.specific(e);
+        return self;
+    }
+
+    fn copyInto(self: *Writer, arena: std.mem.Allocator, path: []const u8, names: []const []const u8, part: []const u8, lay: read.Layout, types_text: []const u8, rels_text: []const u8, wb_text: ?[]const u8, styles_text: ?[]const u8) !void {
+        for (names) |name| {
+            if (std.mem.eql(u8, name, part) or std.mem.endsWith(u8, name, "/calcChain.xml")) continue;
+            if (std.mem.eql(u8, name, "[Content_Types].xml")) {
+                try self.zip.addStored(name, types_text);
+                continue;
+            }
+            if (std.mem.eql(u8, name, lay.workbook_rels)) {
+                try self.zip.addStored(name, rels_text);
+                continue;
+            }
+            if (wb_text) |t| if (std.mem.eql(u8, name, lay.workbook)) {
+                try self.zip.addStored(name, t);
+                continue;
+            };
+            if (styles_text) |t| if (std.mem.eql(u8, name, lay.styles.?)) {
+                try self.zip.addStored(name, t);
+                continue;
+            };
+            const m = try zipsrc.openMember(arena, path, name);
+            defer m.close();
+            const w = try self.zip.begin(name);
+            _ = try m.reader.streamRemaining(w);
+            try self.zip.end();
+        }
+    }
+
+    fn refuse(schema: types.Schema, sheet_name: []const u8) !void {
         if (schema.fields.len > max_cols)
             return explainf(error.XlsxTooManyColumns, "an Excel sheet holds at most {d} columns; this result has {d}", .{ max_cols, schema.fields.len });
         for (schema.fields) |f| if (f.ty.isNested())
             return explainf(error.XlsxNestedColumn, "an Excel sheet cannot hold the list, map or struct column `{s}`", .{f.name});
         if (sheetNameProblem(sheet_name)) |why| return explainf(error.XlsxBadSheetName, "sheet `{s}`: {s}", .{ sheet_name, why });
+    }
 
+    fn begin(arena: std.mem.Allocator, path: []const u8, schema: types.Schema) !*Writer {
         const self = try arena.create(Writer);
         const out = try Output.open(arena, path, content_type, .truncate);
         errdefer out.abort();
         const refs = try arena.alloc([]const u8, schema.fields.len);
         for (refs, 0..) |*r, i| r.* = try read.colName(arena, @intCast(i));
         const z = try zipwrite.Writer.init(arena, out.raw());
-        errdefer z.deinit();
         self.* = .{ .out = out, .zip = z, .sheet = undefined, .refs = refs };
-        self.start(arena, schema, sheet_name) catch |e| return out.specific(e);
         return self;
     }
 
@@ -100,7 +184,12 @@ pub const Writer = struct {
         try self.zip.addStored("xl/workbook.xml", wb.written());
         try self.zip.addStored("xl/_rels/workbook.xml.rels", workbook_rels);
         try self.zip.addStored("xl/styles.xml", styles);
-        self.sheet = try self.zip.begin("xl/worksheets/sheet1.xml");
+        try self.startSheet(schema, "xl/worksheets/sheet1.xml");
+    }
+
+    /// Opens sheet part `part` and writes its header row.
+    fn startSheet(self: *Writer, schema: types.Schema, part: []const u8) !void {
+        self.sheet = try self.zip.begin(part);
         const w = self.sheet;
         try w.writeAll(sheet_head);
         try w.writeAll("<row r=\"1\">");
@@ -130,7 +219,7 @@ pub const Writer = struct {
     }
 
     fn cell(self: *Writer, c: *const column.Column, r: usize, ref: []const u8) !void {
-        return writeCell(self.sheet, c, r, ref, self.row, .{});
+        return writeCell(self.sheet, c, r, ref, self.row, self.styles);
     }
 
     /// Finishes a cell opened up to its reference as an inline string.
@@ -166,9 +255,156 @@ pub const Writer = struct {
 
 const sink_vtable = driver.sinkVTable(Writer);
 
+/// Part `name` of the workbook at `path`, whole.
+pub fn memberText(arena: std.mem.Allocator, path: []const u8, name: []const u8) ![]const u8 {
+    const m = try zipsrc.openMember(arena, path, name);
+    defer m.close();
+    var aw = std.Io.Writer.Allocating.init(arena);
+    _ = try m.reader.streamRemaining(&aw.writer);
+    return aw.written();
+}
+
+pub const Patched = struct { text: []const u8, ids: Styles };
+
+/// Styles part `text` with three cell formats added at the end of `cellXfs`, Excel's
+/// built-in date (14), date and time (22) and time (21) number formats, and their
+/// indices.
+pub fn withTemporalStyles(arena: std.mem.Allocator, text: []const u8) !Patched {
+    const open = std.mem.indexOf(u8, text, "<cellXfs") orelse return error.BadXml;
+    const close = std.mem.indexOfPos(u8, text, open, "</cellXfs>") orelse return error.BadXml;
+    var n: usize = 0;
+    var at = open;
+    while (std.mem.indexOfPos(u8, text, at + 1, "<xf")) |i| {
+        if (i >= close) break;
+        n += 1;
+        at = i;
+    }
+    const xf = "<xf numFmtId=\"{d}\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/>";
+    var o = std.array_list.Managed(u8).init(arena);
+    const head_end = (std.mem.indexOfScalarPos(u8, text, open, '>') orelse return error.BadXml) + 1;
+    const head = text[open..head_end];
+    try o.appendSlice(text[0..open]);
+    if (std.mem.indexOf(u8, head, "count=\"")) |c| {
+        const vs = c + "count=\"".len;
+        const ve = std.mem.indexOfScalarPos(u8, head, vs, '"') orelse return error.BadXml;
+        try o.appendSlice(head[0..vs]);
+        try o.writer().print("{d}", .{n + 3});
+        try o.appendSlice(head[ve..]);
+    } else try o.appendSlice(head);
+    try o.appendSlice(text[head_end..close]);
+    for ([_]u16{ 14, 22, 21 }) |id| try o.writer().print(xf, .{id});
+    try o.appendSlice(text[close..]);
+    return .{
+        .text = o.items,
+        .ids = .{
+            .date = try msgfmt.allocPrint(arena, "{d}", .{n}),
+            .timestamp = try msgfmt.allocPrint(arena, "{d}", .{n + 1}),
+            .time = try msgfmt.allocPrint(arena, "{d}", .{n + 2}),
+        },
+    };
+}
+
+fn hasName(names: []const []const u8, name: []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// A worksheet part name the package does not use, beside the workbook part.
+fn freshSheetPart(arena: std.mem.Allocator, names: []const []const u8, workbook: []const u8) ![]const u8 {
+    const dir = if (std.mem.lastIndexOfScalar(u8, workbook, '/')) |i| workbook[0 .. i + 1] else "";
+    var k: usize = 1;
+    while (true) : (k += 1) {
+        const name = try msgfmt.allocPrint(arena, "{s}worksheets/sheet{d}.xml", .{ dir, k });
+        if (!hasName(names, name)) return name;
+    }
+}
+
+/// `part`'s target in a relationship of `workbook`: relative to its folder, or from
+/// the package root when it lies elsewhere.
+fn relTarget(workbook: []const u8, part: []const u8) []const u8 {
+    const dir = if (std.mem.lastIndexOfScalar(u8, workbook, '/')) |i| workbook[0 .. i + 1] else "";
+    return if (std.mem.startsWith(u8, part, dir)) part[dir.len..] else part;
+}
+
+/// The largest number right after an occurrence of `key` in `text`, 0 when none.
+fn maxAfter(text: []const u8, key: []const u8) usize {
+    var best: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, text, i, key)) |at| {
+        var j = at + key.len;
+        var n: usize = 0;
+        while (j < text.len and std.ascii.isDigit(text[j])) : (j += 1) n = n *| 10 +| (text[j] - '0');
+        best = @max(best, n);
+        i = at + key.len;
+    }
+    return best;
+}
+
+/// Where the last closing tag of element `name` (under any prefix) starts in `text`,
+/// and that prefix with its colon.
+fn lastClose(text: []const u8, name: []const u8) ?struct { at: usize, prefix: []const u8 } {
+    var end = text.len;
+    while (std.mem.lastIndexOf(u8, text[0..end], "</")) |i| {
+        end = i;
+        const rest = text[i + 2 ..];
+        const gt = std.mem.indexOfScalar(u8, rest, '>') orelse continue;
+        const tag = std.mem.trimRight(u8, rest[0..gt], " \t\r\n");
+        const colon = std.mem.indexOfScalar(u8, tag, ':');
+        const local = if (colon) |c| tag[c + 1 ..] else tag;
+        if (std.mem.eql(u8, local, name)) return .{ .at = i, .prefix = if (colon) |c| tag[0 .. c + 1] else "" };
+    }
+    return null;
+}
+
+/// `text` with `insertion` right before the last closing tag of element `name`.
+fn insertBeforeClose(arena: std.mem.Allocator, text: []const u8, name: []const u8, insertion: []const u8) ![]const u8 {
+    const c = lastClose(text, name) orelse return error.BadXml;
+    return std.mem.concat(arena, u8, &.{ text[0..c.at], insertion, text[c.at..] });
+}
+
+/// `text` without each empty element whose tag holds `needle`.
+fn dropEmpty(arena: std.mem.Allocator, text: []const u8, needle: []const u8) ![]const u8 {
+    var out = std.array_list.Managed(u8).init(arena);
+    var i: usize = 0;
+    var from: usize = 0;
+    while (std.mem.indexOfPos(u8, text, from, needle)) |hit| {
+        from = hit + needle.len;
+        const open = std.mem.lastIndexOfScalar(u8, text[0..hit], '<') orelse continue;
+        if (open < i) continue;
+        const close = std.mem.indexOfPos(u8, text, hit, "/>") orelse continue;
+        if (std.mem.indexOfScalar(u8, text[open..close], '>') != null) continue;
+        try out.appendSlice(text[i..open]);
+        i = close + 2;
+        from = i;
+    }
+    try out.appendSlice(text[i..]);
+    return out.items;
+}
+
+/// Workbook part `text` with a `sheet` entry named `name` for relationship `rid` at
+/// the end of its `sheets`, numbered past the others, in the prefix the workbook binds
+/// to the relationships namespace (declared on the entry when it binds none).
+fn addSheetEntry(arena: std.mem.Allocator, text: []const u8, name: []const u8, rid: []const u8) ![]const u8 {
+    const c = lastClose(text, "sheets") orelse return error.BadXml;
+    const ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const prefix: ?[]const u8 = blk: {
+        const q = std.mem.indexOf(u8, text, "=\"" ++ ns ++ "\"") orelse break :blk null;
+        const decl = std.mem.lastIndexOf(u8, text[0..q], "xmlns:") orelse break :blk null;
+        break :blk text[decl + "xmlns:".len .. q];
+    };
+    var aw = std.Io.Writer.Allocating.init(arena);
+    const w = &aw.writer;
+    try w.print("<{s}sheet name=\"", .{c.prefix});
+    try escape.text(w, name, .{ .attr = true });
+    try w.print("\" sheetId=\"{d}\" ", .{maxAfter(text, "sheetId=\"") + 1});
+    if (prefix) |p| try w.print("{s}:id=\"{s}\"/>", .{ p, rid }) else try w.print("r:id=\"{s}\" xmlns:r=\"{s}\"/>", .{ rid, ns });
+    return std.mem.concat(arena, u8, &.{ text[0..c.at], aw.written(), text[c.at..] });
+}
+
 /// The cell styles a writer's temporal cells name, as indices into the workbook's
-/// `cellXfs`: the writer's own, or those added to a workbook it edits.
-pub const Styles = struct { date: []const u8 = style_date, timestamp: []const u8 = style_timestamp, time: []const u8 = style_time };
+/// `cellXfs`: the writer's own, or those added to a workbook it edits; and that
+/// workbook's date system, as a 1904 workbook counts its serials from 1904-01-01.
+pub const Styles = struct { date: []const u8 = style_date, timestamp: []const u8 = style_timestamp, time: []const u8 = style_time, date1904: bool = false };
 
 /// Cell `r` of `c` at column `ref` of sheet row `row`, nothing for a null, its temporal
 /// styles `st`.
@@ -213,7 +449,7 @@ pub fn writeCell(w: *std.Io.Writer, c: *const column.Column, r: usize, ref: []co
         },
         .date => {
             const days: i64 = c.data.i32[r];
-            if (serial.ofDays(days)) |v|
+            if (serial.ofDays(days, st.date1904)) |v|
                 return w.print("<c r=\"{s}{d}\" s=\"{s}\"><v>{d}</v></c>", .{ ref, row, st.date, v });
             try w.print("<c r=\"{s}{d}\" t=\"inlineStr\"><is><t>", .{ ref, row });
             try format.writeDate(w, days);
@@ -221,7 +457,7 @@ pub fn writeCell(w: *std.Io.Writer, c: *const column.Column, r: usize, ref: []co
         },
         .timestamp => {
             const us = c.data.i64[r];
-            if (serial.ofMicros(us)) |v|
+            if (serial.ofMicros(us, st.date1904)) |v|
                 return w.print("<c r=\"{s}{d}\" s=\"{s}\"><v>{d}</v></c>", .{ ref, row, st.timestamp, v });
             try w.print("<c r=\"{s}{d}\" t=\"inlineStr\"><is><t>", .{ ref, row });
             try format.writeTimestamp(w, us);

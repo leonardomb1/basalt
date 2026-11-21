@@ -162,6 +162,30 @@ fn workbook(tmp: *testing.TmpDir, name: []const u8, second: []const u8) !void {
     try tmp.dir.writeFile(.{ .sub_path = name, .data = aw.written() });
 }
 
+/// A workbook whose sheet `Dados` holds a formula, with the calculation chain that
+/// names its cell, and a second sheet `Fixa`.
+fn chainedWorkbook(tmp: *testing.TmpDir, name: []const u8) !void {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var aw = std.Io.Writer.Allocating.init(a);
+    const z = try basalt.zipwrite.Writer.init(a, &aw.writer);
+    defer z.deinit();
+    const decl = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
+    const ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    const rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    const ct = "application/vnd.openxmlformats-officedocument.spreadsheetml.";
+    try z.addStored("[Content_Types].xml", decl ++ "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/><Default Extension=\"xml\" ContentType=\"application/xml\"/><Override PartName=\"/xl/workbook.xml\" ContentType=\"" ++ ct ++ "sheet.main+xml\"/><Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"" ++ ct ++ "worksheet+xml\"/><Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"" ++ ct ++ "worksheet+xml\"/><Override PartName=\"/xl/calcChain.xml\" ContentType=\"" ++ ct ++ "calcChain+xml\"/></Types>");
+    try z.addStored("_rels/.rels", decl ++ "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"" ++ rel ++ "/officeDocument\" Target=\"xl/workbook.xml\"/></Relationships>");
+    try z.addStored("xl/workbook.xml", decl ++ "<workbook xmlns=\"" ++ ns ++ "\" xmlns:r=\"" ++ rel ++ "\"><sheets><sheet name=\"Dados\" sheetId=\"1\" r:id=\"rId1\"/><sheet name=\"Fixa\" sheetId=\"4\" r:id=\"rId2\"/></sheets></workbook>");
+    try z.addStored("xl/_rels/workbook.xml.rels", decl ++ "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"rId1\" Type=\"" ++ rel ++ "/worksheet\" Target=\"worksheets/sheet1.xml\"/><Relationship Id=\"rId2\" Type=\"" ++ rel ++ "/worksheet\" Target=\"worksheets/sheet2.xml\"/><Relationship Id=\"rId7\" Type=\"" ++ rel ++ "/calcChain\" Target=\"calcChain.xml\"/></Relationships>");
+    try z.addStored("xl/worksheets/sheet1.xml", decl ++ "<worksheet xmlns=\"" ++ ns ++ "\"><sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>v</t></is></c><c r=\"B1\" t=\"inlineStr\"><is><t>w</t></is></c></row><row r=\"2\"><c r=\"A2\"><v>1</v></c><c r=\"B2\"><f>A2*2</f><v>2</v></c></row></sheetData></worksheet>");
+    try z.addStored("xl/worksheets/sheet2.xml", decl ++ "<worksheet xmlns=\"" ++ ns ++ "\"><sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>k</t></is></c></row><row r=\"2\"><c r=\"A2\"><v>42</v></c></row></sheetData></worksheet>");
+    try z.addStored("xl/calcChain.xml", decl ++ "<calcChain xmlns=\"" ++ ns ++ "\"><c r=\"B2\" i=\"1\"/></calcChain>");
+    try z.finish();
+    try tmp.dir.writeFile(.{ .sub_path = name, .data = aw.written() });
+}
+
 fn member(a: std.mem.Allocator, tmp: *testing.TmpDir, file: []const u8, name: []const u8) ![]const u8 {
     const path = try tmp.dir.realpathAlloc(a, file);
     const m = try basalt.zipsrc.openMember(a, path, name);
@@ -169,6 +193,43 @@ fn member(a: std.mem.Allocator, tmp: *testing.TmpDir, file: []const u8, name: []
     var aw = std.Io.Writer.Allocating.init(a);
     _ = try m.reader.streamRemaining(&aw.writer);
     return aw.written();
+}
+
+test "LOAD INTO a workbook with a sheet named writes that sheet anew or adds it, keeps every other sheet and drops the calculation chain; dates follow a 1904 workbook's calendar" {
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try load(&tmp, "LOAD INTO '$B/r.xlsx' WITH (sheet = 'Vendas') AS SELECT 1 AS id, 'a' AS t;");
+    try load(&tmp, "LOAD INTO '$B/r.xlsx' WITH (sheet = 'Resumo') AS SELECT 2 AS id, CAST('2026-01-31' AS DATE) AS d;");
+    try load(&tmp, "LOAD INTO '$B/r.xlsx' WITH (sheet = 'vendas') AS SELECT 9 AS id, 'z' AS t;");
+    try testing.expectEqualStrings("id,t\n9,z\n", try rows(a, &tmp, "SELECT * FROM '$B/r.xlsx' WITH (sheet = 'Vendas')"));
+    try testing.expectEqualStrings("id,d\n2,2026-01-31\n", try rows(a, &tmp, "SELECT * FROM '$B/r.xlsx' WITH (sheet = 'Resumo')"));
+    const wbx = try member(a, &tmp, "r.xlsx", "xl/workbook.xml");
+    try testing.expect(std.mem.indexOf(u8, wbx, "<sheet name=\"Vendas\" sheetId=\"1\"") != null);
+    try testing.expect(std.mem.indexOf(u8, wbx, "<sheet name=\"Resumo\" sheetId=\"2\"") != null);
+    try harness.expectRunRefuses(gpa, &tmp, "INSERT INTO '$B/r.xlsx' WITH (sheet = '1') SELECT 1 AS id;", 1, "no sheet `1` (sheets: Vendas, Resumo)");
+
+    try chainedWorkbook(&tmp, "c.xlsx");
+    try load(&tmp, "LOAD INTO '$B/c.xlsx' WITH (sheet = 'Dados') AS SELECT 5 AS v;");
+    try testing.expectEqualStrings("v\n5\n", try rows(a, &tmp, "SELECT * FROM '$B/c.xlsx' WITH (sheet = 'Dados')"));
+    try testing.expectEqualStrings("k\n42\n", try rows(a, &tmp, "SELECT * FROM '$B/c.xlsx' WITH (sheet = 'Fixa')"));
+    try load(&tmp, "LOAD INTO '$B/c.xlsx' WITH (sheet = 'Nova') AS SELECT 6 AS n;");
+    try testing.expectEqualStrings("n\n6\n", try rows(a, &tmp, "SELECT * FROM '$B/c.xlsx' WITH (sheet = 'Nova')"));
+    const c_path = try tmp.dir.realpathAlloc(a, "c.xlsx");
+    for (try basalt.zipsrc.names(a, c_path)) |n| try testing.expect(std.mem.indexOf(u8, n, "calcChain") == null);
+    for ([_][]const u8{ "[Content_Types].xml", "xl/_rels/workbook.xml.rels" }) |p| try testing.expect(std.mem.indexOf(u8, try member(a, &tmp, "c.xlsx", p), "calcChain") == null);
+    const cwb = try member(a, &tmp, "c.xlsx", "xl/workbook.xml");
+    try testing.expect(std.mem.indexOf(u8, cwb, "<sheet name=\"Nova\" sheetId=\"5\" r:id=\"rId3\"/>") != null);
+    try testing.expect(std.mem.indexOf(u8, try member(a, &tmp, "c.xlsx", "[Content_Types].xml"), "<Override PartName=\"/xl/worksheets/sheet3.xml\"") != null);
+
+    try tmp.dir.writeFile(.{ .sub_path = "e.xlsx", .data = basalt.fixtures.edge_xlsx });
+    try load(&tmp, "LOAD INTO '$B/e.xlsx' WITH (sheet = 'Novo') AS SELECT CAST('2026-01-31' AS DATE) AS d;");
+    try testing.expectEqualStrings("d\n2026-01-31\n", try rows(a, &tmp, "SELECT * FROM '$B/e.xlsx' WITH (sheet = 'Novo')"));
+    try testing.expect(std.mem.indexOf(u8, try member(a, &tmp, "e.xlsx", "xl/worksheets/sheet1.xml"), "<v>44591</v>") != null);
+    try testing.expect(std.mem.indexOf(u8, try member(a, &tmp, "e.xlsx", "xl/workbook.xml"), "<x:sheet name=\"Novo\" sheetId=\"3\" r:id=\"rId10\"/>") != null);
+    try harness.expectRunRefuses(gpa, &tmp, "LOAD INTO '$B/e.xlsx' WITH (sheet = 'grafico') AS SELECT 1 AS a;", 1, "a chart sheet of the workbook has that name");
 }
 
 test "DELETE, UPDATE and INSERT on an Excel sheet keep its other sheets, shared strings and styles, and every row they leave" {

@@ -271,7 +271,8 @@ fn resolveTarget(arena: std.mem.Allocator, base: []const u8, target: []const u8)
     return std.mem.join(arena, "/", parts.items);
 }
 
-fn relsOf(arena: std.mem.Allocator, part: []const u8) ![]const u8 {
+/// The relationships part of `part` (`xl/_rels/workbook.xml.rels` for `xl/workbook.xml`).
+pub fn relsOf(arena: std.mem.Allocator, part: []const u8) ![]const u8 {
     const slash = std.mem.lastIndexOfScalar(u8, part, '/');
     const dir = if (slash) |i| part[0 .. i + 1] else "";
     const base = if (slash) |i| part[i + 1 ..] else part;
@@ -318,13 +319,14 @@ fn relKind(rels: []const Rel, kind: []const u8) ?[]const u8 {
 
 /// Where a workbook keeps what an edit of one of its sheets needs: the workbook part,
 /// the sheet's part and name (`sheet`, else the first), the other sheets' parts and
-/// names, and the styles part.
+/// names, the styles part, and whether it counts dates from 1904.
 pub const Located = struct {
     workbook: []const u8,
     sheet_part: []const u8,
     sheet_name: []const u8,
     others: []const []const u8,
     styles: ?[]const u8,
+    date1904: bool = false,
 };
 
 pub fn locate(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []const u8, sheet: ?[]const u8) !Located {
@@ -333,11 +335,14 @@ pub fn locate(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []const u8
     const wb_rels = try readRels(arena, gpa, path, try relsOf(arena, wb_part), wb_part);
     var chosen: ?[]const u8 = null;
     var chosen_name: []const u8 = "";
+    var date1904 = false;
     var others = std.array_list.Managed([]const u8).init(arena);
     var p = try openPart(arena, gpa, path, wb_part);
     defer closePart(&p);
     while (try p.tk.next()) |t| switch (t) {
-        .open => |o| if (std.mem.eql(u8, o.name, "sheet")) {
+        .open => |o| if (std.mem.eql(u8, o.name, "workbookPr")) {
+            if (o.attr("date1904")) |v| date1904 = textconv.boolText(.ooxml_flag, v) orelse false;
+        } else if (std.mem.eql(u8, o.name, "sheet")) {
             const name = try decodeAttr(arena, o.attr("name") orelse continue);
             const rid = o.attr("id") orelse continue;
             for (wb_rels) |r| {
@@ -353,7 +358,56 @@ pub fn locate(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []const u8
         },
         else => {},
     };
-    return .{ .workbook = wb_part, .sheet_part = chosen orelse return error.XlsxSheetNotFound, .sheet_name = chosen_name, .others = others.items, .styles = relKind(wb_rels, "styles") };
+    return .{ .workbook = wb_part, .sheet_part = chosen orelse return error.XlsxSheetNotFound, .sheet_name = chosen_name, .others = others.items, .styles = relKind(wb_rels, "styles"), .date1904 = date1904 };
+}
+
+/// What writing one sheet into an existing workbook needs: the workbook part and its
+/// relationships part, the styles part, and the part and name of the worksheet named
+/// `sheet` (case aside, as Excel tells sheet names apart), null when it has none;
+/// `taken` when a chart or dialog sheet holds that name instead; and whether it counts
+/// dates from 1904.
+pub const Layout = struct {
+    workbook: []const u8,
+    workbook_rels: []const u8,
+    styles: ?[]const u8,
+    sheet_part: ?[]const u8,
+    sheet_name: []const u8,
+    taken: bool = false,
+    date1904: bool = false,
+};
+
+pub fn layout(arena: std.mem.Allocator, gpa: std.mem.Allocator, path: []const u8, sheet: []const u8) !Layout {
+    const root = try readRels(arena, gpa, path, "_rels/.rels", "");
+    const wb_part = relKind(root, "officeDocument") orelse return error.NotXlsx;
+    const rels_part = try relsOf(arena, wb_part);
+    const wb_rels = try readRels(arena, gpa, path, rels_part, wb_part);
+    const loc: ?Located = locate(arena, gpa, path, sheet) catch |e| switch (e) {
+        error.XlsxSheetNotFound => null,
+        else => return e,
+    };
+    var taken = false;
+    var date1904 = if (loc) |l| l.date1904 else false;
+    if (loc == null) {
+        var p = try openPart(arena, gpa, path, wb_part);
+        defer closePart(&p);
+        while (try p.tk.next()) |t| switch (t) {
+            .open => |o| if (std.mem.eql(u8, o.name, "workbookPr")) {
+                if (o.attr("date1904")) |v| date1904 = textconv.boolText(.ooxml_flag, v) orelse false;
+            } else if (std.mem.eql(u8, o.name, "sheet")) {
+                if (std.ascii.eqlIgnoreCase(try decodeAttr(arena, o.attr("name") orelse continue), sheet)) taken = true;
+            },
+            else => {},
+        };
+    }
+    return .{
+        .workbook = wb_part,
+        .workbook_rels = rels_part,
+        .styles = relKind(wb_rels, "styles"),
+        .sheet_part = if (loc) |l| l.sheet_part else null,
+        .sheet_name = if (loc) |l| l.sheet_name else sheet,
+        .taken = taken,
+        .date1904 = date1904,
+    };
 }
 
 pub const Reader = struct {

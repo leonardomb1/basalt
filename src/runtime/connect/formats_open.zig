@@ -24,6 +24,7 @@ const s3 = @import("../../store/s3.zig");
 const formats = @import("../../format/formats.zig");
 const msgfmt = @import("../../base/msgfmt.zig");
 const stream = @import("../../format/stream.zig");
+const bytes = @import("../../format/bytes.zig");
 const csvfmt = @import("../../format/csv.zig");
 const pqdecode = @import("../../format/parquet/read.zig");
 const pqwrite = @import("../../format/parquet/write.zig");
@@ -97,6 +98,10 @@ fn entry(comptime N: type) Open {
 fn filesOf(r: *const Read) []const []const u8 {
     return if (r.folder) |f| f.files else (&r.path)[0..1];
 }
+
+/// Why an Excel workbook could not be opened at a sheet, as a read, an INSERT and a
+/// DELETE or UPDATE all say it.
+pub const workbookFail = impls.xlsx.failOf;
 
 const impls = struct {
     pub const csv = struct {
@@ -192,34 +197,63 @@ const impls = struct {
         pub fn read(env: *Env, r: Read) anyerror!driver.Source {
             var odiag = analyze.Diag{};
             const opts = analyze.xlsxOptions(r.hints, &odiag) catch |e| return aErr(env, &odiag, e);
-            const x = xlsxread.Reader.open(env.arena, env.gpa, r.path, opts) catch |e| {
-                const why = switch (e) {
-                    error.XlsxSheetNotFound => blk: {
-                        const names = xlsxread.sheetNames(env.arena, env.gpa, r.path) catch &.{};
-                        const list = try std.mem.join(env.arena, ", ", names);
-                        break :blk if (opts.sheet) |s|
-                            try msgfmt.allocPrint(env.arena, "no sheet `{s}` (sheets: {s})", .{ s, list })
-                        else
-                            "the workbook has no worksheet";
-                    },
-                    error.NotXlsx, error.ZipNoEndRecord, error.ZipMemberNotFound => "not an Excel workbook (.xlsx)",
-                    error.BadXml, error.XmlTokenTooLong => "the workbook's XML is malformed",
-                    error.XlsxTooManyStrings => "its shared strings pass 512 MB",
-                    else => try pathFail(env.arena, r.path, e),
-                };
-                return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read Excel workbook `{s}` ({s})", .{ r.path, why }));
-            };
+            const x = xlsxread.Reader.open(env.arena, env.gpa, r.path, opts) catch |e|
+                return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read Excel workbook `{s}` ({s})", .{ r.path, try failOf(env, r.path, opts.sheet, e) }));
             return x.source();
         }
 
+        /// Why workbook `path` could not be opened at sheet `sheet`, for a message: a
+        /// sheet it lacks named beside the sheets it has. A read, an INSERT and a
+        /// DELETE or UPDATE say it alike.
+        pub fn failOf(env: *Env, path: []const u8, sheet: ?[]const u8, e: anyerror) ![]const u8 {
+            return switch (e) {
+                error.XlsxSheetNotFound => blk: {
+                    const names = xlsxread.sheetNames(env.arena, env.gpa, path) catch &.{};
+                    const list = try std.mem.join(env.arena, ", ", names);
+                    break :blk if (sheet) |s|
+                        try msgfmt.allocPrint(env.arena, "no sheet `{s}` (sheets: {s})", .{ s, list })
+                    else
+                        "the workbook has no worksheet";
+                },
+                error.NotXlsx, error.ZipNoEndRecord, error.ZipMemberNotFound => "not an Excel workbook (.xlsx)",
+                error.BadXml, error.XmlTokenTooLong => "the workbook's XML is malformed",
+                error.XlsxTooManyStrings => "its shared strings pass 512 MB",
+                else => try pathFail(env.arena, path, e),
+            };
+        }
+
+        /// With a `sheet` named and a workbook already at the target, that sheet is
+        /// written anew in it, or added, and the other sheets are kept; with no file
+        /// there, or no `sheet`, a workbook is written whole. A file there that cannot
+        /// be read as a workbook fails the load rather than losing its sheets.
         pub fn write(env: *Env, w: ast.Write, schema: types.Schema, mode: driver.FileMode) anyerror!driver.Sink {
             _ = mode;
-            const sheet = if (env.write_opts.xlsx.len > 0) env.write_opts.xlsx else "Sheet1";
-            const xw = xlsxwrite.Writer.open(env.arena, w.target, schema, sheet) catch |e| switch (e) {
-                error.XlsxTooManyColumns, error.XlsxNestedColumn, error.XlsxBadSheetName => return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, eval.takeFailure(e) orelse @errorName(e) })),
+            const named = env.write_opts.xlsx.len > 0;
+            const sheet = if (named) env.write_opts.xlsx else "Sheet1";
+            const lay: ?xlsxread.Layout = if (named and try thereToKeep(env, w.target))
+                xlsxread.layout(env.arena, env.gpa, w.target, sheet) catch |e|
+                    return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "cannot write sheet `{s}` into `{s}`, as its other sheets could not be read ({s}); remove the file to write a new workbook", .{ sheet, w.target, try failOf(env, w.target, sheet, e) }))
+            else
+                null;
+            const opened = if (lay) |l| xlsxwrite.Writer.openInto(env.arena, w.target, schema, sheet, l) else xlsxwrite.Writer.open(env.arena, w.target, schema, sheet);
+            const xw = opened catch |e| switch (e) {
+                error.XlsxTooManyColumns, error.XlsxNestedColumn, error.XlsxBadSheetName, error.XlsxSheetHasParts, error.XlsxNoStyles => return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "cannot write `{s}`: {s}", .{ w.target, eval.takeFailure(e) orelse @errorName(e) })),
                 else => return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not open output Excel workbook `{s}` ({s})", .{ w.target, try pathFail(env.arena, w.target, e) })),
             };
             return xw.sink();
+        }
+
+        /// Whether a file is at `path`, which a load into one sheet keeps the rest of.
+        /// Only an answer that it is not there says no; any other failure fails the
+        /// load, so a sheet is never written over a workbook it could not see.
+        fn thereToKeep(env: *Env, path: []const u8) !bool {
+            const b = bytes.Bytes.open(env.arena, path) catch |e| {
+                const ae: anyerror = e;
+                for ([_]anyerror{ error.FileNotFound, error.S3KeyNotFound, error.AzureBlobNotFound, error.HttpNotFound, error.SftpNoSuchFile, error.SmbNoSuchFile }) |gone| if (ae == gone) return false;
+                return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not tell whether `{s}` is there to keep its other sheets ({s})", .{ path, try pathFail(env.arena, path, e) }));
+            };
+            b.close();
+            return true;
         }
 
         pub fn options(in: targets.WriteOptionsIn) analyze.Error!analyze.WriteOptions {

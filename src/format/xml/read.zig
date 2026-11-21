@@ -11,10 +11,11 @@
 //! - text directly inside the row, beside its children, is a column named for the row.
 //!
 //! Columns come from the first `sample` rows in the order first met; a name first
-//! met past the sample is dropped, as a JSON file's key is. Text is typed as a CSV's
-//! cells are (`texttype.zig`): a child left empty (`<a/>`) is the empty string in a
-//! text column and NULL in a typed one, an absent child or `xsi:nil="true"` is NULL,
-//! and a value past the sample its typed column cannot read is an error.
+//! met past the sample is dropped (a JSON key past its sample fails instead). Text
+//! is typed as a CSV's cells are (`texttype.zig`): a child left empty (`<a/>`) is
+//! the empty string in a text column and NULL in a typed one, an absent child or
+//! `xsi:nil="true"` is NULL, and a value past the sample its typed column cannot
+//! read is an error.
 //!
 //! Names lose their namespace prefix and have FOR XML's `_xHHHH_` decoded. The
 //! document's declared encoding is honoured (UTF-8, ISO-8859-1, windows-1252, or

@@ -5,6 +5,7 @@
 pub const rg2_parquet = @embedFile("rg2.parquet");
 pub const two_members_zip = @embedFile("two_members.zip");
 pub const openpyxl_xlsx = @embedFile("openpyxl.xlsx");
+pub const edge_xlsx = @embedFile("edge.xlsx");
 pub const logical_types_parquet = @embedFile("logical_types.parquet");
 pub const unsigned_parquet = @embedFile("unsigned.parquet");
 pub const unsigned_big_parquet = @embedFile("unsigned_big.parquet");

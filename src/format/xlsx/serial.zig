@@ -52,19 +52,24 @@ pub fn timeMicros(serial: f64) i64 {
     return @min(ms, day_ms - 1) * 1000;
 }
 
-/// The serial a 1900 workbook stores date `d` as, null outside `first_day..last_day`.
-pub fn ofDays(d: i64) ?i64 {
-    if (d < first_day or d > last_day) return null;
-    return d + epoch1900;
+/// The first day a 1904 workbook writes as a serial, its epoch (serial 0).
+pub const first_day_1904: i64 = civil.daysFromCivil(1904, 1, 1);
+
+/// The serial a workbook stores date `d` as, in its date system (`date1904`), null
+/// before its first serial day or after `last_day`.
+pub fn ofDays(d: i64, date1904: bool) ?i64 {
+    if (d < (if (date1904) first_day_1904 else first_day) or d > last_day) return null;
+    return d + (if (date1904) epoch1904 else epoch1900);
 }
 
-/// The serial of timestamp `us`, cut to the millisecond, null when its day is
-/// outside `first_day..last_day`.
-pub fn ofMicros(us: i64) ?f64 {
+/// The serial of timestamp `us` in a workbook's date system, cut to the millisecond,
+/// null when its day is outside what `ofDays` writes.
+pub fn ofMicros(us: i64, date1904: bool) ?f64 {
     const ms = @divFloor(us, 1000);
     const d = @divFloor(ms, day_ms);
-    if (d < first_day or d > last_day) return null;
-    return @as(f64, @floatFromInt(ms + epoch1900 * day_ms)) / @as(f64, @floatFromInt(day_ms));
+    if (ofDays(d, date1904) == null) return null;
+    const epoch = if (date1904) epoch1904 else epoch1900;
+    return @as(f64, @floatFromInt(ms + epoch * day_ms)) / @as(f64, @floatFromInt(day_ms));
 }
 
 /// The serial of time `us`, a fraction of a day, cut to the millisecond.
@@ -154,15 +159,16 @@ test "serial: writing equals the writer's old arithmetic, and what it writes rea
     for (0..200_000 + edges.len) |i| {
         const d: i64 = if (i < edges.len) edges[i] else r.intRangeAtMost(i64, first_day - 400, last_day + 400);
         const want: ?i64 = if (d >= Orig.oracle_first_day and d <= Orig.oracle_last_day) d + Orig.oracle_epoch_days else null;
-        try testing.expectEqual(want, ofDays(d));
-        if (ofDays(d)) |s| try testing.expectEqual(d, days(@floatFromInt(s), false));
+        try testing.expectEqual(want, ofDays(d, false));
+        if (ofDays(d, false)) |s| try testing.expectEqual(d, days(@floatFromInt(s), false));
+        if (ofDays(d, true)) |s| try testing.expectEqual(d, days(@floatFromInt(s), true)) else try testing.expect(d < first_day_1904 or d > last_day);
 
         const us = if (i < edges.len) d *| 86_400_000_000 else r.intRangeAtMost(i64, (first_day - 2) * 86_400_000_000, (last_day + 2) * 86_400_000_000);
         const ms = @divFloor(us, 1000);
         const day_of = @divFloor(ms, 86_400_000);
         const want_ts: ?f64 = if (day_of >= Orig.oracle_first_day and day_of <= Orig.oracle_last_day) @as(f64, @floatFromInt(ms + Orig.oracle_epoch_days * 86_400_000)) / 86_400_000 else null;
-        try testing.expectEqual(want_ts, ofMicros(us));
-        if (ofMicros(us)) |s| try testing.expectEqual(ms * 1000, micros(s, false));
+        try testing.expectEqual(want_ts, ofMicros(us, false));
+        if (ofMicros(us, false)) |s| try testing.expectEqual(ms * 1000, micros(s, false));
 
         const tms = @mod(@divFloor(us, 1000), 86_400_000);
         try testing.expectEqual(@as(f64, @floatFromInt(tms)) / 86_400_000, ofTime(us));

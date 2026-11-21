@@ -72,8 +72,8 @@ WHERE json_get(payload, 'kind') = 'purchase'
 GROUP BY user_id;
 ```
 
-Columns come from the first 1,024 rows: their keys, in the order first met, each
-typed from the values it took there. Integers are `INT`, any float makes it
+Columns come from the first 1,024 rows, or the first N with `WITH (sample = N)`:
+their keys, in the order first met, each typed from the values it took there. Integers are `INT`, any float makes it
 `FLOAT`, booleans `BOOL`, and strings, nested objects and arrays, or a mix of
 kinds `STRING`, nested values as compact JSON text that `json_get` and
 `JSON_EACH` take apart. JSON has no date type, so a date stays text until
@@ -81,8 +81,10 @@ kinds `STRING`, nested values as compact JSON text that `json_get` and
 those rows were the whole input (one file, not a folder) it is of unknown type,
 as a CSV column with no value is, so it unifies with any type in a `UNION` or a
 join. A later row is read into those columns as `CAST` reads a value: a missing
-key is `NULL`, a key not among the columns is dropped, and a value its column
-cannot read is `NULL` rather than a guess.
+key is `NULL`, while a key not among the columns, or a value its column cannot
+read (`"yes"` in an `INT` column), fails the read naming the key or the value,
+as a CSV cell past its sniffed type does, rather than dropping data or guessing.
+A larger `sample` types the columns from enough rows to meet them.
 
 Rows stream: an NDJSON file or an array is never held whole, only `items` reads
 its document whole to find the path. A local NDJSON file splits across lanes at
@@ -432,9 +434,11 @@ WHERE downloads > 0;
 
 The rows are the array at `items` (or the response itself); a single object —
 a detail endpoint's answer — is one row. Columns are typed as a JSON file's are
-([JSON and NDJSON](#json-and-ndjson)), from the first page's rows: numbers,
-booleans and strings as themselves, nested objects and arrays as JSON text. A
-later row's value is read into its column as `CAST` would read it, and one that
-cannot be — `"yes"` in a `BOOL` column, `1e300` in an `INT` — is `NULL` rather
-than a guess. `json_get` and `JSON_EACH` ([JSON functions](../reference/json.md), and `UNNEST` in [Queries](queries.md)) take
+([JSON and NDJSON](#json-and-ndjson)): numbers, booleans and strings as
+themselves, nested objects and arrays as JSON text, from the first 1,024 items or
+the first N with `WITH (sample = N)`, the read going on to later pages until it
+holds that many before it fixes the columns. A later item's value is read into
+its column as `CAST` would read it, and one that cannot be (`"yes"` in a `BOOL`
+column, `1e300` in an `INT`), or a key not among the columns, fails the read
+naming it; a larger `sample` reaches it. `json_get` and `JSON_EACH` ([JSON functions](../reference/json.md), and `UNNEST` in [Queries](queries.md)) take
 the nested JSON text apart.

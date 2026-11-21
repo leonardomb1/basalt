@@ -199,7 +199,7 @@ const XlsxInsert = struct {
         const path = w.target;
         const sheet: ?[]const u8 = if (env.write_opts == .xlsx and env.write_opts.xlsx.len > 0) env.write_opts.xlsx else null;
         const x = xlsxread.Reader.open(a, env.gpa, path, .{ .sheet = sheet }) catch |e|
-            return planErrT(env.diag, e, try msgfmt.allocPrint(a, "INSERT INTO {s}: could not read the workbook ({s})", .{ path, @errorName(e) }));
+            return planErrT(env.diag, e, try msgfmt.allocPrint(a, "INSERT INTO {s}: could not read the workbook ({s}); INSERT adds rows to a sheet the workbook has, and `LOAD INTO` with that `sheet` writes a new one beside the others", .{ path, try formats_open.workbookFail(env, path, sheet, e) }));
         defer x.close();
         const loc = try xlsxread.locate(a, env.gpa, path, sheet);
         if (try xlsxedit.problem(a, path, loc)) |why| return planErr(env.diag, try msgfmt.allocPrint(a, "INSERT INTO {s}: {s}", .{ path, why }));
