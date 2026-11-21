@@ -81,10 +81,14 @@ kinds `STRING`, nested values as compact JSON text that `json_get` and
 those rows were the whole input (one file, not a folder) it is of unknown type,
 as a CSV column with no value is, so it unifies with any type in a `UNION` or a
 join. A later row is read into those columns as `CAST` reads a value: a missing
-key is `NULL`, while a key not among the columns, or a value its column cannot
-read (`"yes"` in an `INT` column), fails the read naming the key or the value,
-as a CSV cell past its sniffed type does, rather than dropping data or guessing.
-A larger `sample` types the columns from enough rows to meet them.
+key is `NULL`, and a value its column cannot read (`"yes"` in an `INT`
+column) fails the read naming it, as a CSV cell past its sniffed type does,
+rather than guessing. A key not among the columns fails a read that hands on
+every column (`SELECT *`, `* EXCEPT`), as its values would be lost; a query that
+names its columns (`SELECT count(*), count(DISTINCT sku)`) could not have asked
+for it, so the key is passed over, and a source that adds an optional field
+does not break it. A larger `sample` types the columns from enough rows to meet
+them.
 
 Rows stream: an NDJSON file or an array is never held whole, only `items` reads
 its document whole to find the path. A local NDJSON file splits across lanes at
@@ -439,6 +443,7 @@ themselves, nested objects and arrays as JSON text, from the first 1,024 items o
 the first N with `WITH (sample = N)`, the read going on to later pages until it
 holds that many before it fixes the columns. A later item's value is read into
 its column as `CAST` would read it, and one that cannot be (`"yes"` in a `BOOL`
-column, `1e300` in an `INT`), or a key not among the columns, fails the read
-naming it; a larger `sample` reaches it. `json_get` and `JSON_EACH` ([JSON functions](../reference/json.md), and `UNNEST` in [Queries](queries.md)) take
+column, `1e300` in an `INT`) fails the read naming it; a key not among the
+columns fails it too when the query takes every column, and is passed over when
+the query names its columns, as for a file. A larger `sample` reaches either. `json_get` and `JSON_EACH` ([JSON functions](../reference/json.md), and `UNNEST` in [Queries](queries.md)) take
 the nested JSON text apart.

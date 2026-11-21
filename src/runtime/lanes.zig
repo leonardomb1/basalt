@@ -80,7 +80,10 @@ pub fn runParquetLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w:
 
 pub fn runCsvLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     var rd = stages[0].node.read;
-    if (try projectedColumns(env, pushStages(stages, shape))) |cols| rd.cols = cols;
+    if (try projectedColumns(env, pushStages(stages, shape))) |cols| {
+        rd.cols = cols;
+        rd.projected = true;
+    }
     const mapped = (try csvSplitFile(env, rd, stages[0].hints, w)) orelse
         return runHeld(env, stages[0], shape, w, opts, stats, lanes_used);
     defer mapped.close();

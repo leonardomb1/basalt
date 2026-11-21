@@ -12,7 +12,8 @@
 //!
 //! Columns come from the first `sample` rows in the order first met; a name first
 //! met past the sample fails the read naming it, as a JSON key past its sample
-//! does, rather than its values being dropped. Text is typed as a CSV's cells are
+//! does, rather than its values being dropped, unless the query names its columns
+//! (`skip_strays`), when it is passed over. Text is typed as a CSV's cells are
 //! (`texttype.zig`): a child left empty (`<a/>`) is the empty string in a text
 //! column and NULL in a typed one, an absent child or `xsi:nil="true"` is NULL, and
 //! a value past the sample its typed column cannot read is an error.
@@ -48,6 +49,10 @@ pub const Options = struct {
     schema: ?types.Schema = null,
     text: []const []const u8 = &.{},
     source_name: []const u8 = "",
+    /// Whether the query names the columns it takes, so a name past the sample is one
+    /// it never asked for and is passed over; else the read hands on every column and
+    /// such a name fails it, as its values would be lost.
+    skip_strays: bool = false,
 };
 
 const Kind = enum { elem, attr, child_attr };
@@ -251,7 +256,13 @@ pub const Reader = struct {
                 break;
             };
             @memset(vals, null);
-            for (row) |c| vals[self.columnOf(c) orelse return self.stray(c)] = c;
+            for (row) |c| {
+                const i = self.columnOf(c) orelse {
+                    if (self.opts.skip_strays) continue;
+                    return self.stray(c);
+                };
+                vals[i] = c;
+            }
             for (builders, vals, self.schema.fields) |*b, v, f| try self.put(arena, b, v, f.name);
         }
         if (n == 0) return null;
@@ -657,6 +668,8 @@ test "a name first met past the sample, element or attribute, fails the read nam
         try testing.expect(std.mem.indexOf(u8, msg, "XML row 2:") != null);
         try testing.expect(std.mem.endsWith(u8, msg, "read with a larger WITH (sample = N) so the sample reaches it"));
         _ = try readAll(a, c[0], .{ .sample = 2 });
+        const named = try readAll(a, c[0], .{ .sample = 1, .skip_strays = true });
+        try testing.expectEqual(@as(usize, 2), named.rows.len);
     }
 }
 

@@ -710,6 +710,7 @@ pub fn narrowHead(env: *Env, h: ast.Stage, after: []const ast.Stage) !ast.Stage 
     var out = h;
     var rd = h.node.read;
     rd.cols = cols;
+    rd.projected = true;
     out.node = .{ .read = rd };
     return out;
 }

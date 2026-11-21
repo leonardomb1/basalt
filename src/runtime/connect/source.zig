@@ -99,7 +99,7 @@ pub fn openSourceProjected(
     project: ?[][]const u8,
     bounds: []const pqdecode.Bound,
 ) !driver.Source {
-    const own: ?[][]const u8 = if (project == null and rd_in.form == .path and rd_in.cols.len > 0) @constCast(rd_in.cols) else null;
+    const own: ?[][]const u8 = if (project == null and rd_in.form == .path and (rd_in.projected or rd_in.cols.len > 0)) @constCast(rd_in.cols) else null;
     var src = try openSourceOf(env, rd_in, hints, project orelse own, bounds);
     src.stop = env.stop;
     return src;
@@ -229,6 +229,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         if (rd.form != .path) return planErr(env.diag, "read http needs a quoted URL");
         if (try http_client.optionProblem(env.arena, hints, false, true)) |p| return planErr(env.diag, p.msg);
         var hopts = try http_client.optsFromHints(env.arena, hints);
+        hopts.skip_strays = project != null;
         hopts.logger = env.log;
         const req = if (env.profile != null) try noteRequest(env, rd, hints, try msgfmt.allocPrint(env.arena, "{f}", .{urls.fmtShown(rd.form.path)})) else null;
         if (req) |r| hopts.page_count = &r.pages;
@@ -272,6 +273,7 @@ fn openSourceCols(env: *Env, rd: ast.Read, hints: []const ast.Hint, project: ?[]
         const cc = hc.cc;
         const all = hc.hints;
         var hopts = try http_client.optsFromHints(env.arena, all);
+        hopts.skip_strays = project != null;
         hopts.logger = env.log;
         const path = try http_client.withQuery(env.arena, rd.form.path, try queryParams(env.arena, all));
         const req = if (env.profile != null) try noteRequest(env, rd_eff, hints, try msgfmt.allocPrint(env.arena, "{f}", .{urls.fmtShown(path)})) else null;

@@ -295,6 +295,10 @@ pub const Read = struct {
     form: ReadForm,
     where: []const u8 = "",
     cols: []const []const u8 = &.{},
+    /// Whether `cols` is what the stages after the read take, which may be no column
+    /// at all (a `count(*)`): the query names its columns, so a reader may pass over
+    /// one it never sampled. False when nothing narrowed the read.
+    projected: bool = false,
     text_cols: []const []const u8 = &.{},
 };
 

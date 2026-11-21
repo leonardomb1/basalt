@@ -264,7 +264,9 @@ const impls = struct {
     pub const json = struct {
         /// JSON or NDJSON files as one table, `path` naming them in messages.
         pub fn read(env: *Env, r: Read) anyerror!driver.Source {
-            const f = jsonread.Files.open(env.arena, env.gpa, filesOf(&r), analyze.jsonOptions(r.hints)) catch |e| {
+            var opts = analyze.jsonOptions(r.hints);
+            opts.skip_strays = r.project != null;
+            const f = jsonread.Files.open(env.arena, env.gpa, filesOf(&r), opts) catch |e| {
                 if (e == error.InvalidJson)
                     return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "`{s}` is not valid JSON or NDJSON in its first rows", .{r.path}));
                 return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "could not read JSON `{s}` ({s})", .{ r.path, try pathFail(env.arena, r.path, e) }));
@@ -273,8 +275,9 @@ const impls = struct {
         }
 
         pub fn stdin(env: *Env, s: *stream.Stream, hints: []const ast.Hint, project: ?[][]const u8) anyerror!driver.Source {
-            _ = project;
-            const f = jsonread.Files.on(env.arena, env.gpa, s, &.{}, analyze.jsonOptions(hints)) catch |e| {
+            var opts = analyze.jsonOptions(hints);
+            opts.skip_strays = project != null;
+            const f = jsonread.Files.on(env.arena, env.gpa, s, &.{}, opts) catch |e| {
                 if (e == error.InvalidJson) return planErrT(env.diag, e, "stdin is not valid JSON or NDJSON in its first rows");
                 return e;
             };
@@ -296,15 +299,16 @@ const impls = struct {
         /// XML files as one table, `path` naming them in messages.
         pub fn read(env: *Env, r: Read) anyerror!driver.Source {
             var odiag = analyze.Diag{};
-            const opts = analyze.xmlOptions(r.hints, r.text, &odiag) catch |e| return aErr(env, &odiag, e);
+            var opts = analyze.xmlOptions(r.hints, r.text, &odiag) catch |e| return aErr(env, &odiag, e);
+            opts.skip_strays = r.project != null;
             const f = xmlread.Files.open(env.arena, env.gpa, filesOf(&r), opts) catch |e| return xmlOpenFailed(env, r.path, e);
             return f.source();
         }
 
         pub fn stdin(env: *Env, s: *stream.Stream, hints: []const ast.Hint, project: ?[][]const u8) anyerror!driver.Source {
-            _ = project;
             var odiag = analyze.Diag{};
-            const opts = analyze.xmlOptions(hints, &.{}, &odiag) catch |e| return aErr(env, &odiag, e);
+            var opts = analyze.xmlOptions(hints, &.{}, &odiag) catch |e| return aErr(env, &odiag, e);
+            opts.skip_strays = project != null;
             const f = xmlread.Files.on(env.arena, env.gpa, s, &.{}, opts) catch |e| return xmlOpenFailed(env, "stdin", e);
             return f.source();
         }

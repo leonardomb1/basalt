@@ -451,6 +451,7 @@ pub const MappedCsv = struct {
         if (self.recs != null) return;
         if (self.ndjson) |*o| {
             if (o.known == null) o.known = self.schema;
+            o.skip_strays = true;
             var keep = std.array_list.Managed(types.Schema.Field).init(arena);
             for (self.schema.fields) |f| for (names) |n| {
                 if (std.mem.eql(u8, f.name, n)) {

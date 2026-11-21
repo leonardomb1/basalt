@@ -554,9 +554,10 @@ row named like one of its children is `@attr`. Text directly inside the row,
 beside its children, is a column named for the row.
 
 Columns come from the first 1,024 rows, or the first N with `WITH (sample = N)`,
-in the order first met; a name first met later, element or attribute, fails the
-read naming it and the row, as a JSON key past its sample does, rather than its
-values being dropped, and a larger `sample` reaches it. Values are typed as a
+in the order first met; a name first met later, element or attribute, fails a
+read that hands on every column, naming it and the row, as a JSON key past its
+sample does, rather than its values being dropped, and is passed over when the
+query names its columns; a larger `sample` reaches it. Values are typed as a
 CSV's cells are (INT, FLOAT, DATE, else text, a leading zero keeping a code
 text), and a later value its typed column cannot read is an error naming the
 row, not a NULL; read the column with `CAST(col AS VARCHAR)` to keep it text. An empty element (`<a/>`)

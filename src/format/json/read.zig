@@ -12,9 +12,10 @@
 //! any type as a CSV column of NULLs does (`Type.nullColumn`); the first of several
 //! files is not the whole input. Every row, sampled or later, is read into those
 //! columns as `CAST` reads a value (`Rows`): a key missing from a row is NULL, while
-//! a key not among the columns, or a value its column cannot read, fails the read
-//! (`JsonPastSample`), as a CSV cell past its sniffed type does; `sample` widens the
-//! rows the columns are typed from.
+//! a value its column cannot read fails the read (`JsonPastSample`), as a CSV cell
+//! past its sniffed type does, and so does a key not among the columns, unless the
+//! query names its columns (`skip_strays`), when the key is one it never asked for;
+//! `sample` widens the rows the columns are typed from.
 //!
 //! The input streams: values are cut out of a buffer that holds about one batch of
 //! rows (`Scan`), each validated and read in place by `exec/json.zig`, never built
@@ -46,6 +47,10 @@ pub const Options = struct {
     /// The whole input's columns when `schema` is a projection of them: a key among
     /// these but not read is skipped, while one in neither fails the read.
     known: ?types.Schema = null,
+    /// Whether the query names the columns it takes (a projection, perhaps of none),
+    /// so a key past the sample is one it never asked for and is skipped; else the
+    /// read hands on every column and such a key fails it, as its values would be lost.
+    skip_strays: bool = false,
     /// Whether this input is all that is read, so a sample that reaches its end has
     /// seen every row; false for the first of several files.
     alone: bool = true,
@@ -119,6 +124,8 @@ pub const Rows = struct {
     /// STRING column takes as it stands.
     plain: []bool,
     len: usize = 0,
+    /// `Options.skip_strays`: a key in no column is passed over rather than refused.
+    skip_strays: bool = false,
 
     /// A column's shortcut, chosen once from its type: a plain number or a literal
     /// appended as `read` would append it, without the `Value` and cast between.
@@ -205,7 +212,7 @@ pub const Rows = struct {
             const key = if (plain) raw_key else try jt.decodeString(p.arena, raw_key);
             const fields = p.rows.schema.fields;
             const ci = if (p.at < fields.len and sameName(fields[p.at].name, key)) p.at else p.rows.index.get(key) orelse {
-                if (!p.rows.known.contains(key) and p.stray == null) p.stray = key;
+                if (!p.rows.skip_strays and !p.rows.known.contains(key) and p.stray == null) p.stray = key;
                 return;
             };
             p.rows.vals[ci] = value;
@@ -324,9 +331,11 @@ pub fn schemaOf(arena: std.mem.Allocator, rows: []const []const u8, sample: usiz
     return infer.schema(arena);
 }
 
-/// `rows`, each a validated row's text, read into `schema`'s columns as one batch.
-pub fn batchOf(arena: std.mem.Allocator, schema: *const types.Schema, rows: []const []const u8) Error!Batch {
+/// `rows`, each a validated row's text, read into `schema`'s columns as one batch;
+/// `skip_strays` as `Options.skip_strays`.
+pub fn batchOf(arena: std.mem.Allocator, schema: *const types.Schema, rows: []const []const u8, skip_strays: bool) Error!Batch {
     var r = try Rows.init(arena, schema.*, null, rows.len);
+    r.skip_strays = skip_strays;
     for (rows) |row| try r.add(arena, row);
     return r.finish(arena, schema);
 }
@@ -615,6 +624,7 @@ pub const Reader = struct {
     fn nextInto(self: *Reader, arena: std.mem.Allocator, spans: ?*[2]column.Builder) Error!?Batch {
         if (self.done) return null;
         var rows = try Rows.init(arena, self.schema, self.opts.known, self.opts.batch_rows);
+        rows.skip_strays = self.opts.skip_strays;
         while (rows.len < self.opts.batch_rows) {
             if (self.held_at < self.held.len) {
                 try rows.add(arena, self.held[self.held_at]);

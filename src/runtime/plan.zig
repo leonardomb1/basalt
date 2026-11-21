@@ -1102,6 +1102,7 @@ fn projectJoinedFileRead(env: *Env, stages: []const ast.Stage, needs: []const []
     const out = try env.arena.dupe(ast.Stage, stages);
     var nrd = rd;
     nrd.cols = try @import("connect/sql_read.zig").plainNames(env.arena, cols);
+    nrd.projected = true;
     out[0].node = .{ .read = nrd };
     return out;
 }

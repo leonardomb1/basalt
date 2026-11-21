@@ -712,6 +712,7 @@ fn windowTopKLanes(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, la
     var crd = rd;
     if (crd.cols.len == 0) if (try projectedColumns(env, stages[1..])) |cols| {
         crd.cols = cols;
+        crd.projected = true;
     };
     const m: Morsels = if (try parquetSplit(env, crd, stages[0].hints, stages[1..wi], w, opts)) |pm| pm else blk: {
         mapped = (try csvSplitFile(env, crd, stages[0].hints, w)) orelse return null;

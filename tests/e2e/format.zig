@@ -691,6 +691,38 @@ test "vector functions read embeddings pyarrow wrote, a list and a fixed-size li
     try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/out.csv' AS SELECT list_inner_product(embedding, CAST('[1,null,0,0]' AS LIST(DOUBLE))) AS d FROM '$B/e.parquet';", 1, "list_inner_product: a list holds a NULL element");
 }
 
+fn lateKeyItems(a: std.mem.Allocator, _: []const u8, _: []const u8) anyerror![]const u8 {
+    return a.dupe(u8, "[{\"id\":1,\"sku\":\"a\"},{\"id\":2,\"sku\":\"b\"},{\"id\":3,\"sku\":\"a\",\"promo\":\"x\"}]");
+}
+
+test "a key or name past the sample is passed over when the query names its columns, JSON, XML and REST alike, and fails a read of every column" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "p.ndjson", .data = "{\"id\":1,\"sku\":\"a\"}\n{\"id\":2,\"sku\":\"b\"}\n{\"id\":3,\"sku\":\"a\",\"promo\":\"x\"}\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "p.json", .data = "[{\"id\":1,\"sku\":\"a\"},{\"id\":2,\"sku\":\"b\"},{\"id\":3,\"sku\":\"a\",\"promo\":\"x\"}]" });
+    try tmp.dir.writeFile(.{ .sub_path = "p.xml", .data = "<r><x><id>1</id><sku>a</sku></x><x><id>2</id><sku>b</sku></x><x promo=\"y\"><id>3</id><sku>a</sku><promo>x</promo></x></r>" });
+    var srv: basalt.http_fake.EchoServer = undefined;
+    try srv.start(lateKeyItems, 0);
+    defer srv.stop();
+    const rest = try std.fmt.allocPrint(a, "HTTP('{s}/items')", .{try srv.url(a)});
+    for ([_][]const u8{ "'$B/p.ndjson'", "'$B/p.json'", "'$B/p.xml'", rest }) |src| {
+        for ([_]usize{ 1, 4 }) |threads| {
+            try checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/o.csv' AS SELECT count(*) AS n, count(DISTINCT sku) AS skus FROM {s} WITH (sample = 2);", .{src}), threads, &.{});
+            try expectFile(&tmp, "o.csv", "n,skus\n3,2\n");
+            try checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/o.csv' AS SELECT count(*) AS n FROM {s} WITH (sample = 2);", .{src}), threads, &.{});
+            try expectFile(&tmp, "o.csv", "n\n3\n");
+        }
+        try checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/o.csv' AS SELECT id FROM {s} WITH (sample = 2) WHERE sku = 'a' ORDER BY id;", .{src}), 1, &.{});
+        try expectFile(&tmp, "o.csv", "id\n1\n3\n");
+        for ([_][]const u8{ "SELECT *", "SELECT * EXCEPT (id)" }) |sel|
+            try expectRunRefuses(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/o.csv' AS {s} FROM {s} WITH (sample = 2);", .{ sel, src }), 1, "not among the");
+    }
+}
+
 test "a JSON key or value past the sample fails the read, a larger WITH (sample = N) reads it, and a sample that is no count is refused" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
