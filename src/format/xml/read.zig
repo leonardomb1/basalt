@@ -11,11 +11,11 @@
 //! - text directly inside the row, beside its children, is a column named for the row.
 //!
 //! Columns come from the first `sample` rows in the order first met; a name first
-//! met past the sample is dropped (a JSON key past its sample fails instead). Text
-//! is typed as a CSV's cells are (`texttype.zig`): a child left empty (`<a/>`) is
-//! the empty string in a text column and NULL in a typed one, an absent child or
-//! `xsi:nil="true"` is NULL, and a value past the sample its typed column cannot
-//! read is an error.
+//! met past the sample fails the read naming it, as a JSON key past its sample
+//! does, rather than its values being dropped. Text is typed as a CSV's cells are
+//! (`texttype.zig`): a child left empty (`<a/>`) is the empty string in a text
+//! column and NULL in a typed one, an absent child or `xsi:nil="true"` is NULL, and
+//! a value past the sample its typed column cannot read is an error.
 //!
 //! Names lose their namespace prefix and have FOR XML's `_xHHHH_` decoded. The
 //! document's declared encoding is honoured (UTF-8, ISO-8859-1, windows-1252, or
@@ -251,9 +251,7 @@ pub const Reader = struct {
                 break;
             };
             @memset(vals, null);
-            for (row) |c| if (self.columnOf(c)) |i| {
-                vals[i] = c;
-            };
+            for (row) |c| vals[self.columnOf(c) orelse return self.stray(c)] = c;
             for (builders, vals, self.schema.fields) |*b, v, f| try self.put(arena, b, v, f.name);
         }
         if (n == 0) return null;
@@ -270,6 +268,13 @@ pub const Reader = struct {
             error.TextTypeMismatch => return self.mismatch(name, v, b.ty.kind, "a value"),
             else => return e,
         };
+    }
+
+    /// A name no column holds, first met past the sample: read on, its values would be
+    /// dropped, so the read fails, as a JSON key past its sample does.
+    fn stray(self: *Reader, c: Cell) anyerror {
+        const shown = if (c.kind == .attr) msgfmt.allocPrint(self.arena, "@{s}", .{c.name}) catch c.name else c.name;
+        return eval.explain(error.XmlPastSample, msgfmt.allocPrint(self.arena, "{s}{s}XML row {d}: `{s}` is not among the names of the rows sampled to type the columns, so its values would be dropped; read with a larger WITH (sample = N) so the sample reaches it", .{ self.opts.source_name, if (self.opts.source_name.len > 0) ": " else "", self.rows_seen, eval.clip(shown) }) catch "an XML name falls outside its sampled columns");
     }
 
     fn mismatch(self: *Reader, name: []const u8, v: []const u8, kind: types.TypeKind, what: []const u8) anyerror {
@@ -635,6 +640,24 @@ test "a value past the sample its typed column cannot read is an error; UTF-16 i
     try testing.expectError(error.TextTypeMismatch, readAll(a, "<r><x><n>1</n></x><x><n>abc</n></x></r>", .{ .sample = 1 }));
     try testing.expectError(error.TextTypeMismatch, readAll(a, "<r><x><n>1</n></x><x><n>2</n><n>3</n></x></r>", .{ .sample = 1 }));
     try testing.expectError(error.XmlUnsupportedEncoding, readAll(a, "\xff\xfe<\x00r\x00>\x00", .{}));
+}
+
+test "a name first met past the sample, element or attribute, fails the read naming it; a sample that reaches it reads it" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    for ([_]struct { []const u8, []const u8 }{
+        .{ "<r><x><n>1</n></x><x><n>2</n><novo/></x></r>", "`novo`" },
+        .{ "<r><x a=\"1\"/><x a=\"2\" z=\"3\"/></r>", "`@z`" },
+        .{ "<r><x><n k=\"1\">1</n></x><x><n k=\"2\" j=\"3\">2</n></x></r>", "`n@j`" },
+    }) |c| {
+        try testing.expectError(error.XmlPastSample, readAll(a, c[0], .{ .sample = 1 }));
+        const msg = eval.takeFailure(error.XmlPastSample).?;
+        try testing.expect(std.mem.indexOf(u8, msg, c[1]) != null);
+        try testing.expect(std.mem.indexOf(u8, msg, "XML row 2:") != null);
+        try testing.expect(std.mem.endsWith(u8, msg, "read with a larger WITH (sample = N) so the sample reaches it"));
+        _ = try readAll(a, c[0], .{ .sample = 2 });
+    }
 }
 
 test "text or an attribute that is not UTF-8 fails the read naming row and element; latin-1 decodes it; a name is repaired" {

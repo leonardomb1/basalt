@@ -10,7 +10,7 @@ A query reads from one source, named after `FROM`, and joins may read more
 | raw query | `FROM erp.QUERY($$SELECT ...$$)` (no dialect translation) |
 | file — CSV, Parquet, Arrow IPC or Excel | `FROM 'path.csv'` / `FROM 'path.parquet'` / `FROM 'path.arrow'` (also `.feather`, `.ipc`, `.arrows`) / `FROM 'path.xlsx'` (also `.xlsm`) — the extension picks the reader; local or HTTPS URL (Arrow IPC: local only). Any other extension is a plan-time error unless `WITH (format = 'csv' \| 'parquet' \| 'arrow' \| 'xlsx' \| 'json' \| 'ndjson' \| 'xml')` names one |
 | file — JSON or NDJSON | `FROM 'events.ndjson'` (also `.jsonl`) / `FROM 'rows.json'`; see [JSON and NDJSON](#json-and-ndjson) |
-| file — XML | `FROM 'orders.xml'`, `WITH (row = 'Order')` naming the row element; see [XML](formats.md#xml) |
+| file — XML | `FROM 'orders.xml'`, `WITH (row = 'Order')` naming the row element, `sample = N` the rows its columns are typed from; see [XML](formats.md#xml) |
 | standard input | `FROM STDIN` — CSV, or `WITH (format = 'json' \| 'ndjson' \| 'xml')`; see [Standard input](#standard-input) |
 | compressed file | `FROM 'path.csv.gz'` / `.csv.zst` / `.ndjson.gz` — the inner name picks the reader |
 | file inside a zip | `FROM 'archive.zip :: inner.csv'`, or just `FROM 'archive.zip'` when it holds one file |

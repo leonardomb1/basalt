@@ -553,11 +553,13 @@ and `WITH (row = 'item')` reads the items themselves as rows. An attribute of th
 row named like one of its children is `@attr`. Text directly inside the row,
 beside its children, is a column named for the row.
 
-Columns come from the first 1,024 rows, in the order first met; a name first met
-later is dropped (a JSON key first met past its sample fails the read instead). Values are typed as a CSV's cells are (INT,
-FLOAT, DATE, else text, a leading zero keeping a code text), and a later value
-its typed column cannot read is an error naming the row, not a NULL; read the
-column with `CAST(col AS VARCHAR)` to keep it text. An empty element (`<a/>`)
+Columns come from the first 1,024 rows, or the first N with `WITH (sample = N)`,
+in the order first met; a name first met later, element or attribute, fails the
+read naming it and the row, as a JSON key past its sample does, rather than its
+values being dropped, and a larger `sample` reaches it. Values are typed as a
+CSV's cells are (INT, FLOAT, DATE, else text, a leading zero keeping a code
+text), and a later value its typed column cannot read is an error naming the
+row, not a NULL; read the column with `CAST(col AS VARCHAR)` to keep it text. An empty element (`<a/>`)
 is the empty string in a text column and NULL in a typed one; an absent element
 or `xsi:nil="true"` is NULL. Namespace prefixes are dropped, and names encoded as
 SQL Server's `FOR XML` writes them (`Valor_x0020_Total`) are decoded. The

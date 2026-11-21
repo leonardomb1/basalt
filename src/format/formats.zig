@@ -126,7 +126,7 @@ pub const table = [_]Format{
         .folder_exts = &.{".xml"},
         .lanes = .serial,
         .stdin = true,
-        .read_keys = &.{ "format", "row", "encoding" },
+        .read_keys = &.{ "format", "row", "encoding", "sample" },
         .write = .{ .append_refused = "an XML file's root element closes on its last line, so appending means rewriting the file", .change = .{ .refused = "writes the file again, and an XML file is written in basalt's own shape, losing the rest of its structure" } },
         .write_keys = &.{ "format", "root", "row" },
     },

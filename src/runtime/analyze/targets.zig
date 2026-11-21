@@ -403,6 +403,7 @@ pub fn xlsxSheetFromHints(hints: []const ast.Hint, diag: *Diag) Error![]const u8
 pub fn xmlOptions(hints: []const ast.Hint, text: []const []const u8, diag: *Diag) Error!xmlread.Options {
     var o = xmlread.Options{ .row = hintText(hints, "row"), .text = text };
     if (try encodingFromHints(hints, diag)) |e| o.encoding = e;
+    if (sampleHint(hints)) |n| o.sample = n;
     return o;
 }
 
