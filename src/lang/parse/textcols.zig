@@ -6,8 +6,11 @@
 //! Every query (`parseQuery`) keeps a `ColUses`, chained to the query around it. A
 //! column reference counts as a bare use of each part of its name, in its own query
 //! and every query around it; `CAST(<column> AS T)` turns its innermost bare use into
-//! a cast. A star, `IDENTIFIER(...)` or `search(...)` reads columns the parser cannot
-//! name, which makes the query opaque. Uses are counted by name alone and propagate
+//! a cast. A bare `*` reads every column but those it leaves out, by `EXCEPT` or as
+//! a `REPLACE` target, so only those may be read as text
+//! (`* REPLACE (CAST(gap AS DOUBLE) AS gap)`). A `t.*`, `IDENTIFIER(...)` or
+//! `search(...)` reads columns the parser cannot name, which makes the query
+//! opaque. Uses are counted by name alone and propagate
 //! outward, so a doubt always counts as a bare use: a column is read as text only
 //! when nothing in the query could read it as its sniffed type.
 
@@ -19,6 +22,25 @@ pub const ColUses = struct {
     bare: std.StringHashMapUnmanaged(u32) = .empty,
     cast: std.StringHashMapUnmanaged(void) = .empty,
     opaque_: bool = false,
+    /// The names every bare `*` of the query leaves out, by `EXCEPT` or as a
+    /// `REPLACE` target, null before the first: a star reads every other column as
+    /// it is, so only these may still be read as text.
+    spared: ?std.StringHashMapUnmanaged(void) = null,
+
+    /// A bare `*` that leaves out `names`: it reads every other column, of this query
+    /// alone, as its sniffed type.
+    pub fn starUse(self: *ColUses, a: std.mem.Allocator, names: []const []const u8) !void {
+        if (self.spared) |*s| {
+            var gone = std.array_list.Managed([]const u8).init(a);
+            var it = s.keyIterator();
+            while (it.next()) |k| if (!ast.nameIn(names, k.*)) try gone.append(k.*);
+            for (gone.items) |k| _ = s.remove(k);
+            return;
+        }
+        var s: std.StringHashMapUnmanaged(void) = .empty;
+        for (names) |n| try s.put(a, n, {});
+        self.spared = s;
+    }
 
     pub fn bareUse(self: *ColUses, a: std.mem.Allocator, q: ast.QualName) !void {
         var u: ?*ColUses = self;
@@ -48,13 +70,16 @@ pub const ColUses = struct {
         while (u) |c| : (u = if (all) c.parent else null) c.opaque_ = true;
     }
 
-    /// The columns cast and never used bare, none when the query is opaque.
+    /// The columns cast and never used bare, nor read by a star, none when the query
+    /// is opaque.
     pub fn textCols(self: *const ColUses, a: std.mem.Allocator) ![]const []const u8 {
         if (self.opaque_) return &.{};
         var out = std.array_list.Managed([]const u8).init(a);
         var it = self.cast.keyIterator();
         while (it.next()) |k| {
-            if ((self.bare.get(k.*) orelse 0) == 0) try out.append(k.*);
+            if ((self.bare.get(k.*) orelse 0) != 0) continue;
+            if (self.spared) |s| if (!s.contains(k.*)) continue;
+            try out.append(k.*);
         }
         return out.toOwnedSlice();
     }

@@ -136,6 +136,28 @@ test "a CSV column read only through CAST keeps its text past the sample, on one
     defer alloc.free(bare);
     var rdiag: Diag = .{};
     try std.testing.expectError(error.TextTypeMismatch, exec(alloc, bare, .{ .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } }, &rdiag));
+
+    const starred = try std.fmt.allocPrint(alloc,
+        \\SELECT * REPLACE (CAST(cep AS STRING) AS cep, CAST(v AS DECIMAL(20,2)) AS v) FROM '{s}/c.csv' WHERE id = 3000;
+        \\SELECT * EXCLUDE (cep, v), CAST(cep AS STRING) AS cep FROM '{s}/c.csv' WHERE id = 3000;
+        \\SELECT * EXCEPT (v) REPLACE (CAST(cep AS STRING) AS cep) FROM '{s}/c.csv' WHERE id = 3000;
+    , .{ base, base, base });
+    defer alloc.free(starred);
+    for ([_]usize{ 1, 4 }) |lanes| {
+        const printed = try runToStdout(alloc, tmp.dir, starred, .{ .threads = lanes, .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } });
+        defer alloc.free(printed);
+        try std.testing.expectEqualStrings("id,cep,v\n3000,01310100,12345678901234567.12\nid,cep\n3000,01310100\nid,cep\n3000,01310100\n", printed);
+    }
+    for ([_][]const u8{
+        "SELECT * FROM '{s}/c.csv' WHERE id = 3000;",
+        "SELECT *, CAST(cep AS STRING) AS c FROM '{s}/c.csv' WHERE id = 3000;",
+        "SELECT * EXCLUDE (v) FROM '{s}/c.csv' WHERE id = 3000;",
+    }) |tmpl| {
+        const q = try std.mem.replaceOwned(u8, alloc, tmpl, "{s}", base);
+        defer alloc.free(q);
+        var sdiag: Diag = .{};
+        try std.testing.expectError(error.TextTypeMismatch, exec(alloc, q, .{ .stdout_format = .csv, .log = .{ .quiet = true, .summary = .none } }, &sdiag));
+    }
 }
 
 test "a bare name both sides of a join have is ambiguous in that query, wherever it is read; qualified, merged by USING, or past the query it is not" {

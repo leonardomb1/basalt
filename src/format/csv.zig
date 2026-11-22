@@ -897,7 +897,7 @@ fn rowFailure(e: anyerror, path: []const u8, line_no: u64, line: []const u8, sch
             .date => "a DATE",
             else => @tagName(f.ty.kind),
         };
-        return explainf(e, "{s}, column `{s}`: '{s}' is not {s}, the type sniffed from the first {d} rows — to read the column as written, use CAST({s} AS STRING) (or the type it holds) everywhere the query reads it", .{ where, f.name, clip(raw), want, SAMPLE_ROWS, f.name });
+        return explainf(e, "{s}, column `{s}`: '{s}' is not {s}, the type sniffed from the first {d} rows — to read the column as written, use CAST({s} AS STRING) (or the type it holds) everywhere the query reads it, under a `*` as `* REPLACE (CAST({s} AS STRING) AS {s})`", .{ where, f.name, clip(raw), want, SAMPLE_ROWS, f.name, f.name, f.name });
     }
     if (e == error.CsvRaggedRow)
         return explainf(e, "{s} has {d} fields, the header {d} — a row must have one field per column", .{ where, n, ncols });
@@ -1659,7 +1659,7 @@ test "serial and mapped readers infer the same schema; mismatch past the sample 
     try std.testing.expectEqual(@as(?anyerror, error.TextTypeMismatch), err);
     const why = eval.takeFailure(error.TextTypeMismatch).?;
     try std.testing.expect(std.mem.indexOf(u8, why, "bad.csv` line 1036, column `id`: 'oops' is not an INT, the type sniffed from the first 1024 rows") != null);
-    try std.testing.expect(std.mem.endsWith(u8, why, "use CAST(id AS STRING) (or the type it holds) everywhere the query reads it"));
+    try std.testing.expect(std.mem.endsWith(u8, why, "use CAST(id AS STRING) (or the type it holds) everywhere the query reads it, under a `*` as `* REPLACE (CAST(id AS STRING) AS id)`"));
 
     const mb = try MappedCsv.open(a, bad_path, .{});
     defer mb.close();

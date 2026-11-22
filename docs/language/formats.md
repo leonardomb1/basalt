@@ -35,7 +35,9 @@ cell as written. `SELECT CAST(cep AS STRING) AS cep FROM 'clientes.csv'` keeps
 `CAST(valor AS DECIMAL(18,2))` parses the digits exactly instead of through a
 float. This holds when every use of the column in that query is a cast — a bare
 `cep` anywhere (a `WHERE cep > 0`, a `SELECT *`) reads the sniffed type again, and
-the error on a mismatched cell says so. It applies to the CSV a query reads in its
+the error on a mismatched cell says so. A `*` reads every column but those it leaves
+out, so `SELECT * REPLACE (CAST(cep AS STRING) AS cep)` and `SELECT * EXCEPT (cep),
+CAST(cep AS STRING) AS cep` keep the text while the star passes the rest. It applies to the CSV a query reads in its
 own FROM, not to one joined to it or read through a CTE defined elsewhere.
 A column with no value at all — a header-only file, or one whose every cell is
 empty — is all NULL, and when the sample covered the whole file it is of unknown

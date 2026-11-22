@@ -1322,9 +1322,10 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
     defer self.win_sink = outer_sink;
     self.corr = &scope;
     while (true) {
-        if (self.at(.star) or (self.at(.ident) and self.peekTag() == .dot and self.i + 2 < self.toks.len and self.toks[self.i + 2].tag == .star))
+        if (self.at(.ident) and self.peekTag() == .dot and self.i + 2 < self.toks.len and self.toks[self.i + 2].tag == .star)
             if (self.col_uses) |u| u.opaqueUse(false);
         if (self.eat(.star)) {
+            const replaced_from = replaces.items.len;
             if (self.eatKw("except") or self.eatKw("exclude")) {
                 _ = try self.expect(.lparen);
                 var names = std.array_list.Managed([]const u8).init(self.arena);
@@ -1347,7 +1348,8 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             } else {
                 try raw_items.append(.{ .item = .star });
             }
-            if (raw_items.items[raw_items.items.len - 1].item == .star_rename and self.isKw("replace") and self.peekTag() == .lparen)
+            const star_item = raw_items.items[raw_items.items.len - 1].item;
+            if (star_item == .star_rename and self.isKw("replace") and self.peekTag() == .lparen)
                 return self.fail(self.curPos(), "`* RENAME` and `* REPLACE` do not combine — rename in an outer SELECT", .{});
             if (self.isKw("replace") and self.peekTag() == .lparen) {
                 _ = self.advance();
@@ -1381,6 +1383,12 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     if (!self.eat(.comma)) break;
                 }
                 _ = try self.expect(.rparen);
+            }
+            if (self.col_uses) |u| {
+                var spared = std.array_list.Managed([]const u8).init(self.arena);
+                if (star_item == .star_except) try spared.appendSlice(star_item.star_except);
+                for (replaces.items[replaced_from..]) |r| try spared.append(r.to);
+                try u.starUse(self.arena, spared.items);
             }
         } else if (self.at(.ident) and self.peekTag() == .dot and
             self.i + 2 < self.toks.len and self.toks[self.i + 2].tag == .star)
