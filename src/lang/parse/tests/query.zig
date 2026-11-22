@@ -534,6 +534,8 @@ test "sql: * REPLACE computes each expression as a hidden column, then a star_re
     try testing.expect(std.mem.indexOf(u8, diag.msg, "replaces `b` twice") != null);
     try testing.expectError(error.ParseFailed, parseSource(a, "SELECT * RENAME (a AS c) REPLACE (1 AS b) FROM 'in.csv';", &diag));
     try testing.expect(std.mem.indexOf(u8, diag.msg, "do not combine") != null);
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT DISTINCT * EXCEPT (id) FROM 'in.csv' ORDER BY id;", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "for SELECT DISTINCT, ORDER BY `id` must appear in the select list") != null);
 }
 
 test "sql: multi-key ON, RIGHT/FULL/CROSS join kinds, and the plain-column rule" {

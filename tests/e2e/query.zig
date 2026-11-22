@@ -2199,6 +2199,88 @@ test "SELECT * REPLACE puts each value in its column's place under its name, pas
     try refuse(alloc, &tmp, "SELECT * EXCEPT (name) REPLACE ('x' AS name) FROM '$B/t.csv';", "`* REPLACE` names `name`, which is not among the columns of its `*`");
 }
 
+/// A query with a star modifier beside the same query with its columns listed, and
+/// whether its rows come in order.
+const StarPair = struct { star: []const u8, plain: []const u8, ordered: bool = false };
+
+const star_pairs = [_]StarPair{
+    .{ .star = "SELECT * EXCEPT (x) FROM {S} WHERE x > 900", .plain = "SELECT id, g, y, z FROM {S} WHERE x > 900" },
+    .{ .star = "SELECT * REPLACE (x * 2 AS x) FROM {S} WHERE x > 900", .plain = "SELECT id, g, x * 2 AS x, y, z FROM {S} WHERE x > 900" },
+    .{ .star = "SELECT * FROM (SELECT * REPLACE (x * 2 AS x) FROM {S}) s WHERE x > 1900", .plain = "SELECT * FROM (SELECT id, g, x * 2 AS x, y, z FROM {S}) s WHERE x > 1900" },
+    .{ .star = "SELECT * FROM (SELECT * REPLACE (x * 2 AS x) FROM {S}) s WHERE g = 3 AND id < 200", .plain = "SELECT * FROM (SELECT id, g, x * 2 AS x, y, z FROM {S}) s WHERE g = 3 AND id < 200" },
+    .{ .star = "SELECT * EXCEPT (x) FROM {S} ORDER BY x DESC, id LIMIT 5", .plain = "SELECT id, g, y, z FROM {S} ORDER BY x DESC, id LIMIT 5", .ordered = true },
+    .{ .star = "SELECT * EXCEPT (x) REPLACE (upper(y) AS y) FROM {S} ORDER BY x DESC, id LIMIT 5", .plain = "SELECT id, g, upper(y) AS y, z FROM {S} ORDER BY x DESC, id LIMIT 5", .ordered = true },
+    .{ .star = "SELECT * EXCEPT (x), x * 10 AS x FROM {S} ORDER BY x, id LIMIT 5", .plain = "SELECT id, g, y, z, x * 10 AS x FROM {S} ORDER BY x, id LIMIT 5", .ordered = true },
+    .{ .star = "SELECT * REPLACE (-x AS x) FROM {S} ORDER BY x, id LIMIT 5", .plain = "SELECT id, g, -x AS x, y, z FROM {S} ORDER BY x, id LIMIT 5", .ordered = true },
+    .{ .star = "SELECT DISTINCT ON (g) * EXCEPT (z) FROM {S} ORDER BY g, x DESC, id", .plain = "SELECT DISTINCT ON (g) id, g, x, y FROM {S} ORDER BY g, x DESC, id", .ordered = true },
+    .{ .star = "SELECT DISTINCT ON (x) * EXCEPT (x, z) FROM {S} ORDER BY x, id", .plain = "SELECT DISTINCT ON (x) id, g, y FROM {S} ORDER BY x, id", .ordered = true },
+    .{ .star = "SELECT DISTINCT * EXCEPT (id, z) REPLACE (x % 3 AS x) FROM {S}", .plain = "SELECT DISTINCT g, x % 3 AS x, y FROM {S}" },
+    .{ .star = "SELECT * FROM (SELECT * RENAME (x AS w) FROM {S}) s WHERE w > 990", .plain = "SELECT * FROM (SELECT id, g, x AS w, y, z FROM {S}) s WHERE w > 990" },
+    .{ .star = "WITH c AS (SELECT * EXCEPT (z) REPLACE (x + 1 AS x) FROM {S}) SELECT g, sum(x) AS s, count(*) AS n FROM c WHERE y = 'y2' GROUP BY g", .plain = "WITH c AS (SELECT id, g, x + 1 AS x, y FROM {S}) SELECT g, sum(x) AS s, count(*) AS n FROM c WHERE y = 'y2' GROUP BY g" },
+    .{ .star = "WITH c AS (SELECT * REPLACE (x + 1000 AS x) FROM {S}) SELECT g, count(*) AS n FROM c WHERE x > 1500 GROUP BY g", .plain = "WITH c AS (SELECT id, g, x + 1000 AS x, y, z FROM {S}) SELECT g, count(*) AS n FROM c WHERE x > 1500 GROUP BY g" },
+    .{ .star = "SELECT * EXCEPT (z), row_number() OVER (PARTITION BY g ORDER BY x, id) AS rn FROM {S}", .plain = "SELECT id, g, x, y, row_number() OVER (PARTITION BY g ORDER BY x, id) AS rn FROM {S}" },
+    .{ .star = "WITH c AS (SELECT *, row_number() OVER (PARTITION BY g ORDER BY x DESC, id) AS rn FROM {S}) SELECT g, x, id FROM c WHERE rn = 1", .plain = "WITH c AS (SELECT id, g, x, row_number() OVER (PARTITION BY g ORDER BY x DESC, id) AS rn FROM {S}) SELECT g, x, id FROM c WHERE rn = 1" },
+    .{ .star = "SELECT * REPLACE (x * 2 AS x) FROM {S} WHERE id < 5 UNION ALL BY NAME SELECT * EXCEPT (z) FROM {S} WHERE id > 1995", .plain = "SELECT id, g, x * 2 AS x, y, z FROM {S} WHERE id < 5 UNION ALL BY NAME SELECT id, g, x, y FROM {S} WHERE id > 1995" },
+    .{ .star = "SELECT count(*) AS n FROM (SELECT * REPLACE (x * 2 AS x) FROM {S}) s", .plain = "SELECT count(*) AS n FROM {S}" },
+    .{ .star = "SELECT * EXCEPT (z) FROM {S} a JOIN (SELECT g AS gk, count(*) AS c FROM {S} GROUP BY g) b ON a.g = b.gk WHERE a.id < 20", .plain = "SELECT id, g, x, y, gk, c FROM {S} a JOIN (SELECT g AS gk, count(*) AS c FROM {S} GROUP BY g) b ON a.g = b.gk WHERE a.id < 20" },
+    .{ .star = "SELECT * EXCEPT (z) FROM {S} WHERE id IN (SELECT x FROM (SELECT * REPLACE (x + 1 AS x) FROM {S}) s WHERE g = 1) AND id < 300", .plain = "SELECT id, g, x, y FROM {S} WHERE id IN (SELECT x + 1 FROM {S} WHERE g = 1) AND id < 300" },
+    .{ .star = "SELECT id FROM (SELECT * EXCEPT (x) FROM {S}) s WHERE search((y, z), 'z42')", .plain = "SELECT id FROM {S} WHERE search((y, z), 'z42')" },
+};
+
+test "a `* EXCEPT`, `* REPLACE` or `* RENAME` query answers as the same query with its columns listed, over CSV, Parquet and NDJSON, on one lane or several" {
+    const alloc = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(alloc);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    const make = try std.fmt.allocPrint(a,
+        \\LOAD INTO '{s}/t.csv' AS SELECT range AS id, range % 7 AS g, (range * 37) % 1000 AS x, 'y' || CAST(range % 5 AS VARCHAR) AS y, 'z' || CAST(range AS VARCHAR) AS z FROM RANGE(1, 2001);
+        \\LOAD INTO '{s}/t.parquet' AS SELECT * FROM '{s}/t.csv';
+        \\LOAD INTO '{s}/t.ndjson' AS SELECT * FROM '{s}/t.csv';
+    , .{ base, base, base, base, base });
+    var mdiag: Diag = .{};
+    _ = try exec(alloc, make, .{ .log = .{ .quiet = true } }, &mdiag);
+    for ([_][]const u8{ "t.csv", "t.parquet", "t.ndjson" }) |file| {
+        const src = try std.fmt.allocPrint(a, "'{s}/{s}'", .{ base, file });
+        for (star_pairs) |p| for ([_]usize{ 1, 4 }) |threads| {
+            var got: [2][]const u8 = undefined;
+            for ([_][]const u8{ p.star, p.plain }, &got, [_][]const u8{ "s.csv", "p.csv" }) |q, *g, out| {
+                const script = try std.fmt.allocPrint(a, "LOAD INTO '{s}/{s}' AS {s};", .{ base, out, try std.mem.replaceOwned(u8, a, q, "{S}", src) });
+                var rdiag: Diag = .{};
+                _ = exec(alloc, script, .{ .threads = threads, .log = .{ .quiet = true } }, &rdiag) catch |e| {
+                    std.debug.print("{s} on {s}, -j{d}: {s} ({s})\n", .{ q, file, threads, rdiag.msg, @errorName(e) });
+                    return e;
+                };
+                g.* = try tmp.dir.readFileAlloc(a, out, 1 << 20);
+            }
+            const same = if (p.ordered) std.mem.eql(u8, got[0], got[1]) else try sameRows(a, got[0], got[1]);
+            if (!same) {
+                std.debug.print("{s} on {s}, -j{d}:\n{s}\nvs\n{s}\n", .{ p.star, file, threads, got[0][0..@min(got[0].len, 300)], got[1][0..@min(got[1].len, 300)] });
+                return error.TestUnexpectedResult;
+            }
+        };
+    }
+}
+
+/// Whether two CSV texts hold the same header and the same rows in any order.
+fn sameRows(a: std.mem.Allocator, x: []const u8, y: []const u8) !bool {
+    var lines: [2]std.array_list.Managed([]const u8) = .{ .init(a), .init(a) };
+    for ([_][]const u8{ x, y }, &lines) |text, *l| {
+        var it = std.mem.splitScalar(u8, text, '\n');
+        while (it.next()) |line| if (line.len > 0) try l.append(line);
+        if (l.items.len > 1) std.mem.sort([]const u8, l.items[1..], {}, struct {
+            fn lt(_: void, p: []const u8, q: []const u8) bool {
+                return std.mem.lessThan(u8, p, q);
+            }
+        }.lt);
+    }
+    if (lines[0].items.len != lines[1].items.len) return false;
+    for (lines[0].items, lines[1].items) |p, q| if (!std.mem.eql(u8, p, q)) return false;
+    return true;
+}
+
 test "window: `*` beside a computed column and a window function lists the computed column once, in its place" {
     try runQualCases(&.{
         .{ .q = "SELECT *, upper(name) AS un, row_number() OVER (ORDER BY id DESC) AS rn FROM '$B/t.csv' ORDER BY id", .want = "id,name,amt,un,rn\n1,ana,10.5,ANA,3\n2,bob,20.25,BOB,2\n3,cid,,CID,1\n" },

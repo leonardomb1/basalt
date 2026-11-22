@@ -247,7 +247,7 @@ fn reduceJoinSides(env: *Env, stages: []const ast.Stage, added: *std.array_list.
         const b = (try stampedBinding(env, j.binding)) orelse continue;
         const ai = groupedAt(b.stages) orelse continue;
         for (j.left_keys, j.right_keys) |lk, rk| {
-            const by = groupKey(b.stages[ai].node.aggregate, b.stages[ai + 1 ..], rk) orelse continue;
+            const by = (try groupKey(env.arena, b.stages[ai].node.aggregate, b.stages[ai + 1 ..], rk)) orelse continue;
             const sv = seen orelse blk: {
                 seen = (try pushdown.hoistFilters(env.arena, env.arena, stages, env.bindings, env.tables)) orelse stages;
                 break :blk seen.?;
@@ -328,30 +328,23 @@ fn groupedAt(stages: []const ast.Stage) ?usize {
 
 /// The group key of `ag` that output column `out` carries through the selects of
 /// `after`, the stages past the aggregate.
-fn groupKey(ag: ast.Aggregate, after: []const ast.Stage, out: ast.QualName) ?ast.QualName {
+fn groupKey(arena: std.mem.Allocator, ag: ast.Aggregate, after: []const ast.Stage, out: ast.QualName) !?ast.QualName {
     var q = out;
     var k = after.len;
     while (k > 0) {
         k -= 1;
-        if (after[k].node == .select) q = selectSource(after[k].node.select, q) orelse return null;
+        if (after[k].node == .select) q = (try selectSource(arena, after[k].node.select, q)) orelse return null;
     }
     for (ag.by) |by| if (std.ascii.eqlIgnoreCase(by.last(), q.last())) return by;
     return null;
 }
 
-/// The column a select's output `q` reads: the field it names or renames, or `q`
-/// itself through `*`; null when computed or not plainly there.
-fn selectSource(items: []const ast.SelectItem, q: ast.QualName) ?ast.QualName {
-    var star = false;
-    for (items) |it| switch (it) {
-        .star => star = true,
-        .field => |f| if (std.ascii.eqlIgnoreCase(f.last(), q.last())) return f,
-        .computed => |c| if (std.ascii.eqlIgnoreCase(c.name, q.last())) {
-            return if (c.expr.* == .field and !c.expr.field.dollar) c.expr.field else null;
-        },
-        else => return null,
-    };
-    return if (star) q else null;
+/// The column a select's output `q` reads, by the trace pushdown keeps
+/// (`hoist.projectedFrom`): the field it names or renames, or `q` itself, as written,
+/// through a `*` that passes it; null when computed or not plainly there.
+fn selectSource(arena: std.mem.Allocator, items: []const ast.SelectItem, q: ast.QualName) !?ast.QualName {
+    const src = (try @import("../pushdown/hoist.zig").projectedFrom(arena, items, q.last())) orelse return null;
+    return if (src.parts.len == 1 and std.mem.eql(u8, src.parts[0], q.last())) q else src;
 }
 
 /// Where in `stages` a semi join on group key `by` of the aggregate at `ai` can go,
@@ -363,7 +356,7 @@ fn semiPoint(env: *Env, stages: []const ast.Stage, ai: usize, by: ast.QualName) 
     while (at > 1) : (at -= 1) {
         switch (stages[at - 1].node) {
             .filter => {},
-            .select => |items| key = selectSource(items, key) orelse break,
+            .select => |items| key = (try selectSource(env.arena, items, key)) orelse break,
             .join => |jj| switch (jj.kind) {
                 .semi, .anti => {},
                 .inner, .left => {

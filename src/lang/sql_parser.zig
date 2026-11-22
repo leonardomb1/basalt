@@ -577,8 +577,10 @@ pub const Parser = struct {
         j.own_cols = try own.toOwnedSlice();
     }
 
-    /// A `*` that leaves out the USING key copies an ORDER BY sorts on (`a.k`) keeps
-    /// them through the sort; the select returned drops them after it.
+    /// A `*` that leaves out a column an ORDER BY sorts on keeps it through the sort,
+    /// as an input column the output does not show (`SELECT * EXCEPT (x) ... ORDER
+    /// BY x`, a USING key copy `a.k`), unless another item outputs that name; the
+    /// select returned drops it after the sort.
     pub fn keepSortedCopies(self: *Parser, st: *ast.Stage, keys: []const ast.SortKey) Error!?[]const ast.SelectItem {
         var dropped = std.array_list.Managed([]const u8).init(self.arena);
         const items = try self.arena.dupe(ast.SelectItem, st.node.select);
@@ -586,9 +588,12 @@ pub const Parser = struct {
             var keep = std.array_list.Managed([]const u8).init(self.arena);
             for (it.star_except) |n| {
                 const sorted = for (keys) |k| {
-                    if (k.field.parts.len == 1 and std.mem.eql(u8, k.field.parts[0], n) and std.mem.startsWith(u8, n, "__u")) break true;
+                    if (k.field.parts.len == 1 and std.mem.eql(u8, k.field.parts[0], n)) break true;
                 } else false;
-                try (if (sorted) &dropped else &keep).append(n);
+                const shown = for (items) |o| {
+                    if (outName(o)) |on| if (std.mem.eql(u8, on, n)) break true;
+                } else false;
+                try (if (sorted and !shown) &dropped else &keep).append(n);
             }
             it.* = .{ .star_except = try keep.toOwnedSlice() };
         };

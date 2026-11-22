@@ -873,8 +873,11 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                 }
             }
         }
-        if (!extend_proj and visible == null and stages.items[stages.items.len - 1].node == .select)
-            hidden_drop = try self.keepSortedCopies(&stages.items[stages.items.len - 1], sort_keys);
+        if (!extend_proj and visible == null and stages.items[stages.items.len - 1].node == .select) {
+            const n = stages.items.len;
+            const put_back = n >= 2 and isPutBack(stages.items[n - 1].node.select) and stages.items[n - 2].node == .select;
+            hidden_drop = try self.keepSortedCopies(&stages.items[if (put_back) n - 2 else n - 1], sort_keys);
+        }
         if (!extend_proj and (computed.items.len > 0 or sort_aggs.items.len > 0)) {
             var names = std.array_list.Managed([]const u8).init(self.arena);
             try names.appendSlice(sort_aggs.items);
@@ -917,10 +920,12 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
     }
 }
 
-/// Under a plain DISTINCT a sort key must be a column the SELECT list outputs, as SQL
-/// requires: a key spelled as an item's column takes that item's name, and one a list
-/// without `*` lacks, or a USING side's copy, which no `*` keeps, is refused under the
-/// name the query wrote.
+/// Whether `items` is a `* REPLACE`'s second select, which passes on every column of
+/// the select before it.
+fn isPutBack(items: []const ast.SelectItem) bool {
+    return items.len == 1 and items[0] == .star_replace;
+}
+
 /// Whether a bare ORDER BY `name` is an output column, which SQL reads first: every
 /// one under `*` (`out_keys` null), whose clashing names the join already set
 /// apart, else one the SELECT list names; only an input column past those can be
@@ -931,6 +936,10 @@ fn namesOutput(out_keys: ?[]const ast.QualName, name: []const u8) bool {
     return false;
 }
 
+/// Under a plain DISTINCT a sort key must be a column the SELECT list outputs, as SQL
+/// requires: a key spelled as an item's column takes that item's name, and one a list
+/// without `*` lacks, one a `* EXCEPT` leaves out, or a USING side's copy, which no
+/// `*` keeps, is refused under the name the query wrote.
 fn distinctSortKey(self: *Parser, stages: []const ast.Stage, written: ast.QualName, q: ast.QualName, at: Pos) Error!ast.QualName {
     const n = stages.len;
     if (n < 2 or stages[n - 1].node != .distinct or stages[n - 1].node.distinct.on != null or stages[n - 2].node != .select) return q;
@@ -943,7 +952,10 @@ fn distinctSortKey(self: *Parser, stages: []const ast.Stage, written: ast.QualNa
     const listed = for (items) |it| {
         if (it != .field and it != .computed) break false;
     } else true;
-    if (!listed and !std.mem.startsWith(u8, q.last(), "__")) return q;
+    const excepted = q.parts.len == 1 and for (items) |it| {
+        if (it == .star_except and ast.nameIn(it.star_except, q.last())) break true;
+    } else false;
+    if (!listed and !excepted and !std.mem.startsWith(u8, q.last(), "__")) return q;
     return self.fail(at, "for SELECT DISTINCT, ORDER BY `{s}` must appear in the select list", .{try std.mem.join(self.arena, ".", written.parts)});
 }
 
