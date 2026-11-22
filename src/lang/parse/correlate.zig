@@ -317,6 +317,11 @@ fn hideInner(self: *Parser, w: *Work, c: *ast.Expr, n: *usize) Error!*ast.Expr {
 fn carries(items: []const ast.SelectItem, n: []const u8) bool {
     for (items) |it| switch (it) {
         .star, .star_rename => return true,
+        .star_replace => |rs| {
+            for (rs) |r| {
+                if (std.mem.eql(u8, r.from, n)) break;
+            } else return true;
+        },
         .star_of => |so| if (so.rel.len == 0) return true,
         .star_except => |ex| {
             for (ex) |x| {

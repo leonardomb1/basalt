@@ -2177,6 +2177,33 @@ test "join: under USING `t.k` and `t.*` are that side's own, the key in its plac
     });
 }
 
+test "SELECT * REPLACE puts each value in its column's place under its name, past EXCEPT, a window, DISTINCT, ORDER BY and an outer WHERE" {
+    try runQualCases(&.{
+        .{ .q = "SELECT * REPLACE (upper(name) AS name) FROM '$B/t.csv' ORDER BY id", .want = "id,name,amt\n1,ANA,10.5\n2,BOB,20.25\n3,CID,\n" },
+        .{ .q = "SELECT * EXCEPT (id) REPLACE (amt * 2 AS amt, name || '!' AS name) FROM '$B/t.csv' ORDER BY amt DESC NULLS LAST", .want = "name,amt\nbob!,40.5\nana!,21\ncid!,\n" },
+        .{ .q = "SELECT * REPLACE (row_number() OVER (ORDER BY amt DESC NULLS LAST) AS id) FROM '$B/t.csv' ORDER BY id", .want = "id,name,amt\n1,bob,20.25\n2,ana,10.5\n3,cid,\n" },
+        .{ .q = "SELECT DISTINCT * EXCEPT (item, q) REPLACE (upper(name) AS name) FROM '$B/items.csv' ORDER BY name", .want = "name\nANA\nBOB\nEVE\n" },
+        .{ .q = "SELECT * REPLACE (q * -1 AS q) FROM '$B/items.csv' ORDER BY q * -1, item", .want = "name,item,q\neve,w,-4\nbob,z,-3\nana,y,-2\nana,x,-1\n" },
+        .{ .q = "SELECT * FROM (SELECT * REPLACE (q * 10 AS q) FROM '$B/items.csv') s WHERE q > 20 ORDER BY q", .want = "name,item,q\nbob,z,30\neve,w,40\n" },
+        .{ .q = "SELECT * REPLACE (upper(name) AS name), q + 1 AS q1 FROM '$B/items.csv' WHERE item = 'z'", .want = "name,item,q,q1\nBOB,z,3,4\n" },
+        .{ .q = "SELECT * REPLACE (row_number() OVER (ORDER BY q DESC) AS q, upper(name) AS name) FROM '$B/items.csv' ORDER BY q", .want = "name,item,q\nEVE,w,1\nBOB,z,2\nANA,y,3\nANA,x,4\n" },
+    });
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "t.csv", .data = "id,name\n1,ana\n" });
+    const refuse = @import("harness.zig").expectRefusedAlike;
+    try refuse(alloc, &tmp, "SELECT * REPLACE (1 AS nope) FROM '$B/t.csv';", "`* REPLACE` names `nope`, which is not among the columns of its `*`");
+    try refuse(alloc, &tmp, "SELECT * EXCEPT (name) REPLACE ('x' AS name) FROM '$B/t.csv';", "`* REPLACE` names `name`, which is not among the columns of its `*`");
+}
+
+test "window: `*` beside a computed column and a window function lists the computed column once, in its place" {
+    try runQualCases(&.{
+        .{ .q = "SELECT *, upper(name) AS un, row_number() OVER (ORDER BY id DESC) AS rn FROM '$B/t.csv' ORDER BY id", .want = "id,name,amt,un,rn\n1,ana,10.5,ANA,3\n2,bob,20.25,BOB,2\n3,cid,,CID,1\n" },
+        .{ .q = "SELECT *, row_number() OVER (ORDER BY id DESC) AS rn, upper(name) AS un FROM '$B/t.csv' QUALIFY rn < 3 ORDER BY id", .want = "id,name,amt,rn,un\n2,bob,20.25,2,BOB\n3,cid,,1,CID\n" },
+    });
+}
+
 test "join: a key or column the parser renamed is named in a message as the query wrote it" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

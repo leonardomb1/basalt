@@ -203,7 +203,7 @@ const Needs = struct {
                     }
                     if (items.len == 1 and items[0] == .star_except) continue;
                     for (items) |it| switch (it) {
-                        .star, .star_except, .star_rename, .star_of => return null,
+                        .star, .star_except, .star_rename, .star_replace, .star_of => return null,
                         .field => |q| try self.field(q),
                         .computed => |c| try self.expr(c.expr),
                     };
@@ -404,7 +404,7 @@ fn stageReads(arena: std.mem.Allocator, st: ast.Stage, set: *std.StringHashMap(v
             const through = Needs.passThrough(items) or (items.len == 1 and items[0] == .star_except);
             for (items) |it| switch (it) {
                 .star, .star_except => if (!through) return .opaque_,
-                .star_rename, .star_of => return .opaque_,
+                .star_rename, .star_replace, .star_of => return .opaque_,
                 .field => |q| try qualNames(q, set),
                 .computed => |c| if (!try exprNames(arena, c.expr, set)) return .opaque_,
             };

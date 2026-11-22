@@ -316,6 +316,10 @@ pub const SelectItem = union(enum) {
     star,
     star_except: []const []const u8,
     star_rename: []const Rename,
+    /// The second half of `* REPLACE (e AS c)`: every input column in its place, each
+    /// `to` (`c`) holding the value of the hidden column `from` that the select before
+    /// it computed, which is dropped; the rest pass through as they stand.
+    star_replace: []const Rename,
     star_of: StarOf,
     field: QualName,
     computed: Computed,

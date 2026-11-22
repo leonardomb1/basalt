@@ -72,7 +72,7 @@ fn stageNames(
             .select => |items| {
                 var input = std.array_list.Managed([]const u8).init(out.allocator);
                 for (items) |it| switch (it) {
-                    .star, .star_except, .star_rename => {
+                    .star, .star_except, .star_rename, .star_replace => {
                         if (input.items.len == 0 and !try stageNames(bindings, stages[0..i], &input, depth + 1, tables)) return false;
                         break;
                     },
@@ -94,6 +94,11 @@ fn stageNames(
                             to = r.to;
                         };
                         try out.append(to);
+                    },
+                    .star_replace => |rs| for (input.items) |n| {
+                        for (rs) |r| {
+                            if (std.mem.eql(u8, r.from, n)) break;
+                        } else try out.append(n);
                     },
                     .star_of => unreachable,
                 };
@@ -688,7 +693,7 @@ pub fn projectedFrom(arena: std.mem.Allocator, items: []const ast.SelectItem, na
             for (names) |x| if (std.mem.eql(u8, x, name)) return null;
             star = true;
         },
-        .star_rename => |rs| {
+        .star_rename, .star_replace => |rs| {
             for (rs) |r| {
                 if (std.mem.eql(u8, r.to, name)) return try qual(arena, &.{r.from});
                 if (std.mem.eql(u8, r.from, name)) return null;

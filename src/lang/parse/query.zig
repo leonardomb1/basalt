@@ -1066,7 +1066,7 @@ fn nameRepeats(
                     try self.exprKey(try self.stripExpr(c.expr, aliases), &key);
                     break :blk c.name;
                 },
-                .star, .star_except, .star_rename, .star_of => {
+                .star, .star_except, .star_rename, .star_replace, .star_of => {
                     star = true;
                     continue;
                 },
@@ -1269,6 +1269,9 @@ pub fn resolveExprAlias(map: []const ExprAlias, synth: []const u8) []const u8 {
 /// An ON splits at its ANDs: cross-side equalities are keys, right-only conditions narrow
 /// the right side first, anything else filters the joined rows (inner joins only).
 /// Without a key it all stays the join's condition, run as a nested-loop join.
+/// `* [EXCEPT (..)] REPLACE (e AS c)` computes each `e` as a hidden column of the
+/// select, which a `star_replace` select right after it, ahead of a DISTINCT, puts
+/// in `c`'s place.
 pub fn parseSelectCore(self: *Parser) Error!Core {
     const pos = self.curPos();
     try self.expectKw("select");
@@ -1311,6 +1314,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         win: usize,
     };
     var raw_items = std.array_list.Managed(RawItem).init(self.arena);
+    var replaces = std.array_list.Managed(ast.SelectItem.Rename).init(self.arena);
     var expr_aliases = std.array_list.Managed(ExprAlias).init(self.arena);
     var win_calls = std.array_list.Managed(Parser.WinCall).init(self.arena);
     const outer_sink = self.win_sink;
@@ -1342,6 +1346,41 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 try raw_items.append(.{ .item = .{ .star_rename = try rens.toOwnedSlice() } });
             } else {
                 try raw_items.append(.{ .item = .star });
+            }
+            if (raw_items.items[raw_items.items.len - 1].item == .star_rename and self.isKw("replace") and self.peekTag() == .lparen)
+                return self.fail(self.curPos(), "`* RENAME` and `* REPLACE` do not combine — rename in an outer SELECT", .{});
+            if (self.isKw("replace") and self.peekTag() == .lparen) {
+                _ = self.advance();
+                _ = try self.expect(.lparen);
+                while (true) {
+                    const start = self.i;
+                    const before = win_calls.items.len;
+                    const e = try self.parseExpr();
+                    const sy = try self.synthRange(start, self.i);
+                    try self.expectKw("as");
+                    const to = try self.expectIdent();
+                    for (replaces.items) |r| if (std.mem.eql(u8, r.to, to))
+                        return self.fail(self.curPos(), "`* REPLACE` replaces `{s}` twice", .{to});
+                    const hidden = try std.fmt.allocPrint(self.arena, "\x00replace:{s}", .{to});
+                    try replaces.append(.{ .from = hidden, .to = to });
+                    if (e.* == .field and e.field.parts.len == 1 and win_calls.items.len == before + 1 and
+                        std.mem.eql(u8, e.field.parts[0], win_calls.items[before].hidden))
+                    {
+                        win_calls.items[before].out = hidden;
+                        try expr_aliases.append(.{ .synth = sy, .out = to });
+                        try raw_items.append(.{ .win = before });
+                    } else {
+                        if (e.* != .field or e.field.dollar) {
+                            var key = std.array_list.Managed(u8).init(self.arena);
+                            const keyed = win_calls.items.len == before;
+                            if (keyed) try self.exprKey(e, &key) else try key.appendSlice(sy);
+                            try expr_aliases.append(.{ .synth = try key.toOwnedSlice(), .out = to, .expr = if (keyed) e else null });
+                        }
+                        try raw_items.append(.{ .item = .{ .computed = .{ .name = hidden, .expr = e } } });
+                    }
+                    if (!self.eat(.comma)) break;
+                }
+                _ = try self.expect(.rparen);
             }
         } else if (self.at(.ident) and self.peekTag() == .dot and
             self.i + 2 < self.toks.len and self.toks[self.i + 2].tag == .star)
@@ -1763,7 +1802,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                 .item => |it| switch (it) {
                     .field => |f| f,
                     .computed => |c| try self.singleName(c.name),
-                    .star, .star_except, .star_rename, .star_of => {
+                    .star, .star_except, .star_rename, .star_replace, .star_of => {
                         all = false;
                         continue;
                     },
@@ -1975,7 +2014,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
                     try items.append(all);
                     try post.append(all);
                 },
-                .star_rename, .star_of => {
+                .star_rename, .star_replace, .star_of => {
                     if (it == .star_rename and copy_names.len > 0) {
                         const drop = try self.arena.dupe(ast.SelectItem, &.{.{ .star_except = copy_names }});
                         try stages.append(.{ .node = .{ .select = drop }, .hints = &.{}, .pos = pos });
@@ -2123,7 +2162,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         var kept = std.array_list.Managed(ast.SelectItem).init(self.arena);
         for (items.items) |it| {
             switch (it) {
-                .star, .star_except, .star_rename, .star_of => if (needs_pre)
+                .star, .star_except, .star_rename, .star_replace, .star_of => if (needs_pre)
                     return self.fail(pos, "`*` cannot be combined with a computed GROUP BY key", .{}),
                 .computed => |c| {
                     if (isGroupKey(group, try self.singleName(c.name))) {
@@ -2211,6 +2250,11 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             };
         }
     }
+    const put_back: ?ast.Stage = if (replaces.items.len > 0)
+        .{ .node = .{ .select = try self.arena.dupe(ast.SelectItem, &.{.{ .star_replace = replaces.items }}) }, .hints = &.{}, .pos = pos }
+    else
+        null;
+    if (put_back) |st| if (!agg_mode and win_calls.items.len == 0) try stages.append(st);
 
     if (distinct and win_calls.items.len == 0) {
         try stages.append(.{ .node = .{ .distinct = .{ .on = distinct_on } }, .hints = &.{}, .pos = pos });
@@ -2227,12 +2271,14 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             qualify = try low.carryExpr(q);
         };
         const wstages = try low.stages(specs, pos);
+        var drop = std.array_list.Managed([]const u8).init(self.arena);
         if (agg_mode) {
             if (low.pre.items.len > 0) {
                 try low.pre.insert(0, .star);
                 try stages.append(.{ .node = .{ .select = try low.pre.toOwnedSlice() }, .hints = &.{}, .pos = pos });
             }
         } else {
+            for (items.items) |it| if (it == .computed) try drop.append(it.computed.name);
             for (low.carries.items) |q| {
                 if (!providesName(items.items, q.parts[0])) try items.append(.{ .field = q });
             }
@@ -2243,7 +2289,6 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
         }
         try stages.appendSlice(wstages);
         if (qualify) |q| try stages.append(.{ .node = .{ .filter = q }, .hints = &.{}, .pos = pos });
-        var drop = std.array_list.Managed([]const u8).init(self.arena);
         try drop.appendSlice(low.hidden.items);
         for (win_calls.items) |c| if (c.out) |o| try drop.append(o);
         var out_items = std.array_list.Managed(ast.SelectItem).init(self.arena);
@@ -2254,6 +2299,7 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             else => it,
         });
         try stages.append(.{ .node = .{ .select = try out_items.toOwnedSlice() }, .hints = &.{}, .pos = pos });
+        if (put_back) |st| if (!agg_mode) try stages.append(st);
         if (distinct) try stages.append(.{ .node = .{ .distinct = .{ .on = distinct_on } }, .hints = &.{}, .pos = pos });
     }
 
@@ -2739,7 +2785,7 @@ pub fn providesName(items: []const ast.SelectItem, name: []const u8) bool {
                 if (std.ascii.eqlIgnoreCase(x, name)) break;
             } else return true;
         },
-        .star_rename => |rs| {
+        .star_rename, .star_replace => |rs| {
             for (rs) |r| {
                 if (std.ascii.eqlIgnoreCase(r.from, name)) break;
             } else return true;

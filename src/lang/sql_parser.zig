@@ -400,7 +400,7 @@ pub fn outName(it: ast.SelectItem) ?[]const u8 {
     return switch (it) {
         .field => |q| q.last(),
         .computed => |c| c.name,
-        .star, .star_except, .star_rename, .star_of => null,
+        .star, .star_except, .star_rename, .star_replace, .star_of => null,
     };
 }
 

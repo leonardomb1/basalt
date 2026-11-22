@@ -512,6 +512,30 @@ test "sql: USING keys on renamed right columns, lists the names first and keeps 
     try testing.expect(std.mem.indexOf(u8, diag.msg, "USING (a, b)") != null);
 }
 
+test "sql: * REPLACE computes each expression as a hidden column, then a star_replace select puts it in place ahead of DISTINCT; a repeat or a RENAME before it is refused" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const prog = try parseTest(a, "SELECT DISTINCT * EXCEPT (id) REPLACE (upper(b) AS b, x AS y) FROM 'in.csv';");
+    const st = firstPipelineStages(prog);
+    const sel = st[1].node.select;
+    try testing.expectEqualStrings("id", sel[0].star_except[0]);
+    try testing.expectEqualStrings("\x00replace:b", sel[1].computed.name);
+    try testing.expectEqualStrings("upper", sel[1].computed.expr.call.name);
+    try testing.expectEqualStrings("\x00replace:y", sel[2].computed.name);
+    const put = st[2].node.select[0].star_replace;
+    try testing.expectEqual(@as(usize, 2), put.len);
+    try testing.expectEqualStrings("\x00replace:b", put[0].from);
+    try testing.expectEqualStrings("b", put[0].to);
+    try testing.expect(st[3].node == .distinct);
+
+    var diag: Diagnostic = .{ .msg = "", .line = 0, .col = 0 };
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT * REPLACE (1 AS b, 2 AS b) FROM 'in.csv';", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "replaces `b` twice") != null);
+    try testing.expectError(error.ParseFailed, parseSource(a, "SELECT * RENAME (a AS c) REPLACE (1 AS b) FROM 'in.csv';", &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.msg, "do not combine") != null);
+}
+
 test "sql: multi-key ON, RIGHT/FULL/CROSS join kinds, and the plain-column rule" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();

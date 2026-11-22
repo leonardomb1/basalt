@@ -710,6 +710,7 @@ fn selectText(w: *std.Io.Writer, items: []const ast.SelectItem) !void {
             .star, .star_of => try w.writeByte('*'),
             .star_except => try w.writeAll("* except ..."),
             .star_rename => try w.writeAll("* rename ..."),
+            .star_replace => try w.writeAll("* replace ..."),
             .field => |q| try print.name(w, q),
             .computed => |c| {
                 try print.expr(w, c.expr);

@@ -312,8 +312,9 @@ fn readsAny(read: std.StringHashMap(void), names: []const []const u8) bool {
 
 /// The names a `SELECT * EXCEPT (...)` leaves out of the read, past the filters
 /// before it (a WHERE stands between a read and its select): those of them a filter
-/// reads are kept, as a filter the source does not take reads them here. Null when
-/// no such select follows, or, `sole`, when it holds another star.
+/// or another item of the select reads (`* EXCEPT (x), x + 1 AS y`, a `* REPLACE`'s
+/// expression) are kept, as the source never hands those on. Null when no such
+/// select follows, or, `sole`, when it holds another star.
 pub fn exceptPastFilters(arena: std.mem.Allocator, after: []const ast.Stage, sole: bool) !?[]const []const u8 {
     var read = std.StringHashMap(void).init(arena);
     var i: usize = 0;
@@ -322,8 +323,9 @@ pub fn exceptPastFilters(arena: std.mem.Allocator, after: []const ast.Stage, sol
     var found: ?[]const []const u8 = null;
     for (after[i].node.select) |it| switch (it) {
         .star_except => |names| found = names,
-        .star, .star_rename, .star_of => if (sole) return null,
-        else => {},
+        .star, .star_rename, .star_replace, .star_of => if (sole) return null,
+        .field => |q| if (!q.dollar) try read.put(q.parts[0], {}),
+        .computed => |c| try collectFields(c.expr, &read),
     };
     const names = found orelse return null;
     var out = std.array_list.Managed([]const u8).init(arena);
@@ -601,6 +603,8 @@ test "SELECT * EXCEPT narrows a read past the WHERE before it, keeping an except
         .{ .src = "SELECT * EXCEPT (pdf, note) FROM 't.csv';", .sole = true, .want = &.{ "pdf", "note" } },
         .{ .src = "SELECT * EXCEPT (pdf, note) FROM 't.csv' WHERE n > 1;", .sole = true, .want = &.{ "pdf", "note" } },
         .{ .src = "SELECT * EXCEPT (pdf, note) FROM 't.csv' WHERE n > 1 AND NOTE IS NULL;", .sole = true, .want = &.{"pdf"} },
+        .{ .src = "SELECT * EXCEPT (pdf, note), length(pdf) AS size FROM 't.csv';", .sole = true, .want = &.{"note"} },
+        .{ .src = "SELECT * EXCEPT (pdf, note) REPLACE (upper(note) AS n) FROM 't.csv';", .sole = true, .want = &.{"pdf"} },
         .{ .src = "SELECT n FROM 't.csv' WHERE n > 1;", .sole = true, .want = null },
     };
     for (cases) |c| {

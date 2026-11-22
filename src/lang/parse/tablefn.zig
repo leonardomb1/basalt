@@ -503,6 +503,11 @@ pub fn outputNameOf(items: []const ast.SelectItem, col: ast.QualName) ?[]const u
             }
             return nm;
         },
+        .star_replace => |rs| {
+            for (rs) |r| {
+                if (std.mem.eql(u8, r.from, nm) or std.mem.eql(u8, r.to, nm)) break;
+            } else return nm;
+        },
     };
     return null;
 }

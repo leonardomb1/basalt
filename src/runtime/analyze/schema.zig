@@ -84,6 +84,15 @@ pub fn selectCols(arena: std.mem.Allocator, in: types.Schema, items: []const ast
                 try cols.append(.{ .name = nm, .ty = f.ty, .source = .{ .passthrough = idx }, .rel = rel orelse f.rel, .base = if (rel != null) nm else f.base, .clash = f.clash and nm.ptr == f.name.ptr });
             }
         },
+        .star_replace => |rs| {
+            for (rs) |r| if (in.indexOf(r.to) == null)
+                return fail(diag, "`* REPLACE` names `{s}`, which is not among the columns of its `*`", .{r.to});
+            for (in.fields, 0..) |f, idx| {
+                if (renameTo(rs, f.name) != null) continue;
+                const from = if (renameFrom(rs, f.name)) |h| in.indexOf(h) orelse return fail(diag, "`* REPLACE` lost the value of `{s}`", .{f.name}) else idx;
+                try cols.append(.{ .name = f.name, .ty = in.fields[from].ty, .source = .{ .passthrough = from }, .rel = f.rel, .base = f.base, .clash = f.clash });
+            }
+        },
         .star_of => |so| for (in.fields, 0..) |f, idx| {
             if (so.rel.len > 0) {
                 if (!std.mem.eql(u8, f.rel, so.rel)) continue;
@@ -938,6 +947,12 @@ fn isNumeric(k: types.TypeKind) bool {
 
 fn renameTo(renames: []const ast.SelectItem.Rename, n: []const u8) ?[]const u8 {
     for (renames) |r| if (std.mem.eql(u8, r.from, n)) return r.to;
+    return null;
+}
+
+/// The column renamed to `n`, the inverse of `renameTo`.
+fn renameFrom(renames: []const ast.SelectItem.Rename, n: []const u8) ?[]const u8 {
+    for (renames) |r| if (std.mem.eql(u8, r.to, n)) return r.from;
     return null;
 }
 

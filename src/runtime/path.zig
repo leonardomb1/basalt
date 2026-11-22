@@ -101,7 +101,7 @@ pub fn chunkCopy(stages: []const ast.Stage, f: Facts) bool {
             .star, .star_except, .star_rename => {},
             .field => |q| if (q.parts.len != 1) return false,
             .computed => |c| if (c.expr.* != .field or c.expr.field.parts.len != 1) return false,
-            .star_of => return false,
+            .star_replace, .star_of => return false,
         };
     }
     const w = f.sink;

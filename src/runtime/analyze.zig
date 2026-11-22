@@ -2153,6 +2153,7 @@ const Ctx = struct {
                 .star => try buf.appendSlice("*"),
                 .star_except => try buf.appendSlice("* except (…)"),
                 .star_rename => try buf.appendSlice("* rename (…)"),
+                .star_replace => try buf.appendSlice("* replace (…)"),
                 .star_of => |so| try buf.appendSlice(if (so.rel.len > 0) try msgfmt.allocPrint(self.arena, "{s}.*", .{so.rel}) else "*"),
                 .field => |q| try buf.appendSlice(lastPart(q)),
                 .computed => |c| try buf.appendSlice(c.name),
