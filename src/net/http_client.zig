@@ -999,7 +999,7 @@ pub const HttpSource = struct {
         schema.* = p.schema;
         self.schema = schema;
         self.take = p.take;
-        self.first = try fjson.batchOf(arena, self.schema, items.items, self.take);
+        self.first = try fjson.batchOf(arena, self.schema, items.items, self.take, 0);
         return self;
     }
 
@@ -1417,7 +1417,7 @@ pub const HttpSource = struct {
         const items = try itemsOf(arena, trimmed, self.opts.items);
         if (items.len == 0) return self.finishEmpty();
         self.noteProgress(items.len);
-        const batch = try fjson.batchOf(arena, self.schema, items, self.take);
+        const batch = try fjson.batchOf(arena, self.schema, items, self.take, self.rows_done - items.len);
         if (self.opts.stop_short and items.len < self.opts.page_size) {
             self.issue_done = true;
             self.drainSlots();
@@ -1456,16 +1456,19 @@ pub const HttpSource = struct {
         try self.advance(arena, page.root, page.items.len);
         if (page.items.len == 0) return null;
         self.noteProgress(page.items.len);
-        return try fjson.batchOf(arena, self.schema, page.items, self.take);
+        return try fjson.batchOf(arena, self.schema, page.items, self.take, self.rows_done - page.items.len);
     }
 
+    /// Frees the client unless a request was abandoned to its worker, which may still
+    /// use it. Requests abandoned to an abort are the run's `aborted`, not a warning;
+    /// those that timed out are one.
     pub fn close(self: *HttpSource) void {
         self.drainSlots();
         self.slots.deinit();
         if (self.zombies == 0) {
             self.client.deinit();
             self.gpa.destroy(self.client);
-        } else {
+        } else if (!driver.aborting()) {
             obs.logOr(self.logger, .warn, "http: {d} timed-out request(s) abandoned; client leaked intentionally", .{self.zombies});
         }
     }

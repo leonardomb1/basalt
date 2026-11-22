@@ -133,11 +133,31 @@ pub fn chainOps(ta: std.mem.Allocator, errctx: ?*op.ErrCtx, recs: []const analyz
 /// value of its `=` uses, so the placement sees the same columns. A select of `*`
 /// plus computed columns (a computed join key's) passes every column through and
 /// asks only for what its expressions read; a lone `* EXCEPT` (the drop of those
-/// keys after the join) passes the rest through. A `search` reads whole rows, so
-/// it proves nothing.
+/// keys after the join) passes the rest through. A `search` of a star reads whole
+/// rows, so it proves nothing.
 pub fn projectedColumns(env: *Env, stages: []const ast.Stage) !?[][]const u8 {
     var w = Needs.init(env, null);
     return w.walk(stages);
+}
+
+/// The columns a read of `rd` decodes for the stages `after` it: what they provably
+/// take (`projectedColumns`), else, when they drop columns by name (a `* EXCEPT`
+/// past the filters before it) and the read's columns are known without running it
+/// (a local file's, `offlineSchema`), every column but those, so a dropped column is
+/// never decoded nor its values checked, then `driver.all_but` and the dropped names,
+/// so a reader still fails on a column no sample met; null for every column.
+pub fn readProjection(env: *Env, rd: ast.Read, hints: []const ast.Hint, after: []const ast.Stage) !?[][]const u8 {
+    if (try projectedColumns(env, after)) |p| return p;
+    if (rd.form != .path or rd.cols.len > 0) return null;
+    const except = (try @import("connect/sql_read.zig").exceptPastFilters(env.arena, after, true)) orelse return null;
+    if (except.len == 0) return null;
+    const sch = @import("analyze/targets.zig").offlineSchema(env.arena, rd, hints, env.tables) orelse return null;
+    var out = std.array_list.Managed([]const u8).init(env.arena);
+    for (sch.fields) |f| if (!ast.nameIn(except, f.name)) try out.append(f.name);
+    if (out.items.len == sch.fields.len) return null;
+    try out.append(@import("../exec/driver.zig").all_but);
+    try out.appendSlice(except);
+    return try out.toOwnedSlice();
 }
 
 /// The names a join and the stages after it (`after`) may take from its right side:
@@ -675,7 +695,7 @@ fn openTaker(env: *Env, stages: []const ast.Stage, want: keypush.Want) !Taken {
         .parquet => {
             const r0 = env.pipe.pq_reader;
             const f0 = env.pipe.pq_folder;
-            const src = try openSourceProjected(env, rd, stages[0].hints, try projectedColumns(env, stages[1..]), try filterBounds(env, stages[1..]));
+            const src = try openSourceProjected(env, rd, stages[0].hints, try readProjection(env, rd, stages[0].hints, stages[1..]), try filterBounds(env, stages[1..]));
             const pk = try env.arena.create(keypush.ParquetKeys);
             pk.* = .{ .arena = env.arena };
             if (env.pipe.pq_reader != r0) pk.reader = env.pipe.pq_reader;
@@ -715,7 +735,7 @@ fn buildPipelineWith(env: *Env, stages_in: []const ast.Stage, late_req: ?LateReq
                 (try keypush.LateSql.open(env, rd, stages[0].hints, d)).source()
             else blk: {
                 const before = env.pipe.pq_reader;
-                const s = try openSourceProjected(env, rd, stages[0].hints, try projectedColumns(env, stages[1..]), try filterBounds(env, stages[1..]));
+                const s = try openSourceProjected(env, rd, stages[0].hints, try readProjection(env, rd, stages[0].hints, stages[1..]), try filterBounds(env, stages[1..]));
                 if (env.pipe.pq_reader) |pr| if (pr != before) {
                     pr.codes_only = try codesOnlyColumns(env.arena, stages[1..]);
                 };

@@ -281,7 +281,7 @@ def main(binary):
     fr = k.loads
     report("a load frame per LOAD, a failed one before writing too",
            [f["ok"] for f in fr] == [True, False] and fr[0]["rows_written"] == 7 and fr[0]["rows_read"] == 7
-           and fr[0]["target"] == f"{ld}/one.csv" and fr[1]["line"] == 2 and "FileNotFound" in fr[1]["reason"]
+           and fr[0]["target"] == f"{ld}/one.csv" and fr[1]["line"] == 2 and "/none` does not exist" in fr[1]["reason"]
            and fr[1]["transient"] is False, fr)
     report("the status lists the loads with the run's totals, failed run included",
            not st["ok"] and st.get("loads") == [{k2: v for k2, v in f.items() if k2 not in ("type", "id")} for f in fr]

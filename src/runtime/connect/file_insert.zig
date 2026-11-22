@@ -202,7 +202,7 @@ const XlsxInsert = struct {
             return planErrT(env.diag, e, try msgfmt.allocPrint(a, "INSERT INTO {s}: could not read the workbook ({s}); INSERT adds rows to a sheet the workbook has, and `LOAD INTO` with that `sheet` writes a new one beside the others", .{ path, try formats_open.workbookFail(env, path, sheet, e) }));
         defer x.close();
         const loc = try xlsxread.locate(a, env.gpa, path, sheet);
-        if (try xlsxedit.problem(a, path, loc)) |why| return planErr(env.diag, try msgfmt.allocPrint(a, "INSERT INTO {s}: {s}", .{ path, why }));
+        if (try xlsxedit.problem(a, path, loc, .insert)) |why| return planErr(env.diag, try msgfmt.allocPrint(a, "INSERT INTO {s}: {s}", .{ path, why }));
         const file = x.schema;
         const order = try a.alloc(?usize, file.fields.len);
         for (order, file.fields) |*o, f| o.* = for (rows.fields, 0..) |r, i| {

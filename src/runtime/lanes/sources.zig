@@ -95,7 +95,7 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, hints: []const ast.Hint, push_stage
     }
     const remote = csv.CsvReader.isUrl(path);
 
-    const project = try readColumns(env, rd, push_stages);
+    const project = try readColumns(env, rd, hints, push_stages);
     const bounds = try filterBounds(env, push_stages);
     const probe = pqdecode.Reader.openProjected(arena, files[0], project) catch return null;
     var hold = false;
@@ -154,10 +154,13 @@ pub fn parquetSplit(env: *Env, rd: ast.Read, hints: []const ast.Hint, push_stage
     } };
 }
 
-/// The columns a split read decodes: what the stages after it provably take, else
-/// the read's own `cols` (a joined side narrowed to what follows it), else all.
-fn readColumns(env: *Env, rd: ast.Read, push_stages: []const ast.Stage) !?[][]const u8 {
-    if (try projectedColumns(env, push_stages)) |p| return p;
+/// The columns a split read decodes: what the stages after it provably take, or, for
+/// a file read with `hints`, every column a `* EXCEPT` leaves (`plan.readProjection`),
+/// else the read's own `cols` (a joined side narrowed to what follows it), else all.
+fn readColumns(env: *Env, rd: ast.Read, hints: ?[]const ast.Hint, push_stages: []const ast.Stage) !?[][]const u8 {
+    if (hints) |h| {
+        if (try @import("../plan.zig").readProjection(env, rd, h, push_stages)) |p| return p;
+    } else if (try projectedColumns(env, push_stages)) |p| return p;
     return if (rd.cols.len > 0) @constCast(rd.cols) else null;
 }
 
@@ -171,7 +174,7 @@ const files_per_lane = 8;
 /// not fit the table fails the plan. A file its partition values rule out is left out.
 fn tableSplit(env: *Env, layout: *const pqdecode.Layout, path: []const u8, rd: ast.Read, push_stages: []const ast.Stage, lanes: usize) anyerror!?Morsels {
     const arena = env.arena;
-    const project = try readColumns(env, rd, push_stages);
+    const project = try readColumns(env, rd, null, push_stages);
     const bounds = try filterBounds(env, push_stages);
     const view = try layout.view(arena, project);
     var live: usize = 0;

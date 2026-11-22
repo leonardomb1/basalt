@@ -89,8 +89,10 @@ names its columns (`SELECT count(*), count(DISTINCT sku)`, `search((sku, nome),
 'x')`) decodes only those: a key it could not have asked for is passed over, and
 a value in a column it never reads is never checked, so a source that adds an
 optional field, or sends an odd value in one the query skips, does not break it;
-`count(*)` reads no column at all. A larger `sample` types the columns from enough
-rows to meet them.
+`count(*)` reads no column at all, and a local file's `SELECT * EXCEPT (x)` all but
+`x`. A failure names the file and the row (`orders.ndjson: JSON row 3: …`, a
+line when lanes split the file) and the statement's line in the script. A larger
+`sample` types the columns from enough rows to meet them.
 
 Rows stream: an NDJSON file or an array is never held whole, only `items` reads
 its document whole to find the path. A local NDJSON file splits across lanes at

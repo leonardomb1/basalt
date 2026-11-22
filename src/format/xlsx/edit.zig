@@ -2,17 +2,20 @@
 //! the ones an UPDATE gives new values, the ones an INSERT adds after the last. The
 //! workbook is written again whole, every part but the sheet (and, when a changed
 //! row holds a date, time or timestamp, the styles) copied as it is: the other
-//! sheets, the shared strings, the styles, the workbook's own parts. In the sheet,
-//! every row the change leaves is copied byte for byte, its row and cell numbers
-//! moved up past the rows deleted above it; an updated row is written as the
-//! writer writes a row (`write.zig`), with three styles added for its temporal
-//! cells; the `dimension` and `autoFilter` ranges follow.
+//! sheets, the shared strings, the styles, the workbook's own parts, the workbook
+//! asking to be calculated again when it opens, as its formulas' cached values are
+//! stale. In the sheet, every row the change leaves is copied byte for byte, its
+//! row and cell numbers moved up past the rows deleted above it; an updated row is
+//! written as the writer writes a row (`write.zig`), with the styles its temporal
+//! cells need; the `dimension` and `autoFilter` ranges follow.
 //!
-//! A sheet whose rows a change would move under something that names them by
-//! place is refused, as the move would leave that pointing at other cells: a
+//! A DELETE moves rows, so a sheet with something that names its cells by place is
+//! refused for it, as the move would leave that pointing at other cells: a
 //! formula, merged cells, conditional formats, data validations, hyperlinks,
 //! tables, drawings or comments in it, or a formula or defined name elsewhere in
-//! the workbook that names it.
+//! the workbook that names it. An UPDATE writes rows in their places and an INSERT
+//! after the last, so either is refused only on a sheet with a table, and an
+//! UPDATE of a row that holds a formula, which its values would replace.
 
 const std = @import("std");
 const column = @import("../../exec/column.zig");
@@ -38,8 +41,20 @@ pub const Plan = struct {
     appended: []const Batch = &.{},
 };
 
-/// Why `loc`'s sheet cannot have its rows changed, or null.
-pub fn problem(arena: std.mem.Allocator, path: []const u8, loc: read.Located) !?[]const u8 {
+/// The change a statement makes: only a DELETE moves rows; an UPDATE writes rows in
+/// their places and an INSERT after the last.
+pub const Kind = enum { delete, update, insert };
+
+/// Why `loc`'s sheet cannot have its rows changed by `kind`, or null. Only a DELETE
+/// moves rows under what names cells by place; an UPDATE or INSERT is refused only
+/// on a sheet with a table, whose range and columns it would not follow, and an
+/// UPDATE of a row holding a formula fails as the rewrite meets it (`Editor.row`).
+pub fn problem(arena: std.mem.Allocator, path: []const u8, loc: read.Located, kind: Kind) !?[]const u8 {
+    if (kind != .delete) {
+        if (try findIn(arena, path, loc.sheet_part, &.{"<tableParts"}, false) != null)
+            return try msgfmt.allocPrint(arena, "sheet `{s}` holds a table, whose range and columns an {s} would not follow", .{ loc.sheet_name, if (kind == .insert) "INSERT" else "UPDATE" });
+        return null;
+    }
     const sheet_marks = [_]struct { tag: []const u8, what: []const u8 }{
         .{ .tag = "<f>", .what = "a formula" },
         .{ .tag = "<f ", .what = "a formula" },
@@ -65,35 +80,7 @@ pub fn problem(arena: std.mem.Allocator, path: []const u8, loc: read.Located) !?
     return null;
 }
 
-/// The index in `pats` of the first found in part `name`, case-insensitively when
-/// `fold`; null when none is, or the part is not there.
-fn findIn(arena: std.mem.Allocator, path: []const u8, name: []const u8, pats: []const []const u8, fold: bool) !?usize {
-    const m = zipsrc.openMember(arena, path, name) catch |e| switch (e) {
-        error.ZipMemberNotFound => return null,
-        else => return e,
-    };
-    defer m.close();
-    var longest: usize = 0;
-    for (pats) |p| longest = @max(longest, p.len);
-    var carry = std.array_list.Managed(u8).init(arena);
-    while (true) {
-        const chunk = m.reader.peekGreedy(1) catch |e| switch (e) {
-            error.EndOfStream => return null,
-            else => |x| return x,
-        };
-        try carry.appendSlice(chunk);
-        m.reader.toss(chunk.len);
-        for (pats, 0..) |p, i| {
-            const hit = if (fold) std.ascii.indexOfIgnoreCase(carry.items, p) else std.mem.indexOf(u8, carry.items, p);
-            if (hit != null) return i;
-        }
-        if (carry.items.len > longest) {
-            const keep = longest;
-            std.mem.copyForwards(u8, carry.items[0..keep], carry.items[carry.items.len - keep ..]);
-            carry.items.len = keep;
-        }
-    }
-}
+const findIn = write.findIn;
 
 /// Writes the workbook at `path` again into `out` with `plan`'s changes.
 pub fn rewrite(arena: std.mem.Allocator, path: []const u8, plan: Plan, out: *std.Io.Writer) !void {
@@ -107,6 +94,7 @@ pub fn rewrite(arena: std.mem.Allocator, path: []const u8, plan: Plan, out: *std
         styles = patched.ids;
         styles.date1904 = plan.loc.date1904;
     };
+    const recalc = try write.anyFormula(arena, path, plan.loc.others) or try write.anyFormula(arena, path, &.{plan.loc.sheet_part});
     for (try zipsrc.names(arena, path)) |name| {
         if (std.mem.eql(u8, name, plan.loc.sheet_part)) {
             const w = try z.begin(name);
@@ -116,6 +104,10 @@ pub fn rewrite(arena: std.mem.Allocator, path: []const u8, plan: Plan, out: *std
         }
         if (new_styles != null and std.mem.eql(u8, name, plan.loc.styles.?)) {
             try z.addStored(name, new_styles.?);
+            continue;
+        }
+        if (recalc and std.mem.eql(u8, name, plan.loc.workbook)) {
+            try z.addStored(name, try write.recalcOnLoad(arena, try write.memberText(arena, path, name)));
             continue;
         }
         const m = try zipsrc.openMember(arena, path, name);
@@ -259,6 +251,8 @@ const Editor = struct {
                 self.shift += 1;
                 return;
             }
+            if (std.mem.indexOf(u8, text, "<f>") != null or std.mem.indexOf(u8, text, "<f ") != null)
+                return write.explainf(error.XlsxFormulaRow, "row {d} of sheet `{s}` holds a formula, which writing the row's new values would replace; change that row in Excel, or leave it out of the WHERE", .{ n, self.plan.loc.sheet_name });
             return self.render(n - self.shift, c.batch.?, c.at);
         }
         const now = n - self.shift;

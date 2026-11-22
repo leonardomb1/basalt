@@ -200,16 +200,27 @@ format:
   not name as its bytes, so a FLOAT column keeps all its digits and `21168.20`
   its zero, and the fields set are written as `LOAD INTO` writes them, in the
   file's delimiter and encoding; an updated NDJSON object likewise keeps its other
-  keys as they were and changes only the ones set.
+  keys as they were and changes only the ones set. The file is read for the
+  columns the WHERE and the SETs use alone, so a value past the sample in a
+  column the statement leaves alone (`"n/a"` in a FLOAT column) fails neither a
+  `DELETE` nor an `UPDATE`, and that record's own bytes stay as they were.
 - An Excel workbook keeps every part but the sheet as it was: the other sheets,
   the shared strings, the styles. In the sheet each row kept is copied as it
   is, moved up past the rows deleted above it, and an updated row is written as
-  `LOAD INTO` writes one, losing its cells' own formatting. A sheet whose rows
-  something names by place is refused, as moving them would leave it pointing
-  at other cells: a formula, merged cells, conditional formats, data
-  validations, hyperlinks, tables, drawings or comments in it, or a formula or
-  defined name elsewhere in the workbook naming it. So is a sheet read through
-  `range`, only part of one.
+  `LOAD INTO` writes one, losing its cells' own formatting. Only a `DELETE`
+  moves rows, so a `DELETE` on a sheet whose rows something names by place is
+  refused, as the move would leave it pointing at other cells: a formula, merged
+  cells, conditional formats, data validations, hyperlinks, tables, drawings or
+  comments in it, or a formula or defined name elsewhere in the workbook naming
+  it. An `UPDATE` writes rows in their places and an `INSERT` after the last, so
+  a summary formula over the sheet (`=SUM(Dados!C2:C100)`) allows both; they are
+  refused only on a sheet with a table, whose range and columns they would not
+  follow, and an `UPDATE` of a row holding a formula fails naming the row, as its
+  new values would replace the formula. When a sheet kept holds a formula, the
+  workbook is marked to be calculated again as it opens (`fullCalcOnLoad`), its
+  cached results being stale. The date and time styles an edit adds are used
+  again by the next, so the styles part does not grow edit after edit. A sheet
+  read through `range`, only part of one, is refused.
 - Any other format is read and written again as `LOAD INTO` writes it, the
   updated rows in their places; a JSON array stays an array.
 

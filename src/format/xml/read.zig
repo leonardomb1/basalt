@@ -265,6 +265,9 @@ pub const Reader = struct {
             @memset(vals, null);
             for (row) |c| {
                 const i = self.columnOf(c) orelse {
+                    if (self.opts.project) |pj| if (driver.leftOut(pj)) |out| {
+                        if (!leftOutCell(out, c)) return self.stray(c);
+                    };
                     if (self.opts.project != null) continue;
                     return self.stray(c);
                 };
@@ -286,6 +289,16 @@ pub const Reader = struct {
             error.TextTypeMismatch => return self.mismatch(name, v, b.ty.kind, "a value"),
             else => return e,
         };
+    }
+
+    /// Whether cell `c` lands in a column a `* EXCEPT` left out (`driver.leftOut`), by
+    /// the names `columnOf` tries.
+    fn leftOutCell(out: []const []const u8, c: Cell) bool {
+        for (out) |n| {
+            if (std.mem.eql(u8, n, c.name)) return true;
+            if (c.kind == .attr and n.len == c.name.len + 1 and n[0] == '@' and std.mem.eql(u8, n[1..], c.name)) return true;
+        }
+        return false;
     }
 
     /// A name no column holds, first met past the sample: read on, its values would be

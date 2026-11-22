@@ -79,7 +79,7 @@ pub fn run(env: *Env, w: ast.Write, read: ast.Stage, between_in: []const ast.Sta
         .sheet => .sheet,
         .whole, .refused => .whole,
     };
-    var first = try openRead(env, read, format, &kind);
+    var first = try openRead(env, read, format, &kind, null);
     const data = first.data;
     const dry = env.explain or opts.explain;
     if (dry and !opts.explain) {
@@ -96,9 +96,13 @@ pub fn run(env: *Env, w: ast.Write, read: ast.Stage, between_in: []const ast.Sta
     var stages = std.array_list.Managed(ast.Stage).init(a);
     for (between) |st| if (!(st.node == .select and st.node.select.len > 0 and st.node.select[0] == .star)) try stages.append(st);
     const at = if (between.len > 0) between[between.len - 1].pos else read.pos;
-    if (which == .update) try stages.append(.{ .node = .{ .select = if (kind == .whole) try setProjection(env, w, data, ids) else try projection(env, w, data, ids) }, .hints = &.{}, .pos = at });
-    if (which == .delete and kind == .whole) try stages.append(.{ .node = .{ .select = try idsOnly(a, ids) }, .hints = &.{}, .pos = at });
-    if (kind == .sheet) if (try xlsxedit.problem(a, path, first.loc.?)) |why| {
+    if (which == .update) try stages.append(.{ .node = .{ .select = switch (kind) {
+        .whole => try setProjection(env, w, data, ids),
+        .csv, .ndjson => try textProjection(env, w, data, ids),
+        .sheet => try projection(env, w, data, ids),
+    } }, .hints = &.{}, .pos = at });
+    if (which == .delete and kind != .sheet) try stages.append(.{ .node = .{ .select = try idsOnly(a, ids) }, .hints = &.{}, .pos = at });
+    if (kind == .sheet) if (try xlsxedit.problem(a, path, first.loc.?, if (which == .delete) .delete else .update)) |why| {
         first.src.close();
         return planErr(env.diag, try msgfmt.allocPrint(a, "{s}: {s}", .{ what, why }));
     };
@@ -106,14 +110,16 @@ pub fn run(env: *Env, w: ast.Write, read: ast.Stage, between_in: []const ast.Sta
     key[0] = .{ .field = .{ .parts = try a.dupe([]const u8, &.{ids[0]}) }, .desc = false, .nulls_first = false };
     try stages.append(.{ .node = .{ .sort = .{ .keys = key } }, .hints = &.{}, .pos = at });
 
-    if (kind == .whole) if (try plan.projectedColumns(env, stages.items)) |cols| {
+    if (kind != .sheet) if (try plan.projectedColumns(env, stages.items)) |cols| {
         var keep = std.array_list.Managed([]const u8).init(a);
         for (cols) |c| if (data.indexOf(c) != null) try keep.append(c);
-        if (keep.items.len == 0) try keep.append(data.fields[0].name);
+        if (kind == .whole and keep.items.len == 0) try keep.append(data.fields[0].name);
         if (keep.items.len < data.fields.len) {
             first.src.close();
-            const src = try source.openSourceProjected(env, read.node.read, read.hints, keep.items, &.{});
-            first.src = (try Numbered.open(a, src)).source();
+            if (kind == .whole) {
+                const src = try source.openSourceProjected(env, read.node.read, read.hints, keep.items, &.{});
+                first.src = (try Numbered.open(a, src)).source();
+            } else first.src = (try openRead(env, read, format, &kind, keep.items)).src;
         }
     };
     const scan = try a.create(op.Scan);
@@ -190,9 +196,11 @@ const Guard = struct {
 
 const Opened = struct { src: driver.Source, data: types.Schema, array: bool = false, loc: ?xlsxread.Located = null, first_row: u32 = 0, c0: u32 = 0 };
 
-/// The file's first read, serial, each row with its identity last; `kind` turns to
-/// `whole` for a JSON file that is one array rather than NDJSON.
-fn openRead(env: *Env, read: ast.Stage, format: analyze.FileFormat, kind: *Kind) !Opened {
+/// The file's read, serial, each row with its identity last; `kind` turns to `whole`
+/// for a JSON file that is one array rather than NDJSON. A text file's read decodes
+/// only the columns `project` names, when given, the others never read, so a value
+/// in a column the statement leaves alone cannot fail it.
+fn openRead(env: *Env, read: ast.Stage, format: analyze.FileFormat, kind: *Kind, project: ?[]const []const u8) !Opened {
     const a = env.arena;
     const rd = read.node.read;
     const path = rd.form.path;
@@ -203,13 +211,18 @@ fn openRead(env: *Env, read: ast.Stage, format: analyze.FileFormat, kind: *Kind)
             d.text = rd.text_cols;
             const r = csvfmt.CsvReader.open(a, path, d) catch |e|
                 return planErrT(env.diag, e, try msgfmt.allocPrint(a, "could not read `{s}` ({s})", .{ path, @errorName(e) }));
+            const data = r.schema;
+            if (project) |p| try r.project(p);
             const sp = try csvfmt.Spans.open(a, r);
-            return .{ .src = sp.source(), .data = r.schema };
+            return .{ .src = sp.source(), .data = data };
         },
         .ndjson => {
             const s = stream.Stream.open(a, path) catch |e|
                 return planErrT(env.diag, e, try msgfmt.allocPrint(a, "could not read `{s}` ({s})", .{ path, @errorName(e) }));
-            const r = jsonread.Reader.open(a, env.gpa, s.reader, analyze.jsonOptions(read.hints)) catch |e| {
+            var jopts = analyze.jsonOptions(read.hints);
+            jopts.project = project;
+            jopts.source_name = path;
+            const r = jsonread.Reader.open(a, env.gpa, s.reader, jopts) catch |e| {
                 s.close();
                 return planErrT(env.diag, e, try msgfmt.allocPrint(a, "`{s}` is not valid JSON or NDJSON in its first rows", .{path}));
             };
@@ -243,6 +256,20 @@ fn openRead(env: *Env, read: ast.Stage, format: analyze.FileFormat, kind: *Kind)
     const src = try source.openSourceProjected(env, rd, read.hints, null, &.{});
     const num = try Numbered.open(a, src);
     return .{ .src = num.source(), .data = src.schema() };
+}
+
+/// An UPDATE's new rows in a text file: every column of the file, a SET one its
+/// expression and any other a NULL, then the identity columns. The rewrite takes
+/// only the SET columns from the new row (`patchObject`, `patchRecord`), every other
+/// field from the record's own bytes, so the read decodes only the columns the
+/// conditions and the SETs read.
+fn textProjection(env: *Env, w: ast.Write, data: types.Schema, ids: []const []const u8) ![]ast.SelectItem {
+    const a = env.arena;
+    const items = try projection(env, w, data, ids);
+    for (items[0..data.fields.len], data.fields) |*it, f| if (it.* == .field) {
+        it.* = .{ .computed = .{ .name = f.name, .expr = try ast.mk(a, .{ .cast = .{ .e = try ast.mk(a, .null_lit), .ty = f.ty } }) } };
+    };
+    return items;
 }
 
 /// An UPDATE's new values in a file written again whole: each column a SET names, in
@@ -660,12 +687,14 @@ fn patchObject(a: std.mem.Allocator, orig: []const u8, fresh: []const u8, sets: 
 /// CSV record `orig` (its line ending cut) with the fields of the columns `sets` name
 /// taken from `fresh`, the updated row as the writer renders it, and every other field
 /// kept as its bytes, so a column the SET does not name is never written again from
-/// the value it was read as (a FLOAT column keeps all its digits). A record whose
-/// fields do not line up with the columns is written as `fresh`.
+/// the value it was read as (a FLOAT column keeps all its digits), nor read at all. A
+/// record whose fields do not line up with the columns fails, as `fresh` holds only
+/// the SET's values.
 fn patchRecord(a: std.mem.Allocator, orig: []const u8, fresh: []const u8, sets: []const ast.Update.Set, data: types.Schema, delim: u8) ![]const u8 {
     const old = try csvfmt.rawFields(a, orig, delim);
     const new = try csvfmt.rawFields(a, fresh, delim);
-    if (old.len != data.fields.len or new.len != data.fields.len) return fresh;
+    if (old.len != data.fields.len or new.len != data.fields.len)
+        return @import("../../exec/eval.zig").explain(error.CsvRaggedRow, "an updated record's fields do not line up with the header's columns, so it cannot be patched in place");
     var out = std.array_list.Managed(u8).init(a);
     for (data.fields, old, new, 0..) |f, o, n, i| {
         if (i > 0) try out.append(delim);

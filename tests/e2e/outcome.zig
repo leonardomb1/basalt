@@ -153,7 +153,7 @@ test "on_load: every LOAD reports as it finishes — written, failed before writ
         try std.testing.expect(!bad.ok);
         try std.testing.expectEqual(@as(u32, 2), bad.line);
         try std.testing.expectEqualStrings("/nonexistent/x.csv", bad.target);
-        try std.testing.expect(std.mem.indexOf(u8, bad.reason, "FileNotFound") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bad.reason, "the folder `/nonexistent` does not exist") != null);
         try std.testing.expect(!bad.transient);
         try std.testing.expectEqual(@as(u64, 1), summary.loads);
         try std.testing.expectEqual(@as(u64, 1), summary.loads_failed);

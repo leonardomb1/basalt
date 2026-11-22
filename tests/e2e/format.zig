@@ -754,6 +754,19 @@ test "a value past the sample that its column cannot read fails only a read that
         for ([_][]const u8{ "SELECT *", "SELECT sum(preco) AS s" }) |sel|
             try expectRunRefuses(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/o.csv' AS {s} FROM {s} WITH (sample = 2);", .{ sel, src }), 1, "abc");
     }
+    for ([_][]const u8{ "'$B/w.ndjson'", "'$B/w.json'", "'$B/w.xml'" }) |src| for ([_]usize{ 1, 4 }) |threads| {
+        try checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/o.csv' AS SELECT * EXCEPT (preco) FROM {s} WITH (sample = 2) ORDER BY id;", .{src}), threads, &.{});
+        try expectFile(&tmp, "o.csv", "id,sku\n1,a\n2,b\n3,a\n");
+    };
+    try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/w.ndjson' WITH (sample = 2);", 1, "w.ndjson: JSON row 3: the value \"abc\" in `preco`");
+    try expectRunRefuses(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/o.csv' AS SELECT * FROM {s} WITH (sample = 2);", .{rest}), 1, "API item 3: the value \"abc\" in `preco`");
+    const base = try tmp.dir.realpathAlloc(a, ".");
+    var diag: Diag = .{};
+    const script = try std.fmt.allocPrint(a, "PARAM p INT DEFAULT 1;\nLOAD INTO '{s}/o.csv' AS\n  SELECT * FROM '{s}/w.ndjson' WITH (sample = 2);", .{ base, base });
+    if (exec(alloc, script, .{ .threads = 1, .log = .{ .quiet = true } }, &diag)) |_| return error.TestUnexpectedResult else |_| {}
+    try std.testing.expect(std.mem.indexOf(u8, diag.msg, "JSON row 3") != null);
+    try std.testing.expectEqual(@as(u32, 2), diag.pos.?.line);
+    try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/nope/dir/o.csv' AS SELECT 1 AS a;", 1, "/nope` does not exist");
 
     var text = std.array_list.Managed(u8).init(a);
     try text.appendSlice("id,sku\n");

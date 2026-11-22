@@ -592,7 +592,13 @@ pub const Project = struct {
                 .passthrough => |idx| b.columns[idx],
                 .expr => |e| eval.evalColumn(arena, e, b, c.ty) catch |err| {
                     const name = self.out_schema.fields[i].name;
-                    if (self.err) |ec| if (name.len > 0 and name[0] == 0) ec.set("{s}", .{failLabel(err)}) else ec.set("{s}: computing column `{s}` in select", .{ failLabel(err), name });
+                    if (self.err) |ec| {
+                        var lb: [320]u8 = undefined;
+                        const label = msgfmt.clipPrint(&lb, "{s}", .{failLabel(err)});
+                        var rb: [200]u8 = undefined;
+                        const at = failedRow(arena, e, b, &rb);
+                        if (name.len > 0 and name[0] == 0) ec.set("{s}{s}", .{ label, at }) else ec.set("{s}: computing column `{s}` in select{s}", .{ label, name, at });
+                    }
                     return err;
                 },
             };
@@ -600,6 +606,34 @@ pub const Project = struct {
         return Batch{ .schema = self.out_schema, .columns = outcols, .len = b.len };
     }
 };
+
+/// `, at the row n = 2, rec = '…'`: the first row of `b` that `e` fails on, found by
+/// evaluating it row by row, shown by its first few columns (a record reader's are
+/// its number and text), in `buf`; empty when no row fails alone. A failure the
+/// search meets is dropped, as the caller already took the first one's account.
+fn failedRow(arena: std.mem.Allocator, e: *const ast.Expr, b: Batch, buf: []u8) []const u8 {
+    @branchHint(.cold);
+    const row = for (0..b.len) |r| {
+        _ = eval.evalRow(arena, e, b, r) catch |x| {
+            _ = eval.takeFailure(x);
+            break r;
+        };
+    } else return "";
+    var w = std.Io.Writer.fixed(buf);
+    w.writeAll(", at the row ") catch return "";
+    var shown: usize = 0;
+    for (b.schema.fields, b.columns) |f, *col| {
+        if (shown == 3) break;
+        if (f.name.len == 0 or f.name[0] == 0) continue;
+        const v = col.getValue(row);
+        const text = if (v.isNull()) "NULL" else eval.valueToString(arena, v) catch continue;
+        const quote = v == .string;
+        w.print("{s}{s} = {s}{s}{s}", .{ if (shown > 0) ", " else "", f.name, if (quote) "'" else "", text[0..@min(text.len, 40)], if (quote) "'" else "" }) catch break;
+        shown += 1;
+    }
+    if (shown == 0) return "";
+    return w.buffered();
+}
 
 pub const Limit = struct {
     stats: Stats = .{},

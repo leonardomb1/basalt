@@ -86,7 +86,9 @@ pub const Writer = struct {
     /// workbook has none of that name, and every other part is copied as it is. The
     /// styles gain three temporal formats when the rows hold dates or times, and the
     /// calculation chain is dropped, as Excel rebuilds it and a stale one names cells
-    /// the new sheet no longer has. A sheet with parts of its own (a table, a drawing,
+    /// the new sheet no longer has, and when another sheet holds a formula the
+    /// workbook asks to be calculated again as it opens (`recalcOnLoad`), as the
+    /// formula's cached value is stale. A sheet with parts of its own (a table, a drawing,
     /// comments, a pivot table) is refused, as writing it anew would leave them
     /// behind, and so is a name a chart sheet holds.
     pub fn openInto(arena: std.mem.Allocator, path: []const u8, schema: types.Schema, sheet_name: []const u8, lay: read.Layout) !*Writer {
@@ -112,13 +114,16 @@ pub const Writer = struct {
         const part = lay.sheet_part orelse added.?;
         var types_text = try dropEmpty(arena, try memberText(arena, path, "[Content_Types].xml"), "calcChain");
         var rels_text = try dropEmpty(arena, try memberText(arena, path, lay.workbook_rels), "calcChain");
-        var wb_text: ?[]const u8 = null;
+        var wb_text = try memberText(arena, path, lay.workbook);
         if (added) |np| {
             const rid = try msgfmt.allocPrint(arena, "rId{d}", .{maxAfter(rels_text, "Id=\"rId") + 1});
             types_text = try insertBeforeClose(arena, types_text, "Types", try msgfmt.allocPrint(arena, "<Override PartName=\"/{s}\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>", .{np}));
             rels_text = try insertBeforeClose(arena, rels_text, "Relationships", try msgfmt.allocPrint(arena, "<Relationship Id=\"{s}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"{s}\"/>", .{ rid, relTarget(lay.workbook, np) }));
-            wb_text = try addSheetEntry(arena, try memberText(arena, path, lay.workbook), sheet_name, rid);
+            wb_text = try addSheetEntry(arena, wb_text, sheet_name, rid);
         }
+        var kept = std.array_list.Managed([]const u8).init(arena);
+        for (names) |n| if (std.mem.indexOf(u8, n, "worksheets/") != null and std.mem.endsWith(u8, n, ".xml") and !std.mem.eql(u8, n, part)) try kept.append(n);
+        if (try anyFormula(arena, path, kept.items)) wb_text = try recalcOnLoad(arena, wb_text);
 
         const self = try begin(arena, path, schema);
         errdefer self.abort();
@@ -128,7 +133,7 @@ pub const Writer = struct {
         return self;
     }
 
-    fn copyInto(self: *Writer, arena: std.mem.Allocator, path: []const u8, names: []const []const u8, part: []const u8, lay: read.Layout, types_text: []const u8, rels_text: []const u8, wb_text: ?[]const u8, styles_text: ?[]const u8) !void {
+    fn copyInto(self: *Writer, arena: std.mem.Allocator, path: []const u8, names: []const []const u8, part: []const u8, lay: read.Layout, types_text: []const u8, rels_text: []const u8, wb_text: []const u8, styles_text: ?[]const u8) !void {
         for (names) |name| {
             if (std.mem.eql(u8, name, part) or std.mem.endsWith(u8, name, "/calcChain.xml")) continue;
             if (std.mem.eql(u8, name, "[Content_Types].xml")) {
@@ -139,10 +144,10 @@ pub const Writer = struct {
                 try self.zip.addStored(name, rels_text);
                 continue;
             }
-            if (wb_text) |t| if (std.mem.eql(u8, name, lay.workbook)) {
-                try self.zip.addStored(name, t);
+            if (std.mem.eql(u8, name, lay.workbook)) {
+                try self.zip.addStored(name, wb_text);
                 continue;
-            };
+            }
             if (styles_text) |t| if (std.mem.eql(u8, name, lay.styles.?)) {
                 try self.zip.addStored(name, t);
                 continue;
@@ -266,20 +271,33 @@ pub fn memberText(arena: std.mem.Allocator, path: []const u8, name: []const u8) 
 
 pub const Patched = struct { text: []const u8, ids: Styles };
 
-/// Styles part `text` with three cell formats added at the end of `cellXfs`, Excel's
-/// built-in date (14), date and time (22) and time (21) number formats, and their
-/// indices.
+/// Styles part `text` with the cell formats of Excel's built-in date (14), date and
+/// time (22) and time (21) number formats in `cellXfs`, and their indices: one this
+/// function added before, by an earlier edit, is used again, so editing a workbook
+/// over and over does not grow its styles; the others are added at the end.
 pub fn withTemporalStyles(arena: std.mem.Allocator, text: []const u8) !Patched {
     const open = std.mem.indexOf(u8, text, "<cellXfs") orelse return error.BadXml;
     const close = std.mem.indexOfPos(u8, text, open, "</cellXfs>") orelse return error.BadXml;
+    const fmts = [_]u16{ 14, 22, 21 };
+    var own: [fmts.len][]const u8 = undefined;
+    for (&own, fmts) |*s, id| s.* = try msgfmt.allocPrint(arena, "<xf numFmtId=\"{d}\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/>", .{id});
+    var found = [_]?usize{null} ** fmts.len;
     var n: usize = 0;
     var at = open;
     while (std.mem.indexOfPos(u8, text, at + 1, "<xf")) |i| {
         if (i >= close) break;
+        for (own, &found) |s, *f| if (f.* == null and std.mem.startsWith(u8, text[i..], s)) {
+            f.* = n;
+        };
         n += 1;
         at = i;
     }
-    const xf = "<xf numFmtId=\"{d}\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/>";
+    var idx: [fmts.len]usize = undefined;
+    var added: usize = 0;
+    for (found, &idx) |f, *x| x.* = f orelse blk: {
+        added += 1;
+        break :blk n + added - 1;
+    };
     var o = std.array_list.Managed(u8).init(arena);
     const head_end = (std.mem.indexOfScalarPos(u8, text, open, '>') orelse return error.BadXml) + 1;
     const head = text[open..head_end];
@@ -288,20 +306,95 @@ pub fn withTemporalStyles(arena: std.mem.Allocator, text: []const u8) !Patched {
         const vs = c + "count=\"".len;
         const ve = std.mem.indexOfScalarPos(u8, head, vs, '"') orelse return error.BadXml;
         try o.appendSlice(head[0..vs]);
-        try o.writer().print("{d}", .{n + 3});
+        try o.writer().print("{d}", .{n + added});
         try o.appendSlice(head[ve..]);
     } else try o.appendSlice(head);
     try o.appendSlice(text[head_end..close]);
-    for ([_]u16{ 14, 22, 21 }) |id| try o.writer().print(xf, .{id});
+    for (own, found) |s, f| if (f == null) try o.appendSlice(s);
     try o.appendSlice(text[close..]);
     return .{
         .text = o.items,
         .ids = .{
-            .date = try msgfmt.allocPrint(arena, "{d}", .{n}),
-            .timestamp = try msgfmt.allocPrint(arena, "{d}", .{n + 1}),
-            .time = try msgfmt.allocPrint(arena, "{d}", .{n + 2}),
+            .date = try msgfmt.allocPrint(arena, "{d}", .{idx[0]}),
+            .timestamp = try msgfmt.allocPrint(arena, "{d}", .{idx[1]}),
+            .time = try msgfmt.allocPrint(arena, "{d}", .{idx[2]}),
         },
     };
+}
+
+/// Workbook part `text` asking the application that opens it to calculate every
+/// formula again (`fullCalcOnLoad`), as rows it changed leave the values a formula
+/// cached stale. The `calcPr` goes where the schema orders it, before the elements
+/// that follow it, under the root's namespace prefix; a workbook with none of those
+/// and no closing root tag stays as it is.
+pub fn recalcOnLoad(arena: std.mem.Allocator, text: []const u8) ![]const u8 {
+    const pre = rootPrefix(text);
+    const calc = try msgfmt.allocPrint(arena, "<{s}calcPr", .{pre});
+    if (std.mem.indexOf(u8, text, calc)) |at| {
+        const end = std.mem.indexOfScalarPos(u8, text, at, '>') orelse return error.BadXml;
+        const tag = text[at..end];
+        if (std.mem.indexOf(u8, tag, "fullCalcOnLoad=\"")) |f| {
+            const vs = at + f + "fullCalcOnLoad=\"".len;
+            const ve = std.mem.indexOfScalarPos(u8, text, vs, '"') orelse return error.BadXml;
+            return std.mem.concat(arena, u8, &.{ text[0..vs], "1", text[ve..] });
+        }
+        const after = at + calc.len;
+        return std.mem.concat(arena, u8, &.{ text[0..after], " fullCalcOnLoad=\"1\"", text[after..] });
+    }
+    const later = [_][]const u8{ "<{s}oleSize", "<{s}customWorkbookViews", "<{s}pivotCaches", "<{s}smartTagPr", "<{s}smartTagTypes", "<{s}webPublishing", "<{s}fileRecoveryPr", "<{s}webPublishObjects", "<{s}extLst", "</{s}workbook>" };
+    var at: ?usize = null;
+    inline for (later) |t| if (std.mem.indexOf(u8, text, try msgfmt.allocPrint(arena, t, .{pre}))) |i| {
+        at = if (at) |a| @min(a, i) else i;
+    };
+    const i = at orelse return text;
+    return std.mem.concat(arena, u8, &.{ text[0..i], try msgfmt.allocPrint(arena, "<{s}calcPr fullCalcOnLoad=\"1\"/>", .{pre}), text[i..] });
+}
+
+/// The namespace prefix of the workbook's root element with its colon (`x:`), or
+/// none.
+fn rootPrefix(text: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, text, "<workbook") != null) return "";
+    const at = std.mem.indexOf(u8, text, ":workbook") orelse return "";
+    const lt = std.mem.lastIndexOfScalar(u8, text[0..at], '<') orelse return "";
+    return text[lt + 1 .. at + 1];
+}
+
+/// Whether any of the worksheet parts `parts` holds a formula, bare or under a
+/// namespace prefix.
+pub fn anyFormula(arena: std.mem.Allocator, path: []const u8, parts: []const []const u8) !bool {
+    for (parts) |p| if (try findIn(arena, path, p, &.{ "<f>", "<f ", ":f>", ":f " }, false) != null) return true;
+    return false;
+}
+
+/// The index in `pats` of the first found in part `name`, case-insensitively when
+/// `fold`; null when none is, or the part is not there. The part streams, a chunk at
+/// a time, so a large sheet is never held whole.
+pub fn findIn(arena: std.mem.Allocator, path: []const u8, name: []const u8, pats: []const []const u8, fold: bool) !?usize {
+    const m = zipsrc.openMember(arena, path, name) catch |e| switch (e) {
+        error.ZipMemberNotFound => return null,
+        else => return e,
+    };
+    defer m.close();
+    var longest: usize = 0;
+    for (pats) |p| longest = @max(longest, p.len);
+    var carry = std.array_list.Managed(u8).init(arena);
+    while (true) {
+        const chunk = m.reader.peekGreedy(1) catch |e| switch (e) {
+            error.EndOfStream => return null,
+            else => |x| return x,
+        };
+        try carry.appendSlice(chunk);
+        m.reader.toss(chunk.len);
+        for (pats, 0..) |p, i| {
+            const hit = if (fold) std.ascii.indexOfIgnoreCase(carry.items, p) else std.mem.indexOf(u8, carry.items, p);
+            if (hit != null) return i;
+        }
+        if (carry.items.len > longest) {
+            const keep = longest;
+            std.mem.copyForwards(u8, carry.items[0..keep], carry.items[carry.items.len - keep ..]);
+            carry.items.len = keep;
+        }
+    }
 }
 
 fn hasName(names: []const []const u8, name: []const u8) bool {
@@ -480,7 +573,7 @@ pub fn writeText(w: *std.Io.Writer, s: []const u8, row: u32) !void {
     try w.writeAll("</t></is></c>");
 }
 
-fn explainf(e: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
+pub fn explainf(e: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
     @branchHint(.cold);
     var buf: [480]u8 = undefined;
     return eval.explain(e, msgfmt.bufPrint(&buf, fmt, args) catch fmt);
@@ -673,4 +766,20 @@ test "the written formats read back as dates, timestamps and times" {
         };
         try std.testing.expectEqualStrings(want, gw.written());
     }
+}
+
+test "temporal styles added by an earlier edit are used again, so styles do not grow edit after edit" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const base = "<styleSheet><cellXfs count=\"2\"><xf numFmtId=\"0\"/><xf numFmtId=\"4\" fontId=\"1\"/></cellXfs></styleSheet>";
+    const once = try withTemporalStyles(a, base);
+    try std.testing.expectEqualStrings("2", once.ids.date);
+    try std.testing.expectEqualStrings("3", once.ids.timestamp);
+    try std.testing.expectEqualStrings("4", once.ids.time);
+    try std.testing.expect(std.mem.indexOf(u8, once.text, "count=\"5\"") != null);
+    const twice = try withTemporalStyles(a, once.text);
+    try std.testing.expectEqualStrings(once.text, twice.text);
+    try std.testing.expectEqualStrings(once.ids.date, twice.ids.date);
+    try std.testing.expectEqualStrings(once.ids.time, twice.ids.time);
 }

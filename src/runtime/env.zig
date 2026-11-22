@@ -782,10 +782,32 @@ fn pathLayer(path: []const u8) []const u8 {
     return "local file";
 }
 
+/// Why `path` could not be read or written, as `layer: words`. A local file not found
+/// in a folder that does not exist names the first folder on its way that is missing,
+/// the one a mistyped or unmade path goes wrong at.
 pub fn pathFail(arena: std.mem.Allocator, path: []const u8, e: anyerror) ![]const u8 {
     if (eval.takeFailure(e)) |why| return arena.dupe(u8, why);
     if (connectorNote(e, path)) |n| return msgfmt.allocPrint(arena, "{s}: {s}: {s}", .{ n.layer, @errorName(e), n.why });
-    return msgfmt.allocPrint(arena, "{s}: {s}", .{ pathLayer(path), @errorName(e) });
+    const layer = pathLayer(path);
+    if (e == error.FileNotFound and std.mem.eql(u8, layer, "local file")) if (missingFolder(path)) |dir|
+        return msgfmt.allocPrint(arena, "local file: the folder `{s}` does not exist", .{dir});
+    return msgfmt.allocPrint(arena, "{s}: {s}", .{ layer, @errorName(e) });
+}
+
+/// The first folder on `path`'s way, from the top, that does not exist, or null when
+/// its own folder does.
+fn missingFolder(path: []const u8) ?[]const u8 {
+    var missing: ?[]const u8 = null;
+    var dir = std.fs.path.dirname(path);
+    while (dir) |d| : (dir = std.fs.path.dirname(d)) {
+        std.fs.cwd().access(d, .{}) catch |x| {
+            if (x != error.FileNotFound) return missing;
+            missing = d;
+            continue;
+        };
+        return missing;
+    }
+    return missing;
 }
 
 /// A file connector's own words for its last failure on this thread and the layer it
@@ -939,7 +961,8 @@ test "connectorNote: none for a local path, an error no file connector names, or
     try std.testing.expect(connectorNote(error.ConnectionResetByPeer, null) == null);
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
-    try std.testing.expectEqualStrings("local file: FileNotFound", try pathFail(ar.allocator(), "data/x.csv", error.FileNotFound));
+    try std.testing.expectEqualStrings("local file: FileNotFound", try pathFail(ar.allocator(), "x_not_here.csv", error.FileNotFound));
+    try std.testing.expectEqualStrings("local file: the folder `no_such_zz` does not exist", try pathFail(ar.allocator(), "no_such_zz/sub/x.csv", error.FileNotFound));
     try std.testing.expectEqualStrings("s3 object: S3Throttled", try pathFail(ar.allocator(), "s3://b/k", error.S3Throttled));
 }
 

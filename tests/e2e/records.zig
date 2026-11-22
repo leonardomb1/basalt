@@ -84,6 +84,27 @@ test "check and run refuse a record source's bad arguments alike" {
     }) |c| try expectRefusedAlike(alloc, &tmp, c[0], c[1]);
 }
 
+test "a field that fails to decode names its record by number, offset and text, on one lane or several" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "d.txt", .data = "20260101\n20261301\n20260102\n" });
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+    for ([_]usize{ 1, 4 }) |threads| {
+        var parena = std.heap.ArenaAllocator.init(alloc);
+        defer parena.deinit();
+        const a = parena.allocator();
+        const script = try std.fmt.allocPrint(a, "LOAD INTO '{s}/o.csv' AS SELECT date_at(rec, 0, 8, 'YYYYMMDD') AS d FROM fixed('{s}/d.txt', 8, TRUE);", .{ base, base });
+        var rdiag: Diag = .{};
+        if (exec(alloc, script, .{ .log = .{ .quiet = true }, .threads = threads }, &rdiag)) |_| return error.TestUnexpectedResult else |_| {}
+        if (std.mem.indexOf(u8, rdiag.msg, "computing column `d` in select, at the row n = 2, offset = 9, rec = 20261301") == null) {
+            std.debug.print("got `{s}`\n", .{rdiag.msg});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
 test "a short last fixed record, a missing file and a folder fail the run naming the file, on one lane or several" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -95,6 +116,7 @@ test "a short last fixed record, a missing file and a folder fail the run naming
     for ([_]usize{ 1, 4 }) |threads| for ([_][2][]const u8{
         .{ "fixed('{s}/x.txt', 3)", "x.txt`: the last record, at byte 6, is 2 bytes, short of the 3-byte width" },
         .{ "lines('{s}/nope.txt')", "nope.txt` (local file: FileNotFound)" },
+        .{ "lines('{s}/nofolder/x.txt')", "(local file: the folder `" },
         .{ "lines('{s}/sub')", "sub` is a folder; end it with `/` to read the files in it" },
     }) |c| {
         var parena = std.heap.ArenaAllocator.init(alloc);

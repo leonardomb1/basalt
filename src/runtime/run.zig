@@ -280,6 +280,8 @@ pub fn run(gpa: std.mem.Allocator, raw_program: ast.Program, opts_in: RunOptions
         so.* = runSummary(&env, run_id, stats.rows_out, rows_read.load(.monotonic), @intCast(@max(0, std.time.milliTimestamp() - t0)), lanes_used, &loads, &scan, runnable == 1);
     };
     for (program.stmts[1..], 2..) |s, after| {
+        diag.pos = null;
+        errdefer |e| placeFailure(&env, s, e);
         switch (s) {
             .binding => |b| try bindings.put(b.name, try renderScriptScope(&env, b.pipeline)),
             .output => |p| {
@@ -637,6 +639,23 @@ fn manyLoads(stmts: []const ast.Stmt) bool {
 }
 
 const LoadFacts = struct { rows: u64, rows_read: u64, elapsed_ms: u64, lanes: usize };
+
+/// The statement `s` a run failed in, as the failure's place when nothing narrower
+/// gave one, and the failure's label as its message when nothing else did: a reader's
+/// error (a JSON value past its sample, a record's field) then names its line, as an
+/// operator's does. An abort, a closed stdout and running out of memory keep their
+/// own reports.
+fn placeFailure(env: *Env, s: ast.Stmt, e: anyerror) void {
+    switch (e) {
+        error.Aborted, error.OutOfMemory, error.WriteFailed => return,
+        else => {},
+    }
+    if (env.diag.msg.len == 0 and env.errctx.msg.len == 0 and e != error.PlanFailed) {
+        setMsg(env.diag, eval.peekFailure(e) orelse errLabel(e));
+        env.diag.retryable = isTransient(e);
+    }
+    if (env.diag.pos == null) env.diag.pos = ast.stmtPos(s);
+}
 
 /// A ^C is not a failed load: the run says `aborted` itself.
 pub fn noteLoad(env: *Env, pos: ?ast.Pos, err: ?anyerror, f: LoadFacts) void {

@@ -513,6 +513,8 @@ pub const MappedCsv = struct {
         if (self.ndjson) |o| {
             var opts = o;
             opts.schema = schema.*;
+            opts.whole = self.data;
+            opts.source_name = self.path;
             const r = try json.Reader.openMapped(scratch, scratch, self.chunk(i, n), opts);
             return r.source();
         }

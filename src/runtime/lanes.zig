@@ -71,6 +71,7 @@ const connect_mod = @import("connect.zig");
 const dupeSchema = @import("connect.zig").dupeSchema;
 
 const projectedColumns = @import("plan.zig").projectedColumns;
+const readProjection = @import("plan.zig").readProjection;
 
 pub fn runParquetLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     const split = (try parquetSplit(env, stages[0].node.read, stages[0].hints, pushStages(stages, shape), w, opts)) orelse
@@ -80,7 +81,7 @@ pub fn runParquetLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w:
 
 pub fn runCsvLane(env: *Env, stages: []const ast.Stage, shape: LaneShape, w: ast.Write, opts: RunOptions, stats: *Stats, lanes_used: *usize) anyerror!bool {
     var rd = stages[0].node.read;
-    if (try projectedColumns(env, pushStages(stages, shape))) |cols| {
+    if (try readProjection(env, rd, stages[0].hints, pushStages(stages, shape))) |cols| {
         rd.cols = cols;
         rd.projected = true;
     }

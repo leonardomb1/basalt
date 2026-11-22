@@ -657,10 +657,12 @@ With `sheet` named and a workbook already at the target, the load writes that
 sheet and keeps the rest: a sheet of that name (case aside) is written anew in
 its place, and otherwise one is added after the others, so a report of several
 sheets is built one `LOAD INTO` at a time. Every other part of the workbook is
-copied as it is: its other sheets, shared strings, styles (with three date formats
-added when the rows hold dates), charts and defined names. Its calculation chain
-is dropped, as Excel rebuilds it on opening, and dates follow the workbook's own
-calendar, the 1904 one included. A sheet with parts of its own (a table, a drawing,
+copied as it is: its other sheets, shared strings, styles (with the three date
+formats added when the rows hold dates, once: a later load uses them again),
+charts and defined names. Its calculation chain is dropped, as Excel rebuilds it on
+opening; when another sheet holds a formula the workbook is marked to be
+calculated again as it opens, its cached results being stale; and dates follow the
+workbook's own calendar, the 1904 one included. A sheet with parts of its own (a table, a drawing,
 comments, a pivot table) is refused rather than written over, and so is the name of
 a chart sheet. With no file there, or no `sheet` named, the load writes a new
 workbook. A file there that cannot be read as a workbook fails the load rather

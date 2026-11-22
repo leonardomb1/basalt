@@ -710,7 +710,7 @@ fn windowTopKLanes(env: *Env, opts: RunOptions, stages_in: []const ast.Stage, la
     var mapped: ?*MappedCsv = null;
     defer if (mapped) |mc| mc.close();
     var crd = rd;
-    if (crd.cols.len == 0) if (try projectedColumns(env, stages[1..])) |cols| {
+    if (crd.cols.len == 0) if (try @import("../plan.zig").readProjection(env, crd, stages[0].hints, stages[1..])) |cols| {
         crd.cols = cols;
         crd.projected = true;
     };

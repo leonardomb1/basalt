@@ -53,6 +53,11 @@ pub const Options = struct {
     /// Whether this input is all that is read, so a sample that reaches its end has
     /// seen every row; false for the first of several files.
     alone: bool = true,
+    /// The file read, naming it in a message (`files.Files` sets it per file).
+    source_name: []const u8 = "",
+    /// The whole mapped file a lane's slice of it lies in, so a message names a row
+    /// by its line in the file rather than its place in the slice.
+    whole: []const u8 = "",
 };
 
 pub const Infer = struct {
@@ -114,16 +119,18 @@ fn nonFiniteText(raw: []const u8) bool {
 
 /// What a read takes of its rows: `all` hands on every column, so a key in none fails
 /// it, as its values would be lost; `named` takes the columns a query names and passes
-/// over every other key, its value never read; `none` reads no value, its one column,
-/// kept as a batch needs a column to count (`driver.narrowed`), all NULLs.
-pub const Take = enum { all, named, none };
+/// over every other key, its value never read; `all_but` hands on every column but
+/// those a `* EXCEPT` left out (`driver.all_but`), passing over only their keys;
+/// `none` reads no value, its one column, kept as a batch needs a column to count
+/// (`driver.narrowed`), all NULLs.
+pub const Take = enum { all, named, all_but, none };
 
 /// `schema` narrowed to `project`, the columns the query takes, and how a read takes
 /// its rows; every column, `all`, without one.
 pub fn projected(arena: std.mem.Allocator, schema: types.Schema, project: ?[]const []const u8) Error!struct { schema: types.Schema, take: Take } {
     const p = project orelse return .{ .schema = schema, .take = .all };
     const n = try driver.narrowed(arena, schema, p);
-    return .{ .schema = n.schema, .take = if (n.blind) .none else .named };
+    return .{ .schema = n.schema, .take = if (n.blind) .none else if (driver.leftOut(p) != null) .all_but else .named };
 }
 
 pub const Rows = struct {
@@ -140,16 +147,44 @@ pub const Rows = struct {
     len: usize = 0,
     /// A key in no column is passed over rather than refused: the read is projected.
     skip_strays: bool,
+    /// Under `Take.all_but`, the keys passed over, those a `* EXCEPT` left out; any
+    /// other key in no column fails the read.
+    left_out: []const []const u8 = &.{},
+    /// Where the row at hand is, for a message (`located`): numbered from `first` as
+    /// a `noun` of the input `source`, or, when `whole` maps the file the row's text
+    /// lies in, by the line that text starts on.
+    first: u64 = 0,
+    source: []const u8 = "",
+    noun: []const u8 = "JSON row",
+    whole: []const u8 = "",
 
     /// A column's shortcut, chosen once from its type: a plain number or a literal
     /// appended as `read` would append it, without the `Value` and cast between.
     const Fast = enum { none, int, float, bool, str };
 
+    /// `e`, a key or value past the sample in the row `text`, its message led by
+    /// where the row is.
+    fn located(self: *const Rows, e: Error, text: []const u8) Error {
+        @branchHint(.cold);
+        if (e != error.JsonPastSample) return e;
+        const msg = eval.takeFailure(e) orelse return e;
+        var at_buf: [96]u8 = undefined;
+        const base = @intFromPtr(self.whole.ptr);
+        const p = @intFromPtr(text.ptr);
+        const at = if (self.whole.len > 0 and p >= base and p <= base + self.whole.len)
+            std.fmt.bufPrint(&at_buf, "JSON line {d}", .{std.mem.count(u8, self.whole[0 .. p - base], "\n") + 1}) catch ""
+        else
+            std.fmt.bufPrint(&at_buf, "{s} {d}", .{ self.noun, self.first + self.len + 1 }) catch "";
+        var buf: [640]u8 = undefined;
+        const full = std.fmt.bufPrint(&buf, "{s}{s}{s}: {s}", .{ self.source, if (self.source.len > 0) ": " else "", at, msg }) catch msg;
+        return @errorCast(eval.explain(error.JsonPastSample, full));
+    }
+
     pub fn init(arena: std.mem.Allocator, schema: types.Schema, take: Take, capacity: usize) Error!Rows {
         var r = Rows{
             .schema = schema,
             .picks = if (take == .none) &.{} else schema.fields,
-            .skip_strays = take != .all,
+            .skip_strays = take == .named or take == .none,
             .builders = try arena.alloc(column.Builder, schema.fields.len),
             .fast = try arena.alloc(Fast, schema.fields.len),
             .vals = try arena.alloc(?[]const u8, schema.fields.len),
@@ -183,9 +218,9 @@ pub const Rows = struct {
                 error.InvalidJson => return error.InvalidJson,
                 error.OutOfMemory => return error.OutOfMemory,
             };
-            if (pick.stray) |key| return strayKey(key);
+            if (pick.stray) |key| return self.located(strayKey(key), row);
         } else try jt.validate(arena, row);
-        return self.append(arena);
+        return self.append(arena, row);
     }
 
     /// The object row at the start of `t` read in the one pass that finds its end: how
@@ -199,8 +234,8 @@ pub const Rows = struct {
             error.OutOfMemory => return error.OutOfMemory,
             error.InvalidJson, error.Fallback => return null,
         };
-        if (pick.stray) |key| return strayKey(key);
-        try self.append(arena);
+        if (pick.stray) |key| return self.located(strayKey(key), t);
+        try self.append(arena, t);
         return end;
     }
 
@@ -210,8 +245,8 @@ pub const Rows = struct {
         var pick = Pick{ .rows = self, .arena = arena };
         var m = jt.Members.root(row);
         while (m.next()) |mem| try pick.member(mem.key, false, mem.value, false);
-        if (pick.stray) |key| return strayKey(key);
-        return self.append(arena);
+        if (pick.stray) |key| return self.located(strayKey(key), row);
+        return self.append(arena, row);
     }
 
     /// Where each member of a row goes: rows mostly repeat one key order, so a key is
@@ -226,7 +261,7 @@ pub const Rows = struct {
             const key = if (plain) raw_key else try jt.decodeString(p.arena, raw_key);
             const fields = p.rows.picks;
             const ci = if (p.at < fields.len and sameName(fields[p.at].name, key)) p.at else p.rows.index.get(key) orelse {
-                if (!p.rows.skip_strays and p.stray == null) p.stray = key;
+                if (!p.rows.skip_strays and p.stray == null and !listed(p.rows.left_out, key)) p.stray = key;
                 return;
             };
             p.rows.vals[ci] = value;
@@ -249,12 +284,13 @@ pub const Rows = struct {
         return pastSample("the key `{s}` is not among the keys of the rows sampled to type the columns, so its values would be dropped", .{clip(key)});
     }
 
-    /// The picked values appended to their columns.
-    fn append(self: *Rows, arena: std.mem.Allocator) Error!void {
+    /// The picked values of the row `text` appended to their columns.
+    fn append(self: *Rows, arena: std.mem.Allocator, text: []const u8) Error!void {
         const fields = self.schema.fields;
         for (self.builders, self.vals, fields, self.fast, self.plain) |*b, raw, f, fa, plain| {
             if (raw) |t| if (try appendFast(b, fa, t, plain)) continue;
-            b.append(try read(arena, raw, f)) catch |e| return switch (e) {
+            const v = read(arena, raw, f) catch |e| return self.located(e, text);
+            b.append(v) catch |e| return switch (e) {
                 error.OutOfMemory => error.OutOfMemory,
                 error.CastFailed => error.InvalidJson,
             };
@@ -334,6 +370,11 @@ fn pastSample(comptime fmt: []const u8, args: anytype) Error {
     return @errorCast(eval.explain(error.JsonPastSample, msg));
 }
 
+fn listed(names: []const []const u8, key: []const u8) bool {
+    for (names) |n| if (std.mem.eql(u8, n, key)) return true;
+    return false;
+}
+
 fn clip(s: []const u8) []const u8 {
     return if (s.len <= 60) s else s[0..60];
 }
@@ -346,9 +387,12 @@ pub fn schemaOf(arena: std.mem.Allocator, rows: []const []const u8, sample: usiz
 }
 
 /// `rows`, each a validated row's text, read into `schema`'s columns as one batch,
-/// taken as `take` says (`projected`).
-pub fn batchOf(arena: std.mem.Allocator, schema: *const types.Schema, rows: []const []const u8, take: Take) Error!Batch {
+/// taken as `take` says (`projected`): an API's items, `first` of them read before,
+/// as a message counts them.
+pub fn batchOf(arena: std.mem.Allocator, schema: *const types.Schema, rows: []const []const u8, take: Take, first: u64) Error!Batch {
     var r = try Rows.init(arena, schema.*, take, rows.len);
+    r.first = first;
+    r.noun = "API item";
     for (rows) |row| try r.add(arena, row);
     return r.finish(arena, schema);
 }
@@ -576,6 +620,8 @@ pub const Reader = struct {
     held_spans: []const [2]u64 = &.{},
     held_at: usize = 0,
     rows_seen: u64 = 0,
+    /// The rows handed on so far, numbering the next batch's for a message.
+    emitted: u64 = 0,
     done: bool = false,
 
     pub fn open(arena: std.mem.Allocator, gpa: std.mem.Allocator, in: *std.Io.Reader, opts: Options) Error!*Reader {
@@ -647,6 +693,10 @@ pub const Reader = struct {
     fn nextInto(self: *Reader, arena: std.mem.Allocator, spans: ?*[2]column.Builder) Error!?Batch {
         if (self.done) return null;
         var rows = try Rows.init(arena, self.schema, self.take, self.opts.batch_rows);
+        if (self.opts.project) |p| rows.left_out = driver.leftOut(p) orelse &.{};
+        rows.first = self.emitted;
+        rows.source = self.opts.source_name;
+        rows.whole = self.opts.whole;
         while (rows.len < self.opts.batch_rows) {
             if (self.held_at < self.held.len) {
                 try rows.add(arena, self.held[self.held_at]);
@@ -671,6 +721,7 @@ pub const Reader = struct {
             if (spans) |sp| try spanOf(sp, .{ self.scan.last_start, self.scan.last_end });
         }
         if (rows.len == 0) return null;
+        self.emitted += rows.len;
         return try rows.finish(arena, &self.schema);
     }
 

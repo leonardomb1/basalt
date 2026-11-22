@@ -37,8 +37,24 @@ var g_abort = std.atomic.Value(bool).init(false);
 /// path into it (`s.city` for struct column `s`), which a reader that cannot
 /// read part of a column reads the whole column for.
 pub fn wantsColumn(want: []const []const u8, name: []const u8) bool {
-    for (want) |w| if (std.mem.startsWith(u8, w, name) and (w.len == name.len or w[name.len] == '.')) return true;
+    for (want) |w| {
+        if (std.mem.eql(u8, w, all_but)) break;
+        if (std.mem.startsWith(u8, w, name) and (w.len == name.len or w[name.len] == '.')) return true;
+    }
     return false;
+}
+
+/// In a projection, the names before it are the columns read and those after it the
+/// ones a `* EXCEPT` left out: the read hands on every other column, so a reader
+/// that meets a column no sample did (a JSON key, an XML name) fails rather than
+/// pass it over, as its values would be lost, and passes over only those left out.
+pub const all_but = "\x00all_but";
+
+/// The names a projection `want` leaves out after `all_but`, or null when it names
+/// the columns it reads and no others.
+pub fn leftOut(want: []const []const u8) ?[]const []const u8 {
+    for (want, 0..) |w, i| if (std.mem.eql(u8, w, all_but)) return want[i + 1 ..];
+    return null;
 }
 
 /// The columns of `full` a read projected to `want` decodes (`wantsColumn`), in

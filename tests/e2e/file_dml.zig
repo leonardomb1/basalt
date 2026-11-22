@@ -57,6 +57,28 @@ test "DELETE and UPDATE of an NDJSON file: a deleted line goes with its indent a
     try harness.expectFile(&tmp, "n.ndjson", "{\"id\":1,\"v\":\"a\"}\n\n{\"id\":3,\"v\":\"C\",\"x\":[1,2],\"w\":{\"k\":\"\\u00e9\"}}\n{\"id\":4,\"v\":\"novo\"}\n");
 }
 
+test "DELETE and UPDATE of an NDJSON or CSV file read only the columns they use, so a value past the sample in another column fails neither" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "bad.ndjson", .data = "{\"id\":1,\"sku\":\"a\",\"p\":1.5}\n  {\"id\":2,\"sku\":\"b\",\"p\":2.5, \"x\":[1]}\n{\"id\":3,\"sku\":\"c\",\"p\":\"abc\"}\n" });
+    try load(&tmp, "UPDATE '$B/bad.ndjson' WITH (sample = 2) SET sku = upper(sku) WHERE id <= 2;");
+    try load(&tmp, "DELETE FROM '$B/bad.ndjson' WITH (sample = 2) WHERE id = 1;");
+    try harness.expectFile(&tmp, "bad.ndjson", "  {\"id\":2,\"sku\":\"B\",\"p\":2.5, \"x\":[1]}\n{\"id\":3,\"sku\":\"c\",\"p\":\"abc\"}\n");
+    var text = std.array_list.Managed(u8).init(gpa);
+    defer text.deinit();
+    try text.appendSlice("id,sku,p\n");
+    for (1..1201) |i| try text.print("{d},a,1.50\n", .{i});
+    try text.appendSlice("1201,b,abc\n");
+    try tmp.dir.writeFile(.{ .sub_path = "bad.csv", .data = text.items });
+    try load(&tmp, "UPDATE '$B/bad.csv' SET sku = 'z' WHERE id = 1;");
+    try load(&tmp, "DELETE FROM '$B/bad.csv' WHERE id = 2;");
+    try load(&tmp, "UPDATE '$B/bad.csv' SET p = 9 WHERE id = 1201;");
+    const got = try tmp.dir.readFileAlloc(gpa, "bad.csv", 1 << 20);
+    defer gpa.free(got);
+    try testing.expect(std.mem.startsWith(u8, got, "id,sku,p\n1,z,1.50\n3,a,1.50\n"));
+    try testing.expect(std.mem.endsWith(u8, got, "1200,a,1.50\n1201,b,9\n"));
+}
+
 test "DELETE and UPDATE of a Parquet, Avro, Arrow or JSON-array file write it again whole, rows in their places" {
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
@@ -256,5 +278,17 @@ test "DELETE, UPDATE and INSERT on an Excel sheet keep its other sheets, shared 
 
     try workbook(&tmp, "f.xlsx", "<c r=\"A1\"><f>SUM(Dados!C2:C5)</f><v>100</v></c>");
     try harness.expectRunRefuses(gpa, &tmp, "DELETE FROM '$B/f.xlsx' WHERE id = 2;", 1, "a formula in another sheet names sheet `Dados`");
+    try load(&tmp, "UPDATE '$B/f.xlsx' SET valor = 99 WHERE id = 2;");
+    try load(&tmp, "INSERT INTO '$B/f.xlsx' WITH (sheet = 'Dados') SELECT 5 AS id, 'Eva' AS nome, 50 AS valor;");
+    try testing.expectEqualStrings("id,nome,valor\n1,Ana,10\n2,Bia,99\n3,Caio,30\n4,Dora,40\n5,Eva,50\n", try rows(a, &tmp, "SELECT * FROM '$B/f.xlsx'"));
+    try testing.expect(std.mem.indexOf(u8, try member(a, &tmp, "f.xlsx", "xl/workbook.xml"), "<calcPr fullCalcOnLoad=\"1\"/>") != null);
+    try testing.expect(std.mem.indexOf(u8, try member(a, &tmp, "f.xlsx", "xl/worksheets/sheet2.xml"), "<f>SUM(Dados!C2:C5)</f>") != null);
+    try chainedWorkbook(&tmp, "g.xlsx");
+    try harness.expectRunRefuses(gpa, &tmp, "UPDATE '$B/g.xlsx' WITH (sheet = 'Dados') SET v = 7 WHERE v = 1;", 1, "row 2 of sheet `Dados` holds a formula");
+    try load(&tmp, "INSERT INTO '$B/g.xlsx' WITH (sheet = 'Dados') SELECT 3 AS v;");
+    try testing.expect(std.mem.indexOf(u8, try member(a, &tmp, "g.xlsx", "xl/worksheets/sheet1.xml"), "<f>A2*2</f>") != null);
+    for (0..3) |_| try load(&tmp, "INSERT INTO '$B/w.xlsx' WITH (sheet = 'Dados') SELECT 9 AS id, CAST('2026-02-01' AS DATE) AS nome;");
+    const styles = try member(a, &tmp, "w.xlsx", "xl/styles.xml");
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, styles, "applyNumberFormat=\"1\"/>") - std.mem.count(u8, before[2], "applyNumberFormat=\"1\"/>"));
     try harness.expectRefusedAlike(gpa, &tmp, "DELETE FROM '$B/w.xlsx' WITH (range = 'A1:C3') WHERE id = 2;", "drop `range`");
 }
