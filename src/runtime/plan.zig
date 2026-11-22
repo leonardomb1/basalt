@@ -278,15 +278,13 @@ const Needs = struct {
     }
 
     fn expr(self: *Needs, e: *const ast.Expr) !void {
-        if (ast.hasSearch(e)) self.whole_row = true;
+        if (ast.searchesRows(e)) self.whole_row = true;
+        var quals = std.array_list.Managed(ast.QualName).init(self.env.arena);
+        try refsOf(self.env.arena, e, &quals);
         if (!self.joined) {
-            var quals = std.array_list.Managed(ast.QualName).init(self.env.arena);
-            try ast.fieldsOf(e, &quals);
             for (quals.items) |q| if (!q.dollar) try self.path(q.parts);
             return;
         }
-        var quals = std.array_list.Managed(ast.QualName).init(self.env.arena);
-        try ast.fieldsOf(e, &quals);
         for (quals.items) |q| try self.field(q);
     }
 };
@@ -294,9 +292,10 @@ const Needs = struct {
 /// `stages` with each select's columns that no later stage reads dropped, so a CTE
 /// or derived table never reads a column its reader leaves unused. A select stays
 /// whole when what follows is unprovable (a `*`, a plain DISTINCT, whose rows a column
-/// sets apart, a `search`, or no later select or aggregate fixing the output) or when
-/// two of its items share a name, which a drop would rename. A computed column that
-/// may fail on a row is kept, so a run that failed on it still fails.
+/// sets apart, a `search` of a star, or no later select or aggregate fixing the
+/// output) or when two of its items share a name, which a drop would rename. A
+/// computed column that may fail on a row is kept, so a run that failed on it still
+/// fails.
 pub fn pruneSelects(arena: std.mem.Allocator, stages_in: []const ast.Stage) ![]const ast.Stage {
     var out: ?[]ast.Stage = null;
     var i = stages_in.len;
@@ -338,7 +337,7 @@ pub fn pruneSelects(arena: std.mem.Allocator, stages_in: []const ast.Stage) ![]c
     return o;
 }
 
-/// Every name any of `stages` reads, null when one holds a `search`.
+/// Every name any of `stages` reads, null when one holds a `search` of a star.
 fn allNames(arena: std.mem.Allocator, stages: []const ast.Stage) !?std.StringHashMap(void) {
     var set = std.StringHashMap(void).init(arena);
     for (stages) |st| switch (st.node) {
@@ -437,11 +436,18 @@ pub fn codesOnlyColumns(arena: std.mem.Allocator, after: []const ast.Stage) ![]c
 }
 
 fn exprNames(arena: std.mem.Allocator, e: *const ast.Expr, set: *std.StringHashMap(void)) !bool {
-    if (ast.hasSearch(e)) return false;
+    if (ast.searchesRows(e)) return false;
     var quals = std.array_list.Managed(ast.QualName).init(arena);
-    try ast.fieldsOf(e, &quals);
+    try refsOf(arena, e, &quals);
     for (quals.items) |q| try qualNames(q, set);
     return true;
+}
+
+/// The columns `e` reads: its references, and the columns a `search` of a `(a, b)`
+/// list searches.
+fn refsOf(arena: std.mem.Allocator, e: *const ast.Expr, out: *std.array_list.Managed(ast.QualName)) !void {
+    try ast.fieldsOf(e, out);
+    try ast.searchFields(arena, e, out);
 }
 
 fn qualNames(q: ast.QualName, set: *std.StringHashMap(void)) !void {

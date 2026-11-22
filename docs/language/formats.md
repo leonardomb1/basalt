@@ -25,7 +25,9 @@ a `DATE` — so `WHERE day >= '2026-01-01'`, `date_add`, `date_diff` and `EXTRAC
 work on it directly, and a parquet sink stores it as a date. A string function
 on it (`substr(day, 1, 7)`, `day LIKE '2026%'`) still sees the ISO text. A cell
 past the sample that does not parse as the inferred type is an error, never a
-silent coercion. Timestamps are not sniffed; `CAST(ts AS TIMESTAMP)` as before.
+silent coercion, in a column the query reads: one it never names is not
+converted, so `count(*)` reads no cell at all. Timestamps are not sniffed;
+`CAST(ts AS TIMESTAMP)` as before.
 
 A column the query reads only through `CAST` is not sniffed: the cast converts the
 cell as written. `SELECT CAST(cep AS STRING) AS cep FROM 'clientes.csv'` keeps
@@ -560,7 +562,8 @@ sample does, rather than its values being dropped, and is passed over when the
 query names its columns; a larger `sample` reaches it. Values are typed as a
 CSV's cells are (INT, FLOAT, DATE, else text, a leading zero keeping a code
 text), and a later value its typed column cannot read is an error naming the
-row, not a NULL; read the column with `CAST(col AS VARCHAR)` to keep it text. An empty element (`<a/>`)
+row, not a NULL, in a column the query reads (a query that names its columns
+reads only those); read the column with `CAST(col AS VARCHAR)` to keep it text. An empty element (`<a/>`)
 is the empty string in a text column and NULL in a typed one; an absent element
 or `xsi:nil="true"` is NULL. Namespace prefixes are dropped, and names encoded as
 SQL Server's `FOR XML` writes them (`Valor_x0020_Total`) are decoded. The

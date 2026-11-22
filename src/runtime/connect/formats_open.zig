@@ -265,7 +265,7 @@ const impls = struct {
         /// JSON or NDJSON files as one table, `path` naming them in messages.
         pub fn read(env: *Env, r: Read) anyerror!driver.Source {
             var opts = analyze.jsonOptions(r.hints);
-            opts.skip_strays = r.project != null;
+            opts.project = r.project;
             const f = jsonread.Files.open(env.arena, env.gpa, filesOf(&r), opts) catch |e| {
                 if (e == error.InvalidJson)
                     return planErrT(env.diag, e, try msgfmt.allocPrint(env.arena, "`{s}` is not valid JSON or NDJSON in its first rows", .{r.path}));
@@ -276,7 +276,7 @@ const impls = struct {
 
         pub fn stdin(env: *Env, s: *stream.Stream, hints: []const ast.Hint, project: ?[][]const u8) anyerror!driver.Source {
             var opts = analyze.jsonOptions(hints);
-            opts.skip_strays = project != null;
+            opts.project = project;
             const f = jsonread.Files.on(env.arena, env.gpa, s, &.{}, opts) catch |e| {
                 if (e == error.InvalidJson) return planErrT(env.diag, e, "stdin is not valid JSON or NDJSON in its first rows");
                 return e;
@@ -300,7 +300,7 @@ const impls = struct {
         pub fn read(env: *Env, r: Read) anyerror!driver.Source {
             var odiag = analyze.Diag{};
             var opts = analyze.xmlOptions(r.hints, r.text, &odiag) catch |e| return aErr(env, &odiag, e);
-            opts.skip_strays = r.project != null;
+            opts.project = r.project;
             const f = xmlread.Files.open(env.arena, env.gpa, filesOf(&r), opts) catch |e| return xmlOpenFailed(env, r.path, e);
             return f.source();
         }
@@ -308,7 +308,7 @@ const impls = struct {
         pub fn stdin(env: *Env, s: *stream.Stream, hints: []const ast.Hint, project: ?[][]const u8) anyerror!driver.Source {
             var odiag = analyze.Diag{};
             var opts = analyze.xmlOptions(hints, &.{}, &odiag) catch |e| return aErr(env, &odiag, e);
-            opts.skip_strays = project != null;
+            opts.project = project;
             const f = xmlread.Files.on(env.arena, env.gpa, s, &.{}, opts) catch |e| return xmlOpenFailed(env, "stdin", e);
             return f.source();
         }

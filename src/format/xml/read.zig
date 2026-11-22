@@ -12,8 +12,9 @@
 //!
 //! Columns come from the first `sample` rows in the order first met; a name first
 //! met past the sample fails the read naming it, as a JSON key past its sample
-//! does, rather than its values being dropped, unless the query names its columns
-//! (`skip_strays`), when it is passed over. Text is typed as a CSV's cells are
+//! does, rather than its values being dropped. A read the query projects (`project`)
+//! reads only the columns it names and passes over every other name, so no value or
+//! name it never asked for fails it. Text is typed as a CSV's cells are
 //! (`texttype.zig`): a child left empty (`<a/>`) is the empty string in a text
 //! column and NULL in a typed one, an absent child or `xsi:nil="true"` is NULL, and
 //! a value past the sample its typed column cannot read is an error.
@@ -49,10 +50,11 @@ pub const Options = struct {
     schema: ?types.Schema = null,
     text: []const []const u8 = &.{},
     source_name: []const u8 = "",
-    /// Whether the query names the columns it takes, so a name past the sample is one
-    /// it never asked for and is passed over; else the read hands on every column and
-    /// such a name fails it, as its values would be lost.
-    skip_strays: bool = false,
+    /// The columns the query takes, when it names them (a projection, perhaps of
+    /// none): only those are read (`driver.narrowed`), and a name past the sample is
+    /// one it never asked for, passed over. Null hands on every column, and such a
+    /// name fails the read, as its values would be lost.
+    project: ?[]const []const u8 = null,
 };
 
 const Kind = enum { elem, attr, child_attr };
@@ -217,10 +219,15 @@ pub const Reader = struct {
         return .{ .fields = fields };
     }
 
+    /// `sch`, narrowed to the columns the query takes: narrowing again changes nothing,
+    /// so a later file handed the narrowed columns reads alike. A blind column is in
+    /// no index, so no cell lands in it.
     fn setSchema(self: *Reader, sch: types.Schema) !void {
-        self.schema = sch;
+        const n: driver.Narrowed = if (self.opts.project) |p| try driver.narrowed(self.arena, sch, p) else .{ .schema = sch, .blind = false };
+        self.schema = n.schema;
         self.index = .empty;
-        for (sch.fields, 0..) |f, i| try self.index.put(self.arena, f.name, i);
+        if (n.blind) return;
+        for (n.schema.fields, 0..) |f, i| try self.index.put(self.arena, f.name, i);
     }
 
     /// The column a cell lands in: an element by its name, a row's attribute by
@@ -258,7 +265,7 @@ pub const Reader = struct {
             @memset(vals, null);
             for (row) |c| {
                 const i = self.columnOf(c) orelse {
-                    if (self.opts.skip_strays) continue;
+                    if (self.opts.project != null) continue;
                     return self.stray(c);
                 };
                 vals[i] = c;
@@ -644,12 +651,19 @@ test "row names an element at any depth; FOR XML names decode; latin-1 is declar
     try testing.expect(got.rows[1][1] == null);
 }
 
-test "a value past the sample its typed column cannot read is an error; UTF-16 is refused" {
+test "a value past the sample its typed column cannot read is an error, unless the query reads no such column; UTF-16 is refused" {
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     try testing.expectError(error.TextTypeMismatch, readAll(a, "<r><x><n>1</n></x><x><n>abc</n></x></r>", .{ .sample = 1 }));
     try testing.expectError(error.TextTypeMismatch, readAll(a, "<r><x><n>1</n></x><x><n>2</n><n>3</n></x></r>", .{ .sample = 1 }));
+    const doc = "<r><x><n>1</n><s>a</s></x><x><n>abc</n><s>b</s></x></r>";
+    const named = try readAll(a, doc, .{ .sample = 1, .project = &.{"s"} });
+    try testing.expectEqual(@as(usize, 1), named.schema.fields.len);
+    try testing.expectEqualStrings("b", named.rows[1][0].?);
+    const none = try readAll(a, doc, .{ .sample = 1, .project = &.{} });
+    try testing.expectEqual(@as(usize, 2), none.rows.len);
+    try testing.expect(none.rows[1][0] == null);
     try testing.expectError(error.XmlUnsupportedEncoding, readAll(a, "\xff\xfe<\x00r\x00>\x00", .{}));
 }
 
@@ -668,7 +682,7 @@ test "a name first met past the sample, element or attribute, fails the read nam
         try testing.expect(std.mem.indexOf(u8, msg, "XML row 2:") != null);
         try testing.expect(std.mem.endsWith(u8, msg, "read with a larger WITH (sample = N) so the sample reaches it"));
         _ = try readAll(a, c[0], .{ .sample = 2 });
-        const named = try readAll(a, c[0], .{ .sample = 1, .skip_strays = true });
+        const named = try readAll(a, c[0], .{ .sample = 1, .project = &.{} });
         try testing.expectEqual(@as(usize, 2), named.rows.len);
     }
 }

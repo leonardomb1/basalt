@@ -149,6 +149,8 @@ pub const CsvReader = struct {
     line_no: u64 = 0,
     rec_line: u64 = 0,
     slot: ?[]const i16 = null,
+    /// `Projection.blind`: the one column is NULLs, no cell converted.
+    blind: bool = false,
     /// Bytes of the current file's decoded stream taken so far, and the span of the
     /// record `readLine` last returned.
     offset: u64 = 0,
@@ -161,6 +163,7 @@ pub const CsvReader = struct {
         const p = (try Projection.of(self.arena, self.schema, names)) orelse return;
         self.slot = p.slot;
         self.schema = p.schema;
+        self.blind = p.blind;
     }
 
     /// Starts reading `path` from its newly opened stream: its line ending and line count.
@@ -269,6 +272,7 @@ pub const CsvReader = struct {
     fn nextInto(self: *CsvReader, arena: std.mem.Allocator, spans: ?*[2]column.Builder) !?Batch {
         if (self.done) return null;
         const ncols = self.schema.fields.len;
+        const width = widthOf(self.slot, ncols);
         const builders = try arena.alloc(column.Builder, ncols);
         for (builders, self.schema.fields) |*b, f| b.* = try column.Builder.initCapacity(arena, f.ty, BATCH_ROWS);
 
@@ -298,7 +302,7 @@ pub const CsvReader = struct {
                 };
                 at = .{ .text = line, .line_no = self.rec_line, .path = self.path, .start = self.rec_start, .end = self.rec_end };
             }
-            if (skipsBlank(line, ncols)) continue;
+            if (skipsBlank(line, width)) continue;
             splitInto(arena, line, builders, self.dialect, self.slot) catch |e|
                 return rowFailure(e, at.path, at.line_no, line, self.schema, self.dialect, self.slot);
             if (spans) |sp| {
@@ -308,6 +312,7 @@ pub const CsvReader = struct {
             rows += 1;
         }
         if (rows == 0) return null;
+        if (self.blind) try builders[0].appendRepeated(.null, rows);
 
         const cols = try arena.alloc(column.Column, ncols);
         for (builders, 0..) |*b, i| cols[i] = try b.finish();
@@ -446,25 +451,21 @@ pub const MappedCsv = struct {
     recs: ?*records.Mapped = null,
     dialect: Dialect = .{},
     slot: ?[]const i16 = null,
+    blind: bool = false,
 
+    /// Narrows the columns each lane reads to `names`; an NDJSON lane's reader narrows
+    /// the sampled columns alike (`json.Options.project`).
     pub fn project(self: *MappedCsv, arena: std.mem.Allocator, names: []const []const u8) !void {
         if (self.recs != null) return;
         if (self.ndjson) |*o| {
-            if (o.known == null) o.known = self.schema;
-            o.skip_strays = true;
-            var keep = std.array_list.Managed(types.Schema.Field).init(arena);
-            for (self.schema.fields) |f| for (names) |n| {
-                if (std.mem.eql(u8, f.name, n)) {
-                    try keep.append(f);
-                    break;
-                }
-            };
-            if (keep.items.len > 0) self.schema = .{ .fields = keep.items };
+            o.project = names;
+            self.schema = (try json.projected(arena, self.schema, names)).schema;
             return;
         }
         const p = (try Projection.of(arena, self.schema, names)) orelse return;
         self.slot = p.slot;
         self.schema = p.schema;
+        self.blind = p.blind;
     }
 
     /// A local NDJSON file mapped for lanes, its columns from its sampled rows. Every
@@ -571,7 +572,7 @@ pub const MappedCsv = struct {
     /// whose pages the open-time scan already mapped, releasing them cost a third of
     /// the read, so they stay.
     pub fn reader(self: *const MappedCsv, i: usize, n: usize, schema: *const types.Schema) CsvSliceReader {
-        return .{ .data = self.chunk(i, n), .schema = schema, .dialect = self.dialect, .slot = self.slot, .path = self.path, .whole = self.data, .release = self.quote_free };
+        return .{ .data = self.chunk(i, n), .schema = schema, .dialect = self.dialect, .slot = self.slot, .blind = self.blind, .path = self.path, .whole = self.data, .release = self.quote_free };
     }
 
     /// The i-th of `n` newline-aligned chunks of the body; a line belongs to the
@@ -625,9 +626,16 @@ pub const MappedCsv = struct {
 /// `release_every` bytes the pages already read are released, so a lane holds a few
 /// MiB of its chunk resident, not all of it.
 /// A blank line is no record where a row has several fields; in a one-column file it
-/// is that column's NULL, as the writer spells one.
+/// is that column's NULL, as the writer spells one. `ncols` is the file's columns, not
+/// the ones a projection reads (`widthOf`).
 inline fn skipsBlank(line: []const u8, ncols: usize) bool {
     return line.len == 0 and ncols > 1;
+}
+
+/// The fields a row of the file has: all its columns, which a projection's `slot`
+/// spans, else the `ncols` read.
+inline fn widthOf(slot: ?[]const i16, ncols: usize) usize {
+    return if (slot) |sl| sl.len else ncols;
 }
 
 pub const CsvSliceReader = struct {
@@ -638,6 +646,7 @@ pub const CsvSliceReader = struct {
     schema: *const types.Schema,
     dialect: Dialect = .{},
     slot: ?[]const i16 = null,
+    blind: bool = false,
     path: []const u8 = "",
     whole: []const u8 = "",
 
@@ -647,8 +656,9 @@ pub const CsvSliceReader = struct {
         const builders = try arena.alloc(column.Builder, ncols);
         for (builders, self.schema.fields) |*b, f| b.* = try column.Builder.initCapacity(arena, f.ty, BATCH_ROWS);
 
-        const rows = if (ncols == 1) try self.fill(true, arena, builders) else try self.fill(false, arena, builders);
+        const rows = if (widthOf(self.slot, ncols) == 1) try self.fill(true, arena, builders) else try self.fill(false, arena, builders);
         if (rows == 0) return null;
+        if (self.blind) try builders[0].appendRepeated(.null, rows);
         const cols = try arena.alloc(column.Column, ncols);
         for (builders, 0..) |*b, i| cols[i] = try b.finish();
         if (self.release and (self.pos - self.released >= release_every or self.pos >= self.data.len)) {
@@ -792,25 +802,22 @@ fn unterminated(path: []const u8, line_no: u64) anyerror {
 pub const Projection = struct {
     slot: []const i16,
     schema: types.Schema,
+    /// `driver.narrowed`'s: no column is read, the one kept being NULLs.
+    blind: bool = false,
 
     /// Null when every column is wanted. A query naming none (a `COUNT(*)`) keeps the
-    /// first, as a batch still needs a column to count.
+    /// first, blind, as a batch still needs a column to count.
     pub fn of(arena: std.mem.Allocator, full: types.Schema, names: []const []const u8) !?Projection {
         const slot = try arena.alloc(i16, full.fields.len);
-        var fields = std.array_list.Managed(types.Schema.Field).init(arena);
-        for (full.fields, slot) |f, *sl| {
-            sl.* = -1;
-            if (driver.wantsColumn(names, f.name)) {
-                sl.* = @intCast(fields.items.len);
-                try fields.append(f);
-            }
-        }
-        if (fields.items.len == full.fields.len) return null;
-        if (fields.items.len == 0 and full.fields.len > 0) {
-            slot[0] = 0;
-            try fields.append(full.fields[0]);
-        }
-        return .{ .slot = slot, .schema = .{ .fields = try fields.toOwnedSlice() } };
+        for (full.fields, slot) |f, *sl| sl.* = if (driver.wantsColumn(names, f.name)) 0 else -1;
+        const n = try driver.narrowed(arena, full, names);
+        if (n.schema.fields.len == full.fields.len and !n.blind) return null;
+        var at: i16 = 0;
+        for (slot) |*sl| if (sl.* == 0) {
+            sl.* = at;
+            at += 1;
+        };
+        return .{ .slot = slot, .schema = n.schema, .blind = n.blind };
     }
 };
 
@@ -2661,7 +2668,13 @@ test "splitInto: delimiter bitmask across chunk edges, missing and extra fields 
     try std.testing.expectEqualStrings("bee", pb.getValue(0).string);
     try std.testing.expectEqual(@as(i64, 6), pd.getValue(1).int);
     try std.testing.expect((try Projection.of(a, full, &.{ "a", "b", "c", "d" })) == null);
-    try std.testing.expectEqualStrings("a", (try Projection.of(a, full, &.{"zz"})).?.schema.fields[0].name);
+    const none = (try Projection.of(a, full, &.{"zz"})).?;
+    try std.testing.expectEqualStrings("a", none.schema.fields[0].name);
+    try std.testing.expect(none.blind and none.schema.fields[0].ty.nullable);
+    for (none.slot) |sl| try std.testing.expectEqual(@as(i16, -1), sl);
+    var nb = [_]column.Builder{column.Builder.init(a, none.schema.fields[0].ty)};
+    try splitInto(a, "not-an-int,b,c,d", &nb, .{}, none.slot);
+    try std.testing.expectEqual(@as(usize, 0), nb[0].rows);
 }
 
 test "a header's quoted names lose their quotes and may hold the delimiter" {

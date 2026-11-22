@@ -405,6 +405,49 @@ pub fn hasSearch(e: *const Expr) bool {
     return anyExpr(e, {}, S.hit);
 }
 
+/// Whether a `search` in `e` reads whole rows: it searches a star (`*`, `t.*`,
+/// `* EXCEPT`), which no column list proves. One searching `(a, b)` reads those
+/// columns alone, which `searchFields` gives.
+pub fn searchesRows(e: *const Expr) bool {
+    const S = struct {
+        fn hit(_: void, n: *const Expr) ?bool {
+            if (n.* != .call or !std.mem.eql(u8, n.call.name, "search")) return null;
+            const items = searchList(n.call) orelse return true;
+            for (items) |it| if (!std.mem.startsWith(u8, it.str_lit, "=")) return true;
+            return null;
+        }
+    };
+    return anyExpr(e, {}, S.hit);
+}
+
+/// The columns the `(a, t.b)` lists of `e`'s `search` calls name, appended to `out`
+/// as references, a qualified one split as `search` resolves it.
+pub fn searchFields(arena: std.mem.Allocator, e: *const Expr, out: *std.array_list.Managed(QualName)) error{OutOfMemory}!void {
+    const S = struct {
+        arena: std.mem.Allocator,
+        out: *std.array_list.Managed(QualName),
+        fn add(s: *const @This(), n: *const Expr) ?bool {
+            if (n.* != .call or !std.mem.eql(u8, n.call.name, "search")) return null;
+            for (searchList(n.call) orelse return null) |it| if (std.mem.startsWith(u8, it.str_lit, "=")) {
+                var parts = std.array_list.Managed([]const u8).init(s.arena);
+                var split = std.mem.splitScalar(u8, it.str_lit[1..], '.');
+                while (split.next()) |p| parts.append(p) catch return true;
+                s.out.append(.{ .parts = parts.items }) catch return true;
+            };
+            return null;
+        }
+    };
+    if (anyExpr(e, &S{ .arena = arena, .out = out }, S.add)) return error.OutOfMemory;
+}
+
+/// A `search` call's column items, each a string the parser wrote (`*`, `*@t`, `-c`,
+/// `=c`), or null when its first argument is not that list.
+fn searchList(c: Expr.Call) ?[]const *Expr {
+    if (c.args.len < 2 or c.args[0].* != .call or !std.mem.eql(u8, c.args[0].call.name, "search_cols")) return null;
+    for (c.args[0].call.args) |a| if (a.* != .str_lit) return null;
+    return c.args[0].call.args;
+}
+
 /// The conjuncts of `e`, its `AND` chain flattened left to right; `P` is `*Expr` or
 /// `*const Expr`, as the caller's list holds.
 pub fn splitAnd(comptime P: type, e: P, out: *std.array_list.Managed(P)) std.mem.Allocator.Error!void {

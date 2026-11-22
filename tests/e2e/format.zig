@@ -718,8 +718,54 @@ test "a key or name past the sample is passed over when the query names its colu
         }
         try checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/o.csv' AS SELECT id FROM {s} WITH (sample = 2) WHERE sku = 'a' ORDER BY id;", .{src}), 1, &.{});
         try expectFile(&tmp, "o.csv", "id\n1\n3\n");
+        try checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/o.csv' AS SELECT id FROM {s} WITH (sample = 2) WHERE search((sku), 'a') ORDER BY id;", .{src}), 1, &.{});
+        try expectFile(&tmp, "o.csv", "id\n1\n3\n");
         for ([_][]const u8{ "SELECT *", "SELECT * EXCEPT (id)" }) |sel|
             try expectRunRefuses(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/o.csv' AS {s} FROM {s} WITH (sample = 2);", .{ sel, src }), 1, "not among the");
+        try expectRunRefuses(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/o.csv' AS SELECT id FROM {s} WITH (sample = 2) WHERE search(*, 'a');", .{src}), 1, "not among the");
+    }
+}
+
+fn wrongTypeItems(a: std.mem.Allocator, _: []const u8, _: []const u8) anyerror![]const u8 {
+    return a.dupe(u8, "[{\"id\":1,\"sku\":\"a\",\"preco\":1.5},{\"id\":2,\"sku\":\"b\",\"preco\":2.5},{\"id\":3,\"sku\":\"a\",\"preco\":\"abc\"}]");
+}
+
+test "a value past the sample that its column cannot read fails only a read that takes the column, CSV, JSON, XML and REST alike" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "w.ndjson", .data = "{\"id\":1,\"sku\":\"a\",\"preco\":1.5}\n{\"id\":2,\"sku\":\"b\",\"preco\":2.5}\n{\"id\":3,\"sku\":\"a\",\"preco\":\"abc\"}\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "w.json", .data = "[{\"preco\":1.5,\"id\":1,\"sku\":\"a\"},{\"preco\":2.5,\"id\":2,\"sku\":\"b\"},{\"preco\":\"abc\",\"id\":3,\"sku\":\"a\"}]" });
+    try tmp.dir.writeFile(.{ .sub_path = "w.xml", .data = "<r><x><preco>1.5</preco><id>1</id><sku>a</sku></x><x><preco>2.5</preco><id>2</id><sku>b</sku></x><x><preco>abc</preco><id>3</id><sku>a</sku></x></r>" });
+    var srv: basalt.http_fake.EchoServer = undefined;
+    try srv.start(wrongTypeItems, 0);
+    defer srv.stop();
+    const rest = try std.fmt.allocPrint(a, "HTTP('{s}/items')", .{try srv.url(a)});
+    for ([_][]const u8{ "'$B/w.ndjson'", "'$B/w.json'", "'$B/w.xml'", rest }) |src| {
+        for ([_]usize{ 1, 4 }) |threads| {
+            try checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/o.csv' AS SELECT count(*) AS n FROM {s} WITH (sample = 2);", .{src}), threads, &.{});
+            try expectFile(&tmp, "o.csv", "n\n3\n");
+            try checkAndRun(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/o.csv' AS SELECT count(sku) AS n, max(id) AS m FROM {s} WITH (sample = 2);", .{src}), threads, &.{});
+            try expectFile(&tmp, "o.csv", "n,m\n3,3\n");
+        }
+        for ([_][]const u8{ "SELECT *", "SELECT sum(preco) AS s" }) |sel|
+            try expectRunRefuses(alloc, &tmp, try std.fmt.allocPrint(a, "LOAD INTO '$B/o.csv' AS {s} FROM {s} WITH (sample = 2);", .{ sel, src }), 1, "abc");
+    }
+
+    var text = std.array_list.Managed(u8).init(a);
+    try text.appendSlice("id,sku\n");
+    for (0..1500) |i| try text.print("{d},a\n", .{i});
+    try text.appendSlice("abc,b\n\n");
+    try tmp.dir.writeFile(.{ .sub_path = "w.csv", .data = text.items });
+    for ([_]usize{ 1, 4 }) |threads| {
+        try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT count(*) AS n FROM '$B/w.csv';", threads, &.{});
+        try expectFile(&tmp, "o.csv", "n\n1501\n");
+        try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT count(DISTINCT sku) AS n FROM '$B/w.csv';", threads, &.{});
+        try expectFile(&tmp, "o.csv", "n\n2\n");
+        try expectRunRefuses(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT max(id) AS m FROM '$B/w.csv';", threads, "'abc' is not an INT");
     }
 }
 

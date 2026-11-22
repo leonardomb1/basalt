@@ -544,9 +544,10 @@ pub const Options = struct {
     max_pages: i64 = 10_000,
     /// The items the columns are typed from, read across as many pages as it takes.
     sample: usize = (fjson.Options{}).sample,
-    /// Whether the query names the columns it takes, so an item's key past the sample
-    /// is skipped rather than failing the read (`fjson.Options.skip_strays`).
-    skip_strays: bool = false,
+    /// The columns the query takes, when it names them: each item decodes only those,
+    /// and a key past the sample is passed over rather than failing the read
+    /// (`fjson.Options.project`).
+    project: ?[]const []const u8 = null,
     prefetch: i64 = 1,
     retries: i64 = (Deadline{}).retries,
     retry_base_ms: i64 = (Deadline{}).retry_base_ms,
@@ -855,6 +856,7 @@ pub const HttpSource = struct {
     opts: Options,
     headers: []const std.http.Header,
     schema: *types.Schema,
+    take: fjson.Take = .all,
     first: ?Batch,
     page_no: i64,
     next_url: ?[]const u8 = null,
@@ -993,9 +995,11 @@ pub const HttpSource = struct {
             try items.appendSlice(more.items);
         }
         const schema = try arena.create(types.Schema);
-        schema.* = try fjson.schemaOf(arena, items.items, opts.sample);
+        const p = try fjson.projected(arena, try fjson.schemaOf(arena, items.items, opts.sample), opts.project);
+        schema.* = p.schema;
         self.schema = schema;
-        self.first = try fjson.batchOf(arena, self.schema, items.items, self.opts.skip_strays);
+        self.take = p.take;
+        self.first = try fjson.batchOf(arena, self.schema, items.items, self.take);
         return self;
     }
 
@@ -1413,7 +1417,7 @@ pub const HttpSource = struct {
         const items = try itemsOf(arena, trimmed, self.opts.items);
         if (items.len == 0) return self.finishEmpty();
         self.noteProgress(items.len);
-        const batch = try fjson.batchOf(arena, self.schema, items, self.opts.skip_strays);
+        const batch = try fjson.batchOf(arena, self.schema, items, self.take);
         if (self.opts.stop_short and items.len < self.opts.page_size) {
             self.issue_done = true;
             self.drainSlots();
@@ -1452,7 +1456,7 @@ pub const HttpSource = struct {
         try self.advance(arena, page.root, page.items.len);
         if (page.items.len == 0) return null;
         self.noteProgress(page.items.len);
-        return try fjson.batchOf(arena, self.schema, page.items, self.opts.skip_strays);
+        return try fjson.batchOf(arena, self.schema, page.items, self.take);
     }
 
     pub fn close(self: *HttpSource) void {

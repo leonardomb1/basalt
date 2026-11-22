@@ -13,9 +13,10 @@
 //! files is not the whole input. Every row, sampled or later, is read into those
 //! columns as `CAST` reads a value (`Rows`): a key missing from a row is NULL, while
 //! a value its column cannot read fails the read (`JsonPastSample`), as a CSV cell
-//! past its sniffed type does, and so does a key not among the columns, unless the
-//! query names its columns (`skip_strays`), when the key is one it never asked for;
-//! `sample` widens the rows the columns are typed from.
+//! past its sniffed type does, and so does a key not among the columns. A read the
+//! query projects (`project`) decodes only the columns it names and passes over every
+//! other key, so no value or key it never asked for fails it; `sample` widens the
+//! rows the columns are typed from.
 //!
 //! The input streams: values are cut out of a buffer that holds about one batch of
 //! rows (`Scan`), each validated and read in place by `exec/json.zig`, never built
@@ -44,13 +45,11 @@ pub const Options = struct {
     batch_rows: usize = 2048,
     chunk: usize = 64 << 10,
     schema: ?types.Schema = null,
-    /// The whole input's columns when `schema` is a projection of them: a key among
-    /// these but not read is skipped, while one in neither fails the read.
-    known: ?types.Schema = null,
-    /// Whether the query names the columns it takes (a projection, perhaps of none),
-    /// so a key past the sample is one it never asked for and is skipped; else the
-    /// read hands on every column and such a key fails it, as its values would be lost.
-    skip_strays: bool = false,
+    /// The columns the query takes, when it names them (a projection, perhaps of
+    /// none): only those are decoded (`projected`), and a key past the sample is one it
+    /// never asked for, passed over. Null hands on every column, and such a key fails
+    /// the read, as its values would be lost.
+    project: ?[]const []const u8 = null,
     /// Whether this input is all that is read, so a sample that reaches its end has
     /// seen every row; false for the first of several files.
     alone: bool = true,
@@ -113,10 +112,25 @@ fn nonFiniteText(raw: []const u8) bool {
     return false;
 }
 
+/// What a read takes of its rows: `all` hands on every column, so a key in none fails
+/// it, as its values would be lost; `named` takes the columns a query names and passes
+/// over every other key, its value never read; `none` reads no value, its one column,
+/// kept as a batch needs a column to count (`driver.narrowed`), all NULLs.
+pub const Take = enum { all, named, none };
+
+/// `schema` narrowed to `project`, the columns the query takes, and how a read takes
+/// its rows; every column, `all`, without one.
+pub fn projected(arena: std.mem.Allocator, schema: types.Schema, project: ?[]const []const u8) Error!struct { schema: types.Schema, take: Take } {
+    const p = project orelse return .{ .schema = schema, .take = .all };
+    const n = try driver.narrowed(arena, schema, p);
+    return .{ .schema = n.schema, .take = if (n.blind) .none else .named };
+}
+
 pub const Rows = struct {
     schema: types.Schema,
     index: std.StringHashMapUnmanaged(usize) = .empty,
-    known: std.StringHashMapUnmanaged(void) = .empty,
+    /// The columns a key may land in: `schema`'s, or none when `Take.none` reads none.
+    picks: []const types.Schema.Field,
     builders: []column.Builder,
     fast: []Fast,
     vals: []?[]const u8,
@@ -124,17 +138,18 @@ pub const Rows = struct {
     /// STRING column takes as it stands.
     plain: []bool,
     len: usize = 0,
-    /// `Options.skip_strays`: a key in no column is passed over rather than refused.
-    skip_strays: bool = false,
+    /// A key in no column is passed over rather than refused: the read is projected.
+    skip_strays: bool,
 
     /// A column's shortcut, chosen once from its type: a plain number or a literal
     /// appended as `read` would append it, without the `Value` and cast between.
     const Fast = enum { none, int, float, bool, str };
 
-    /// `known`, the whole input's columns when `schema` projects them, else null.
-    pub fn init(arena: std.mem.Allocator, schema: types.Schema, known: ?types.Schema, capacity: usize) Error!Rows {
+    pub fn init(arena: std.mem.Allocator, schema: types.Schema, take: Take, capacity: usize) Error!Rows {
         var r = Rows{
             .schema = schema,
+            .picks = if (take == .none) &.{} else schema.fields,
+            .skip_strays = take != .all,
             .builders = try arena.alloc(column.Builder, schema.fields.len),
             .fast = try arena.alloc(Fast, schema.fields.len),
             .vals = try arena.alloc(?[]const u8, schema.fields.len),
@@ -149,9 +164,8 @@ pub const Rows = struct {
                 .string => .str,
                 else => .none,
             };
-            try r.index.put(arena, f.name, i);
+            if (take != .none) try r.index.put(arena, f.name, i);
         }
-        if (known) |k| for (k.fields) |f| try r.known.put(arena, f.name, {});
         return r;
     }
 
@@ -210,9 +224,9 @@ pub const Rows = struct {
 
         pub inline fn member(p: *Pick, raw_key: []const u8, plain: bool, value: []const u8, plain_value: bool) jt.Error!void {
             const key = if (plain) raw_key else try jt.decodeString(p.arena, raw_key);
-            const fields = p.rows.schema.fields;
+            const fields = p.rows.picks;
             const ci = if (p.at < fields.len and sameName(fields[p.at].name, key)) p.at else p.rows.index.get(key) orelse {
-                if (!p.rows.skip_strays and !p.rows.known.contains(key) and p.stray == null) p.stray = key;
+                if (!p.rows.skip_strays and p.stray == null) p.stray = key;
                 return;
             };
             p.rows.vals[ci] = value;
@@ -331,11 +345,10 @@ pub fn schemaOf(arena: std.mem.Allocator, rows: []const []const u8, sample: usiz
     return infer.schema(arena);
 }
 
-/// `rows`, each a validated row's text, read into `schema`'s columns as one batch;
-/// `skip_strays` as `Options.skip_strays`.
-pub fn batchOf(arena: std.mem.Allocator, schema: *const types.Schema, rows: []const []const u8, skip_strays: bool) Error!Batch {
-    var r = try Rows.init(arena, schema.*, null, rows.len);
-    r.skip_strays = skip_strays;
+/// `rows`, each a validated row's text, read into `schema`'s columns as one batch,
+/// taken as `take` says (`projected`).
+pub fn batchOf(arena: std.mem.Allocator, schema: *const types.Schema, rows: []const []const u8, take: Take) Error!Batch {
+    var r = try Rows.init(arena, schema.*, take, rows.len);
     for (rows) |row| try r.add(arena, row);
     return r.finish(arena, schema);
 }
@@ -556,6 +569,7 @@ pub const Reader = struct {
     scan: Scan,
     opts: Options,
     schema: types.Schema,
+    take: Take = .all,
     whole: ?[]const u8 = null,
     elems: ?jt.Elements = null,
     held: []const []const u8 = &.{},
@@ -593,7 +607,7 @@ pub const Reader = struct {
         }
         if (opts.schema) |sch| {
             self.schema = sch;
-            return self;
+            return self.narrow();
         }
         var infer = Infer{};
         var held = std.array_list.Managed([]const u8).init(arena);
@@ -612,6 +626,15 @@ pub const Reader = struct {
         self.held = held.items;
         self.held_spans = spans.items;
         self.schema = try infer.schema(arena);
+        return self.narrow();
+    }
+
+    /// `schema` narrowed to the columns the query takes; narrowing again changes
+    /// nothing, so a later file or a lane handed the narrowed columns reads alike.
+    fn narrow(self: *Reader) Error!*Reader {
+        const p = try projected(self.arena, self.schema, self.opts.project);
+        self.schema = p.schema;
+        self.take = p.take;
         return self;
     }
 
@@ -623,8 +646,7 @@ pub const Reader = struct {
     /// the byte past its value).
     fn nextInto(self: *Reader, arena: std.mem.Allocator, spans: ?*[2]column.Builder) Error!?Batch {
         if (self.done) return null;
-        var rows = try Rows.init(arena, self.schema, self.opts.known, self.opts.batch_rows);
-        rows.skip_strays = self.opts.skip_strays;
+        var rows = try Rows.init(arena, self.schema, self.take, self.opts.batch_rows);
         while (rows.len < self.opts.batch_rows) {
             if (self.held_at < self.held.len) {
                 try rows.add(arena, self.held[self.held_at]);

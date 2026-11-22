@@ -243,7 +243,7 @@ pub fn csvSplitFile(env: *Env, rd: ast.Read, hints: []const ast.Hint, w: ast.Wri
         mapped.close();
         return null;
     }
-    if (rd.cols.len > 0) try mapped.project(env.arena, rd.cols);
+    if (rd.projected or rd.cols.len > 0) try mapped.project(env.arena, rd.cols);
     return mapped;
 }
 

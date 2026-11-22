@@ -41,6 +41,22 @@ pub fn wantsColumn(want: []const []const u8, name: []const u8) bool {
     return false;
 }
 
+/// The columns of `full` a read projected to `want` decodes (`wantsColumn`), in
+/// `full`'s order. Naming none of them (a `count(*)`) keeps the first, nullable, as a
+/// batch needs a column to count: `blind`, the reader fills it with NULLs and decodes
+/// no value, so a value no stage reads never fails the read.
+pub const Narrowed = struct { schema: types.Schema, blind: bool };
+
+pub fn narrowed(arena: std.mem.Allocator, full: types.Schema, want: []const []const u8) error{OutOfMemory}!Narrowed {
+    var fields = std.array_list.Managed(types.Schema.Field).init(arena);
+    for (full.fields) |f| if (wantsColumn(want, f.name)) try fields.append(f);
+    if (fields.items.len > 0 or full.fields.len == 0) return .{ .schema = .{ .fields = fields.items }, .blind = false };
+    var first = full.fields[0];
+    first.ty = first.ty.asNullable();
+    try fields.append(first);
+    return .{ .schema = .{ .fields = fields.items }, .blind = true };
+}
+
 pub fn requestAbort() void {
     g_abort.store(true, .seq_cst);
 }

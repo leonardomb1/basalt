@@ -63,9 +63,9 @@ SELECT COUNT_IF(search((note, memo), 'urgent')) AS urgent FROM 'orders.csv';
 SELECT * FROM 'payments.csv' WHERE search(kind, 'credito', true);
 ```
 
-It reads whole rows, so it is never pushed to a source: a SQL read sends every
-column and filters here, and a `WHERE` with `search` stays after the selects and
-joins it follows. In a join's `ON` it applies to the joined pair — filtering an
+It is never pushed to a source: a read hands on the columns it searches, every
+column for a star and only those listed for `(a, b)`, and it filters here, and a
+`WHERE` with `search` stays after the selects and joins it follows. In a join's `ON` it applies to the joined pair — filtering an
 inner join, deciding the matches of an outer one. The columns are resolved when
 the query is planned, so an unknown name fails `check`; the text may be a
 literal or a `$param`. Every searched value is turned into text for each row, so
