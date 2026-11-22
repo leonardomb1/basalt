@@ -2187,6 +2187,8 @@ test "SELECT * REPLACE puts each value in its column's place under its name, pas
         .{ .q = "SELECT * FROM (SELECT * REPLACE (q * 10 AS q) FROM '$B/items.csv') s WHERE q > 20 ORDER BY q", .want = "name,item,q\nbob,z,30\neve,w,40\n" },
         .{ .q = "SELECT * REPLACE (upper(name) AS name), q + 1 AS q1 FROM '$B/items.csv' WHERE item = 'z'", .want = "name,item,q,q1\nBOB,z,3,4\n" },
         .{ .q = "SELECT * REPLACE (row_number() OVER (ORDER BY q DESC) AS q, upper(name) AS name) FROM '$B/items.csv' ORDER BY q", .want = "name,item,q\nEVE,w,1\nBOB,z,2\nANA,y,3\nANA,x,4\n" },
+        .{ .q = "WITH c AS (SELECT * EXCEPT (item) REPLACE (q * 10 AS q) FROM '$B/items.csv') SELECT name, sum(q) AS s FROM c WHERE q > 10 GROUP BY name ORDER BY name", .want = "name,s\nana,20\nbob,30\neve,40\n" },
+        .{ .q = "WITH c AS (SELECT *, row_number() OVER (PARTITION BY name ORDER BY q DESC) AS rn FROM '$B/items.csv') SELECT name, q FROM c WHERE rn = 1 ORDER BY name", .want = "name,q\nana,2\nbob,3\neve,4\n" },
     });
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

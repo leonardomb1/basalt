@@ -196,12 +196,19 @@ const Needs = struct {
                     break;
                 },
                 .select => |items| {
-                    if (passThrough(items)) {
-                        for (items[1..]) |it| try self.expr(it.computed.expr);
-                        for (items[1..]) |it| try self.made.put(it.computed.name, {});
+                    if (starThrough(items)) {
+                        for (items[1..]) |it| switch (it) {
+                            .field => |q| try self.field(q),
+                            .computed => |c| try self.expr(c.expr),
+                            else => {},
+                        };
+                        for (items[1..]) |it| if (it == .computed) try self.made.put(it.computed.name, {});
                         continue;
                     }
-                    if (items.len == 1 and items[0] == .star_except) continue;
+                    if (items.len == 1 and items[0] == .star_replace) {
+                        for (items[0].star_replace) |r| try self.made.put(r.to, {});
+                        continue;
+                    }
                     for (items) |it| switch (it) {
                         .star, .star_except, .star_rename, .star_replace, .star_of => return null,
                         .field => |q| try self.field(q),
@@ -219,6 +226,7 @@ const Needs = struct {
                     for (wd.partition_by) |q| try self.field(q);
                     for (wd.order_by) |k| try self.field(k.field);
                     for (wd.funcs) |f| if (f.arg) |q| try self.field(q);
+                    for (wd.funcs) |f| try self.made.put(f.out, {});
                 },
                 .join => |j| {
                     for (j.left_keys) |q| try self.key(q);
@@ -246,6 +254,15 @@ const Needs = struct {
     fn passThrough(items: []const ast.SelectItem) bool {
         if (items.len < 2 or items[0] != .star) return false;
         for (items[1..]) |it| if (it != .computed) return false;
+        return true;
+    }
+
+    /// `*` or `* EXCEPT`, then only columns and computed ones: what a later stage reads
+    /// of its output is what it reads of its input, but for the names it computes. A
+    /// window's select, or a `* REPLACE`'s, is one.
+    fn starThrough(items: []const ast.SelectItem) bool {
+        if (items.len == 0 or (items[0] != .star and items[0] != .star_except)) return false;
+        for (items[1..]) |it| if (it != .computed and it != .field) return false;
         return true;
     }
 
@@ -1390,6 +1407,49 @@ test "projectedColumns and rightNeeds: computed and deferred join keys narrow bo
         };
     }
     try std.testing.expect((try projectedColumns(&env, outs.items[2][1..])) == null);
+}
+
+/// `projectedColumns` of the stages after the read in `cteAndReader(src)`, sorted.
+fn cteNeeds(a: std.mem.Allocator, src: []const u8) !?[]const []const u8 {
+    const env_mod = @import("env.zig");
+    var params = std.StringHashMap(Value).init(a);
+    var bindings = std.StringHashMap(ast.Pipeline).init(a);
+    var connections = std.StringHashMap(ast.Connection).init(a);
+    var sources = std.array_list.Managed(@import("../exec/driver.zig").Source).init(a);
+    var diag = env_mod.Diag{};
+    var log = obs.Logger.init(0, .text, .err);
+    var params_expr = std.StringHashMap(*const ast.Expr).init(a);
+    var errctx = op.ErrCtx{};
+    var rows = obs.RowCounter.init(0);
+    var json = std.StringHashMap(std.json.Value).init(a);
+    const fns = std.StringHashMap(ast.FnDecl).init(a);
+    var env = Env{ .arena = a, .gpa = a, .params = &params, .bindings = &bindings, .connections = &connections, .sources = &sources, .diag = &diag, .log = &log, .params_expr = &params_expr, .errctx = &errctx, .rows_read = &rows, .json_params = &json, .fns = &fns };
+    const stages = try cteAndReader(a, src);
+    const got = (try projectedColumns(&env, stages[1..])) orelse return null;
+    return try sortedNames(got);
+}
+
+test "projectedColumns: a `* EXCEPT` beside computed columns, a window's select and a `* REPLACE` narrow a CTE's read to what its reader takes" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const Case = struct { src: []const u8, want: ?[]const []const u8 };
+    for ([_]Case{
+        .{ .src = "WITH c AS (SELECT * EXCEPT (note) REPLACE (amt * 2 AS amt) FROM 't.parquet') SELECT cat, sum(amt) AS s FROM c WHERE region = 'x' GROUP BY cat;", .want = &.{ "amt", "cat", "region" } },
+        .{ .src = "WITH c AS (SELECT * EXCEPT (note), amt * 2 AS amt2 FROM 't.parquet') SELECT cat, sum(amt2) AS s FROM c GROUP BY cat;", .want = &.{ "amt", "cat" } },
+        .{ .src = "WITH c AS (SELECT *, row_number() OVER (PARTITION BY cat ORDER BY amt DESC) AS rn FROM 't.parquet') SELECT cat, amt FROM c WHERE rn = 1;", .want = &.{ "amt", "cat" } },
+        .{ .src = "WITH c AS (SELECT * REPLACE (upper(cat) AS cat) FROM 't.parquet') SELECT * FROM c;", .want = null },
+        .{ .src = "WITH c AS (SELECT * REPLACE (upper(cat) AS cat) FROM 't.parquet') SELECT DISTINCT * FROM c;", .want = null },
+    }) |c| {
+        errdefer std.debug.print("{s}\n", .{c.src});
+        const got = try cteNeeds(a, c.src);
+        const w = c.want orelse {
+            try std.testing.expect(got == null);
+            continue;
+        };
+        try std.testing.expectEqual(w.len, got.?.len);
+        for (w, got.?) |x, y| try std.testing.expectEqualStrings(x, y);
+    }
 }
 
 fn cteAndReader(a: std.mem.Allocator, src: []const u8) ![]const ast.Stage {
