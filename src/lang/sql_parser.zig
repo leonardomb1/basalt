@@ -577,30 +577,69 @@ pub const Parser = struct {
         j.own_cols = try own.toOwnedSlice();
     }
 
-    /// A `*` that leaves out a column an ORDER BY sorts on keeps it through the sort,
-    /// as an input column the output does not show (`SELECT * EXCEPT (x) ... ORDER
-    /// BY x`, a USING key copy `a.k`), unless another item outputs that name; the
-    /// select returned drops it after the sort.
-    pub fn keepSortedCopies(self: *Parser, st: *ast.Stage, keys: []const ast.SortKey) Error!?[]const ast.SelectItem {
-        var dropped = std.array_list.Managed([]const u8).init(self.arena);
-        const items = try self.arena.dupe(ast.SelectItem, st.node.select);
-        for (items) |*it| if (it.* == .star_except) {
-            var keep = std.array_list.Managed([]const u8).init(self.arena);
-            for (it.star_except) |n| {
-                const sorted = for (keys) |k| {
-                    if (k.field.parts.len == 1 and std.mem.eql(u8, k.field.parts[0], n)) break true;
-                } else false;
-                const shown = for (items) |o| {
-                    if (outName(o)) |on| if (std.mem.eql(u8, on, n)) break true;
-                } else false;
-                try (if (sorted and !shown) &dropped else &keep).append(n);
+    /// A `*` that leaves out a column a sort key names keeps it through the sort, as
+    /// an input column the output does not show (`SELECT * EXCEPT (x) ... ORDER BY
+    /// x`, a USING key copy `a.k`): every `* EXCEPT` on the key's way back from the
+    /// last stage (`excludedOnWay`) passes it on. The names kept, which the caller
+    /// drops after the sort; none when no key was left out.
+    pub fn keepSortedCopies(self: *Parser, stages: []ast.Stage, keys: []const ast.SortKey) Error![]const []const u8 {
+        var kept = std.array_list.Managed([]const u8).init(self.arena);
+        for (keys) |k| {
+            if (k.field.parts.len != 1 or ast.nameIn(kept.items, k.field.parts[0])) continue;
+            const n = k.field.parts[0];
+            var buf: [max_way]usize = undefined;
+            const way = try excludedOnWay(self.arena, stages, n, &buf);
+            if (way.len == 0) continue;
+            for (way) |si| {
+                const items = try self.arena.dupe(ast.SelectItem, stages[si].node.select);
+                for (items) |*it| if (it.* == .star_except and ast.nameIn(it.star_except, n)) {
+                    var rest = std.array_list.Managed([]const u8).init(self.arena);
+                    for (it.star_except) |x| if (!std.mem.eql(u8, x, n)) try rest.append(x);
+                    it.* = .{ .star_except = try rest.toOwnedSlice() };
+                };
+                stages[si].node.select = items;
             }
-            it.* = .{ .star_except = try keep.toOwnedSlice() };
-        };
-        if (dropped.items.len == 0) return null;
-        st.node.select = items;
-        return try self.arena.dupe(ast.SelectItem, &.{.{ .star_except = try dropped.toOwnedSlice() }});
+            try kept.append(n);
+        }
+        return kept.toOwnedSlice();
     }
+
+    /// The selects that leave column `name` out by `* EXCEPT`, walking back from the
+    /// last of `stages` through those that pass their input's columns on (a select
+    /// with a `*`, a window, a filter, a limit) until one outputs `name` itself, by
+    /// an item or as a rename (`ast.projectedFrom`), or none passes it on; at most
+    /// `buf.len` of them, in `buf`.
+    pub fn excludedOnWay(arena: std.mem.Allocator, stages: []const ast.Stage, name: []const u8, buf: *[max_way]usize) Error![]const usize {
+        var n: usize = 0;
+        var i = stages.len;
+        walk: while (i > 0) {
+            i -= 1;
+            switch (stages[i].node) {
+                .filter, .limit, .window => {},
+                .select => |items| {
+                    for (items) |it| if (it == .field or it == .computed) if (outName(it)) |on| if (std.mem.eql(u8, on, name)) break :walk;
+                    const star = for (items) |it| {
+                        if (it != .field and it != .computed) break true;
+                    } else false;
+                    if (!star) break :walk;
+                    if (try ast.projectedFrom(arena, items, name)) |src| {
+                        if (!std.mem.eql(u8, src.last(), name)) break :walk;
+                        continue;
+                    }
+                    const leaves = for (items) |it| {
+                        if (it == .star_except and ast.nameIn(it.star_except, name)) break true;
+                    } else false;
+                    if (!leaves or n == buf.len) break :walk;
+                    buf[n] = i;
+                    n += 1;
+                },
+                else => break :walk,
+            }
+        }
+        return buf[0..n];
+    }
+
+    pub const max_way = 8;
 
     /// An `IN (SELECT ...)` or `EXISTS (...)` held in the WHERE by its sentinel;
     /// `corr` when the subquery was correlated, with the join it lowers to.

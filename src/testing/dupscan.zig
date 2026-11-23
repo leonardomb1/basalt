@@ -416,7 +416,7 @@ pub const plan = [_]Rule{
     .{ .home = "minmax", .pattern = minmax_pattern, .exact = true, .allow = &.{"exec/minmax.zig"} },
     .{ .home = "decimal.roundTo", .pattern = round_to_pattern, .exact = true, .allow = &.{"base/decimal.zig"} },
     .{ .home = "csv.Quoting", .pattern = csv_quote_pattern, .under = "format/", .exact = true, .allow = &.{"format/csv.zig"} },
-    .{ .home = "hoist.projectedFrom", .pattern = projected_pattern, .exact = true, .allow = &.{"runtime/pushdown/hoist.zig"} },
+    .{ .home = "ast.projectedFrom", .pattern = projected_pattern, .exact = true, .allow = &.{"lang/ast.zig"} },
     .{ .home = "ast.splitAnd", .pattern = split_and_pattern, .exact = true, .allow = &.{
         "lang/ast.zig",
         "lang/parse/tablefn.zig",

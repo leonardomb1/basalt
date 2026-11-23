@@ -112,7 +112,7 @@ const RegexCache = struct {
 
 threadlocal var regex_cache: RegexCache = .{};
 
-threadlocal var fail_note: struct { err: ?anyerror = null, buf: [480]u8 = undefined, len: usize = 0 } = .{};
+threadlocal var fail_note: struct { err: ?anyerror = null, buf: [1024]u8 = undefined, len: usize = 0 } = .{};
 
 pub fn explain(e: anyerror, msg: []const u8) anyerror {
     const n = &fail_note;

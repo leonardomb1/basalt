@@ -865,6 +865,7 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                         if (std.mem.eql(u8, c.computed.name, k.field.last())) break c;
                     } else ast.SelectItem{ .field = k.field };
                     try extended.append(hidden);
+                    try carryBack(self, stages.items[0..si], hidden);
                 }
                 if (extended.items.len != proj.len) {
                     nameApart(self.arena, extended.items[0..proj.len]) catch return error.OutOfMemory;
@@ -873,13 +874,11 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
                 }
             }
         }
-        if (!extend_proj and visible == null and stages.items[stages.items.len - 1].node == .select) {
-            const n = stages.items.len;
-            const put_back = n >= 2 and isPutBack(stages.items[n - 1].node.select) and stages.items[n - 2].node == .select;
-            hidden_drop = try self.keepSortedCopies(&stages.items[if (put_back) n - 2 else n - 1], sort_keys);
-        }
+        const kept: []const []const u8 = if (!extend_proj and visible == null) try self.keepSortedCopies(stages.items, sort_keys) else &.{};
+        if (kept.len > 0) hidden_drop = try self.arena.dupe(ast.SelectItem, &.{.{ .star_except = kept }});
         if (!extend_proj and (computed.items.len > 0 or sort_aggs.items.len > 0)) {
             var names = std.array_list.Managed([]const u8).init(self.arena);
+            try names.appendSlice(kept);
             try names.appendSlice(sort_aggs.items);
             if (computed.items.len > 0) {
                 const tail = stages.items[stages.items.len - 1].node;
@@ -920,12 +919,6 @@ pub fn parseQuery(self: *Parser, out: *std.array_list.Managed(ast.Stmt), stages:
     }
 }
 
-/// Whether `items` is a `* REPLACE`'s second select, which passes on every column of
-/// the select before it.
-fn isPutBack(items: []const ast.SelectItem) bool {
-    return items.len == 1 and items[0] == .star_replace;
-}
-
 /// Whether a bare ORDER BY `name` is an output column, which SQL reads first: every
 /// one under `*` (`out_keys` null), whose clashing names the join already set
 /// apart, else one the SELECT list names; only an input column past those can be
@@ -952,9 +945,8 @@ fn distinctSortKey(self: *Parser, stages: []const ast.Stage, written: ast.QualNa
     const listed = for (items) |it| {
         if (it != .field and it != .computed) break false;
     } else true;
-    const excepted = q.parts.len == 1 and for (items) |it| {
-        if (it == .star_except and ast.nameIn(it.star_except, q.last())) break true;
-    } else false;
+    var way: [Parser.max_way]usize = undefined;
+    const excepted = q.parts.len == 1 and (try Parser.excludedOnWay(self.arena, stages[0 .. n - 1], q.last(), &way)).len > 0;
     if (!listed and !excepted and !std.mem.startsWith(u8, q.last(), "__")) return q;
     return self.fail(at, "for SELECT DISTINCT, ORDER BY `{s}` must appear in the select list", .{try std.mem.join(self.arena, ".", written.parts)});
 }
@@ -1004,6 +996,36 @@ fn placeStrippedKey(self: *Parser, items: *std.array_list.Managed(ast.SelectItem
     if (!providesName(items.items, b.name)) try items.append(.{ .computed = .{ .name = b.name, .expr = try self.mk(.{ .field = k.* }) } });
     k.* = try self.singleName(b.name);
     return true;
+}
+
+/// The columns `hidden`, a sort key's item the last select lists past its outputs,
+/// reads, carried back through the window and filter stages before it into each
+/// select there that does not pass them on, so a window's selects keep a column
+/// only the ORDER BY reads (`SELECT a, rank() OVER (...) AS r ... ORDER BY b`).
+fn carryBack(self: *Parser, stages: []ast.Stage, hidden: ast.SelectItem) Error!void {
+    var need = std.array_list.Managed(ast.QualName).init(self.arena);
+    switch (hidden) {
+        .field => |q| try need.append(q),
+        .computed => |c| try ast.fieldsOf(c.expr, &need),
+        else => return,
+    }
+    var j = stages.len;
+    walk: while (j > 0) {
+        j -= 1;
+        switch (stages[j].node) {
+            .filter, .limit, .window => {},
+            .select => |items| {
+                var ext = std.array_list.Managed(ast.SelectItem).init(self.arena);
+                try ext.appendSlice(items);
+                for (need.items) |q| {
+                    if (q.dollar or providesName(ext.items, q.last())) continue;
+                    try ext.append(.{ .field = q });
+                }
+                if (ext.items.len != items.len) stages[j].node.select = try ext.toOwnedSlice();
+            },
+            else => break :walk,
+        }
+    }
 }
 
 /// A key read from the output that carries it, as itself or renamed, else carried
@@ -2266,7 +2288,8 @@ pub fn parseSelectCore(self: *Parser) Error!Core {
             if (distinct_on) |on| if (distinct_drop == null) {
                 const ks = try self.arena.alloc(ast.SortKey, on.len);
                 for (on, ks) |k, *sk| sk.* = .{ .field = k, .desc = false, .nulls_first = false };
-                distinct_drop = try self.keepSortedCopies(&stages.items[stages.items.len - 1], ks);
+                const kept = try self.keepSortedCopies(stages.items, ks);
+                if (kept.len > 0) distinct_drop = try self.arena.dupe(ast.SelectItem, &.{.{ .star_except = kept }});
             };
         }
     }

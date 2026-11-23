@@ -665,50 +665,8 @@ fn andWith(arena: std.mem.Allocator, acc: ?*ast.Expr, e: *ast.Expr) !*ast.Expr {
     return mkExpr(arena, .{ .binary = .{ .op = .@"and", .l = l, .r = e } });
 }
 
-/// The input column a projection outputs as `name`, or null when it computes it,
-/// drops it, fills it from a `$param`, or outputs two columns of that name (a
-/// reference to it is ambiguous). The one trace of a name through a SELECT that
-/// pushdown keeps, so filters and top-N keys descend by the same rule.
-pub fn projectedFrom(arena: std.mem.Allocator, items: []const ast.SelectItem, name: []const u8) !?ast.QualName {
-    var named: usize = 0;
-    var all = false;
-    for (items) |it| switch (it) {
-        .field => |q| if (std.mem.eql(u8, q.last(), name)) {
-            named += 1;
-        },
-        .computed => |c| if (std.mem.eql(u8, c.name, name)) {
-            named += 1;
-        },
-        .star => all = true,
-        .star_except => |names| all = all or for (names) |x| {
-            if (std.mem.eql(u8, x, name)) break false;
-        } else true,
-        else => {},
-    };
-    if (named > 1 or (named == 1 and all)) return null;
-    var star = false;
-    for (items) |it| switch (it) {
-        .star => star = true,
-        .star_except => |names| {
-            for (names) |x| if (std.mem.eql(u8, x, name)) return null;
-            star = true;
-        },
-        .star_rename, .star_replace => |rs| {
-            for (rs) |r| {
-                if (std.mem.eql(u8, r.to, name)) return try qual(arena, &.{r.from});
-                if (std.mem.eql(u8, r.from, name)) return null;
-            }
-            star = true;
-        },
-        .star_of => return null,
-        .field => |q| if (std.mem.eql(u8, q.last(), name)) return q,
-        .computed => |c| if (std.mem.eql(u8, c.name, name)) {
-            if (c.expr.* == .field and !c.expr.field.dollar) return c.expr.field;
-            return null;
-        },
-    };
-    return if (star) try qual(arena, &.{name}) else null;
-}
+/// `ast.projectedFrom`, the one trace of a name through a SELECT that pushdown keeps.
+pub const projectedFrom = ast.projectedFrom;
 
 const ColSwap = struct {
     arena: std.mem.Allocator,

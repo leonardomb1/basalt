@@ -40,7 +40,7 @@ const Space = @import("../exec/space.zig").Space;
 const Profile = @import("../exec/profile.zig").Profile;
 
 pub const Diag = struct {
-    buf: [512]u8 = undefined,
+    buf: [1024]u8 = undefined,
     msg: []const u8 = "",
     retryable: bool = false,
     pos: ?ast.Pos = null,

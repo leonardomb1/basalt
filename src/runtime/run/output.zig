@@ -340,10 +340,12 @@ fn groupKey(arena: std.mem.Allocator, ag: ast.Aggregate, after: []const ast.Stag
 }
 
 /// The column a select's output `q` reads, by the trace pushdown keeps
-/// (`hoist.projectedFrom`): the field it names or renames, or `q` itself, as written,
-/// through a `*` that passes it; null when computed or not plainly there.
+/// (`hoist.projectedFrom`): the field it names or renames, as that item wrote it, or
+/// `q` itself, as written, through a `*` that passes it; null when computed or not
+/// plainly there.
 fn selectSource(arena: std.mem.Allocator, items: []const ast.SelectItem, q: ast.QualName) !?ast.QualName {
     const src = (try @import("../pushdown/hoist.zig").projectedFrom(arena, items, q.last())) orelse return null;
+    for (items) |it| if (it == .field and std.mem.eql(u8, it.field.last(), q.last())) return src;
     return if (src.parts.len == 1 and std.mem.eql(u8, src.parts[0], q.last())) q else src;
 }
 

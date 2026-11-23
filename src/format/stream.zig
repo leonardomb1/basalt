@@ -303,7 +303,7 @@ pub const Stream = struct {
 /// failing mid-stream.
 pub fn explainf(e: anyerror, comptime fmt: []const u8, args: anytype) anyerror {
     @branchHint(.cold);
-    var buf: [480]u8 = undefined;
+    var buf: [1024]u8 = undefined;
     return eval.explain(e, msgfmt.clipPrint(&buf, fmt, args));
 }
 
