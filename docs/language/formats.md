@@ -19,6 +19,18 @@ repaired, as DuckDB's reader refuses it: read a file that is not UTF-8 `WITH
 (encoding = 'latin1')` or `'cp1252'`, which decode every byte. A header name that
 is not UTF-8 is repaired (each invalid byte U+FFFD), so it cannot hide the rest.
 
+A file with no header reads `WITH (header = false)`: every record is a row and the
+columns are `column1`, `column2`, …, as many as the first record has. `WITH
+(comment = '#')` passes over every line that starts with that character, before
+the header or among the rows, whatever quotes it holds; a value that starts with
+it inside a quoted field is still data. A self-published geofeed (RFC 8805), which
+opens with `#` lines and has no header, reads with both:
+
+```sql
+SELECT column1 AS prefix, column2 AS country, column4 AS city
+FROM 'https://example.com/geofeed.csv' WITH (header = false, comment = '#');
+```
+
 A CSV column's type is sniffed from the first 1024 rows: int ⊂ float ⊂ string,
 and a column whose every non-empty, unquoted cell is an ISO `YYYY-MM-DD` reads as
 a `DATE` — so `WHERE day >= '2026-01-01'`, `date_add`, `date_diff` and `EXTRACT`

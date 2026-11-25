@@ -695,6 +695,36 @@ fn lateKeyItems(a: std.mem.Allocator, _: []const u8, _: []const u8) anyerror![]c
     return a.dupe(u8, "[{\"id\":1,\"sku\":\"a\"},{\"id\":2,\"sku\":\"b\"},{\"id\":3,\"sku\":\"a\",\"promo\":\"x\"}]");
 }
 
+test "a CSV read WITH (header = false, comment = '#') numbers its columns and passes over comment lines, on one lane or several, in a folder too" {
+    const alloc = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(alloc);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var feed = std.array_list.Managed(u8).init(a);
+    try feed.appendSlice("##,,,,\n# Feed (c)\n# Format: https://tools.ietf.org/html/draft-google-self-published-geofeeds-02,,,,\n##,,,,\n");
+    for (0..3000) |i| {
+        try feed.writer().print("10.{d}.{d}.0/24,BR,SP-{d},City{d},\n", .{ i / 256, i % 256, i % 3, i % 5 });
+        if (i % 500 == 499) try feed.writer().print("# a note, \"with a quote\n", .{});
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "feed.csv", .data = feed.items });
+    try tmp.dir.writeFile(.{ .sub_path = "named.csv", .data = "# exported 2026-11-25\nid,v\n1,a\n# skipped\n2,b\n" });
+    try tmp.dir.makeDir("fold");
+    try tmp.dir.writeFile(.{ .sub_path = "fold/a.csv", .data = "# first\n1,x\n2,y\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "fold/b.csv", .data = "3,z\n# last\n" });
+    for ([_]usize{ 1, 4 }) |threads| {
+        try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT count(*) AS n, count(DISTINCT column3) AS regions, count(column5) AS postal FROM '$B/feed.csv' WITH (header = false, comment = '#');", threads, &.{});
+        try expectFile(&tmp, "o.csv", "n,regions,postal\n3000,3,0\n");
+        try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/named.csv' WITH (comment = '#') ORDER BY id;", threads, &.{});
+        try expectFile(&tmp, "o.csv", "id,v\n1,a\n2,b\n");
+        try checkAndRun(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/fold/' WITH (header = false, comment = '#') ORDER BY column1;", threads, &.{});
+        try expectFile(&tmp, "o.csv", "column1,column2\n1,x\n2,y\n3,z\n");
+    }
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/feed.csv' WITH (comment = '//');", "`comment` is the one character that starts a line to pass over");
+    try expectRefusedAlike(alloc, &tmp, "LOAD INTO '$B/o.csv' AS SELECT * FROM '$B/feed.csv' WITH (header = 'sometimes');", "`header` is true or false, not `sometimes`");
+}
+
 test "a key or name past the sample is passed over when the query names its columns, JSON, XML and REST alike, and fails a read of every column" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();

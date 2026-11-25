@@ -96,7 +96,34 @@ pub const Dialect = struct {
     text: []const []const u8 = &.{},
     /// A writer's line ending: `\r\n` where true, else `\n`.
     crlf: bool = false,
+    /// Whether a read's first record names the columns; else every record is data and
+    /// the columns are `column1`, `column2`, … (`WITH (header = false)`).
+    header: bool = true,
+    /// A record a read meets that starts with this byte is a comment, passed over
+    /// wherever it is, before the header too (`WITH (comment = '#')`).
+    comment: ?u8 = null,
 };
+
+/// Whether `line` is a comment under `d`: it starts with the comment byte.
+inline fn isComment(line: []const u8, d: Dialect) bool {
+    const c = d.comment orelse return false;
+    return line.len > 0 and line[0] == c;
+}
+
+/// The columns of a file read without a header, named `column1` … `column{n}`, each a
+/// nullable string until sniffed.
+fn numberedFields(arena: std.mem.Allocator, n: usize) ![]types.Schema.Field {
+    const fields = try arena.alloc(types.Schema.Field, n);
+    for (fields, 1..) |*f, i| f.* = .{ .name = try std.fmt.allocPrint(arena, "column{d}", .{i}), .ty = types.Type.init(.string).asNullable() };
+    return fields;
+}
+
+/// The columns of a read whose first record is `first`: named by it, or numbered as
+/// many as its fields when the file has no header.
+fn firstFields(arena: std.mem.Allocator, first: []const u8, d: Dialect) ![]types.Schema.Field {
+    const named = try headerFields(arena, first, d);
+    return if (d.header) named else numberedFields(arena, named.len);
+}
 
 /// The column names of a header line, every one a nullable string until sniffed. A
 /// quoted name loses its quotes (`""` is one quote) and may hold the delimiter; an
@@ -235,18 +262,24 @@ pub const CsvReader = struct {
     }
 
     /// The header and the type sample of the stream just opened, its first file `first`.
+    /// Without a header the first record is the first row, sampled as the others.
     fn start(self: *CsvReader, first: []const u8) !*CsvReader {
         const arena = self.arena;
         self.begin(first);
 
-        const header = stripBom((try self.readLine()) orelse return error.EmptyCsv);
-        self.header_line = try arena.dupe(u8, std.mem.trim(u8, header, " \t\r"));
-        var fields = std.array_list.Managed(types.Schema.Field).fromOwnedSlice(arena, try headerFields(arena, header, self.dialect));
+        const head = (try self.nextRecord()) orelse return error.EmptyCsv;
+        self.header_line = if (self.dialect.header) try arena.dupe(u8, std.mem.trim(u8, head, " \t\r")) else "";
+        var fields = std.array_list.Managed(types.Schema.Field).fromOwnedSlice(arena, try firstFields(arena, head, self.dialect));
 
         var sniff = try TypeSniffer.init(arena, fields.items.len, self.dialect.delim);
         var pending = std.array_list.Managed(Pending).init(arena);
+        if (!self.dialect.header and !skipsBlank(head, fields.items.len)) {
+            const own = try arena.dupe(u8, head);
+            sniff.feed(own);
+            try pending.append(.{ .text = own, .line_no = self.rec_line, .path = self.path, .start = self.rec_start, .end = self.rec_end });
+        }
         while (pending.items.len <= SAMPLE_ROWS) {
-            const line = (try self.readLine()) orelse {
+            const line = (try self.nextRecord()) orelse {
                 if (try self.advance()) continue;
                 self.stream_eof = true;
                 break;
@@ -292,8 +325,8 @@ pub const CsvReader = struct {
                     }
                     self.stream_eof = false;
                 }
-                line = (try self.readLine()) orelse blk: {
-                    if (try self.advance()) break :blk (try self.readLine()) orelse {
+                line = (try self.nextRecord()) orelse blk: {
+                    if (try self.advance()) break :blk (try self.nextRecord()) orelse {
                         self.done = true;
                         break;
                     };
@@ -329,10 +362,13 @@ pub const CsvReader = struct {
         return true;
     }
 
+    /// A later file of a folder: its header checked against the first file's, none
+    /// read when the files have no header.
     fn nextHeader(self: *CsvReader, url: []const u8) !void {
         self.begin(url);
-        const hdr = (try self.readLine()) orelse return error.EmptyCsv;
-        const got = std.mem.trim(u8, stripBom(hdr), " \t\r");
+        if (!self.dialect.header) return;
+        const hdr = (try self.nextRecord()) orelse return error.EmptyCsv;
+        const got = std.mem.trim(u8, hdr, " \t\r");
         if (!std.mem.eql(u8, got, self.header_line))
             return explainf(error.CsvHeaderMismatch, "`{s}` has the header `{s}`, not the first file's `{s}` — a folder read takes CSVs of one layout", .{ url, clip(got), clip(self.header_line) });
     }
@@ -345,6 +381,16 @@ pub const CsvReader = struct {
         return .{ .ptr = self, .vtable = &source_vtable };
     }
 
+    /// The next record past any comment, a file's first without its byte order mark.
+    fn nextRecord(self: *CsvReader) !?[]const u8 {
+        while (try self.readLine()) |raw| {
+            const line = if (self.rec_line == 1) stripBom(raw) else raw;
+            if (isComment(line, self.dialect)) continue;
+            return line;
+        }
+        return null;
+    }
+
     /// One record, which may span physical lines. Balanced quotes take the zero-copy
     /// path; only a continued record is joined, into a buffer reused across records,
     /// and only its new line is scanned for quotes. A `\r` is cut only where the record
@@ -354,6 +400,7 @@ pub const CsvReader = struct {
         self.rec_start = self.offset;
         const first = (try self.takePhysical()) orelse return null;
         self.rec_end = self.offset;
+        if (isComment(if (self.rec_line == 1) stripBom(first) else first, self.dialect)) return trimCr(first);
         if (!quotesOpen(first, self.dialect.delim, false)) return trimCr(first);
 
         self.join_buf.clearRetainingCapacity();
@@ -533,19 +580,28 @@ pub const MappedCsv = struct {
         if (data.len == 0) return error.EmptyCsv;
 
         if (std.mem.indexOfScalar(u8, data, '\n') == null) return error.NotMappable;
-        const head = scanRecord(data, 0, dialect.delim);
-        if (head.open) return unterminated(path, 1);
-        if (data[head.next - 1] != '\n') return error.EmptyCsv;
-        var fields = std.array_list.Managed(types.Schema.Field).fromOwnedSlice(arena, try headerFields(arena, stripBom(head.line), dialect));
+        var at: usize = 0;
+        var head = scanDialect(data, 0, dialect);
+        while (true) {
+            if (head.open) return unterminated(path, std.mem.count(u8, data[0..at], "\n") + 1);
+            if (!isComment(if (at == 0) stripBom(head.line) else head.line, dialect)) break;
+            if (head.next >= data.len) return error.EmptyCsv;
+            at = head.next;
+            head = scanDialect(data, at, dialect);
+        }
+        const first = if (at == 0) stripBom(head.line) else head.line;
+        if (dialect.header and data[head.next - 1] != '\n') return error.EmptyCsv;
+        var fields = std.array_list.Managed(types.Schema.Field).fromOwnedSlice(arena, try firstFields(arena, first, dialect));
 
-        const body = data[head.next..];
+        const body = if (dialect.header) data[head.next..] else data[at + head.line.len - first.len ..];
+        const body_at = data.len - body.len;
         var sniff = try TypeSniffer.init(arena, fields.items.len, dialect.delim);
         var fed: usize = 0;
         var pos: usize = 0;
         while (pos < body.len) {
-            const rec = scanRecord(body, pos, dialect.delim);
-            if (rec.open) return unterminated(path, std.mem.count(u8, data[0 .. head.next + pos], "\n") + 1);
-            if (rec.line.len > 0) {
+            const rec = scanDialect(body, pos, dialect);
+            if (rec.open) return unterminated(path, std.mem.count(u8, data[0 .. body_at + pos], "\n") + 1);
+            if (rec.line.len > 0 and !isComment(rec.line, dialect)) {
                 if (fed == SAMPLE_ROWS) break;
                 sniff.feed(rec.line);
                 fed += 1;
@@ -563,7 +619,7 @@ pub const MappedCsv = struct {
             .path = try arena.dupe(u8, path),
             .dialect = dialect,
         };
-        const quotes = scanQuotes(body, dialect.delim);
+        const quotes = scanQuotes(body, dialect);
         self.quoted_newlines = quotes == .quoted_newlines;
         self.quote_free = quotes == .none;
         return self;
@@ -589,7 +645,9 @@ pub const MappedCsv = struct {
     /// A quote-free file costs one `memchr`, which releases the pages behind it as it
     /// goes, so checking it never holds all of it resident; a file with quotes is
     /// walked record by record.
-    fn scanQuotes(body: []const u8, delim: u8) enum { none, quotes, quoted_newlines } {
+    const Quotes = enum { none, quotes, quoted_newlines };
+
+    fn scanQuotes(body: []const u8, d: Dialect) Quotes {
         var at: usize = 0;
         const quoted = while (at < body.len) {
             const end = @min(body.len, at + scan_window);
@@ -598,9 +656,16 @@ pub const MappedCsv = struct {
             at = end;
         } else false;
         if (!quoted) return .none;
+        return if (d.comment == null) quotedLines(false, body, d) else quotedLines(true, body, d);
+    }
+
+    /// Whether a record of `body` holds a newline inside quotes, each comment a line of
+    /// its own when `comments`; fixed per file, as the walk runs over every record
+    /// before the lanes start.
+    fn quotedLines(comptime comments: bool, body: []const u8, d: Dialect) Quotes {
         var pos: usize = 0;
         while (pos < body.len) {
-            const rec = scanRecord(body, pos, delim);
+            const rec = if (comments) scanDialect(body, pos, d) else scanRecord(body, pos, d.delim);
             if (std.mem.indexOfScalar(u8, rec.line, '\n') != null) return .quoted_newlines;
             pos = rec.next;
         }
@@ -658,7 +723,10 @@ pub const CsvSliceReader = struct {
         const builders = try arena.alloc(column.Builder, ncols);
         for (builders, self.schema.fields) |*b, f| b.* = try column.Builder.initCapacity(arena, f.ty, BATCH_ROWS);
 
-        const rows = if (widthOf(self.slot, ncols) == 1) try self.fill(true, arena, builders) else try self.fill(false, arena, builders);
+        const one = widthOf(self.slot, ncols) == 1;
+        const rows = if (self.dialect.comment == null)
+            (if (one) try self.fill(true, false, arena, builders) else try self.fill(false, false, arena, builders))
+        else if (one) try self.fill(true, true, arena, builders) else try self.fill(false, true, arena, builders);
         if (rows == 0) return null;
         if (self.blind) try builders[0].appendRepeated(.null, rows);
         const cols = try arena.alloc(column.Column, ncols);
@@ -670,15 +738,17 @@ pub const CsvSliceReader = struct {
         return Batch{ .schema = self.schema, .columns = cols, .len = rows };
     }
 
-    /// Up to a batch of records into `builders`, the blank-line rule of `skipsBlank`
-    /// fixed per file, as a branch per record costs the many-column hot loop.
-    fn fill(self: *CsvSliceReader, comptime one_column: bool, arena: std.mem.Allocator, builders: []column.Builder) !usize {
+    /// Up to a batch of records into `builders`, the blank-line rule of `skipsBlank` and
+    /// whether comments are passed over fixed per file, as a branch per record costs
+    /// the many-column hot loop.
+    fn fill(self: *CsvSliceReader, comptime one_column: bool, comptime comments: bool, arena: std.mem.Allocator, builders: []column.Builder) !usize {
         var rows: usize = 0;
         while (rows < BATCH_ROWS and self.pos < self.data.len) {
-            const rec = scanRecord(self.data, self.pos, self.dialect.delim);
+            const rec = if (comments) scanDialect(self.data, self.pos, self.dialect) else scanRecord(self.data, self.pos, self.dialect.delim);
             const line = rec.line;
             if (rec.open) return unterminated(self.path, self.lineOf(line));
             self.pos = rec.next;
+            if (comments and isComment(line, self.dialect)) continue;
             if (skipsBlank(line, if (one_column) 1 else 2)) continue;
             splitInto(arena, line, builders, self.dialect, self.slot) catch |e|
                 return rowFailure(e, self.path, self.lineOf(line), line, self.schema.*, self.dialect, self.slot);
@@ -774,6 +844,20 @@ const Quoting = struct {
 /// One record from `data[start]`, where the next begins, and whether it ends inside a
 /// quote the data never closes. A quoteless line ends at the next newline, found by
 /// two SIMD scans.
+/// `scanRecord` under dialect `d`: a comment ends at its line's end, whatever quotes
+/// it holds, a file's first after its byte order mark.
+fn scanDialect(data: []const u8, start: usize, d: Dialect) struct { line: []const u8, next: usize, open: bool = false } {
+    if (d.comment != null and start < data.len) {
+        const from = if (start == 0) data.len - stripBom(data).len else start;
+        if (isComment(data[from..], d)) {
+            const nl = std.mem.indexOfScalarPos(u8, data, start, '\n') orelse return .{ .line = trimCr(data[start..]), .next = data.len };
+            return .{ .line = trimCr(data[start..nl]), .next = nl + 1 };
+        }
+    }
+    const r = scanRecord(data, start, d.delim);
+    return .{ .line = r.line, .next = r.next, .open = r.open };
+}
+
 fn scanRecord(data: []const u8, start: usize, delim: u8) struct { line: []const u8, next: usize, open: bool = false } {
     if (std.mem.indexOfScalarPos(u8, data, start, '\n')) |nl| {
         if (std.mem.indexOfScalar(u8, data[start..nl], '"') == null)
@@ -2595,9 +2679,9 @@ test "quotesOpen / scanQuotes drive the continuation and split decisions" {
     try std.testing.expect(quotesOpen("end\",\"again", ',', true));
     try std.testing.expect(quotesOpen("a \"\"quoted\"\" word", ',', true));
 
-    try std.testing.expect(MappedCsv.scanQuotes("1,\"a\nb\"\n", ',') == .quoted_newlines);
-    try std.testing.expect(MappedCsv.scanQuotes("1,\"a b\"\n2,c\n", ',') == .quotes);
-    try std.testing.expect(MappedCsv.scanQuotes("1,a\n2,b\n", ',') == .none);
+    try std.testing.expect(MappedCsv.scanQuotes("1,\"a\nb\"\n", .{}) == .quoted_newlines);
+    try std.testing.expect(MappedCsv.scanQuotes("1,\"a b\"\n2,c\n", .{}) == .quotes);
+    try std.testing.expect(MappedCsv.scanQuotes("1,a\n2,b\n", .{}) == .none);
 }
 
 test "CsvReader reads every member of a multi-member .csv.gz, as pigz and an append write it" {
@@ -2685,4 +2769,40 @@ test "a header's quoted names lose their quotes and may hold the delimiter" {
     const fields = try headerFields(ar.allocator(), "\"Valor Total\",\"a,b\", c ,\"x\"\"y\",", .{});
     try std.testing.expectEqual(@as(usize, 5), fields.len);
     for ([_][]const u8{ "Valor Total", "a,b", "c", "x\"y", "" }, fields) |want, f| try std.testing.expectEqualStrings(want, f.name);
+}
+
+test "header = false numbers the columns and reads the first record as a row; a comment is passed over anywhere, quotes and all, by the serial and the mapped reader alike" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const Case = struct { name: []const u8, data: []const u8, d: Dialect, want: []const u8 };
+    const cases = [_]Case{
+        .{ .name = "feed.csv", .data = "\xef\xbb\xbf##,,\n# Format: x,\"open\n10.0.0.0/8,BR,SP\n# mid\n10.1.0.0/16,US,\n", .d = .{ .header = false, .comment = '#' }, .want = "column1|column2|column3|10.0.0.0/8|BR|SP|10.1.0.0/16|US|NULL|" },
+        .{ .name = "named.csv", .data = "# top\nid,v\n1,a\n#x,\"y\n2,b\n", .d = .{ .comment = '#' }, .want = "id|v|1|a|2|b|" },
+        .{ .name = "bare.csv", .data = "1,a\n2,b\n", .d = .{ .header = false }, .want = "column1|column2|1|a|2|b|" },
+        .{ .name = "hash.csv", .data = "id,v\n#1,a\n2,b\n", .d = .{}, .want = "id|v|#1|a|2|b|" },
+    };
+    for (cases) |c| {
+        try tmp.dir.writeFile(.{ .sub_path = c.name, .data = c.data });
+        const path = try std.fs.path.join(a, &.{ try tmp.dir.realpathAlloc(a, "."), c.name });
+        const r = try CsvReader.open(a, path, c.d);
+        defer r.close();
+        const m = try MappedCsv.open(a, path, c.d);
+        defer m.close();
+        for ([_]driver.Source{ r.source(), try m.lane(a, 0, 1, &m.schema) }, [_]types.Schema{ r.schema, m.schema }) |src, sch| {
+            var out = std.array_list.Managed(u8).init(a);
+            for (sch.fields) |f| try out.writer().print("{s}|", .{f.name});
+            while (try src.next(a)) |b| for (0..b.len) |i| for (b.columns) |col| {
+                const v = col.getValue(i);
+                try out.writer().print("{s}|", .{if (v.isNull()) "NULL" else try eval.valueToString(a, v)});
+            };
+            std.testing.expectEqualStrings(c.want, out.items) catch |e| {
+                std.debug.print("{s}\n", .{c.name});
+                return e;
+            };
+        }
+    }
 }

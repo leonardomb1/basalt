@@ -324,6 +324,7 @@ pub const stdinProblem = @import("analyze/targets.zig").stdinProblem;
 const targets = @import("analyze/targets.zig");
 pub const hintText = @import("analyze/targets.zig").hintText;
 pub const dialectFromHints = @import("analyze/targets.zig").dialectFromHints;
+pub const csvReadDialect = @import("analyze/targets.zig").csvReadDialect;
 pub const formatFromHints = @import("analyze/targets.zig").formatFromHints;
 pub const jsonOptions = @import("analyze/targets.zig").jsonOptions;
 pub const parquetCodecFromHints = @import("analyze/targets.zig").parquetCodecFromHints;
@@ -1860,7 +1861,7 @@ const Ctx = struct {
                         return fail(self.diag, "cannot read `{s}`: {s}", .{ rd.form.path, why });
                     if (readFormat(rd.form.path, fmt) == .xlsx) _ = try xlsxOptions(lead.hints, self.diag);
                     if (readFormat(rd.form.path, fmt) == .xml) _ = try xmlOptions(lead.hints, &.{}, self.diag);
-                    _ = try dialectFromHints(lead.hints, self.diag);
+                    _ = if (readFormat(rd.form.path, fmt) == .csv) try csvReadDialect(lead.hints, self.diag) else try dialectFromHints(lead.hints, self.diag);
                     _ = try lakeAt(lead.hints, self.diag);
                 }
                 const later = for (lead.hints) |h| {

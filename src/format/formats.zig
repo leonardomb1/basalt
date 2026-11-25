@@ -59,7 +59,7 @@ pub const table = [_]Format{
         .folder_exts = &.{ ".csv", ".tsv", ".txt" },
         .lanes = .local_ranges,
         .stdin = true,
-        .read_keys = &.{ "format", "delimiter", "delim", "encoding" },
+        .read_keys = &.{ "format", "delimiter", "delim", "encoding", "header", "comment" },
         .write = .{ .change = .text },
         .write_keys = &.{ "format", "delimiter", "delim", "encoding" },
     },

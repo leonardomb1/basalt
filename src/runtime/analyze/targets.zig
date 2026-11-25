@@ -71,6 +71,21 @@ pub fn dialectFromHints(hints: []const ast.Hint, diag: *Diag) Error!csv.Dialect 
     return d;
 }
 
+/// A CSV file read's dialect: `dialectFromHints`, and the options only a CSV read
+/// takes, which another connector's read names otherwise (a REST read's `header` is
+/// an HTTP header): `header = false` reads every record as data, and `comment` is the
+/// one byte that starts a line to pass over, neither the delimiter nor a quote.
+pub fn csvReadDialect(hints: []const ast.Hint, diag: *Diag) Error!csv.Dialect {
+    var d = try dialectFromHints(hints, diag);
+    if (try hintBool(hints, "header", diag)) |b| d.header = b;
+    if (hintText(hints, "comment")) |c| {
+        if (c.len != 1 or c[0] == d.delim or c[0] == '"' or c[0] == '\n' or c[0] == '\r')
+            return fail(diag, "`comment` is the one character that starts a line to pass over (`'#'`), not the delimiter or a quote; got `{s}`", .{c});
+        d.comment = c[0];
+    }
+    return d;
+}
+
 /// The `encoding` option, null when unset; a read decodes from it, a records sink
 /// encodes its text to it.
 pub fn encodingFromHints(hints: []const ast.Hint, diag: *Diag) Error!?csv.Encoding {
@@ -513,7 +528,7 @@ fn joinNames(arena: std.mem.Allocator, items: []const []const u8) []const u8 {
 /// agreeing with the extension. `lanes.laneEligible` and EXPLAIN both ask this.
 pub fn laneHints(st: ast.Stage) bool {
     for (st.hints) |h| {
-        if (std.mem.eql(u8, h.key, "delimiter") or std.mem.eql(u8, h.key, "delim") or std.mem.eql(u8, h.key, "encoding")) continue;
+        if (ast.nameIn(&.{ "delimiter", "delim", "encoding", "header", "comment" }, h.key)) continue;
         if (std.mem.eql(u8, h.key, "format")) {
             if (st.node != .read or st.node.read.form != .path) return false;
             var d = Diag{};
@@ -637,7 +652,7 @@ pub fn offlineSchema(arena: std.mem.Allocator, rd: ast.Read, hints: []const ast.
         if (readFormat(rd.form.path, explicit) == .xml) return xmlSchema(arena, &.{rd.form.path}, hints, rd.text_cols);
         if (readFormat(rd.form.path, explicit) == .avro) return avroSchema(arena, &.{rd.form.path});
         var hdiag = Diag{};
-        var d = dialectFromHints(hints, &hdiag) catch return null;
+        var d = csvReadDialect(hints, &hdiag) catch return null;
         d.text = rd.text_cols;
         const reader = csv.CsvReader.open(arena, rd.form.path, d) catch return null;
         const schema = reader.schema;
@@ -727,6 +742,12 @@ test "dialectFromHints: parses, and rejects what cannot work" {
 
     try std.testing.expectError(error.AnalyzeFailed, dialectFromHints(try mkh.hint(a, "delimiter", ";;"), &d));
     try std.testing.expectError(error.AnalyzeFailed, dialectFromHints(try mkh.hint(a, "delimiter", "\""), &d));
+    const csv_d = try csvReadDialect(try mkh.hint(a, "comment", "#"), &d);
+    try std.testing.expectEqual(@as(?u8, '#'), csv_d.comment);
+    try std.testing.expect(!(try csvReadDialect(try mkh.hint(a, "header", "false"), &d)).header);
+    try std.testing.expect((try dialectFromHints(try mkh.hint(a, "header", "X-Token: t"), &d)).header);
+    for ([_][]const u8{ "##", ",", "\"" }) |c| try std.testing.expectError(error.AnalyzeFailed, csvReadDialect(try mkh.hint(a, "comment", c), &d));
+    try std.testing.expectError(error.AnalyzeFailed, csvReadDialect(try mkh.hint(a, "header", "talvez"), &d));
     try std.testing.expectError(error.AnalyzeFailed, dialectFromHints(try mkh.hint(a, "encoding", "latin9"), &d));
 }
 

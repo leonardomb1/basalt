@@ -107,7 +107,7 @@ const impls = struct {
     pub const csv = struct {
         pub fn read(env: *Env, r: Read) anyerror!driver.Source {
             var ddiag = analyze.Diag{};
-            var d = analyze.dialectFromHints(r.hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
+            var d = analyze.csvReadDialect(r.hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
             d.text = r.text;
             if (analyze.archiveProblem(env.arena, r.path, r.want, true)) |why|
                 return planErr(env.diag, try msgfmt.allocPrint(env.arena, "cannot read `{s}`: {s}", .{ r.path, why }));
@@ -130,7 +130,7 @@ const impls = struct {
 
         pub fn stdin(env: *Env, s: *stream.Stream, hints: []const ast.Hint, project: ?[][]const u8) anyerror!driver.Source {
             var ddiag = analyze.Diag{};
-            const d = analyze.dialectFromHints(hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
+            const d = analyze.csvReadDialect(hints, &ddiag) catch |e| return aErr(env, &ddiag, e);
             const r = csvfmt.CsvReader.openStream(env.arena, s, d) catch |e| {
                 if (e == error.EmptyCsv) return planErrT(env.diag, e, "stdin is empty: a CSV read needs at least a header line");
                 return e;

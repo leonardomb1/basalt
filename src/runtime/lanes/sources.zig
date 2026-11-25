@@ -239,7 +239,8 @@ pub fn csvSplitFile(env: *Env, rd: ast.Read, hints: []const ast.Hint, w: ast.Wri
         else => return null,
     }
 
-    var d = env.csv_in;
+    var ddiag = analyze.Diag{};
+    var d = analyze.csvReadDialect(hints, &ddiag) catch return null;
     d.text = rd.text_cols;
     const mapped = csv.MappedCsv.open(env.arena, path, d) catch return null;
     if (mapped.quoted_newlines) {

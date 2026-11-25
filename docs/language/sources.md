@@ -346,10 +346,11 @@ matched in any case; a value holding a loop's `${...}` is checked once filled in
 |---|---|
 | `format` | `csv`, `parquet`, `arrow`, `xlsx`, `json` or `ndjson` (`jsonl`), whatever the extension says |
 | `delimiter` | a CSV's separator: one character, or `tab` (also on a `LOAD INTO` file) |
+| `comment` | a CSV line starting with this one character is passed over, before the header or among the rows |
 | `encoding` | a CSV's text encoding: `utf8` (default), `latin1` / `iso-8859-1`, `cp1252` / `windows-1252` |
 | `sheet` | an Excel worksheet by name (default the first) |
 | `range` | an Excel block such as `'B3:F200'`, or `'B3:F'` to the last row |
-| `header` | `false` reads an Excel sheet's first row as data, the columns named `A`, `B`, … |
+| `header` | `false` reads a CSV with no header, every record a row and the columns `column1`, `column2`, …; an Excel sheet's first row as data, the columns `A`, `B`, … |
 | `buffer` | a flag: drain the source fully before opening the sink |
 
 **REST sources** — `HTTP(...)`, `conn.GET(...)` and `conn.POST(...)`

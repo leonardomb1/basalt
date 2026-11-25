@@ -207,7 +207,7 @@ fn openRead(env: *Env, read: ast.Stage, format: analyze.FileFormat, kind: *Kind,
     switch (kind.*) {
         .csv => {
             var ddiag = analyze.Diag{};
-            var d = analyze.dialectFromHints(read.hints, &ddiag) catch |e| return env_mod.aErr(env, &ddiag, e);
+            var d = analyze.csvReadDialect(read.hints, &ddiag) catch |e| return env_mod.aErr(env, &ddiag, e);
             d.text = rd.text_cols;
             const r = csvfmt.CsvReader.open(a, path, d) catch |e|
                 return planErrT(env.diag, e, try msgfmt.allocPrint(a, "could not read `{s}` ({s})", .{ path, @errorName(e) }));
@@ -363,7 +363,7 @@ fn rewriteText(env: *Env, w: ast.Write, path: []const u8, kind: Kind, which: Op,
     const a = env.arena;
     if (stream.splitCodec(path).codec == .zstd) return planErr(env.diag, try msgfmt.allocPrint(a, "{s}: basalt writes no zstd, so it cannot write the file again", .{what}));
     var ddiag = analyze.Diag{};
-    const dialect = analyze.dialectFromHints(read.hints, &ddiag) catch |e| return env_mod.aErr(env, &ddiag, e);
+    const dialect = analyze.csvReadDialect(read.hints, &ddiag) catch |e| return env_mod.aErr(env, &ddiag, e);
     const in = stream.Stream.open(a, path) catch |e|
         return planErrT(env.diag, e, try msgfmt.allocPrint(a, "could not read `{s}` ({s})", .{ path, @errorName(e) }));
     var in_open = true;
