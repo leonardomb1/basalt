@@ -134,13 +134,21 @@ pub fn repairBundle(gpa: std.mem.Allocator, bundle: *std.crypto.Certificate.Bund
     return trust.grow(gpa, bundle, ders[0..cap.count], std.time.timestamp());
 }
 
-/// After a failed TLS handshake, grows `client`'s CA bundle from the chain `uri`'s
-/// host presents (see `repairBundle`); true when a replay may now succeed.
+/// After a failed TLS handshake, the system's CA roots loaded when the client never
+/// loaded them, else its bundle grown from the chain `uri`'s host presents (see
+/// `repairBundle`); true when a replay may now succeed. The std client loads the
+/// roots only for a request that starts at an `https` URL, so a plain `http` one
+/// redirected to `https` handshakes with none.
 pub fn repairClient(client: *HttpClient, uri: std.Uri) bool {
     const h = uriHost(uri) orelse return false;
-    if (!repairBundle(client.allocator, &client.ca_bundle, h, uri.port orelse 443)) return false;
-    client.next_https_rescan_certs = false;
-    return true;
+    if (client.next_https_rescan_certs) {
+        client.ca_bundle_mutex.lock();
+        defer client.ca_bundle_mutex.unlock();
+        client.ca_bundle.rescan(client.allocator) catch return false;
+        client.next_https_rescan_certs = false;
+        return true;
+    }
+    return repairBundle(client.allocator, &client.ca_bundle, h, uri.port orelse 443);
 }
 
 /// `repairClient` for `url`, at most once per `done` flag, which it sets.
@@ -2623,7 +2631,7 @@ test "a URL in a log or message keeps no login and no query values" {
 }
 
 test "repairOnce tries once per flag, and a URL with no host repairs nothing" {
-    var client = HttpClient{ .allocator = std.testing.allocator };
+    var client = HttpClient{ .allocator = std.testing.allocator, .next_https_rescan_certs = false };
     defer client.deinit();
     var done = false;
     try std.testing.expect(!repairOnce(&client, &done, "not a url"));
@@ -2633,6 +2641,15 @@ test "repairOnce tries once per flag, and a URL with no host repairs nothing" {
     try std.testing.expect(!repairOnce(&client, &fresh, "file:///x"));
     try std.testing.expect(fresh);
     try std.testing.expectEqual(@as(usize, 0), client.ca_bundle.bytes.items.len);
+}
+
+test "repairClient loads the system roots a client never loaded, as an http request redirected to https needs, then grows the bundle only from a reachable host" {
+    var client = HttpClient{ .allocator = std.testing.allocator };
+    defer client.deinit();
+    const uri = try std.Uri.parse("http://127.0.0.1:1/x");
+    try std.testing.expect(repairClient(&client, uri));
+    try std.testing.expect(!client.next_https_rescan_certs);
+    try std.testing.expect(!repairClient(&client, uri));
 }
 
 test "HTTP() names 408 busy like the object stores do, and 501, 505, 511 and 6xx a plain failure" {
