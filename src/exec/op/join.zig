@@ -34,6 +34,7 @@
 const Batch = @import("../batch.zig").Batch;
 const ErrCtx = @import("../op.zig").ErrCtx;
 const Op = @import("../op.zig").Op;
+const driver = @import("../driver.zig");
 const Stats = @import("../op.zig").Stats;
 const ast = @import("../../lang/ast.zig");
 const column = @import("../column.zig");
@@ -2139,6 +2140,35 @@ test "join: cross pairs every probe row with every build row" {
     };
     const got = try JoinRows.collect(a, .{ .join = &jn }, 3);
     try got.expect(&.{ 1, 1, 1, 2, 2, 2 }, &.{ "x", "y", "z", "x", "y", "z" });
+}
+
+test "join: a cross join stops at its next chunk once aborted, its probe batch not yet paired out" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const lb = [_]Batch{try kvBatch(a, &join_left_schema, &.{ 1, 2, 3 }, &.{ "a", "b", "c" })};
+    const rb = [_]Batch{try kvBatch(a, &join_right_schema, &.{ 7, 8, 9 }, &.{ "x", "y", "z" })};
+    var lts = TestSource{ .schema_ = join_left_schema, .batches = &lb };
+    var rts = TestSource{ .schema_ = join_right_schema, .batches = &rb };
+    var lscan = Scan{ .src = lts.src() };
+    var rscan = Scan{ .src = rts.src() };
+    var jn = Join{
+        .probe = .{ .scan = &lscan },
+        .build = .{ .scan = &rscan },
+        .left_keys = &.{},
+        .right_keys = &.{},
+        .left_schema = &join_left_schema,
+        .right_schema = &join_right_schema,
+        .out_schema = &join_both_schema,
+        .kind = .cross,
+        .state = a,
+        .cross_chunk = 2,
+    };
+    const op = Op{ .join = &jn };
+    _ = (try op.next(a)).?;
+    driver.requestAbort();
+    defer driver.resetAbort();
+    try testing.expectError(error.Aborted, op.next(a));
 }
 
 test "join: cross emits bounded batches and keeps its build cap" {

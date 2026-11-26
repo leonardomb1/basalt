@@ -333,7 +333,11 @@ pub const Op = union(enum) {
         }
     }
 
+    /// Checks the abort flag on every call, as a source's pull does: an operator that
+    /// makes many batches of one input batch (a CROSS JOIN pairs a probe batch with
+    /// every build row) pulls from its source too rarely for that check alone.
     pub fn next(self: Op, arena: std.mem.Allocator) anyerror!?Batch {
+        if (driver.aborting()) return error.Aborted;
         const st = self.stats();
         const t0 = std.time.Instant.now() catch {
             return self.nextInner(arena);
