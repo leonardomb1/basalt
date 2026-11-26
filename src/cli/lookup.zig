@@ -234,7 +234,7 @@ fn declHover(arena: std.mem.Allocator, e: *const DeclStore.Entry, shown: []const
                 h.value = try std.json.Stringify.valueAlloc(arena, v, .{});
             };
         },
-        .let => if (std.mem.eql(u8, e.origin.file, "session")) if (session.heldValue(e.name)) |v| {
+        .let => if (try heldFor(arena, session, e)) |v| {
             var aw = std.Io.Writer.Allocating.init(arena);
             try jsontext.scalar(&aw.writer, v, .{ .decimal = .string });
             h.value = aw.written();
@@ -243,6 +243,18 @@ fn declHover(arena: std.mem.Allocator, e: *const DeclStore.Entry, shown: []const
         .connection => try connectionParts(arena, &h, stmt),
     }
     return h;
+}
+
+/// The value the session holds for LET `e`: the session's own declaration, or the
+/// script's when it is the statement the session ran (its words, comments aside), as
+/// a file run in the kernel and then hovered is. A LET written otherwise since has
+/// no value yet.
+fn heldFor(arena: std.mem.Allocator, session: *const DeclStore, e: *const DeclStore.Entry) !?Value {
+    const v = session.heldValue(e.name) orelse return null;
+    if (std.mem.eql(u8, e.origin.file, "session")) return v;
+    const ran = session.find(.let, e.name) orelse return null;
+    const same = std.mem.eql(u8, try oneLine(arena, pastComments(ran.text)), try oneLine(arena, pastComments(e.text)));
+    return if (same) v else null;
 }
 
 /// The type of a value a LET holds, or null for a nested one.
@@ -549,6 +561,9 @@ test "resolve: a session PARAM's type, default and bound value, a LET's held val
     const own = (try testHover(a, &session, "LET n = 7;\nSELECT $n AS n", "$n AS", null)).?;
     try testing.expectEqualStrings("script", own.origin.?.file);
     try testing.expect(own.value == null);
+    const ran = (try testHover(a, &session, "-- the answer\nLET n =  41 + 1;\nSELECT $n AS n", "$n AS", null)).?;
+    try testing.expectEqualStrings("script", ran.origin.?.file);
+    try testing.expectEqualStrings("42", ran.value.?);
 }
 
 test "resolve: a connection shows its TYPE and literal options, never a secret, an env() value or a URL's password" {

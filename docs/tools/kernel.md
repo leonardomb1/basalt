@@ -69,7 +69,8 @@ return type and doc. A declared function shows its signature as written, with
 `type` `table` for a table function and its `body` for an expression function;
 a `PARAM` its `type`, its `default` and the `value` the request's `params` bind
 it to; a `LET` the `value` it holds, as JSON, and its `type`, once a script has
-given it one; a connection its `TYPE` as `type`, and in `signature` the
+given it one — the script hovered too, when it declares that LET as the session
+ran it; a connection its `TYPE` as `type`, and in `signature` the
 `OPTIONS` whose values are literals — never a password, a token, an `env()` or
 `secret()` value, or a URL's user and password; a `conn.schema.table` its
 `columns`, asked as `complete` asks; a column its `type`, where the file or
@@ -111,14 +112,15 @@ script's is ignored, and one without an `id` stops whatever runs. SIGINT
 cancels the running script too — however many times it is sent, it never ends
 the process.
 
-Requests are answered in the order they come, but for this: while a script
-runs, a `check`, `complete`, `hover`, `definition`, `format` or `catalog` is
-answered at once, on a thread of its own, so an editor's features keep
-working through a long query. It reads the session as it stands — the
-running script's declarations among it once that script parsed — and asks
+Requests are answered in the order they come, but for this: while the kernel
+is busy — a script running or about to start, or any request being answered
+or waiting its turn — a `check`, `complete`, `hover`, `definition`, `format`
+or `catalog` is answered at once, on a thread of its own, so an editor's
+features keep working through a long query. It reads the session as it
+stands — a script's declarations among it once that script parsed — and asks
 no connection, as one may be busy with the script, so `complete` and `hover`
-offer only what the connections already said. Its status may come before the
-running script's; each status names its request's `id`.
+offer only what the connections already said. Its status may come before an
+earlier request's; each status names its request's `id`.
 
 ## Replies
 

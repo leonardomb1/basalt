@@ -336,6 +336,27 @@ def main(binary):
            and st.get("id") == "long" and st.get("cancelled") is True, (got, st, quick))
     _, st = k.run("SELECT 1 AS v;")
     report("the session goes on after a cancelled run with side requests", st["ok"], st)
+    k.p.stdin.write((json.dumps({"op": "run", "id": "long2", "script": "WITH a AS (SELECT * FROM range(20000)), b AS (SELECT * FROM range(20000)) "
+                                 "SELECT count(DISTINCT a.range * 100000 + b.range) AS n FROM a CROSS JOIN b;"}) + "\n"
+                     + json.dumps({"op": "hover", "id": "hv2", "script": "SELECT twice(1) AS v", "pos": 8}) + "\n").encode())
+    k.p.stdin.flush()
+    first = None
+    while first is None:
+        h = json.loads(k.p.stdout.readline())
+        if h["type"] == "data":
+            k.p.stdout.read(h["len"])
+        elif h["type"] == "status":
+            first = h
+    k.send(op="cancel", id="long2")
+    _, st = k.reply()
+    report("a hover sent the instant after a run answers before it, not after", first.get("id") == "hv2" and st.get("id") == "long2", (first, st))
+    letfile = "-- the answer\nLET answer = 41 + 1;\nSELECT $answer AS a;"
+    k.run(letfile)
+    k.send(op="hover", id="hl", script=letfile, pos=letfile.index("$answer") + 2)
+    _, st = k.reply()
+    hl = st.get("hover") or {}
+    report("hover on a file's own LET shows the value the session holds once the file ran",
+           hl.get("kind") == "let" and hl.get("value") == 42 and hl.get("type") == "int", st)
 
     # Columns count UTF-16 units under utf16, in errors as in hover.
     bad = "SELECT 'é😀' AS a, nope FROM range(1);"

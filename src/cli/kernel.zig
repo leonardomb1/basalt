@@ -67,10 +67,10 @@
 //!
 //! Threads and fds. A stdin thread reads requests: `cancel` acts there at once,
 //! since it must reach a busy script, and only stops the script whose id it
-//! names; while a script runs, a request that only reads the session
-//! (`side_ops`) goes to a side thread, answered at once from a copy of the
-//! session and asking no connection; everything else queues for the main loop
-//! in order. The main loop alone writes the session, holding `Shared.lock`. ^C
+//! names; while the main loop is busy (a script running or about to, anything
+//! answered or queued), a request that only reads the session (`side_ops`) goes
+//! to a side thread, answered at once from a copy of the session and asking no
+//! connection; everything else queues for the main loop in order. The main loop alone writes the session, holding `Shared.lock`. ^C
 //! cancels the script, never the session (the CLI's own handler exits on a second signal,
 //! taking every declaration with it). Frames go to a private dup of stdout; fd 1
 //! points at stderr between scripts, so a stray write cannot corrupt the stream,
@@ -124,6 +124,8 @@ const Queue = struct {
     eof: bool = false,
     running: ?[]const u8 = null,
     active: bool = false,
+    /// The main loop is answering a request it popped: from `pop` until `idle`.
+    busy: bool = false,
 
     fn push(self: *Queue, line: []u8) !void {
         self.mu.lock();
@@ -144,13 +146,21 @@ const Queue = struct {
         defer self.mu.unlock();
         while (self.items.items.len == 0 and !self.eof) self.cond.wait(&self.mu);
         if (self.items.items.len == 0) return null;
+        self.busy = true;
         return self.items.orderedRemove(0);
     }
 
-    fn isActive(self: *Queue) bool {
+    fn idle(self: *Queue) void {
         self.mu.lock();
         defer self.mu.unlock();
-        return self.active;
+        self.busy = false;
+    }
+
+    /// Whether a request sent now would wait: one is being answered or queued.
+    fn isBusy(self: *Queue) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.busy or self.items.items.len > 0;
     }
 
     fn setRunning(self: *Queue, id: ?[]const u8) void {
@@ -266,6 +276,7 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     reader.detach();
 
     while (queue.pop()) |raw| {
+        defer queue.idle();
         defer pagecache.trim();
         defer alloc.free(raw);
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -330,9 +341,10 @@ fn answer(gpa: std.mem.Allocator, a: std.mem.Allocator, out: *Out, shared: *Shar
     return lookupScript(gpa, a, out, decls, shared.catalog, req);
 }
 
-/// The side thread: what the reader routes here while a script runs, answered at
-/// once from a copy of the session as it stands, with no connection asked, as one
-/// may be busy with the script: what connections said before is still offered.
+/// The side thread: what the reader routes here while the main loop is busy,
+/// answered at once from a copy of the session as it stands, with no connection
+/// asked, as one may be busy with a script: what connections said before is still
+/// offered.
 fn sideLoop(alloc: std.mem.Allocator, out: *Out, q: *Queue, shared: *Shared) void {
     while (q.pop()) |raw| {
         defer alloc.free(raw);
@@ -543,8 +555,9 @@ fn withComments(script: []const u8, entry: cli.Prepared, stmt: []const u8) []con
     return std.mem.trim(u8, script[from .. off + own.len], " \t\r\n");
 }
 
-/// Reads requests: a cancel acts at once; while a script runs, one of `side_ops`
-/// goes to the side thread; anything else waits its turn on the main loop.
+/// Reads requests: a cancel acts at once; while the main loop is busy, with a script
+/// running or about to, or anything else answered or queued, one of `side_ops` goes
+/// to the side thread; anything else waits its turn on the main loop.
 fn readRequests(alloc: std.mem.Allocator, q: *Queue, side_q: *Queue) void {
     defer q.close();
     defer side_q.close();
@@ -563,7 +576,7 @@ fn readRequests(alloc: std.mem.Allocator, q: *Queue, side_q: *Queue) void {
                 if (id) |s| alloc.free(s);
             } else {
                 const line = alloc.dupe(u8, t) catch return;
-                const to = if (q.isActive() and sideRequest(alloc, t)) side_q else q;
+                const to = if (q.isBusy() and sideRequest(alloc, t)) side_q else q;
                 to.push(line) catch {
                     alloc.free(line);
                     return;
