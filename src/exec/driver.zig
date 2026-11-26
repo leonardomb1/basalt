@@ -83,6 +83,13 @@ pub fn resetAbort() void {
     g_abort.store(false, .seq_cst);
 }
 
+/// `error.Aborted` once the run is cancelled, for a loop that pulls no batch and may
+/// run long (a rehash, a set turned into pairs, a final fold): checked at every
+/// `every`-th step, a power of two, so the loop stays cheap.
+pub inline fn stopEvery(i: usize, comptime every: usize) error{Aborted}!void {
+    if (i & (every - 1) == 0 and aborting()) return error.Aborted;
+}
+
 pub const ScanTally = struct {
     row_groups: std.atomic.Value(u64) = .init(0),
     row_groups_skipped: std.atomic.Value(u64) = .init(0),

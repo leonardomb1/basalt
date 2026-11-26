@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const keytable = @import("../../keytable.zig");
+const driver = @import("../../driver.zig");
 
 pub const max_words: usize = 1 << 19;
 const chunk: u64 = 64;
@@ -90,7 +91,10 @@ pub const Bits = struct {
         const parts: u64 = keytable.parts;
         const c0 = self.base / chunk;
         var c = c0 + (p + parts - c0 % parts) % parts;
+        var step: usize = 0;
         while (c * chunk < end) : (c += parts) {
+            try driver.stopEvery(step, 1 << 8);
+            step += 1;
             const lo = @max(c * chunk, self.base);
             const hi = @min((c + 1) * chunk, end);
             try f(ctx, @as(usize, @intCast(lo - self.base)), @as(usize, @intCast(hi - self.base)));

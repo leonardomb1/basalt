@@ -30,6 +30,7 @@ const keyhash = @import("../../keyhash.zig");
 const keytable = @import("../../keytable.zig");
 const ast = @import("../../../lang/ast.zig");
 const Bits = @import("bits.zig").Bits;
+const driver = @import("../../driver.zig");
 const std = @import("std");
 const types = @import("../../../lang/types.zig");
 
@@ -234,7 +235,13 @@ pub const Pairs = struct {
         const runs = try keytable.Runs(i64).init(scratch, self.parts.len, nk, pof, &.{}, hashes, keys, &.{});
         for (self.parts, 0..) |*part, p| {
             var v = Record(FixedStore){ .tb = &part.table, .st = part.store.fixed };
-            try keytable.probe(FixedStore, .dupe, &runs, runs.starts[p], runs.starts[p + 1], &v);
+            var lo = runs.starts[p];
+            while (lo < runs.starts[p + 1]) {
+                if (driver.aborting()) return error.Aborted;
+                const hi = @min(lo + (1 << 16), runs.starts[p + 1]);
+                try keytable.probe(FixedStore, .dupe, &runs, lo, hi, &v);
+                lo = hi;
+            }
         }
     }
 
@@ -323,6 +330,7 @@ pub const Pairs = struct {
         try self.toPairs();
         switch (src.parts[sp].store) {
             .fixed => |st| for (0..st.len) |i| {
+                try driver.stopEvery(i, 1 << 16);
                 const r = st.at(i);
                 if (remap) |rm| {
                     const key = [2]i64{ rm[@intCast(r.keys[0])], r.keys[1] };
@@ -330,6 +338,7 @@ pub const Pairs = struct {
                 } else try put(part, st.hashAt(i), r.keys);
             },
             .boxed => |st| for (0..st.len) |i| {
+                try driver.stopEvery(i, 1 << 16);
                 const r = st.at(i);
                 if (remap) |rm| {
                     const key = [2]Value{ .{ .int = rm[@intCast(r.keys[0].int)] }, r.keys[1] };
@@ -362,12 +371,14 @@ pub const Pairs = struct {
         }
         switch (self.parts[p].store) {
             .fixed => |st| for (0..st.len) |i| {
+                try driver.stopEvery(i, 1 << 16);
                 const r = st.at(i);
                 const ord: usize = if (self.grouped) @intCast(r.keys[0]) else 0;
                 const v = keytable.wordValue(self.ty.kind, r.keys[r.keys.len - 1], strs);
                 try k.add(into.tail(ord) + off, v, cx);
             },
             .boxed => |st| for (0..st.len) |i| {
+                try driver.stopEvery(i, 1 << 16);
                 const r = st.at(i);
                 const ord: usize = if (self.grouped) @intCast(r.keys[0].int) else 0;
                 try k.add(into.tail(ord) + off, r.keys[r.keys.len - 1], cx);

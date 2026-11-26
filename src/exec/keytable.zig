@@ -13,6 +13,7 @@ const Value = @import("value.zig").Value;
 const decimal = @import("../base/decimal.zig");
 const column = @import("column.zig");
 const keyhash = @import("keyhash.zig");
+const driver = @import("driver.zig");
 const textconv = @import("textconv.zig");
 const types = @import("../lang/types.zig");
 const std = @import("std");
@@ -569,14 +570,17 @@ pub const GroupTable = struct {
     /// record, the records read a few entries ahead, and free the outgrown entries
     /// (an arena kept every outgrown table). Walking the old entries writes the new
     /// table nearly in order; walking the records wrote it at random and was slower.
+    /// A cancelled run stops it, the table left as it was.
     fn grow(self: *GroupTable, store: anytype) !void {
         tally(&self.counts, .rehashes, 1);
         tally(&self.counts, .moved, self.len);
         const cap = self.entries.len * growth;
         const ne = try self.alloc.alloc(u32, cap);
+        errdefer self.alloc.free(ne);
         @memset(ne, 0);
         const nmask = cap - 1;
         for (self.entries, 0..) |e, ei| {
+            try driver.stopEvery(ei, 1 << 16);
             if (ei + prefetch_ahead < self.entries.len) {
                 const ahead = self.entries[ei + prefetch_ahead];
                 if (ahead != 0) @prefetch(store.recs.base((ahead & max_groups) - 1), .{ .rw = .read, .locality = 3 });
@@ -1161,6 +1165,34 @@ test "probe: two-column keys with NULLs just past each table bound keep one reco
         try std.testing.expectEqual((n + 1) / 2, side.misses);
         for (0..n) |r| if (r % 2 == 1) try std.testing.expectEqual(held[r], side.slots[r]);
     }
+}
+
+test "grow: a cancelled run stops a rehash, the table and its records left whole" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const payload = NoPayload{};
+    const n: usize = 200;
+    const keys = try a.alloc(i64, n);
+    const masks = try a.alloc(u64, n);
+    const hashes = try a.alloc(u64, n);
+    for (0..n) |r| {
+        keys[r] = @intCast(r);
+        masks[r] = 0;
+        hashes[r] = fixedHash(keys[r..][0..1], 0);
+    }
+    const runs = Runs(i64).over(1, &.{}, hashes, keys, masks);
+    var tb = try GroupTable.init(std.testing.allocator, 16);
+    defer tb.deinit();
+    var st = FixedStore(NoPayload).init(a, 1, &payload);
+    var side = TestSide(FixedStore(NoPayload)){ .tb = &tb, .st = &st, .slots = try a.alloc(u32, n) };
+    driver.requestAbort();
+    const stopped = probe(FixedStore(NoPayload), .alias, &runs, 0, n, &side);
+    driver.resetAbort();
+    try std.testing.expectError(error.Aborted, stopped);
+    try std.testing.expect(st.len > 0 and st.len < n);
+    try probe(FixedStore(NoPayload), .alias, &runs, 0, n, &side);
+    try std.testing.expectEqual(n, st.len);
 }
 
 test "probe: boxed string keys are copied once a key and found again" {
