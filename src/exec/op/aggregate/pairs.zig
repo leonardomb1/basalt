@@ -329,21 +329,25 @@ pub const Pairs = struct {
         }
         try self.toPairs();
         switch (src.parts[sp].store) {
-            .fixed => |st| for (0..st.len) |i| {
-                try driver.stopEvery(i, 1 << 16);
-                const r = st.at(i);
-                if (remap) |rm| {
-                    const key = [2]i64{ rm[@intCast(r.keys[0])], r.keys[1] };
-                    try put(part, keytable.fixedHash(&key, 0), &key);
-                } else try put(part, st.hashAt(i), r.keys);
+            .fixed => |st| {
+                var sl = driver.slices(0, st.len);
+                while (try sl.next()) |s| for (s[0]..s[1]) |i| {
+                    const r = st.at(i);
+                    if (remap) |rm| {
+                        const key = [2]i64{ rm[@intCast(r.keys[0])], r.keys[1] };
+                        try put(part, keytable.fixedHash(&key, 0), &key);
+                    } else try put(part, st.hashAt(i), r.keys);
+                };
             },
-            .boxed => |st| for (0..st.len) |i| {
-                try driver.stopEvery(i, 1 << 16);
-                const r = st.at(i);
-                if (remap) |rm| {
-                    const key = [2]Value{ .{ .int = rm[@intCast(r.keys[0].int)] }, r.keys[1] };
-                    try putBoxed(part, keyhash.MultiKeyCtx.hash(.{}, &key), &key);
-                } else try putBoxed(part, st.hashAt(i), r.keys);
+            .boxed => |st| {
+                var sl = driver.slices(0, st.len);
+                while (try sl.next()) |s| for (s[0]..s[1]) |i| {
+                    const r = st.at(i);
+                    if (remap) |rm| {
+                        const key = [2]Value{ .{ .int = rm[@intCast(r.keys[0].int)] }, r.keys[1] };
+                        try putBoxed(part, keyhash.MultiKeyCtx.hash(.{}, &key), &key);
+                    } else try putBoxed(part, st.hashAt(i), r.keys);
+                };
             },
         }
     }
@@ -370,18 +374,22 @@ pub const Pairs = struct {
             return;
         }
         switch (self.parts[p].store) {
-            .fixed => |st| for (0..st.len) |i| {
-                try driver.stopEvery(i, 1 << 16);
-                const r = st.at(i);
-                const ord: usize = if (self.grouped) @intCast(r.keys[0]) else 0;
-                const v = keytable.wordValue(self.ty.kind, r.keys[r.keys.len - 1], strs);
-                try k.add(into.tail(ord) + off, v, cx);
+            .fixed => |st| {
+                var sl = driver.slices(0, st.len);
+                while (try sl.next()) |s| for (s[0]..s[1]) |i| {
+                    const r = st.at(i);
+                    const ord: usize = if (self.grouped) @intCast(r.keys[0]) else 0;
+                    const v = keytable.wordValue(self.ty.kind, r.keys[r.keys.len - 1], strs);
+                    try k.add(into.tail(ord) + off, v, cx);
+                };
             },
-            .boxed => |st| for (0..st.len) |i| {
-                try driver.stopEvery(i, 1 << 16);
-                const r = st.at(i);
-                const ord: usize = if (self.grouped) @intCast(r.keys[0].int) else 0;
-                try k.add(into.tail(ord) + off, r.keys[r.keys.len - 1], cx);
+            .boxed => |st| {
+                var sl = driver.slices(0, st.len);
+                while (try sl.next()) |s| for (s[0]..s[1]) |i| {
+                    const r = st.at(i);
+                    const ord: usize = if (self.grouped) @intCast(r.keys[0].int) else 0;
+                    try k.add(into.tail(ord) + off, r.keys[r.keys.len - 1], cx);
+                };
             },
         }
     }

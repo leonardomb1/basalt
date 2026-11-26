@@ -90,15 +90,16 @@ pub const Bits = struct {
         const end = self.base + n;
         const parts: u64 = keytable.parts;
         const c0 = self.base / chunk;
-        var c = c0 + (p + parts - c0 % parts) % parts;
-        var step: usize = 0;
-        while (c * chunk < end) : (c += parts) {
-            try driver.stopEvery(step, 1 << 8);
-            step += 1;
+        const first = c0 + (p + parts - c0 % parts) % parts;
+        if (first * chunk >= end) return;
+        const nchunks: usize = @intCast((end - first * chunk + parts * chunk - 1) / (parts * chunk));
+        var sl = driver.slicesBy(0, nchunks, driver.slice_steps / (chunk * 64));
+        while (try sl.next()) |s| for (s[0]..s[1]) |k| {
+            const c = first + k * parts;
             const lo = @max(c * chunk, self.base);
             const hi = @min((c + 1) * chunk, end);
             try f(ctx, @as(usize, @intCast(lo - self.base)), @as(usize, @intCast(hi - self.base)));
-        }
+        };
     }
 
     /// How many values partition `p` holds.

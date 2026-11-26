@@ -407,7 +407,7 @@ pub const Mapped = struct {
                 c.before = countReleasing(ctx.m.data[c.lo..c.hi], ctx.term);
             }
         };
-        par.each(n, n, &Count{ .m = self, .term = term }, Count.one);
+        try par.each(n, n, &Count{ .m = self, .term = term }, Count.one);
         var before: u64 = 0;
         for (self.cuts) |*c| {
             const here = c.before;

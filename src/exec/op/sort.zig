@@ -44,6 +44,7 @@ const intBatch = @import("testing_util.zig").intBatch;
 const int_schema = @import("testing_util.zig").int_schema;
 const linearize = @import("../op.zig").linearize;
 const par = @import("../par.zig");
+const driver = @import("../driver.zig");
 const testing = std.testing;
 
 pub const Sort = struct {
@@ -571,7 +572,23 @@ pub const Held = struct {
         defer tmp.deinit();
         const t = tmp.allocator();
         const idx = try self.ar.allocator().alloc(usize, self.rows);
-        for (idx, 0..) |*x, i| x.* = i;
+        const nc = par.chunks(idx.len, 1 << 16);
+        const Count = struct {
+            idx: []usize,
+            nc: usize,
+            fn f(c: *const @This(), i: usize) void {
+                const b = par.bounds(c.idx.len, c.nc, i);
+                for (c.idx[b[0]..b[1]], b[0]..) |*x, r| x.* = r;
+            }
+        };
+        if (threads > 1) {
+            try par.each(threads, nc, &Count{ .idx = idx, .nc = nc }, Count.f);
+        } else {
+            var sl = driver.slices(0, idx.len);
+            while (try sl.next()) |r| for (idx[r[0]..r[1]], r[0]..) |*x, i| {
+                x.* = i;
+            };
+        }
         const arrs = try t.alloc(KeyArr, keys.len);
         for (keys, arrs) |k, *x| x.* = try KeyArr.prepareThreads(t, try self.whole(t, k.idx, threads), k, threads);
         try sortIdxMarked(t, idx, arrs, threads, m);
@@ -585,10 +602,30 @@ pub const Held = struct {
             at += b.len;
         }
         const refs: []Ref = @as([*]Ref, @ptrCast(idx.ptr))[0..idx.len];
-        for (0..idx.len) |i| {
-            const g = idx[i];
-            const c = chunk_of[g];
-            refs[i] = .{ .chunk = c, .row = @intCast(g - starts[c]) };
+        const ToRefs = struct {
+            idx: []usize,
+            refs: []Ref,
+            chunk_of: []const u32,
+            starts: []const usize,
+            nc: usize,
+            fn f(c: *const @This(), i: usize) void {
+                const b = par.bounds(c.idx.len, c.nc, i);
+                for (b[0]..b[1]) |r| {
+                    const g = c.idx[r];
+                    const ch = c.chunk_of[g];
+                    c.refs[r] = .{ .chunk = ch, .row = @intCast(g - c.starts[ch]) };
+                }
+            }
+        };
+        if (threads > 1) {
+            try par.each(threads, nc, &ToRefs{ .idx = idx, .refs = refs, .chunk_of = chunk_of, .starts = starts, .nc = nc }, ToRefs.f);
+        } else {
+            var sl = driver.slices(0, idx.len);
+            while (try sl.next()) |r| for (r[0]..r[1]) |i| {
+                const g = idx[i];
+                const c = chunk_of[g];
+                refs[i] = .{ .chunk = c, .row = @intCast(g - starts[c]) };
+            };
         }
         self.refs = refs;
         self.pos = 0;
@@ -596,11 +633,20 @@ pub const Held = struct {
         return if (mk.ok) mk else null;
     }
 
-    /// Column `ci` of every row, in order, gathered into `a`.
-    pub fn sortedColumn(self: *Held, a: std.mem.Allocator, ci: usize) !column.Column {
+    /// Column `ci` of every row, in order, gathered into `a`: past one slice of rows
+    /// (`driver.slices`), a slice at a time, so a cancelled run stops the gather within
+    /// one, the slices then laid end to end on up to `threads` threads.
+    pub fn sortedColumn(self: *Held, a: std.mem.Allocator, ci: usize, threads: usize) !column.Column {
         const srcs = try a.alloc(column.Column, self.chunks.items.len);
         for (srcs, self.chunks.items) |*s, b| s.* = b.columns[ci];
-        return column.takeAcross(a, srcs, self.refs);
+        if (self.refs.len <= driver.slice_steps) return column.takeAcross(a, srcs, self.refs);
+        var parts_ar = std.heap.ArenaAllocator.init(self.gpa);
+        defer parts_ar.deinit();
+        const pa = parts_ar.allocator();
+        var parts: std.ArrayList(column.Column) = .empty;
+        var sl = driver.slices(0, self.refs.len);
+        while (try sl.next()) |s| try parts.append(pa, try column.takeAcross(pa, srcs, self.refs[s[0]..s[1]]));
+        return column.concatThreads(a, parts.items, self.refs.len, threads);
     }
 
     /// Columns of the next up to `max_rows` ordered rows, gathered into `arena`, into
@@ -878,7 +924,7 @@ pub const KeyArr = struct {
             }
         };
         const out = try arena.alloc([]const u8, col.len);
-        par.each(threads, nc, &Fill{ .b = col.data.bytes, .out = out, .nc = nc }, Fill.f);
+        try par.each(threads, nc, &Fill{ .b = col.data.bytes, .out = out, .nc = nc }, Fill.f);
         return .{ .desc = key.desc, .nulls_first = key.nulls_first, .valid = col.validity, .data = .{ .strs = out }, .col = col, .scale = 0 };
     }
 
@@ -1041,7 +1087,8 @@ fn sortRows(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans:
     for (plans) |p| stride += p.words + @intFromBool(p.nulls);
     const recs = try arena.alloc(u64, n * stride);
     const tmp = try arena.alloc(u64, n * stride);
-    for (idx, 0..) |row, r| {
+    var sl = driver.slices(0, n);
+    while (try sl.next()) |s| for (idx[s[0]..s[1]], s[0]..) |row, r| {
         const rec = recs[r * stride ..][0..stride];
         var o: usize = 0;
         for (arrs, plans) |k, p| {
@@ -1053,9 +1100,12 @@ fn sortRows(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans:
             o += p.words;
         }
         rec[o] = row;
-    }
-    msdSort(recs, tmp, stride, 0);
-    for (idx, 0..) |*x, r| x.* = @intCast(recs[r * stride + stride - 1]);
+    };
+    try msdSort(recs, tmp, stride, 0);
+    sl = driver.slices(0, n);
+    while (try sl.next()) |s| for (idx[s[0]..s[1]], s[0]..) |*x, r| {
+        x.* = @intCast(recs[r * stride + stride - 1]);
+    };
     if (!exact) fixTies(idx, arrs, plans);
     if (marks) |mk| markGroups(recs, stride, plans, mk, at);
 }
@@ -1081,8 +1131,9 @@ fn markGroups(recs: []const u64, stride: usize, plans: []const KeyPlan, mk: *Mar
 /// row number left as the tie-break. Bytes every record shares are skipped, found in
 /// one pass per word; the scatter is stable, so records equal on every key keep the
 /// order they came in, and a small bucket goes to an insertion sort on the words
-/// with the row number last.
-pub fn msdSort(recs: []u64, tmp: []u64, stride: usize, d0: usize) void {
+/// with the row number last. Each pass runs in `driver.slices`, so a cancelled run
+/// stops the sort within one.
+pub fn msdSort(recs: []u64, tmp: []u64, stride: usize, d0: usize) error{Aborted}!void {
     const n = recs.len / stride;
     if (n < 2) return;
     const nkey = stride - 1;
@@ -1092,8 +1143,10 @@ pub fn msdSort(recs: []u64, tmp: []u64, stride: usize, d0: usize) void {
         const wi = d / 8;
         const first = recs[wi];
         var diff: u64 = 0;
-        var r: usize = 0;
-        while (r < n) : (r += 1) diff |= recs[r * stride + wi] ^ first;
+        var sl = driver.slices(0, n);
+        while (try sl.next()) |s| for (s[0]..s[1]) |r| {
+            diff |= recs[r * stride + wi] ^ first;
+        };
         const done: u6 = @intCast((d % 8) * 8);
         diff &= @as(u64, std.math.maxInt(u64)) >> done;
         if (diff == 0) {
@@ -1106,21 +1159,24 @@ pub fn msdSort(recs: []u64, tmp: []u64, stride: usize, d0: usize) void {
     const wi = d / 8;
     const sh: u6 = @intCast(56 - (d % 8) * 8);
     var counts = [_]usize{0} ** 257;
-    var r: usize = 0;
-    while (r < n) : (r += 1) counts[@as(usize, @intCast((recs[r * stride + wi] >> sh) & 0xff)) + 1] += 1;
+    var sl = driver.slices(0, n);
+    while (try sl.next()) |s| for (s[0]..s[1]) |r| {
+        counts[@as(usize, @intCast((recs[r * stride + wi] >> sh) & 0xff)) + 1] += 1;
+    };
     for (1..257) |b| counts[b] += counts[b - 1];
     var fill: [256]usize = counts[0..256].*;
-    r = 0;
-    while (r < n) : (r += 1) {
+    sl = driver.slices(0, n);
+    while (try sl.next()) |s| for (s[0]..s[1]) |r| {
         const b: usize = @intCast((recs[r * stride + wi] >> sh) & 0xff);
         @memcpy(tmp[fill[b] * stride ..][0..stride], recs[r * stride ..][0..stride]);
         fill[b] += 1;
-    }
-    @memcpy(recs, tmp);
+    };
+    sl = driver.slices(0, n);
+    while (try sl.next()) |s| @memcpy(recs[s[0] * stride .. s[1] * stride], tmp[s[0] * stride .. s[1] * stride]);
     for (0..256) |b| {
         const lo = counts[b];
         const hi = counts[b + 1];
-        if (hi - lo > 1) msdSort(recs[lo * stride .. hi * stride], tmp[lo * stride .. hi * stride], stride, d + 1);
+        if (hi - lo > 1) try msdSort(recs[lo * stride .. hi * stride], tmp[lo * stride .. hi * stride], stride, d + 1);
     }
 }
 
@@ -1167,7 +1223,11 @@ const Deal = struct {
     start: [max_ranges + 1]usize = undefined,
     errs: [max_ranges]?anyerror = @splat(null),
 
-    const max_ranges = 128;
+    const max_ranges = 255;
+
+    /// The rows a range is cut toward, so sorting one is a bounded unit of work, which
+    /// a cancelled run stops between (`par.each`), however many rows or threads.
+    const range_rows = 1 << 20;
 
     fn rows(d: *const Deal, c: usize) [2]usize {
         return par.bounds(d.idx.len, d.nc, c);
@@ -1236,9 +1296,10 @@ const Deal = struct {
 };
 
 /// Deal rows, in input order, into ranges of the first key split where a histogram
-/// puts about an even share in each, a few per thread so a slow core takes fewer
-/// (nulls in a range of their own, first or last as the key places them), and sort
-/// each range. False when not worth it or the first key cannot split.
+/// puts about an even share in each, a few per thread so a slow core takes fewer,
+/// and no more than about `range_rows` in each where the key's leading bits spread
+/// them (nulls in a range of their own, first or last as the key places them), and
+/// sort each range. False when not worth it or the first key cannot split.
 fn sortIdxParallel(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr, plans: []const KeyPlan, exact: bool, threads: usize, marks: ?*Marks) !bool {
     const n = idx.len;
     if (threads < 2 or n < 1 << 17) return false;
@@ -1258,7 +1319,7 @@ fn sortIdxParallel(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr,
         .exact = exact,
         .marks = marks,
     };
-    par.each(threads, nc, &d, Deal.scan);
+    try par.each(threads, nc, &d, Deal.scan);
     var lo: u64 = std.math.maxInt(u64);
     var hi: u64 = 0;
     for (d.lo, d.hi) |l, h| {
@@ -1269,14 +1330,14 @@ fn sortIdxParallel(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr,
     const bits: u32 = 64 - @clz(hi - lo);
     d.lo_all = lo;
     d.shift = @intCast(if (bits > 11) bits - 11 else 0);
-    par.each(threads, nc, &d, Deal.histogram);
+    try par.each(threads, nc, &d, Deal.histogram);
     var hist = [_]u32{0} ** (1 << 11);
     var nonnull: usize = 0;
     for (d.hist) |h| for (&hist, h) |*t, x| {
         t.* += x;
         nonnull += x;
     };
-    const want = @min(threads * 4, Deal.max_ranges - 1);
+    const want = @min(@max(threads * 4, (n + Deal.range_rows - 1) / Deal.range_rows), Deal.max_ranges - 1);
     var cur: usize = 0;
     var acc: usize = 0;
     for (hist, &d.of_digit) |h, *dg| {
@@ -1289,7 +1350,7 @@ fn sortIdxParallel(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr,
     if (d.k.nulls_first) {
         for (&d.of_digit) |*dg| dg.* += 1;
     }
-    par.each(threads, nc, &d, Deal.count);
+    try par.each(threads, nc, &d, Deal.count);
     var size = [_]usize{0} ** Deal.max_ranges;
     for (d.pos) |pp| for (size[0..nranges], pp[0..nranges]) |*t, x| {
         t.* += x;
@@ -1303,8 +1364,8 @@ fn sortIdxParallel(arena: std.mem.Allocator, idx: []usize, arrs: []const KeyArr,
         x.* = t.*;
         t.* += c;
     };
-    par.each(threads, nc, &d, Deal.scatter);
-    par.each(threads, nranges, &d, Deal.sortRange);
+    try par.each(threads, nc, &d, Deal.scatter);
+    try par.each(threads, nranges, &d, Deal.sortRange);
     for (d.errs[0..nranges]) |e| if (e) |err| return err;
     if (marks) |mk| {
         for (0..nranges) |g| if (d.start[g] < d.start[g + 1]) {
@@ -1590,6 +1651,55 @@ test "sortIdxMarked: the marks read off the key words start a group exactly wher
                 std.debug.print("round {d} row {d} peer\n", .{ round, r });
                 return e;
             };
+        }
+    }
+}
+
+test "msdSort: a cancelled run stops a pass within one slice" {
+    const n = 3 * driver.slice_steps;
+    const recs = try testing.allocator.alloc(u64, n * 2);
+    defer testing.allocator.free(recs);
+    const tmp = try testing.allocator.alloc(u64, n * 2);
+    defer testing.allocator.free(tmp);
+    for (0..n) |r| {
+        recs[2 * r] = (r * 7919) % 100_003;
+        recs[2 * r + 1] = r;
+    }
+    driver.requestAbort();
+    defer driver.resetAbort();
+    try testing.expectError(error.Aborted, msdSort(recs, tmp, 2, 0));
+}
+
+test "Held.sortedColumn: a gather past one slice, a slice at a time, is the gather in one" {
+    var ar = std.heap.ArenaAllocator.init(testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const kv = @import("testing_util.zig").kvBatch;
+    const schema = @import("testing_util.zig").join_left_schema;
+    for ([_]usize{ 1, 4 }) |threads| {
+        const h = try Held.create(testing.allocator);
+        defer h.destroy();
+        for (0..3) |c| {
+            const n: usize = 50_000;
+            const ints = try a.alloc(?i64, n);
+            const strs = try a.alloc(?[]const u8, n);
+            for (0..n) |r| {
+                const v: i64 = @intCast((r * 7919 + c * 13) % 100_003);
+                ints[r] = v;
+                strs[r] = if (r % 17 == 0) null else try std.fmt.allocPrint(a, "w{d}", .{v});
+            }
+            try h.add(try kv(a, &schema, ints, strs));
+        }
+        try h.order(&.{.{ .idx = 0, .desc = false, .nulls_first = false }}, threads);
+        const got = try h.sortedColumn(a, 1, threads);
+        const srcs = try a.alloc(column.Column, h.chunks.items.len);
+        for (srcs, h.chunks.items) |*x, b| x.* = b.columns[1];
+        const want = try column.takeAcross(a, srcs, h.refs);
+        try testing.expectEqual(want.len, got.len);
+        for (0..want.len) |r| {
+            const w = want.getValue(r);
+            const g = got.getValue(r);
+            if (w.isNull()) try testing.expect(g.isNull()) else try testing.expectEqualStrings(w.string, g.string);
         }
     }
 }

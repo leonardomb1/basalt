@@ -55,6 +55,7 @@ const Value = @import("../value.zig").Value;
 const ast = @import("../../lang/ast.zig");
 const column = @import("../column.zig");
 const par = @import("../par.zig");
+const driver = @import("../driver.zig");
 const errLabel = @import("../op.zig").errLabel;
 const eval = @import("../eval.zig");
 const floatord = @import("../floatord.zig");
@@ -206,7 +207,7 @@ pub const Window = struct {
             .gnew = if (marks) |m| m.peer else try arena.alloc(bool, n),
             .carry = try arena.alloc(LayoutCtx.Carry, nc),
         };
-        if (marks == null) par.each(threads, nc, &lc, LayoutCtx.mark);
+        if (marks == null) try par.each(threads, nc, &lc, LayoutCtx.mark);
         var ps: usize = 0;
         var gs: usize = 0;
         for (lc.carry, 0..) |*c, i| {
@@ -247,7 +248,7 @@ pub const Window = struct {
                 break;
             };
         }
-        par.each(threads, nc, &lc, LayoutCtx.fill);
+        try par.each(threads, nc, &lc, LayoutCtx.fill);
         return lc.l;
     }
 
@@ -357,6 +358,7 @@ pub const Window = struct {
             const pe = l.pend[ps];
             if (!fr.range) {
                 for (ps..pe) |k| {
+                    try driver.atStep(k);
                     const ki: i64 = @intCast(k);
                     const lo: i64 = @intCast(ps);
                     const hi: i64 = @intCast(pe);
@@ -379,12 +381,13 @@ pub const Window = struct {
                 }
             } else if (rk) |keys| {
                 if (keys.float) {
-                    rangeOffsets(f64, keys.floats, keys.null_at, l, fr, ps, pe, fs, fe);
+                    try rangeOffsets(f64, keys.floats, keys.null_at, l, fr, ps, pe, fs, fe);
                 } else {
-                    rangeOffsets(i128, keys.ints, keys.null_at, l, fr, ps, pe, fs, fe);
+                    try rangeOffsets(i128, keys.ints, keys.null_at, l, fr, ps, pe, fs, fe);
                 }
             } else {
                 for (ps..pe) |k| {
+                    try driver.atStep(k);
                     const s = switch (fr.start) {
                         .unbounded_preceding => ps,
                         .current_row => l.gstart[k],
@@ -412,7 +415,7 @@ pub const Window = struct {
     /// block `[lo, hi)`, the nulls before or after it: each offset edge is the first
     /// position past a target, found by a pointer that only moves forward as the keys
     /// grow.
-    fn rangeOffsets(comptime T: type, keys: []const T, null_at: []const bool, l: Layout, fr: Frame, ps: usize, pe: usize, fs: []usize, fe: []usize) void {
+    fn rangeOffsets(comptime T: type, keys: []const T, null_at: []const bool, l: Layout, fr: Frame, ps: usize, pe: usize, fs: []usize, fe: []usize) error{Aborted}!void {
         var lo = ps;
         while (lo < pe and null_at[lo]) lo += 1;
         var hi = lo;
@@ -432,6 +435,7 @@ pub const Window = struct {
         var sp = Ptr{ .at = lo };
         var ep = Ptr{ .at = lo };
         for (ps..pe) |k| {
+            try driver.atStep(k);
             const is_null = null_at[k];
             const s: usize = switch (fr.start) {
                 .unbounded_preceding => ps,
@@ -874,6 +878,7 @@ pub const Window = struct {
                 if (fr.exclude == .none) return slide(false, col, fr, l, cx, &s, bd);
                 if (comptime takesAnyOut(A)) return slide(true, col, fr, l, cx, &s, bd);
                 for (0..fr.fs.len) |k| {
+                    if (driver.aborting()) return error.Aborted;
                     if (@hasDecl(A, "reset")) A.reset(&s) else s = .{};
                     for (fr.fs[k]..fr.fe[k]) |j| {
                         if (fr.excluded(l, k, j)) continue;
@@ -895,6 +900,7 @@ pub const Window = struct {
                     var lo = k;
                     var hi = k;
                     while (k < pe) : (k += 1) {
+                        try driver.atStep(k);
                         while (hi < fr.fe[k]) : (hi += 1) {
                             if (try at(col, hi, cx)) |x| try step(A.add, s, x, hi, cx);
                         }
@@ -1184,11 +1190,11 @@ pub const Window = struct {
         const sc = try work.alloc(?column.Column, self.in_schema.fields.len);
         @memset(sc, null);
         for (self.funcs) |f| if (f.arg) |ai| {
-            if (sc[ai] == null) sc[ai] = try h.sortedColumn(work, ai);
+            if (sc[ai] == null) sc[ai] = try h.sortedColumn(work, ai, self.threads);
         };
         const l = if (marked) |m| try layout(work, n, &.{}, &.{}, m, self.threads) else blk: {
             for (keys) |k| {
-                if (sc[k.idx] == null) sc[k.idx] = try h.sortedColumn(work, k.idx);
+                if (sc[k.idx] == null) sc[k.idx] = try h.sortedColumn(work, k.idx, self.threads);
             }
             const sorted_keys = try work.alloc(KeyArr, keys.len);
             for (keys, sorted_keys) |k, *x| x.* = try KeyArr.prepareThreads(work, sc[k.idx].?, k, self.threads);
@@ -1199,7 +1205,7 @@ pub const Window = struct {
         for (self.funcs) |f| {
             if (f.frame.range and (f.frame.start == .preceding or f.frame.start == .following or f.frame.end == .preceding or f.frame.end == .following)) {
                 const oi = self.ord[0].idx;
-                if (sc[oi] == null) sc[oi] = try h.sortedColumn(work, oi);
+                if (sc[oi] == null) sc[oi] = try h.sortedColumn(work, oi, self.threads);
                 rk = try self.rangeKeys(work, sc[oi].?);
                 break;
             }
@@ -1218,6 +1224,7 @@ pub const Window = struct {
                         var rk_: i64 = 0;
                         var dr: i64 = 0;
                         for (0..n) |k| {
+                            try driver.atStep(k);
                             if (k == l.pstart[k]) {
                                 rn = 1;
                                 rk_ = 1;
@@ -1241,10 +1248,12 @@ pub const Window = struct {
                         }
                     },
                     .cume_dist => for (0..n) |k| {
+                        try driver.atStep(k);
                         const size = l.pend[k] - l.pstart[k];
                         try bd.append(.{ .float = @as(f64, @floatFromInt(l.gend[k] - l.pstart[k])) / @as(f64, @floatFromInt(size)) });
                     },
                     .ntile => for (0..n) |k| {
+                        try driver.atStep(k);
                         const size: i64 = @intCast(l.pend[k] - l.pstart[k]);
                         const i: i64 = @intCast(k - l.pstart[k]);
                         const q = @divTrunc(size, f.offset);
@@ -1261,20 +1270,24 @@ pub const Window = struct {
                             cnt = try work.alloc(usize, n + 1);
                             var c: usize = 0;
                             for (0..n) |p| {
+                                try driver.atStep(p);
                                 cnt[p] = c;
                                 if (!vc.getValue(p).isNull()) c += 1;
                             }
                             cnt[n] = c;
                             nnpos = try work.alloc(usize, c);
                             c = 0;
-                            for (0..n) |p| if (!vc.getValue(p).isNull()) {
+                            for (0..n) |p| {
+                                try driver.atStep(p);
+                                if (vc.getValue(p).isNull()) continue;
                                 nnpos[c] = p;
                                 c += 1;
-                            };
+                            }
                         }
                         var fr: ?Frames = null;
                         if (kind != .lag and kind != .lead) fr = try frames(work, l, f.frame, rk);
                         for (0..n) |k| {
+                            try driver.atStep(k);
                             const ps = l.pstart[k];
                             const pe = l.pend[k];
                             const v: Value = switch (kind) {

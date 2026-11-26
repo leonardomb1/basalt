@@ -579,8 +579,8 @@ pub const GroupTable = struct {
         errdefer self.alloc.free(ne);
         @memset(ne, 0);
         const nmask = cap - 1;
-        for (self.entries, 0..) |e, ei| {
-            try driver.stopEvery(ei, 1 << 16);
+        var sl = driver.slices(0, self.entries.len);
+        while (try sl.next()) |s| for (self.entries[s[0]..s[1]], s[0]..) |e, ei| {
             if (ei + prefetch_ahead < self.entries.len) {
                 const ahead = self.entries[ei + prefetch_ahead];
                 if (ahead != 0) @prefetch(store.recs.base((ahead & max_groups) - 1), .{ .rw = .read, .locality = 3 });
@@ -590,7 +590,7 @@ pub const GroupTable = struct {
             var i = h & nmask;
             while (ne[i] != 0) i = (i + 1) & nmask;
             ne[i] = e;
-        }
+        };
         self.alloc.free(self.entries);
         self.entries = ne;
         self.mask = nmask;

@@ -511,7 +511,7 @@ pub const JoinIndex = struct {
         b.counts = try state.alloc(u32, b.nc * nparts);
         @memset(b.counts, 0);
         b.nparts = nparts;
-        par.each(threads, b.nc, &b, Build.hashChunk);
+        try par.each(threads, b.nc, &b, Build.hashChunk);
         b.starts = try state.alloc(u32, nparts + 1);
         b.offs = try state.alloc(u32, b.nc * nparts);
         var at: u32 = 0;
@@ -524,14 +524,14 @@ pub const JoinIndex = struct {
         }
         b.starts[nparts] = at;
         b.order = try state.alloc(u32, at);
-        par.each(threads, b.nc, &b, Build.scatterChunk);
+        try par.each(threads, b.nc, &b, Build.scatterChunk);
 
         const tsa = try state.create(std.heap.ThreadSafeAllocator);
         tsa.* = .{ .child_allocator = state };
         b.alloc = tsa.allocator();
         self.parts = try state.alloc(Part, nparts);
-        par.each(threads, nparts, &b, Build.fillPart);
-        if (b.failed) return error.OutOfMemory;
+        try par.each(threads, nparts, &b, Build.fillPart);
+        if (b.failed) |e| return e;
         for (b.nulls) |nl| if (nl) {
             self.has_null_key = true;
             break;
@@ -572,7 +572,7 @@ pub const JoinIndex = struct {
         starts: []u32 = &.{},
         order: []u32 = &.{},
         alloc: std.mem.Allocator = undefined,
-        failed: bool = false,
+        failed: ?anyerror = null,
         vals: []Value = &.{},
 
         fn part(b: *const Build, h: u64) usize {
@@ -616,8 +616,8 @@ pub const JoinIndex = struct {
         }
 
         fn fillPart(b: *Build, p: usize) void {
-            b.fill(p) catch {
-                b.failed = true;
+            b.fill(p) catch |e| {
+                b.failed = e;
             };
         }
 
@@ -635,13 +635,15 @@ pub const JoinIndex = struct {
             pt.boxed.* = .init(b.alloc, ix.keys.len, &head_payload);
             const nk = ix.keys.len;
             std.mem.reverse(u32, rows_);
+            var sl = driver.slices(0, rows_.len);
             if (b.enc) |e| {
                 var v = Link(keytable.FixedStore(Head)){ .ix = ix, .tb = &pt.table, .st = pt.fixed };
-                try keytable.probe(keytable.FixedStore(Head), .alias, &keytable.Runs(i64).over(nk, rows_, b.hashes, e.keys, e.masks), 0, rows_.len, &v);
+                const runs = keytable.Runs(i64).over(nk, rows_, b.hashes, e.keys, e.masks);
+                while (try sl.next()) |r| try keytable.probe(keytable.FixedStore(Head), .alias, &runs, r[0], r[1], &v);
             } else {
                 var v = Link(keytable.GroupStore(Head)){ .ix = ix, .tb = &pt.table, .st = pt.boxed };
                 const vals = keytable.ValueRows{ .cols = ix.build_batch.columns, .idx = ix.keys, .buf = b.vals[(b.nc + p) * nk ..][0..nk], .hashes = b.hashes, .rows = rows_ };
-                try keytable.probe(keytable.GroupStore(Head), .alias, &vals, 0, rows_.len, &v);
+                while (try sl.next()) |r| try keytable.probe(keytable.GroupStore(Head), .alias, &vals, r[0], r[1], &v);
             }
         }
 
@@ -655,6 +657,7 @@ pub const JoinIndex = struct {
             var j = rows_.len;
             while (j > 0) {
                 j -= 1;
+                try driver.atStep(j);
                 const r = rows_[j];
                 if (j >= 8) @prefetch(&t[b.hashes[rows_[j - 8]] & m], .{ .rw = .write, .locality = 3 });
                 const k = keys[r];

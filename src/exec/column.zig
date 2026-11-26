@@ -475,7 +475,7 @@ pub fn concat(arena: std.mem.Allocator, chunks_raw: []const Column, total: usize
 /// the validity, a chunk's bits landing mid-byte, is copied first on this thread.
 pub fn concatThreads(arena: std.mem.Allocator, chunks_raw: []const Column, total: usize, threads: usize) !Column {
     const chunks_in = try spellAll(arena, chunks_raw);
-    if (threads < 2 or chunks_in.len < 2 or total < 1 << 17 or chunks_in[0].data == .nested) return concat(arena, chunks_in, total);
+    if (chunks_in.len < 2 or total < 1 << 17 or chunks_in[0].data == .nested) return concat(arena, chunks_in, total);
     const chunks = try sameLayout(arena, chunks_in);
     const bm = try concatValidity(arena, chunks, total);
     const rows = try arena.alloc(usize, chunks.len);
@@ -511,7 +511,7 @@ pub fn concatThreads(arena: std.mem.Allocator, chunks_raw: []const Column, total
             }
         }
     };
-    par.each(threads, chunks.len, &Copy{ .chunks = chunks, .rows = rows, .bytes = bytes, .out = out }, Copy.f);
+    try par.each(threads, chunks.len, &Copy{ .chunks = chunks, .rows = rows, .bytes = bytes, .out = out }, Copy.f);
     return Column.derived(chunks[0].ty, total, bm, out);
 }
 
@@ -759,7 +759,7 @@ pub fn permuteThreads(arena: std.mem.Allocator, c_in: Column, idx: []const usize
                 x.starts[i] = x.b.spanOf(x.idx[r[0]..r[1]]);
             }
         };
-        par.each(threads, nc, &Span{ .b = c.data.bytes, .idx = idx, .starts = starts }, Span.f);
+        try par.each(threads, nc, &Span{ .b = c.data.bytes, .idx = idx, .starts = starts }, Span.f);
         for (starts) |*st| {
             const len = st.*;
             st.* = span;
@@ -801,7 +801,7 @@ pub fn permuteThreads(arena: std.mem.Allocator, c_in: Column, idx: []const usize
         }
     };
     const g = Gather{ .c = c, .idx = idx, .out = out, .bm = &bm, .starts = starts, .nulls = !c.validity.allSet(c.len) };
-    par.each(threads, nc, &g, Gather.f);
+    try par.each(threads, nc, &g, Gather.f);
     return Column.derived(c.ty, n, bm, out);
 }
 

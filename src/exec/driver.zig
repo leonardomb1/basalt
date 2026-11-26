@@ -83,11 +83,41 @@ pub fn resetAbort() void {
     g_abort.store(false, .seq_cst);
 }
 
-/// `error.Aborted` once the run is cancelled, for a loop that pulls no batch and may
-/// run long (a rehash, a set turned into pairs, a final fold): checked at every
-/// `every`-th step, a power of two, so the loop stays cheap.
-pub inline fn stopEvery(i: usize, comptime every: usize) error{Aborted}!void {
-    if (i & (every - 1) == 0 and aborting()) return error.Aborted;
+/// The steps of a loop as long as the data, not a batch (a sort's pass, a rehash, a
+/// final fold), cut into slices of `slice_steps`, each a bounded unit of work: the
+/// abort flag is read before each, as `par.each` reads it before each item and an
+/// operator before each batch, so a cancelled run stops within one slice.
+pub const slice_steps = 1 << 16;
+
+pub const Slices = struct {
+    at: usize,
+    end: usize,
+    steps: usize = slice_steps,
+
+    /// The next slice's steps, null past the end, `error.Aborted` once cancelled.
+    pub fn next(self: *Slices) error{Aborted}!?[2]usize {
+        if (self.at >= self.end) return null;
+        if (aborting()) return error.Aborted;
+        const lo = self.at;
+        self.at = @min(self.end, lo + self.steps);
+        return .{ lo, self.at };
+    }
+};
+
+pub fn slices(lo: usize, hi: usize) Slices {
+    return .{ .at = lo, .end = hi };
+}
+
+/// For a loop slices cannot cut, its steps walked by pointers (a window frame sliding
+/// over a partition): the abort flag read every `slice_steps` steps of `i`, the same
+/// unit of work.
+pub inline fn atStep(i: usize) error{Aborted}!void {
+    if (i & (slice_steps - 1) == 0 and aborting()) return error.Aborted;
+}
+
+/// `slices` of `steps` steps, for a loop whose every step is many values' work.
+pub fn slicesBy(lo: usize, hi: usize, steps: usize) Slices {
+    return .{ .at = lo, .end = hi, .steps = steps };
 }
 
 pub const ScanTally = struct {

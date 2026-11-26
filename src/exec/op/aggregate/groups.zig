@@ -290,7 +290,7 @@ pub const GroupMerge = struct {
         const errs = try self.alloc.alloc(?anyerror, keytable.parts);
         @memset(errs, null);
         const ctx = GlobalCtx{ .m = self, .layout = layout, .partials = partials, .keep = keep, .errs = errs };
-        par.each(self.threads, keytable.parts, &ctx, GlobalCtx.run);
+        try par.each(self.threads, keytable.parts, &ctx, GlobalCtx.run);
         for (errs) |e| if (e) |err| return err;
         for (partials) |pt| {
             for (self.globals.items[0].pairs) |*pp| try layout.merge(self.alloc, dst, pt, pp.j);

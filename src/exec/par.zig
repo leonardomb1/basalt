@@ -6,9 +6,15 @@
 //! 64, so a validity bitmap's bytes never straddle two chunks. The calling thread is
 //! one of the workers, and a worker that cannot be spawned leaves the items to the
 //! others. `f` cannot fail: allocate before, report through `ctx` after.
+//!
+//! The items are where a cancelled run is seen, as morsels are where a morsel-driven
+//! engine sees it: no worker takes another item once the run is aborted, and the
+//! pass answers `error.Aborted`, its results unfinished. A pass's items are bounded
+//! in size (a chunk of rows, a partition, a sort range) so that holds within one item.
 
 const std = @import("std");
 const trace = @import("trace.zig");
+const driver = @import("driver.zig");
 
 pub const max_workers = 64;
 
@@ -23,17 +29,22 @@ pub fn bounds(n: usize, nc: usize, c: usize) [2]usize {
     return .{ @min(n, c * step), @min(n, (c + 1) * step) };
 }
 
-/// Calls `f(ctx, i)` once for every `i` below `count`, on up to `threads` threads.
-pub fn each(threads: usize, count: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx), usize) void) void {
+/// Calls `f(ctx, i)` once for every `i` below `count`, on up to `threads` threads,
+/// or `error.Aborted` when the run is cancelled before every item is taken.
+pub fn each(threads: usize, count: usize, ctx: anytype, comptime f: fn (@TypeOf(ctx), usize) void) error{Aborted}!void {
     const workers = @min(@min(threads, count), max_workers);
     if (workers <= 1) {
-        for (0..count) |i| f(ctx, i);
+        for (0..count) |i| {
+            if (driver.aborting()) return error.Aborted;
+            f(ctx, i);
+        }
         return;
     }
     var next = std.atomic.Value(usize).init(0);
     const W = struct {
         fn work(c: @TypeOf(ctx), nx: *std.atomic.Value(usize), n: usize) void {
             while (true) {
+                if (driver.aborting()) return;
                 const i = nx.fetchAdd(1, .monotonic);
                 if (i >= n) return;
                 const span = trace.begin(comptime trace.short(@TypeOf(c)), i);
@@ -46,6 +57,7 @@ pub fn each(threads: usize, count: usize, ctx: anytype, comptime f: fn (@TypeOf(
     for (handles[1..workers]) |*h| h.* = std.Thread.spawn(.{}, W.work, .{ ctx, &next, count }) catch null;
     W.work(ctx, &next, count);
     for (handles[1..workers]) |h| if (h) |t| t.join();
+    if (next.load(.monotonic) < count) return error.Aborted;
 }
 
 test "each hands every item out once; chunks are cut at multiples of 64" {
@@ -60,7 +72,24 @@ test "each hands every item out once; chunks are cut at multiples of 64" {
         }
     };
     const ctx = Ctx{ .seen = &seen, .nc = chunks(seen.len, 100) };
-    each(7, ctx.nc, &ctx, Ctx.f);
+    try each(7, ctx.nc, &ctx, Ctx.f);
     for (seen) |s| try std.testing.expectEqual(@as(u8, 1), s);
     try std.testing.expectEqual(@as(usize, 1), chunks(100, 1000));
+}
+
+test "each takes no item once the run is aborted, and says so" {
+    var hits = std.atomic.Value(usize).init(0);
+    const Ctx = struct {
+        hits: *std.atomic.Value(usize),
+        fn f(c: *const @This(), _: usize) void {
+            if (c.hits.fetchAdd(1, .monotonic) == 2) driver.requestAbort();
+        }
+    };
+    defer driver.resetAbort();
+    for ([_]usize{ 1, 4 }) |threads| {
+        hits.store(0, .monotonic);
+        driver.resetAbort();
+        try std.testing.expectError(error.Aborted, each(threads, 1000, &Ctx{ .hits = &hits }, Ctx.f));
+        try std.testing.expect(hits.load(.monotonic) < 1000);
+    }
 }

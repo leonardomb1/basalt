@@ -446,7 +446,7 @@ fn gatherKeyOrder(scratch: std.mem.Allocator, g: *const BucketSink, keys: []cons
     errdefer rows.deinit();
     const cols = try scratch.alloc(column.Column, ncols);
     var ctx = GatherCtx{ .srcs = srcs.items, .refs = refs, .cols = cols, .arenas = rows.arenas };
-    par.each(g.threads, ncols, &ctx, GatherCtx.one);
+    try par.each(g.threads, ncols, &ctx, GatherCtx.one);
     if (ctx.failed.load(.monotonic)) return error.OutOfMemory;
     const n_batches = (total + batch_rows - 1) / batch_rows;
     const batches = try scratch.alloc(Batch, n_batches);

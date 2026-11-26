@@ -410,7 +410,7 @@ pub const TopK = struct {
         const a = tmp.allocator();
         const recs = try a.alloc(u64, items.len * 4);
         for (items, 0..) |e, i| recs[i * 4 ..][0..4].* = .{ @intCast(e.head >> 64), @truncate(e.head), e.seq, i };
-        msdSort(recs, try a.alloc(u64, recs.len), 4, 0);
+        try msdSort(recs, try a.alloc(u64, recs.len), 4, 0);
         const was = try a.dupe(Entry, items);
         for (items, 0..) |*o, i| o.* = was[@intCast(recs[i * 4 + 3])];
     }
