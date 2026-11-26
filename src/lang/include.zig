@@ -456,16 +456,31 @@ fn scanDirectives(ctx: *Ctx, text: []const u8, label: []const u8, out: *std.arra
 }
 
 fn parseDirective(ctx: *Ctx, s: []const u8, label: []const u8, line: u32, col: u32) Error!struct { path: []const u8, alias: ?[]const u8 } {
+    return switch (readDirective(s)) {
+        .ok => |d| .{ .path = d.path, .alias = d.alias },
+        .bad => |b| ctx.fail(label, line, col + @as(u32, @intCast(b.at)), "{s}", .{b.msg}),
+    };
+}
+
+/// A directive's line read: its path and alias, or why it is not one and how far into
+/// the line the fault lies.
+pub const ReadDirective = union(enum) {
+    ok: struct { path: []const u8, alias: ?[]const u8 },
+    bad: struct { msg: []const u8, at: usize = 0 },
+};
+
+/// Reads one trimmed `@include 'path' [AS name];` line.
+pub fn readDirective(s: []const u8) ReadDirective {
     const syntax = "expected `@include 'path.sql';` or `@include 'path.sql' AS name;`";
     var rest = s["@include".len..];
     if (rest.len == 0 or (rest[0] != ' ' and rest[0] != '\t' and rest[0] != '\''))
-        return ctx.fail(label, line, col, "{s}", .{syntax});
+        return .{ .bad = .{ .msg = syntax } };
     rest = std.mem.trimLeft(u8, rest, " \t");
-    if (rest.len == 0 or rest[0] != '\'') return ctx.fail(label, line, col, "{s}", .{syntax});
+    if (rest.len == 0 or rest[0] != '\'') return .{ .bad = .{ .msg = syntax } };
     const close = std.mem.indexOfScalarPos(u8, rest, 1, '\'') orelse
-        return ctx.fail(label, line, col, "unterminated include path — {s}", .{syntax});
+        return .{ .bad = .{ .msg = "unterminated include path — " ++ syntax } };
     const path = rest[1..close];
-    if (path.len == 0) return ctx.fail(label, line, col, "empty include path", .{});
+    if (path.len == 0) return .{ .bad = .{ .msg = "empty include path" } };
     var tail = std.mem.trimLeft(u8, rest[close + 1 ..], " \t");
     var alias: ?[]const u8 = null;
     if (tail.len >= 3 and std.ascii.eqlIgnoreCase(tail[0..2], "as") and (tail[2] == ' ' or tail[2] == '\t')) {
@@ -473,15 +488,38 @@ fn parseDirective(ctx: *Ctx, s: []const u8, label: []const u8, line: u32, col: u
         var n: usize = 0;
         while (n < tail.len and (std.ascii.isAlphanumeric(tail[n]) or tail[n] == '_')) n += 1;
         if (n == 0 or std.ascii.isDigit(tail[0]))
-            return ctx.fail(label, line, col, "`AS` takes a name for the library, like `AS stats`", .{});
+            return .{ .bad = .{ .msg = "`AS` takes a name for the library, like `AS stats`" } };
         alias = tail[0..n];
         tail = std.mem.trimLeft(u8, tail[n..], " \t");
     }
-    if (tail.len == 0 or tail[0] != ';') return ctx.fail(label, line, col, "missing `;` after @include", .{});
+    if (tail.len == 0 or tail[0] != ';') return .{ .bad = .{ .msg = "missing `;` after @include" } };
     tail = std.mem.trimLeft(u8, tail[1..], " \t");
     if (tail.len != 0 and !std.mem.startsWith(u8, tail, "--"))
-        return ctx.fail(label, line, col + @as(u32, @intCast(s.len - tail.len)), "unexpected text after @include — one file per directive", .{});
-    return .{ .path = path, .alias = alias };
+        return .{ .bad = .{ .msg = "unexpected text after @include — one file per directive", .at = s.len - tail.len } };
+    return .{ .ok = .{ .path = path, .alias = alias } };
+}
+
+/// A directive a script's leading block holds, for a reader that only looks.
+pub const Written = struct { path: []const u8, alias: ?[]const u8, line: u32 };
+
+/// The `@include` directives that lead `text`, as `scanDirectives` finds them; one
+/// that does not read is passed over rather than refused.
+pub fn writtenIncludes(arena: std.mem.Allocator, text: []const u8) ![]const Written {
+    var out = std.array_list.Managed(Written).init(arena);
+    var off: usize = 0;
+    var line: u32 = 1;
+    while (off < text.len) {
+        const nl = std.mem.indexOfScalarPos(u8, text, off, '\n') orelse text.len;
+        const trimmed = std.mem.trim(u8, text[off..nl], " \t\r");
+        if (!inDirectives(trimmed)) break;
+        if (std.mem.startsWith(u8, trimmed, "@include")) switch (readDirective(trimmed)) {
+            .ok => |d| try out.append(.{ .path = d.path, .alias = d.alias, .line = line }),
+            .bad => {},
+        };
+        off = if (nl == text.len) text.len else nl + 1;
+        line += 1;
+    }
+    return out.items;
 }
 
 /// Line-oriented: a literal `@include` at the start of a line inside a `$$…$$`

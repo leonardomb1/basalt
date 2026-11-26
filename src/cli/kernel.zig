@@ -18,6 +18,11 @@
 //!                               and tables other cells hold; nothing runs, the
 //!                               session is untouched: the status carries
 //!                               `diagnostics: [...]`, as `check --format json`
+//!   {"op":"hover","id":"c5","script":"SELECT tax(1);","pos":8}
+//!                               what the name there is: the status carries
+//!                               `hover: {start, end, kind, signature, type, doc}`
+//!   {"op":"definition",...}     where it is declared: `definition: {file, line,
+//!                               col, end_line, end_col}`, null for a built-in
 //!   {"op":"catalog","id":"c4"}  every built-in function, keyword and type: the
 //!                               status carries `catalog: {...}`, as `basalt
 //!                               catalog --format json`
@@ -52,8 +57,9 @@
 //! errors only unless asked, and without the per-run summary the status carries.
 //!
 //! Unknown request fields are ignored, so a newer frontend can talk to an older
-//! kernel. `complete`'s `pos` and its answer's `start`/`end` count UTF-16 units,
-//! a JavaScript editor's offsets, not bytes. `check`'s `tables` are names, or
+//! kernel. Under `utf16`, the `pos` of `complete`, `hover` and `definition` and
+//! the offsets and columns they answer count UTF-16 units, a JavaScript editor's,
+//! not bytes. `check`'s `tables` are names, or
 //! `{"name":…,"columns":[{"name":…,"type":…}]}` to type what is read from them.
 //! Echoed ids are clipped to 256 bytes; a clipped echo still pairs in order.
 //!
@@ -72,7 +78,9 @@
 //!
 //! A LET holds the value the script that declares it gave it, not one a later
 //! script computes again, and holds it whether or not the rest of that script
-//! succeeds.
+//! succeeds. A declaration keeps the comment above it and where its name stood in
+//! the script that made it, the request's `id` with it: what `hover` and
+//! `definition` answer for it.
 
 const std = @import("std");
 const pagecache = @import("../exec/pagecache.zig");
@@ -250,8 +258,10 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             try completeScript(alloc, a, &out, &decls, &catalog, req);
         } else if (std.mem.eql(u8, req.op, "check")) {
             try checkScript(a, &out, &decls, req);
+        } else if (std.mem.eql(u8, req.op, "hover") or std.mem.eql(u8, req.op, "definition")) {
+            try lookupScript(alloc, a, &out, &decls, &catalog, req);
         } else if (std.mem.eql(u8, req.op, "catalog")) {
-            try reply(a, &out, req.id, .{ .ok = true, .catalog = try cli.catalogJson(alloc) });
+            try reply(a, &out, req.id, .{ .ok = true, .catalog = try cli.catalogJson() });
         } else if (std.mem.eql(u8, req.op, "reset")) {
             decls.clear();
             catalog.deinit();
@@ -261,7 +271,7 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             try reply(a, &out, req.id, .{ .ok = true });
             break;
         } else {
-            const m = try msgfmt.allocPrint(a, "unknown op `{s}` — run, check, complete, catalog, cancel, reset or close", .{req.op});
+            const m = try msgfmt.allocPrint(a, "unknown op `{s}` — run, check, complete, hover, definition, catalog, cancel, reset or close", .{req.op});
             try reply(a, &out, req.id, .{ .ok = false, .@"error" = .{ .msg = m } });
         }
     }
@@ -355,15 +365,64 @@ fn completeScript(gpa: std.mem.Allocator, a: std.mem.Allocator, out: *Out, decls
     const at = if (req.pos) |p| (if (req.utf16) utf16.unitToByte(script, p) else p) else script.len;
     if (at > script.len)
         return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = "`pos` is past the end of `script`" } });
-    var scope = cli.DeclStore.init(gpa);
+    var scope = try cli.scopeFor(gpa, a, decls, script);
     defer scope.deinit();
-    for (decls.items.items) |e| try scope.put(.{ .kind = e.kind, .name = e.name }, e.text);
-    try cli.declareFrom(&scope, a, script);
     const cx = cli.Completer{ .gpa = gpa, .decls = &scope, .catalog = catalog, .connect = req.connect };
     const offer = try cli.suggestFor(a, &cx, script, at);
     var aw = std.Io.Writer.Allocating.init(a);
     try cli.writeOfferIn(&aw.writer, offer, at, script, req.utf16);
     try reply(a, out, req.id, .{ .ok = true, .complete = aw.written() });
+}
+
+/// `hover` and `definition`: what the name at `pos` is, and where it is declared,
+/// against the session, the script's own declarations and its includes' exports.
+/// Nothing runs; connections are asked as `complete` asks them.
+fn lookupScript(gpa: std.mem.Allocator, a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, catalog: *cli.Catalog, req: Request) !void {
+    const script = req.script orelse "";
+    const at = if (req.pos) |p| (if (req.utf16) utf16.unitToByte(script, p) else p) else script.len;
+    if (at > script.len)
+        return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = "`pos` is past the end of `script`" } });
+    var scope = try cli.scopeFor(gpa, a, decls, script);
+    defer scope.deinit();
+    const cx = cli.Completer{ .gpa = gpa, .decls = &scope, .catalog = catalog, .connect = req.connect };
+    const found = try cli.resolveName(a, &cx, decls, script, at, req.params);
+    var aw = std.Io.Writer.Allocating.init(a);
+    if (std.mem.eql(u8, req.op, "hover")) {
+        try cli.writeHover(&aw.writer, found, script, req.utf16);
+        return reply(a, out, req.id, .{ .ok = true, .hover = aw.written() });
+    }
+    try cli.writeDefinition(&aw.writer, found, req.utf16);
+    try reply(a, out, req.id, .{ .ok = true, .definition = aw.written() });
+}
+
+/// `part` as a slice of the script as sent: a slice of it already, or of the
+/// prelude-and-script text, whose script part keeps the script's offsets.
+fn inScript(script: []const u8, entry: cli.Prepared, part: []const u8) ?[]const u8 {
+    if (cli.sliceAt(script, part) != null) return part;
+    const off = cli.sliceAt(entry.text, part) orelse return null;
+    if (off < entry.entry_at or off - entry.entry_at + part.len > script.len) return null;
+    return script[off - entry.entry_at ..][0..part.len];
+}
+
+/// Where a declaration a script makes stands in the script as sent, for the session
+/// to answer `definition` with.
+fn declaredAt(id: []const u8, script: []const u8, entry: cli.Prepared, stmt: []const u8) cli.Origin {
+    const d = cli.declOf(stmt) orelse return .{ .file = "session", .id = id };
+    const name = inScript(script, entry, d.name) orelse return .{ .file = "session", .id = id };
+    return cli.originIn("session", id, script, name);
+}
+
+/// A declaration with the comments above it, back to the statement before, which
+/// the session keeps as its doc: the parse starts a statement past them.
+fn withComments(script: []const u8, entry: cli.Prepared, stmt: []const u8) []const u8 {
+    const own = inScript(script, entry, stmt) orelse return stmt;
+    const off = cli.sliceAt(script, own).?;
+    var from: usize = 0;
+    while (cli.nextTopSemi(script, from)) |semi| {
+        if (semi >= off) break;
+        from = semi + 1;
+    }
+    return std.mem.trim(u8, script[from .. off + own.len], " \t\r\n");
 }
 
 fn readRequests(alloc: std.mem.Allocator, q: *Queue) void {
@@ -428,6 +487,8 @@ const Status = struct {
     complete: ?[]const u8 = null,
     diagnostics: ?[]const u8 = null,
     catalog: ?[]const u8 = null,
+    hover: ?[]const u8 = null,
+    definition: ?[]const u8 = null,
 };
 
 fn anyTruncated(results: ?[]const ResultFrame) bool {
@@ -468,10 +529,10 @@ fn reply(a: std.mem.Allocator, out: *Out, id: ?[]const u8, st: Status) !void {
         try w.writeAll(",\"diagnostics\":");
         try w.writeAll(d);
     }
-    if (st.catalog) |c| {
-        try w.writeAll(",\"catalog\":");
-        try w.writeAll(c);
-    }
+    inline for (.{ "catalog", "hover", "definition" }) |f| if (@field(st, f)) |raw| {
+        try w.writeAll(",\"" ++ f ++ "\":");
+        try w.writeAll(raw);
+    };
     if (st.@"error") |e| {
         try w.writeAll(",\"error\":");
         try writeObject(w, e);
@@ -739,7 +800,10 @@ fn runScript(
 
     const stands = try cli.declarationsStand(a, decls, entry.pending);
     const kept: []const cli.Pending = if (stands) entry.pending else &.{};
-    for (kept) |p| try decls.put(p.id, p.text);
+    for (kept) |p| {
+        const stmt = withComments(script, entry, p.text);
+        try decls.putAt(p.id, stmt, declaredAt(id, script, entry, stmt));
+    }
     const declared = try a.alloc(Declared, kept.len);
     for (declared, kept) |*d, p| d.* = .{ .kind = @tagName(p.id.kind), .name = p.id.name };
 

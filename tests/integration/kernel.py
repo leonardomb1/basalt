@@ -255,6 +255,64 @@ def main(binary):
            "select" in cat.get("keywords", []) and any(t["name"] == "bigint" and t["is"] == "int" for t in cat.get("types", []))
            and cat.get("version"), {k2: cat.get(k2) for k2 in ("version", "types")})
 
+    # Hover and definition, against the session, the script's own names and its includes.
+    _, st = k.run("-- doubles a number\nCREATE FUNCTION twice(x) AS x * 2;", id="decl1")
+    k.send(op="hover", id="h1", script="SELECT twice(2) AS v", pos=8)
+    _, st = k.reply()
+    h = st.get("hover") or {}
+    report("hover shows a session function's signature, body and comment",
+           h.get("kind") == "function" and h.get("signature") == "twice(x)" and h.get("body") == "x * 2"
+           and h.get("doc") == "doubles a number" and (h.get("start"), h.get("end")) == (7, 12), st)
+    k.send(op="definition", id="d1", script="SELECT twice(2) AS v", pos=8)
+    _, st = k.reply()
+    report("definition of a session name is where the script that declared it put it",
+           st.get("definition") == {"file": "session", "line": 2, "col": 17, "end_line": 2, "end_col": 22, "id": "decl1"}, st)
+    own = "CREATE FUNCTION twice(x) AS x + x;\nSELECT twice(2) AS v"
+    k.send(op="hover", id="h2", script=own, pos=own.index("twice(2)") + 1)
+    _, st = k.reply()
+    k.send(op="definition", id="d2", script=own, pos=own.index("twice(2)") + 1)
+    _, st2 = k.reply()
+    report("a script's own declaration shadows the session's, in hover and definition",
+           (st.get("hover") or {}).get("body") == "x + x"
+           and st2.get("definition") == {"file": "script", "line": 1, "col": 17, "end_line": 1, "end_col": 22}, (st, st2))
+    libdir = tempfile.mkdtemp()
+    lib = os.path.join(libdir, "fin.sql")
+    with open(lib, "w") as f:
+        f.write("-- money helpers\nEXPORT FUNCTION half(x) AS x / 2;\n")
+    inc = f"@include '{lib}' AS fin;\nSELECT fin.half(4) AS v"
+    k.send(op="hover", id="h3", script=inc, pos=inc.index("half(4)") + 1)
+    _, st = k.reply()
+    k.send(op="definition", id="d3", script=inc, pos=inc.index("fin.half") + 1)
+    _, st2 = k.reply()
+    report("a library's export through @include: its hover, and its definition in the included file",
+           (st.get("hover") or {}).get("signature") == "fin.half(x)"
+           and st2.get("definition") == {"file": lib, "line": 2, "col": 17, "end_line": 2, "end_col": 21}, (st, st2))
+    k.send(op="complete", id="c3", script=f"@include '{lib}' AS fin;\nSELECT fin.ha")
+    _, st = k.reply()
+    report("complete offers a library's functions after its alias",
+           any(i["text"] == "fin.half" for i in (st.get("complete") or {}).get("items", [])), st)
+    wide = "SELECT 'é😀' AS a; CREATE FUNCTION f9(x) AS x;\nSELECT 'é😀', f9(1) AS v"
+    at16 = len(wide[:wide.rindex("f9(1)")].encode("utf-16-le")) // 2 + 1
+    k.send(op="hover", id="h4", script=wide, pos=at16, utf16=True)
+    _, st = k.reply()
+    k.send(op="definition", id="d4", script=wide, pos=at16, utf16=True)
+    _, st2 = k.reply()
+    h = st.get("hover") or {}
+    report("hover and definition count UTF-16 units past text that is not ASCII",
+           (h.get("start"), h.get("end")) == (at16 - 1, at16 + 1)
+           and st2.get("definition") == {"file": "script", "line": 1, "col": 36, "end_line": 1, "end_col": 38}, (st, st2))
+    k.send(op="hover", id="h5", script="SELECT 1  + 2 AS v", pos=9)
+    _, st = k.reply()
+    k.send(op="definition", id="d5", script="SELECT upper('a') AS v", pos=8)
+    _, st2 = k.reply()
+    report("a cursor on nothing, and a built-in's definition, answer null",
+           st["ok"] and "hover" in st and st["hover"] is None and st2["ok"] and st2.get("definition", 0) is None, (st, st2))
+    k.send(op="hover", id="h6", script="SELECT upper('a') AS v", pos=8)
+    _, st = k.reply()
+    h = st.get("hover") or {}
+    report("hover on a built-in shows its catalog entry",
+           h.get("builtin") == "scalar" and h.get("signature") == "upper(s)" and h.get("type") == "string" and h.get("doc"), st)
+
     # A LET keeps the value the declaring cell decided: later cells never
     # recompute now() nor re-run the query, even after its source changes.
     lf = os.path.join(tempfile.mkdtemp(), "let.csv")

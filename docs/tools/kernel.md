@@ -24,6 +24,8 @@ Requests are NDJSON on stdin, one object per line:
 {"op":"complete","id":"c2","script":"SELECT erp.","pos":11}
 {"op":"check","id":"c3","script":"SELECT ...;","tables":["enrich"]}
 {"op":"catalog","id":"c4"}
+{"op":"hover","id":"c5","script":"SELECT tax(1);","pos":8}
+{"op":"definition","id":"c6","script":"SELECT tax(1);","pos":8}
 {"op":"reset"}                forget every declaration
 {"op":"close"}                exit 0 (as does EOF)
 ```
@@ -50,6 +52,30 @@ words, and `types` each name a `CAST` or `PARAM` reads as `{name, is, form}`
 (`bigint` is `int`, `varchar` takes `(n)`). `WITH` options are read by each
 format on its own and are not listed. Nothing connects, and the answer is the
 same for the life of the process.
+
+`hover` says what the name at `pos` is, and `definition` where it is
+declared, against the session's declarations, the script's own and what its
+`@include`s export to it — a library's as `alias.name` — read from the text, so
+a script half typed resolves too; `pos` and `utf16` work as for `complete`.
+`hover` carries `{start, end, kind, name, signature, type, doc}`, or `null`
+when nothing is under the cursor: `start`/`end` bound the name, and `kind` is
+`function`, `param`, `let`, `connection`, `table` or `column`. A built-in
+function adds `builtin`, its kind in the catalog, with the catalog's signature,
+return type and doc. A declared function shows its signature as written, with
+`type` `table` for a table function and its `body` for an expression function;
+a `PARAM` its `type`, its `default` and the `value` the request's `params` bind
+it to; a `LET` the `value` it holds, as JSON, and its `type`, once a script has
+given it one; a connection its `TYPE` as `type`, and in `signature` the
+`OPTIONS` whose values are literals — never a password, a token, an `env()` or
+`secret()` value, or a URL's user and password; a `conn.schema.table` its
+`columns`, asked as `complete` asks; a column its `type`, where the file or
+table it comes from says it. A declaration's `doc` is the comment above it.
+`definition` carries `{file, line, col, end_line, end_col}`, the name's place,
+or `null` for a built-in, a column or nothing: `file` is `script`, an
+`@include`d file's path — a pinned remote include's copy in the local cache — or
+`session`, whose `line` and `col` count in the script that declared it, named by
+its `id`. `col` counts bytes, or UTF-16 units with `"utf16": true`. Nothing runs,
+and the session is left as it was.
 
 `check` lists every problem in a script without running it, against the
 session — its connections, params, LETs and functions — as `basalt check

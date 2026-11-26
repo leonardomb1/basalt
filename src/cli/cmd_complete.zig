@@ -6,6 +6,7 @@ const Completer = @import("repl/catalog.zig").Completer;
 const DeclStore = @import("entry.zig").DeclStore;
 const Offer = @import("repl/catalog.zig").Offer;
 const declOf = @import("entry.zig").declOf;
+const originIn = @import("entry.zig").originIn;
 const loadSource = @import("args.zig").loadSource;
 const loadExit = @import("args.zig").loadExit;
 const nextVal = @import("args.zig").nextVal;
@@ -74,11 +75,12 @@ pub fn cmdComplete(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
 }
 
 /// The declarations a text makes, by its statements' first words, so a script still
-/// being typed, which will not parse, still has its names in scope.
+/// being typed, which will not parse, still has its names in scope, each where it
+/// stands in the script.
 pub fn declareFrom(decls: *DeclStore, arena: std.mem.Allocator, text: []const u8) !void {
     for (try splitStatements(arena, text)) |st| {
         const id = declOf(st) orelse continue;
-        try decls.put(id, st);
+        try decls.putAt(id, st, originIn("script", "", text, id.name));
     }
 }
 

@@ -183,6 +183,15 @@ pub const Resolver = struct {
         return text;
     }
 
+    /// The cache's file holding `spec`'s pinned text, when the cache holds it whole;
+    /// nothing is fetched.
+    pub fn cachedPath(self: *Resolver, spec: Spec) !?[]const u8 {
+        const want = self.pins.get(try spec.key(self.arena)) orelse return null;
+        const dir = self.cache_dir orelse return null;
+        if (self.cached(want) == null) return null;
+        return try std.fs.path.join(self.arena, &.{ dir, want });
+    }
+
     /// Writes `basalt.sum` with every pin, sorted, when `get` added any.
     pub fn save(self: *Resolver) !void {
         if (self.added.items.len == 0) return;

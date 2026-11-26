@@ -12,6 +12,7 @@ const Value = @import("../exec/value.zig").Value;
 const nested = @import("../exec/nested.zig");
 const std = @import("std");
 const Catalog = @import("repl/catalog.zig").Catalog;
+const utf16 = @import("../base/utf16.zig");
 
 /// Next statement-level `;`, skipping strings, dollar quotes and comments by the
 /// lexer's own spans, so the REPL agrees with the parser on where a statement ends.
@@ -73,7 +74,8 @@ pub fn splitStatements(arena: std.mem.Allocator, s: []const u8) ![]const []const
 
 pub const DeclKind = enum { connection, function, param, let };
 
-pub const DeclId = struct { kind: DeclKind, name: []const u8 };
+/// A declaration's kind and name, and whether it is written `EXPORT`.
+pub const DeclId = struct { kind: DeclKind, name: []const u8, exported: bool = false };
 
 pub fn nextWord(s: []const u8, i: *usize) ?[]const u8 {
     while (i.* < s.len and std.ascii.isWhitespace(s[i.*])) i.* += 1;
@@ -97,18 +99,19 @@ pub fn declOf(stmt_in: []const u8) ?DeclId {
     const stmt = pastComments(stmt_in);
     var i: usize = 0;
     var w = nextWord(stmt, &i) orelse return null;
-    if (std.ascii.eqlIgnoreCase(w, "export")) {
+    const exported = std.ascii.eqlIgnoreCase(w, "export");
+    if (exported) {
         const at = i;
         const next = nextWord(stmt, &i) orelse return null;
         if (std.ascii.eqlIgnoreCase(next, "param") or std.ascii.eqlIgnoreCase(next, "let")) w = next else i = at;
     }
     if (std.ascii.eqlIgnoreCase(w, "param")) {
         const n = identPrefix(nextWord(stmt, &i) orelse return null);
-        return if (n.len == 0) null else .{ .kind = .param, .name = n };
+        return if (n.len == 0) null else .{ .kind = .param, .name = n, .exported = exported };
     }
     if (std.ascii.eqlIgnoreCase(w, "let")) {
         const n = identPrefix(nextWord(stmt, &i) orelse return null);
-        return if (n.len == 0) null else .{ .kind = .let, .name = n };
+        return if (n.len == 0) null else .{ .kind = .let, .name = n, .exported = exported };
     }
     if (!std.ascii.eqlIgnoreCase(w, "create") and !std.ascii.eqlIgnoreCase(w, "export")) return null;
     w = nextWord(stmt, &i) orelse return null;
@@ -124,7 +127,42 @@ pub fn declOf(stmt_in: []const u8) ?DeclId {
     else
         return null;
     const n = identPrefix(nextWord(stmt, &i) orelse return null);
-    return if (n.len == 0) null else .{ .kind = kind, .name = n };
+    return if (n.len == 0) null else .{ .kind = kind, .name = n, .exported = exported };
+}
+
+/// Where a declaration's name stands: `script`, `session` or an included file's path,
+/// the request that declared a session's (`id`), and the name's line, its column in
+/// bytes and in UTF-16 units, and its length. A zero `line` is unknown.
+pub const Origin = struct {
+    file: []const u8 = "",
+    id: []const u8 = "",
+    line: u32 = 0,
+    col: u32 = 0,
+    col16: u32 = 0,
+    len: u32 = 0,
+};
+
+/// The origin of `name`, a slice of `text` (the file `file` holds), or an unknown
+/// one when it is not.
+pub fn originIn(file: []const u8, id: []const u8, text: []const u8, name: []const u8) Origin {
+    const off = sliceAt(text, name) orelse return .{ .file = file, .id = id };
+    const line_start = if (std.mem.lastIndexOfScalar(u8, text[0..off], '\n')) |nl| nl + 1 else 0;
+    return .{
+        .file = file,
+        .id = id,
+        .line = @intCast(1 + std.mem.count(u8, text[0..off], "\n")),
+        .col = @intCast(off - line_start + 1),
+        .col16 = @intCast(utf16.byteToUnit(text[line_start..], off - line_start) + 1),
+        .len = @intCast(name.len),
+    };
+}
+
+/// Where `part` starts in `whole`, when it is a slice of it.
+pub fn sliceAt(whole: []const u8, part: []const u8) ?usize {
+    const w = @intFromPtr(whole.ptr);
+    const p = @intFromPtr(part.ptr);
+    if (p < w or p + part.len > w + whole.len) return null;
+    return p - w;
 }
 
 /// `stmt` past its leading blanks and comments, by the lexer's own spans.
@@ -145,7 +183,7 @@ fn pastComments(stmt: []const u8) []const u8 {
 /// The session's declarations as text, replayed ahead of each entry, and the value
 /// each LET was given when its entry ran, which it holds until declared anew.
 pub const DeclStore = struct {
-    const Entry = struct { kind: DeclKind, name: []u8, text: []u8 };
+    pub const Entry = struct { kind: DeclKind, name: []u8, text: []u8, origin: Origin = .{} };
     const Held = struct { name: []u8, arena: *std.heap.ArenaAllocator, value: Value };
 
     gpa: std.mem.Allocator,
@@ -164,6 +202,7 @@ pub const DeclStore = struct {
         for (self.items.items) |e| {
             self.gpa.free(e.name);
             self.gpa.free(e.text);
+            self.freeOrigin(e.origin);
         }
         self.items.clearRetainingCapacity();
         for (self.held.items) |h| self.freeHeld(h);
@@ -206,18 +245,52 @@ pub const DeclStore = struct {
     /// A LET declared anew drops the value the old one held: it holds what it is given
     /// when it runs.
     pub fn put(self: *DeclStore, id: DeclId, text: []const u8) !void {
+        return self.putAt(id, text, .{});
+    }
+
+    /// `put`, keeping where the name was declared.
+    pub fn putAt(self: *DeclStore, id: DeclId, text: []const u8, origin: Origin) !void {
         if (id.kind == .let) self.drop(id.name);
         const dup_text = try self.gpa.dupe(u8, text);
         errdefer self.gpa.free(dup_text);
+        const own = try self.ownOrigin(origin);
+        errdefer self.freeOrigin(own);
         for (self.items.items) |*e| {
             if (e.kind != id.kind or !std.ascii.eqlIgnoreCase(e.name, id.name)) continue;
             self.gpa.free(e.text);
+            self.freeOrigin(e.origin);
             e.text = dup_text;
+            e.origin = own;
             return;
         }
         const dup_name = try self.gpa.dupe(u8, id.name);
         errdefer self.gpa.free(dup_name);
-        try self.items.append(.{ .kind = id.kind, .name = dup_name, .text = dup_text });
+        try self.items.append(.{ .kind = id.kind, .name = dup_name, .text = dup_text, .origin = own });
+    }
+
+    /// The declaration of kind `kind` named `name`, in any case.
+    pub fn find(self: *const DeclStore, kind: DeclKind, name: []const u8) ?*const Entry {
+        for (self.items.items) |*e| if (e.kind == kind and std.ascii.eqlIgnoreCase(e.name, name)) return e;
+        return null;
+    }
+
+    /// The value LET `name` holds, if it holds one.
+    pub fn heldValue(self: *const DeclStore, name: []const u8) ?Value {
+        for (self.held.items) |h| if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
+        return null;
+    }
+
+    fn ownOrigin(self: *DeclStore, o: Origin) !Origin {
+        var own = o;
+        own.file = try self.gpa.dupe(u8, o.file);
+        errdefer self.gpa.free(own.file);
+        own.id = try self.gpa.dupe(u8, o.id);
+        return own;
+    }
+
+    fn freeOrigin(self: *DeclStore, o: Origin) void {
+        self.gpa.free(o.file);
+        self.gpa.free(o.id);
     }
 };
 

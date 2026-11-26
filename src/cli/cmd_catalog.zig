@@ -514,19 +514,30 @@ pub fn writeText(w: *std.Io.Writer, c: Catalog) !void {
     for (c.types) |t| try w.print("  {s}  [{s}]\n", .{ t.form, t.is });
 }
 
-var cached: ?[]u8 = null;
+var kept: ?Catalog = null;
+var kept_json: ?[]const u8 = null;
+var kept_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
 
-/// The catalog as JSON, built at the first call and kept for the process.
-pub fn json(gpa: std.mem.Allocator) ![]const u8 {
-    if (cached) |c| return c;
-    var ar = std.heap.ArenaAllocator.init(gpa);
-    defer ar.deinit();
-    const c = try build(gpa, ar.allocator());
-    var aw = std.Io.Writer.Allocating.init(gpa);
-    errdefer aw.deinit();
-    try writeJson(&aw.writer, c);
-    cached = try aw.toOwnedSlice();
-    return cached.?;
+/// The catalog, built at the first call and kept for the process.
+pub fn get() !Catalog {
+    if (kept) |c| return c;
+    kept = try build(std.heap.page_allocator, kept_arena.allocator());
+    return kept.?;
+}
+
+/// The catalog as JSON, written at the first call and kept for the process.
+pub fn json() ![]const u8 {
+    if (kept_json) |j| return j;
+    var aw = std.Io.Writer.Allocating.init(kept_arena.allocator());
+    try writeJson(&aw.writer, try get());
+    kept_json = aw.written();
+    return kept_json.?;
+}
+
+/// The built-in function named `name` or answering to it, in any case.
+pub fn lookup(c: Catalog, name: []const u8) ?Function {
+    for (c.functions) |f| if (std.ascii.eqlIgnoreCase(f.name, name) or inList(f.aliases, name)) return f;
+    return null;
 }
 
 /// `basalt catalog [--format json|text]`: text by default, JSON as the kernel's

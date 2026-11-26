@@ -291,9 +291,35 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
         if (k + 2 < text.len and std.ascii.eqlIgnoreCase(text[k .. k + 2], "as") and text[k + 2] == ' ') try ctes.append(text[ns..j]);
     }
 
+    const src = try sourcesIn(arena, cx, text, cursor, conns.items, true);
+    const r = try complete.complete(arena, .{
+        .connections = conns.items,
+        .ctes = ctes.items,
+        .functions = fns.items,
+        .params = params.items,
+        .tables = src.tables,
+        .columns = src.columns,
+    }, text, cursor);
+    switch (r) {
+        .none => return .{ .start = complete.wordStart(text, cursor) },
+        .candidates => |c| return .{ .start = c.start, .items = c.items },
+        .path => |p| {
+            const paths = try listPaths(arena, p.partial);
+            const items = try arena.alloc(complete.Candidate, paths.len);
+            for (paths, items) |pth, *it| it.* = .{ .text = pth, .kind = .path };
+            return .{ .start = p.start, .items = items };
+        },
+    }
+}
+
+const Sources = struct { tables: []const complete.ConnTables, columns: []const complete.Column };
+
+/// The columns of the tables and files `text` names, and, with `tables`, the tables
+/// of each connection it names; a name still being typed at `cursor` is not asked.
+fn sourcesIn(arena: std.mem.Allocator, cx: *const Completer, text: []const u8, cursor: usize, conns: []const []const u8, with_tables: bool) !Sources {
     var tables = std.array_list.Managed(complete.ConnTables).init(arena);
     var columns = std.array_list.Managed(complete.Column).init(arena);
-    for (conns.items) |c| {
+    for (conns) |c| {
         var pos: usize = 0;
         var wanted = false;
         while (std.mem.indexOfPos(u8, text, pos, c)) |p| : (pos = p + c.len) {
@@ -308,7 +334,7 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
             const typing = cursor > p and cursor <= e;
             if (dots == 1 and !typing and (e == text.len or text[e] != '(')) for (sourceColumns(cx, text[p..e])) |col| try columns.append(col);
         }
-        if (wanted) try tables.append(.{ .conn = c, .tables = if (isHttp(cx, c)) &.{} else connTables(cx, c) });
+        if (wanted and with_tables) try tables.append(.{ .conn = c, .tables = if (isHttp(cx, c)) &.{} else connTables(cx, c) });
     }
     var q: usize = 0;
     while (q < text.len) {
@@ -326,25 +352,20 @@ pub fn suggestFor(arena: std.mem.Allocator, cx: *const Completer, text: []const 
         if (file_like)
             for (sourceColumns(cx, lit)) |col| try columns.append(col);
     }
+    return .{ .tables = tables.items, .columns = columns.items };
+}
 
-    const r = try complete.complete(arena, .{
-        .connections = conns.items,
-        .ctes = ctes.items,
-        .functions = fns.items,
-        .params = params.items,
-        .tables = tables.items,
-        .columns = columns.items,
-    }, text, cursor);
-    switch (r) {
-        .none => return .{ .start = complete.wordStart(text, cursor) },
-        .candidates => |c| return .{ .start = c.start, .items = c.items },
-        .path => |p| {
-            const paths = try listPaths(arena, p.partial);
-            const items = try arena.alloc(complete.Candidate, paths.len);
-            for (paths, items) |pth, *it| it.* = .{ .text = pth, .kind = .path };
-            return .{ .start = p.start, .items = items };
-        },
-    }
+/// The columns, with their types, of the tables and files `text` names: what a
+/// name under `cursor` may be. Connections are asked only under `connect`.
+pub fn columnsIn(arena: std.mem.Allocator, cx: *const Completer, text: []const u8, cursor: usize) ![]const complete.Column {
+    var conns = std.array_list.Managed([]const u8).init(arena);
+    for (cx.decls.items.items) |e| if (e.kind == .connection) try conns.append(e.name);
+    return (try sourcesIn(arena, cx, text, cursor, conns.items, false)).columns;
+}
+
+/// The columns of `conn.schema.table`, asked of the connection only under `connect`.
+pub fn tableColumns(cx: *const Completer, qualified: []const u8) []const complete.Column {
+    return sourceColumns(cx, qualified);
 }
 
 fn listPaths(arena: std.mem.Allocator, partial: []const u8) ![]const []const u8 {

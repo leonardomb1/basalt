@@ -8,7 +8,8 @@
 //!   - inside an unclosed `'…'`, as the lexer reads it: a file path, asked of the
 //!     caller, which replaces from just after the opening quote;
 //!   - `$…`: params and LETs;
-//!   - `conn.…`: that connection's tables, `schema.table`; `x.…` otherwise: columns;
+//!   - `lib.…`: a library's functions (`@include … AS lib`); `conn.…`: that
+//!     connection's tables, `schema.table`; `x.…` otherwise: columns;
 //!   - a bare word: CTEs, connections, declared functions, the columns of the
 //!     tables and files the entry names, the built-in functions, then keywords —
 //!     spelled in the case of the prefix.
@@ -311,6 +312,8 @@ pub fn complete(arena: std.mem.Allocator, names: Names, text: []const u8, cursor
     if (std.mem.indexOfScalar(u8, word, '.')) |dot| {
         const head = word[0..dot];
         const rest = word[dot + 1 ..];
+        for (names.functions) |n| if (std.mem.indexOfScalar(u8, n, '.') != null and startsWithFold(n, word)) try out.append(.{ .text = n, .kind = .function });
+        if (out.items.len > 0) return finish(&out, start);
         for (names.tables) |ct| {
             if (!std.ascii.eqlIgnoreCase(ct.conn, head)) continue;
             for (ct.tables) |t| {
