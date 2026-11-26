@@ -34,7 +34,9 @@ pub const keywords = [_][]const u8{
     "get",      "post",      "json_each",  "following", "filter",     "window",     "ignore",     "respect",
     "nulls",    "interval",  "varchar",    "char",      "nvarchar",   "text",       "bigint",     "smallint",
     "tinyint",  "integer",   "double",     "real",      "numeric",    "boolean",    "datetime",   "insert",
-    "delete",   "update",    "set",
+    "delete",   "update",    "set",        "begin",     "describe",   "exists",     "fetch",      "first",
+    "groups",   "include",   "intersect",  "last",      "lateral",    "natural",    "next",       "no",
+    "only",     "others",    "resource",   "returns",   "show",       "stdin",      "tables",     "ties",
 };
 
 fn isKeyword(word: []const u8) bool {

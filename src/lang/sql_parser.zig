@@ -314,7 +314,8 @@ pub const AliasSet = struct {
     }
 };
 
-const reserved_after_source = [_][]const u8{
+/// The words that end a source in `FROM`, never read as its alias.
+pub const reserved_after_source = [_][]const u8{
     "where",  "group",   "order",  "limit",     "union",  "join",     "inner",
     "left",   "right",   "full",   "cross",     "semi",   "anti",     "on",
     "with",   "as",      "end",    "when",      "then",   "else",     "case",

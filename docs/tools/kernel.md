@@ -23,6 +23,7 @@ Requests are NDJSON on stdin, one object per line:
 {"op":"cancel","id":"c1"}     stop the running script; the session survives
 {"op":"complete","id":"c2","script":"SELECT erp.","pos":11}
 {"op":"check","id":"c3","script":"SELECT ...;","tables":["enrich"]}
+{"op":"catalog","id":"c4"}
 {"op":"reset"}                forget every declaration
 {"op":"close"}                exit 0 (as does EOF)
 ```
@@ -34,6 +35,21 @@ columns once per session and remembered, as the REPL does (`"connect": false`
 keeps it offline); `reset` forgets that too. `pos` is a byte offset, or — with
 `"utf16": true` — a UTF-16 offset, the unit a JavaScript editor counts in, and
 the answer's `start`/`end` then count the same way.
+
+`catalog` lists what the engine answers to, so an editor completes, colours and
+documents it with no list of its own; its status carries `catalog: {version,
+functions, keywords, types}`, as `basalt catalog --format json` prints it.
+Each function is `{name, kind, signature, params, returns, doc, aliases}`:
+`kind` is `scalar`, `aggregate`, `window` or `table`; `params` are `{name,
+optional, variadic}` in order, one entry per function, its optional parameters
+covering its shorter forms; `returns` is the type it gives whatever its
+arguments, null when that depends on them (`abs`, `sum`, `lag`); `doc` is the
+reference's one sentence; `aliases` are the other names it answers to
+(`variance`, `year`, `datediff`). `keywords` are the reserved and contextual
+words, and `types` each name a `CAST` or `PARAM` reads as `{name, is, form}`
+(`bigint` is `int`, `varchar` takes `(n)`). `WITH` options are read by each
+format on its own and are not listed. Nothing connects, and the answer is the
+same for the life of the process.
 
 `check` lists every problem in a script without running it, against the
 session — its connections, params, LETs and functions — as `basalt check

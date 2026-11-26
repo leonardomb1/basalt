@@ -4,8 +4,8 @@ Function names are case-insensitive. A function given a null argument answers
 null unless its row says otherwise. Aggregates (`COUNT`, `SUM`, `MEDIAN`, …) are
 listed under [Queries](../language/queries.md#operators), window functions under
 [Window functions](../language/windows.md), the JSON functions on
-[their own page](json.md), and `CAST`, `TRY_CAST`, `IF`, `CASE` and the
-operators under [Expressions and types](expressions.md).
+[their own page](json.md), and `CASE`, the operators and the rules a `CAST`
+follows under [Expressions and types](expressions.md).
 
 ## Strings
 
@@ -37,6 +37,16 @@ never fails a load.
 | `unaccent(s)`, `strip_accents(s)` | the accents of Latin letters dropped: `São` → `Sao`, `Æ` → `AE`, `ß` → `ss` |
 | `ascii(s)` | the first character's code point |
 | `chr(n)` | the character with code point `n` |
+
+## Conversions and conditions
+
+The rules of each conversion are under [Expressions and types](expressions.md).
+
+| function | returns |
+|---|---|
+| `cast(x AS type)` | `x` as `type`; a value that does not convert fails the statement |
+| `try_cast(x AS type)` | the same, but null where `x` does not convert |
+| `if(cond, a, b)` | `a` when `cond` is true, else `b` |
 
 ## Searching rows
 

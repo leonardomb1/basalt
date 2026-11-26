@@ -92,12 +92,15 @@ mid-fold would quietly undo everything folded before it.
 
 ## Arrays
 
-`CHARS(s)` is a string's characters as a JSON array, `JSON_RANGE([start,]
-stop)` the integers `start` (default 0) up to but not including `stop`,
-`JSON_LENGTH(arr)` an array's element count, `JSON_SLICE(arr, start[, stop])`
-its elements from `start` to before `stop` (from 0; a negative bound counts
-from the end, as in Python) and `JSON_CONCAT(a, b, …)` the arrays joined (null
-when any is). Together with `json_reduce` they make a per-character algorithm
+| function | returns |
+|---|---|
+| `CHARS(s)` | a string's characters as a JSON array |
+| `JSON_RANGE([start,] stop)` | the integers `start` (default 0) up to but not including `stop` |
+| `JSON_LENGTH(arr)` | an array's element count |
+| `JSON_SLICE(arr, start[, stop])` | its elements from `start` to before `stop` (from 0; a negative bound counts from the end, as in Python) |
+| `JSON_CONCAT(a, b, …)` | the arrays joined (null when any is) |
+
+Together with `json_reduce` they make a per-character algorithm
 a function — a CNPJ check digit, letters included (the July 2026
 alphanumeric CNPJ counts a character as its code point minus 48):
 

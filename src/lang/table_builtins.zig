@@ -1,5 +1,6 @@
 //! The table builtins' signatures, read as `FROM name(args)`: each name, the kinds
-//! and count of its constant arguments, and the message a wrong one gets. The parser
+//! and count of its constant arguments, how a person writes the call, and the
+//! message a wrong one gets. The parser
 //! needs no more than these to read a call; what an entry reads and how it opens
 //! lives with the run (`runtime/connect/table_builtins.zig`), one entry per signature.
 
@@ -11,15 +12,17 @@ pub const Signature = struct {
     name: []const u8,
     args: []const ArgKind,
     min_args: usize,
+    /// The call as Tab and the catalog show it, its arguments named.
+    usage: []const u8,
     arg_msg: []const u8,
 };
 
 pub const signatures = [_]Signature{
-    .{ .name = "range", .args = &.{ .int, .int }, .min_args = 1, .arg_msg = "RANGE bounds must be integer literals, params or expressions of them" },
-    .{ .name = "lines", .args = &.{.path}, .min_args = 1, .arg_msg = "LINES takes a file path: text, not a `dir/` folder" },
-    .{ .name = "fixed", .args = &.{ .path, .size, .bool }, .min_args = 2, .arg_msg = "FIXED takes a file path (text, not a `dir/` folder), a positive integer width of at most 64 MiB and an optional TRUE/FALSE skip_newlines" },
-    .{ .name = "split", .args = &.{ .path, .text }, .min_args = 2, .arg_msg = "SPLIT takes a file path (text, not a `dir/` folder) and a non-empty text terminator" },
-    .{ .name = "chunks", .args = &.{ .path, .size }, .min_args = 2, .arg_msg = "CHUNKS takes a file path (text, not a `dir/` folder) and a positive integer size of at most 64 MiB" },
+    .{ .name = "range", .args = &.{ .int, .int }, .min_args = 1, .usage = "range([lo,] hi)", .arg_msg = "RANGE bounds must be integer literals, params or expressions of them" },
+    .{ .name = "lines", .args = &.{.path}, .min_args = 1, .usage = "lines(path)", .arg_msg = "LINES takes a file path: text, not a `dir/` folder" },
+    .{ .name = "fixed", .args = &.{ .path, .size, .bool }, .min_args = 2, .usage = "fixed(path, width[, skip_newlines])", .arg_msg = "FIXED takes a file path (text, not a `dir/` folder), a positive integer width of at most 64 MiB and an optional TRUE/FALSE skip_newlines" },
+    .{ .name = "split", .args = &.{ .path, .text }, .min_args = 2, .usage = "split(path, terminator)", .arg_msg = "SPLIT takes a file path (text, not a `dir/` folder) and a non-empty text terminator" },
+    .{ .name = "chunks", .args = &.{ .path, .size }, .min_args = 2, .usage = "chunks(path, size)", .arg_msg = "CHUNKS takes a file path (text, not a `dir/` folder) and a positive integer size of at most 64 MiB" },
 };
 
 /// The signature named `name`, in any case.

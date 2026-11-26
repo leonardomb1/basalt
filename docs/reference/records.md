@@ -54,7 +54,7 @@ records, `fixed()`, `lines()`, `split()` and `chunks()` stream it instead
 | `text_at(rec, pos, len[, charset])` | text, trailing spaces trimmed |
 | `int_at(rec, pos, len)` | an `INT`: digits with an optional sign, spaces around it allowed, leading zeros fine |
 | `decimal_at(rec, pos, len, scale[, separator])` | `DECIMAL(len, scale)`: with no separator the last `scale` digits are the places (`0000012345` → `123.45`); with `','` or `'.'`, that is the decimal point and the other a grouping mark (`1.234,50`) |
-| `date_at(rec, pos, len, pattern[, null marker])` | a `DATE`; `time_at` and `timestamp_at` likewise |
+| `date_at(rec, pos, len, pattern[, null marker])`, `time_at`, `timestamp_at` | a `DATE`, `TIME` or `TIMESTAMP` read by the pattern |
 | `zoned_at(rec, pos, len, scale)` | a zoned decimal, ASCII overpunch (`0001234}`) or EBCDIC zones |
 | `packed_at(rec, pos, len, scale)` | a packed (COMP-3) decimal |
 | `u8_at(rec, pos)`, `u16le_at`, `i32be_at`, … `u64be_at` | binary integers, little or big endian |

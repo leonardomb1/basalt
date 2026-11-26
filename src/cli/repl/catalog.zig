@@ -465,8 +465,9 @@ test "a file's columns are offered with their type, in the offer and in its JSON
 
     const text = try msgfmt.allocPrint(a, "SELECT * FROM '{s}/t.csv' WHERE na", .{dir});
     const n = try suggestFor(a, &cx, text, text.len);
-    try std.testing.expectEqual(@as(usize, 1), n.items.len);
+    try std.testing.expectEqualStrings("name", n.items[0].text);
     try std.testing.expectEqual(complete.Kind.column, n.items[0].kind);
+    for (n.items[1..]) |c| try std.testing.expect(c.kind != .column);
     try std.testing.expectEqualStrings("string", n.items[0].detail);
 
     var aw = std.Io.Writer.Allocating.init(a);

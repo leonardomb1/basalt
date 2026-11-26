@@ -18,6 +18,9 @@
 //!                               and tables other cells hold; nothing runs, the
 //!                               session is untouched: the status carries
 //!                               `diagnostics: [...]`, as `check --format json`
+//!   {"op":"catalog","id":"c4"}  every built-in function, keyword and type: the
+//!                               status carries `catalog: {...}`, as `basalt
+//!                               catalog --format json`
 //!   {"op":"cancel"}             stop the running script; the session survives
 //!   {"op":"reset"}              forget every declaration
 //!   {"op":"close"}              exit (as does EOF on stdin)
@@ -247,6 +250,8 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             try completeScript(alloc, a, &out, &decls, &catalog, req);
         } else if (std.mem.eql(u8, req.op, "check")) {
             try checkScript(a, &out, &decls, req);
+        } else if (std.mem.eql(u8, req.op, "catalog")) {
+            try reply(a, &out, req.id, .{ .ok = true, .catalog = try cli.catalogJson(alloc) });
         } else if (std.mem.eql(u8, req.op, "reset")) {
             decls.clear();
             catalog.deinit();
@@ -256,7 +261,7 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             try reply(a, &out, req.id, .{ .ok = true });
             break;
         } else {
-            const m = try msgfmt.allocPrint(a, "unknown op `{s}` — run, check, complete, cancel, reset or close", .{req.op});
+            const m = try msgfmt.allocPrint(a, "unknown op `{s}` — run, check, complete, catalog, cancel, reset or close", .{req.op});
             try reply(a, &out, req.id, .{ .ok = false, .@"error" = .{ .msg = m } });
         }
     }
@@ -422,6 +427,7 @@ const Status = struct {
     @"error": ?ErrorInfo = null,
     complete: ?[]const u8 = null,
     diagnostics: ?[]const u8 = null,
+    catalog: ?[]const u8 = null,
 };
 
 fn anyTruncated(results: ?[]const ResultFrame) bool {
@@ -461,6 +467,10 @@ fn reply(a: std.mem.Allocator, out: *Out, id: ?[]const u8, st: Status) !void {
     if (st.diagnostics) |d| {
         try w.writeAll(",\"diagnostics\":");
         try w.writeAll(d);
+    }
+    if (st.catalog) |c| {
+        try w.writeAll(",\"catalog\":");
+        try w.writeAll(c);
     }
     if (st.@"error") |e| {
         try w.writeAll(",\"error\":");

@@ -447,17 +447,27 @@ fn expandCall(cx: *Ctx, c: ast.Expr.Call, subst: ?*Subst, depth: usize) Error!*a
     return mk(cx, .{ .call = .{ .name = c.name, .args = args, .distinct = c.distinct, .span = c.span } });
 }
 
+/// `year(d)` and its kin, each read as `extract` of its unit.
+const date_parts = [_][2][]const u8{
+    .{ "year", "year" },      .{ "month", "month" }, .{ "week", "week" },     .{ "day", "day" },
+    .{ "dayofmonth", "day" }, .{ "hour", "hour" },   .{ "minute", "minute" }, .{ "second", "second" },
+};
+
+/// Every spelling `sugar` reads, with the builtin it becomes: the aliases a catalog
+/// lists for that builtin.
+pub const spellings = blk: {
+    var out: []const [2][]const u8 = &.{};
+    for (date_parts) |p| out = out ++ [_][2][]const u8{.{ p[0], "extract" }};
+    break :blk out ++ [_][2][]const u8{ .{ "date_part", "extract" }, .{ "substring", "substr" }, .{ "datediff", "date_diff" }, .{ "date_sub", "date_add" } };
+};
+
 /// Other dialects' spellings of builtins, written as the builtin, unless the script
 /// defines a function of that name: `year(d)` and the other parts as `extract`,
 /// `date_part` as `extract`, `substring` as `substr`, `datediff` as `date_diff`
 /// (MySQL's two arguments counting the days from the second to the first), and
 /// DuckDB's `date_add` / `date_sub` of an INTERVAL as `date_add(unit, n, d)`.
 fn sugar(cx: *Ctx, c: ast.Expr.Call, args: []const *ast.Expr) Error!?*ast.Expr {
-    const parts = [_][2][]const u8{
-        .{ "year", "year" },      .{ "month", "month" }, .{ "week", "week" },     .{ "day", "day" },
-        .{ "dayofmonth", "day" }, .{ "hour", "hour" },   .{ "minute", "minute" }, .{ "second", "second" },
-    };
-    for (parts) |p| if (args.len == 1 and std.mem.eql(u8, c.name, p[0])) {
+    for (date_parts) |p| if (args.len == 1 and std.mem.eql(u8, c.name, p[0])) {
         return try call(cx, c, "extract", &.{ try mk(cx, .{ .str_lit = p[1] }), args[0] });
     };
     if (std.mem.eql(u8, c.name, "date_part") and args.len == 2) return try call(cx, c, "extract", args);

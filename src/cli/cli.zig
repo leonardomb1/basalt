@@ -37,6 +37,7 @@
 //!
 //! This file keeps the signal handling, the dispatch and the usage text. Each
 //! command is its own file (`cmd_run.zig`, `cmd_check.zig`, `cmd_complete.zig`,
+//! `cmd_catalog.zig`,
 //! `repl/repl.zig`, `kernel.zig`), with what they share in
 //! `args.zig` (script and flags), `entry.zig` (statements and the session's
 //! declarations), `prepare.zig` (an entry made runnable), `repl/catalog.zig` (what Tab
@@ -88,6 +89,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
         std.process.exit(try cmdRun(alloc, args));
     } else if (std.mem.eql(u8, verb, "complete")) {
         std.process.exit(try cmdComplete(alloc, args));
+    } else if (std.mem.eql(u8, verb, "catalog")) {
+        std.process.exit(try cmdCatalog(alloc, args));
     } else if (std.mem.eql(u8, verb, "kernel")) {
         std.process.exit(try kernel.cmdKernel(alloc, args));
     } else if (std.mem.eql(u8, verb, "repl")) {
@@ -130,6 +133,8 @@ pub const CheckOpts = @import("cmd_check.zig").CheckOpts;
 pub const checkText = @import("cmd_check.zig").checkText;
 const cmdCheck = @import("cmd_check.zig").cmdCheck;
 const cmdComplete = @import("cmd_complete.zig").cmdComplete;
+const cmdCatalog = @import("cmd_catalog.zig").cmdCatalog;
+pub const catalogJson = @import("cmd_catalog.zig").json;
 pub const declareFrom = @import("cmd_complete.zig").declareFrom;
 pub const writeOfferIn = @import("cmd_complete.zig").writeOfferIn;
 pub const writeOffer = @import("cmd_complete.zig").writeOffer;
@@ -164,6 +169,9 @@ fn usage(w: anytype) !void {
         \\               their ranges; --known: tables the script reads, undeclared
         \\  basalt complete <script>|-|-c <script> --pos N [--connect] [--utf16]
         \\               what Tab offers at offset N (bytes, or UTF-16 units), as JSON
+        \\  basalt catalog [--format json]
+        \\               every built-in function, keyword and type, with signatures
+        \\               and docs
         \\  basalt repl  interactive read-eval-print loop
         \\  basalt kernel [--format FMT] [-j N]
         \\               a session for a notebook: NDJSON requests on stdin, framed
@@ -354,6 +362,7 @@ test "Tab offers every table builtin, as a keyword or a function" {
 test {
     _ = @import("args.zig");
     _ = @import("repl/catalog.zig");
+    _ = @import("cmd_catalog.zig");
     _ = @import("cmd_check.zig");
     _ = @import("cmd_complete.zig");
     _ = @import("cmd_run.zig");

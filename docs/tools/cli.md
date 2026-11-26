@@ -4,6 +4,7 @@
 basalt run      <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--format table|json|csv|tsv|arrow] [--max-rows N] [--op-memory SIZE] [--spill-dir DIR] [--spill-cap SIZE] [--trace FILE]
 basalt check    <script>|-|-c "<inline>" [-p key=value ...] [--format json] [--known t1,t2] [--pin]
 basalt complete <script>|-|-c "<inline>" [--pos N] [--connect] [--utf16]
+basalt catalog  [--format json]
 basalt repl
 basalt kernel   [--format table|json|csv|tsv|arrow] [-j threads] [--max-rows N]
 basalt version
@@ -142,6 +143,14 @@ comes back once: a column named `name` is not offered again as the keyword
 script's own declarations, so a script half typed still has its names; local
 files named in it give their columns; connections are asked for their tables and
 columns only under `--connect`, since that is a round trip to each.
+
+`basalt catalog` lists every built-in function — its signature, kind, return
+type when the arguments do not decide it, aliases and the reference's one
+sentence — then the keywords and the type names. `--format json` prints it for a
+program, as the kernel's `catalog` answers ([Kernel protocol](kernel.md)): an
+editor that reads it keeps no function list of its own. It is drawn from the
+tables the parser, the binder and Tab read, and the docs from these pages, so a
+function added to the engine shows up there with its sentence.
 
 ## Progress and summaries
 

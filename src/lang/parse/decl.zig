@@ -234,36 +234,50 @@ pub fn parseParam(self: *Parser) Error!ast.Param {
     return .{ .name = name, .ty = ty, .default = default, .pos = pos, .is_json = is_json };
 }
 
+pub const TypeName = struct { n: []const u8, k: types.TypeKind };
+
+/// The type names that take no arguments, each with the kind it names.
+pub const simple_types = [_]TypeName{
+    .{ .n = "bool", .k = .bool },          .{ .n = "boolean", .k = .bool },
+    .{ .n = "int", .k = .int },            .{ .n = "integer", .k = .int },
+    .{ .n = "bigint", .k = .int },         .{ .n = "smallint", .k = .int },
+    .{ .n = "tinyint", .k = .int },        .{ .n = "float", .k = .float },
+    .{ .n = "real", .k = .float },         .{ .n = "double", .k = .float },
+    .{ .n = "string", .k = .string },      .{ .n = "text", .k = .string },
+    .{ .n = "bytes", .k = .bytes },        .{ .n = "binary", .k = .bytes },
+    .{ .n = "varbinary", .k = .bytes },    .{ .n = "date", .k = .date },
+    .{ .n = "time", .k = .time },          .{ .n = "timestamp", .k = .timestamp },
+    .{ .n = "datetime", .k = .timestamp },
+};
+
+/// Text types that may carry a length, which is read and dropped: `varchar(20)`.
+pub const sized_text_types = [_][]const u8{ "varchar", "char", "nvarchar" };
+
+/// `decimal` and its alias, with an optional `(precision[, scale])`.
+pub const decimal_types = [_][]const u8{ "decimal", "numeric" };
+
+fn inNoCase(names: []const []const u8, n: []const u8) bool {
+    for (names) |x| if (eqlNoCase(x, n)) return true;
+    return false;
+}
+
 pub fn parseTypeName(self: *Parser) Error!types.Type {
     const pos = self.curPos();
     const name = try self.expectIdent();
-    const Map = struct { n: []const u8, k: types.TypeKind };
-    const simple = [_]Map{
-        .{ .n = "bool", .k = .bool },          .{ .n = "boolean", .k = .bool },
-        .{ .n = "int", .k = .int },            .{ .n = "integer", .k = .int },
-        .{ .n = "bigint", .k = .int },         .{ .n = "smallint", .k = .int },
-        .{ .n = "tinyint", .k = .int },        .{ .n = "float", .k = .float },
-        .{ .n = "real", .k = .float },         .{ .n = "double", .k = .float },
-        .{ .n = "string", .k = .string },      .{ .n = "text", .k = .string },
-        .{ .n = "bytes", .k = .bytes },        .{ .n = "binary", .k = .bytes },
-        .{ .n = "varbinary", .k = .bytes },    .{ .n = "date", .k = .date },
-        .{ .n = "time", .k = .time },          .{ .n = "timestamp", .k = .timestamp },
-        .{ .n = "datetime", .k = .timestamp },
-    };
-    for (simple) |m| {
+    for (simple_types) |m| {
         if (eqlNoCase(name, m.n)) {
             if (eqlNoCase(name, "double")) _ = self.eatKw("precision");
             return types.Type.init(m.k);
         }
     }
-    if (eqlNoCase(name, "varchar") or eqlNoCase(name, "char") or eqlNoCase(name, "nvarchar")) {
+    if (inNoCase(&sized_text_types, name)) {
         if (self.eat(.lparen)) {
             _ = try self.expect(.int);
             _ = try self.expect(.rparen);
         }
         return types.Type.init(.string);
     }
-    if (eqlNoCase(name, "decimal") or eqlNoCase(name, "numeric")) {
+    if (inNoCase(&decimal_types, name)) {
         var p: u8 = 38;
         var s: u8 = 0;
         if (self.eat(.lparen)) {

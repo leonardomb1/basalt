@@ -122,12 +122,12 @@ Four table sources read a file's bytes as records rather than parsing a
 format, for the files no reader fits — logs, fixed-width bank and mainframe
 exports, EDI:
 
-| call | one row per |
-|------|-------------|
-| `lines(p)` | line; `\n` and `\r\n` both end one (the `\r` is not in `rec`), a last line without one is a row |
-| `fixed(p, width [, skip_newlines])` | `width` bytes, back to back; `skip_newlines = TRUE` skips a `\n` or `\r\n` between records. A short last record fails the read naming its offset and length |
-| `split(p, terminator)` | record ended by the terminator's bytes (`'~'`, `''''`, any text), which is not in `rec`; a lone line end after the last one is not a record |
-| `chunks(p, size)` | block of `size` bytes, the last one shorter |
+| call | reads |
+|------|-------|
+| `lines(p)` | one row per line; `\n` and `\r\n` both end one (the `\r` is not in `rec`), a last line without one is a row |
+| `fixed(p, width [, skip_newlines])` | one row per `width` bytes, back to back; `skip_newlines = TRUE` skips a `\n` or `\r\n` between records. A short last record fails the read naming its offset and length |
+| `split(p, terminator)` | one row per record ended by the terminator's bytes (`'~'`, `''''`, any text), which is not in `rec`; a lone line end after the last one is not a record |
+| `chunks(p, size)` | one row per block of `size` bytes, the last one shorter |
 
 Each returns `n INT` (the record's number, from 1), `offset INT` (its first
 byte in the decoded file, from 0) and `rec BYTES`. The path and sizes are

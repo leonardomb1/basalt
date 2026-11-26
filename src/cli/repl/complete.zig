@@ -20,12 +20,14 @@
 //!
 //! `builtin_functions` and `meta_commands` list everything the engine and REPL
 //! answer to by name; `cli.zig`'s tests hold them to the engine's registries both
-//! ways, so a builtin added there cannot go missing from Tab.
+//! ways, so a builtin added there cannot go missing from Tab. A table function's
+//! signature is its registry entry's usage and the columns it reads.
 
 const std = @import("std");
 const msgfmt = @import("../../base/msgfmt.zig");
 const hilite = @import("hilite.zig");
 const eval = @import("../../exec/eval.zig");
+const table_builtins = @import("../../runtime/connect/table_builtins.zig");
 const sql_lexer = @import("../../lang/sql_lexer.zig");
 
 pub const Kind = enum { meta, param, cte, connection, function, table, column, keyword, path };
@@ -48,8 +50,18 @@ pub const Names = struct {
 pub const Builtin = struct { name: []const u8, sig: []const u8 };
 
 /// Every function Tab offers: those listed here, then each registry entry that
-/// carries its own signature.
-pub const builtin_functions = listed ++ signed;
+/// carries its own signature, then the table functions.
+pub const builtin_functions = listed ++ signed ++ tabled;
+
+const tabled = blk: {
+    var out: [table_builtins.table.len]Builtin = undefined;
+    for (table_builtins.table, &out) |b, *o| {
+        var sig: []const u8 = b.sig.usage ++ " →";
+        for (b.schema.fields, 0..) |f, i| sig = sig ++ (if (i > 0) ", " else " ") ++ f.name;
+        o.* = .{ .name = b.sig.name, .sig = sig };
+    }
+    break :blk out;
+};
 
 const signed = blk: {
     var n = 0;
@@ -69,7 +81,7 @@ const listed = [_]Builtin{
     .{ .name = "now", .sig = "now()" },
     .{ .name = "today", .sig = "today()" },
     .{ .name = "regexp_replace", .sig = "regexp_replace(s, pattern, replacement[, flags])" },
-    .{ .name = "search", .sig = "search(* | t.* | * EXCEPT (c) | (a, b), 'words -not col:word \"a phrase\"'[, unaccent bool])" },
+    .{ .name = "search", .sig = "search(cols, text[, unaccent])" },
     .{ .name = "regexp_matches", .sig = "regexp_matches(s, pattern)" },
     .{ .name = "regexp_extract", .sig = "regexp_extract(s, pattern[, group])" },
     .{ .name = "md5", .sig = "md5(s)" },
@@ -220,10 +232,6 @@ const listed = [_]Builtin{
     .{ .name = "cast", .sig = "cast(x AS type)" },
     .{ .name = "try_cast", .sig = "try_cast(x AS type)" },
     .{ .name = "if", .sig = "if(cond, a, b)" },
-    .{ .name = "lines", .sig = "lines(path) → n, offset, rec" },
-    .{ .name = "fixed", .sig = "fixed(path, width[, skip_newlines]) → n, offset, rec" },
-    .{ .name = "split", .sig = "split(path, terminator) → n, offset, rec" },
-    .{ .name = "chunks", .sig = "chunks(path, size) → n, offset, rec" },
 };
 
 pub const meta_commands = [_][]const u8{ "\\connections", "\\c", "\\connect", "\\reset", "\\clear", "\\cls", "\\format", "\\f", "\\view", "\\v", "\\d", "\\dt", "\\i", "\\source", "\\save", "\\edit", "\\e", "\\help", "\\h", "\\q", "\\quit" };
@@ -432,7 +440,7 @@ test "complete: built-in functions by prefix with their signature, columns with 
 
     const names = Names{ .columns = &.{ .{ .name = "name", .type = "string" }, .{ .name = "amount", .type = "decimal(10,2)" }, .{ .name = "NAME", .type = "int" } } };
     const n = (try complete(a, names, "SELECT na", 9)).candidates.items;
-    try std.testing.expectEqual(@as(usize, 1), n.len);
+    try std.testing.expectEqual(@as(usize, 1), timesOffered(n, "name") + timesOffered(n, "NAME"));
     try std.testing.expectEqual(Kind.column, n[0].kind);
     try std.testing.expectEqualStrings("string", n[0].detail);
     const q = (try complete(a, names, "SELECT t.am", 11)).candidates.items;

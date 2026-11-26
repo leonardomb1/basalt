@@ -1,4 +1,5 @@
-//! The build graph. The e2e and docs tests see the engine only as the `basalt` module,
+//! The build graph. The catalog's function docs are generated from docs/ at build
+//! time (`tools/fn_docs.zig`). The e2e and docs tests see the engine only as the `basalt` module,
 //! its public API; the docs check reads docs/, so it always re-runs. The unit tests run
 //! from the repo root, since one of them reads src/. Coverage builds the
 //! tests with LLVM, since kcov cannot read the self-hosted backend's debug info, and makes
@@ -6,10 +7,31 @@
 
 const std = @import("std");
 
+/// The pages the catalog takes each function's one-sentence doc from, the first
+/// that describes a function winning (`tools/fn_docs.zig`).
+const doc_pages = [_][]const u8{
+    "docs/reference/functions.md",
+    "docs/reference/json.md",
+    "docs/reference/records.md",
+    "docs/reference/regex.md",
+    "docs/language/aggregates.md",
+    "docs/language/queries.md",
+    "docs/language/windows.md",
+    "docs/language/sources.md",
+    "docs/reference/expressions.md",
+};
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const strip = b.option(bool, "strip", "Omit debug info from the binary") orelse false;
+
+    const fn_docs_gen = b.addRunArtifact(b.addExecutable(.{
+        .name = "fn-docs",
+        .root_module = b.createModule(.{ .root_source_file = b.path("tools/fn_docs.zig"), .target = b.graph.host }),
+    }));
+    const fn_docs = fn_docs_gen.addOutputFileArg("fn_docs.zig");
+    for (doc_pages) |page| fn_docs_gen.addFileArg(b.path(page));
 
     const opts = b.addOptions();
     opts.addOption([]const u8, "version", @import("build.zig.zon").version);
@@ -24,6 +46,7 @@ pub fn build(b: *std.Build) void {
         .strip = strip,
     });
     root_module.addOptions("build_options", opts);
+    root_module.addAnonymousImport("fn_docs", .{ .root_source_file = fn_docs });
 
     const exe_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -33,6 +56,7 @@ pub fn build(b: *std.Build) void {
         .unwind_tables = if (optimize != .Debug and !stats) .none else null,
     });
     exe_module.addOptions("build_options", opts);
+    exe_module.addAnonymousImport("fn_docs", .{ .root_source_file = fn_docs });
 
     const exe = b.addExecutable(.{
         .name = "basalt",
@@ -62,6 +86,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     basalt_module.addOptions("build_options", opts);
+    basalt_module.addAnonymousImport("fn_docs", .{ .root_source_file = fn_docs });
     const e2e_tests = b.addTest(.{
         .filters = filters,
         .root_module = b.createModule(.{
@@ -94,6 +119,12 @@ pub fn build(b: *std.Build) void {
     docs_step.dependOn(&run_docs_tests.step);
     const unit_step = b.step("test-unit", "Run the unit tests in src/");
     unit_step.dependOn(&run_unit_tests.step);
+    const tool_tests = b.addRunArtifact(b.addTest(.{
+        .filters = filters,
+        .root_module = b.createModule(.{ .root_source_file = b.path("tools/fn_docs.zig"), .target = b.graph.host }),
+    }));
+    test_step.dependOn(&tool_tests.step);
+    unit_step.dependOn(&tool_tests.step);
     const e2e_step = b.step("test-e2e", "Run the end-to-end tests in tests/e2e/");
     e2e_step.dependOn(&run_e2e_tests.step);
 

@@ -240,6 +240,21 @@ def main(binary):
     names = [(i["text"], i["kind"]) for i in (st.get("complete") or {}).get("items", [])]
     report("complete offers a function an earlier script declared", ("dbl", "function") in names, st)
 
+    # The catalog: every built-in, keyword and type, from the engine's own tables.
+    k.send(op="catalog", id="cat")
+    _, st = k.reply()
+    cat = st.get("catalog") or {}
+    fns = {f["name"]: f for f in cat.get("functions", [])}
+    sub = fns.get("substr") or {}
+    report("catalog lists functions with kind, params, return type, doc and aliases",
+           st["ok"] and sub.get("kind") == "scalar" and [p["name"] for p in sub.get("params", [])] == ["s", "start", "length"]
+           and sub["params"][2]["optional"] and sub.get("returns") == "string" and sub.get("doc")
+           and "substring" in sub.get("aliases", []) and fns.get("count", {}).get("kind") == "aggregate"
+           and fns.get("lag", {}).get("returns") is None and fns.get("lines", {}).get("kind") == "table", st if not cat else sub)
+    report("catalog lists keywords and types, and carries the version",
+           "select" in cat.get("keywords", []) and any(t["name"] == "bigint" and t["is"] == "int" for t in cat.get("types", []))
+           and cat.get("version"), {k2: cat.get(k2) for k2 in ("version", "types")})
+
     # A LET keeps the value the declaring cell decided: later cells never
     # recompute now() nor re-run the query, even after its source changes.
     lf = os.path.join(tempfile.mkdtemp(), "let.csv")
