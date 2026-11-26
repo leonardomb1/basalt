@@ -517,9 +517,17 @@ pub fn writeText(w: *std.Io.Writer, c: Catalog) !void {
 var kept: ?Catalog = null;
 var kept_json: ?[]const u8 = null;
 var kept_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+var kept_mu: std.Thread.Mutex = .{};
 
-/// The catalog, built at the first call and kept for the process.
+/// The catalog, built at the first call and kept for the process; the kernel's two
+/// threads may ask at once.
 pub fn get() !Catalog {
+    kept_mu.lock();
+    defer kept_mu.unlock();
+    return keptCatalog();
+}
+
+fn keptCatalog() !Catalog {
     if (kept) |c| return c;
     kept = try build(std.heap.page_allocator, kept_arena.allocator());
     return kept.?;
@@ -527,9 +535,11 @@ pub fn get() !Catalog {
 
 /// The catalog as JSON, written at the first call and kept for the process.
 pub fn json() ![]const u8 {
+    kept_mu.lock();
+    defer kept_mu.unlock();
     if (kept_json) |j| return j;
     var aw = std.Io.Writer.Allocating.init(kept_arena.allocator());
-    try writeJson(&aw.writer, try get());
+    try writeJson(&aw.writer, try keptCatalog());
     kept_json = aw.written();
     return kept_json.?;
 }

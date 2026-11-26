@@ -59,16 +59,19 @@
 //! errors only unless asked, and without the per-run summary the status carries.
 //!
 //! Unknown request fields are ignored, so a newer frontend can talk to an older
-//! kernel. Under `utf16`, the `pos` of `complete`, `hover` and `definition` and
-//! the offsets and columns they answer count UTF-16 units, a JavaScript editor's,
-//! not bytes. `check`'s `tables` are names, or
+//! kernel. Under `utf16`, `pos` and every offset and column a request is answered
+//! with (errors, diagnostics, result and load frames, hover and definition)
+//! count UTF-16 units, a JavaScript editor's, not bytes. `check`'s `tables` are names, or
 //! `{"name":…,"columns":[{"name":…,"type":…}]}` to type what is read from them.
 //! Echoed ids are clipped to 256 bytes; a clipped echo still pairs in order.
 //!
 //! Threads and fds. A stdin thread reads requests: `cancel` acts there at once,
 //! since it must reach a busy script, and only stops the script whose id it
-//! names; everything else queues for the main loop in order. ^C cancels the
-//! script, never the session (the CLI's own handler exits on a second signal,
+//! names; while a script runs, a request that only reads the session
+//! (`side_ops`) goes to a side thread, answered at once from a copy of the
+//! session and asking no connection; everything else queues for the main loop
+//! in order. The main loop alone writes the session, holding `Shared.lock`. ^C
+//! cancels the script, never the session (the CLI's own handler exits on a second signal,
 //! taking every declaration with it). Frames go to a private dup of stdout; fd 1
 //! points at stderr between scripts, so a stray write cannot corrupt the stream,
 //! and at a capture pipe while one runs, whose pump thread frames it as `data`.
@@ -142,6 +145,12 @@ const Queue = struct {
         while (self.items.items.len == 0 and !self.eof) self.cond.wait(&self.mu);
         if (self.items.items.len == 0) return null;
         return self.items.orderedRemove(0);
+    }
+
+    fn isActive(self: *Queue) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.active;
     }
 
     fn setRunning(self: *Queue, id: ?[]const u8) void {
@@ -236,13 +245,25 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         for (queue.items.items) |l| alloc.free(l);
         queue.items.deinit();
     }
-    const reader = try std.Thread.spawn(.{}, readRequests, .{ alloc, &queue });
-    reader.detach();
+    var side_q = Queue{ .items = std.array_list.Managed([]u8).init(alloc) };
+    defer {
+        for (side_q.items.items) |l| alloc.free(l);
+        side_q.items.deinit();
+    }
 
     var decls = cli.DeclStore.init(alloc);
     defer decls.deinit();
     var catalog = cli.Catalog.init(alloc);
     defer catalog.deinit();
+    var shared = Shared{ .decls = &decls, .catalog = &catalog };
+
+    const side = try std.Thread.spawn(.{}, sideLoop, .{ alloc, &out, &side_q, &shared });
+    defer {
+        side_q.close();
+        side.join();
+    }
+    const reader = try std.Thread.spawn(.{}, readRequests, .{ alloc, &queue, &side_q });
+    reader.detach();
 
     while (queue.pop()) |raw| {
         defer pagecache.trim();
@@ -255,21 +276,17 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             continue;
         };
         if (std.mem.eql(u8, req.op, "run")) {
-            try runScript(alloc, a, &out, &queue, &decls, req, opts);
-        } else if (std.mem.eql(u8, req.op, "complete")) {
-            try completeScript(alloc, a, &out, &decls, &catalog, req);
-        } else if (std.mem.eql(u8, req.op, "check")) {
-            try checkScript(a, &out, &decls, req);
-        } else if (std.mem.eql(u8, req.op, "hover") or std.mem.eql(u8, req.op, "definition")) {
-            try lookupScript(alloc, a, &out, &decls, &catalog, req);
-        } else if (std.mem.eql(u8, req.op, "format")) {
-            try formatScript(a, &out, &decls, req);
-        } else if (std.mem.eql(u8, req.op, "catalog")) {
-            try reply(a, &out, req.id, .{ .ok = true, .catalog = try cli.catalogJson() });
+            try runScript(alloc, a, &out, &queue, &shared, req, opts);
+        } else if (isSide(req.op)) {
+            try answer(alloc, a, &out, &shared, &decls, req);
         } else if (std.mem.eql(u8, req.op, "reset")) {
+            shared.lock.lock();
             decls.clear();
+            shared.lock.unlock();
+            shared.catalog_mu.lock();
             catalog.deinit();
             catalog = cli.Catalog.init(alloc);
+            shared.catalog_mu.unlock();
             try reply(a, &out, req.id, .{ .ok = true });
         } else if (std.mem.eql(u8, req.op, "close")) {
             try reply(a, &out, req.id, .{ .ok = true });
@@ -280,6 +297,59 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         }
     }
     return 0;
+}
+
+/// What the side thread shares with the main loop: the session, which the main loop
+/// alone writes, holding `lock` exclusively, and the side thread reads holding it
+/// shared; and Tab's cache of what connections said, which either may fill, under
+/// `catalog_mu`.
+const Shared = struct {
+    decls: *cli.DeclStore,
+    catalog: *cli.Catalog,
+    lock: std.Thread.RwLock = .{},
+    catalog_mu: std.Thread.Mutex = .{},
+};
+
+/// The requests that only read the session, which the side thread answers while a
+/// script runs.
+const side_ops = [_][]const u8{ "check", "complete", "hover", "definition", "format", "catalog" };
+
+fn isSide(op: []const u8) bool {
+    for (side_ops) |o| if (std.mem.eql(u8, o, op)) return true;
+    return false;
+}
+
+/// Answers one of `side_ops` against `decls`, from either thread.
+fn answer(gpa: std.mem.Allocator, a: std.mem.Allocator, out: *Out, shared: *Shared, decls: *const cli.DeclStore, req: Request) !void {
+    if (std.mem.eql(u8, req.op, "check")) return checkScript(a, out, decls, req);
+    if (std.mem.eql(u8, req.op, "format")) return formatScript(a, out, decls, req);
+    if (std.mem.eql(u8, req.op, "catalog")) return reply(a, out, req.id, .{ .ok = true, .catalog = try cli.catalogJson() });
+    shared.catalog_mu.lock();
+    defer shared.catalog_mu.unlock();
+    if (std.mem.eql(u8, req.op, "complete")) return completeScript(gpa, a, out, decls, shared.catalog, req);
+    return lookupScript(gpa, a, out, decls, shared.catalog, req);
+}
+
+/// The side thread: what the reader routes here while a script runs, answered at
+/// once from a copy of the session as it stands, with no connection asked, as one
+/// may be busy with the script: what connections said before is still offered.
+fn sideLoop(alloc: std.mem.Allocator, out: *Out, q: *Queue, shared: *Shared) void {
+    while (q.pop()) |raw| {
+        defer alloc.free(raw);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        var req = std.json.parseFromSliceLeaky(Request, a, raw, .{ .ignore_unknown_fields = true }) catch continue;
+        req.connect = false;
+        shared.lock.lockShared();
+        var snap = shared.decls.clone(alloc) catch {
+            shared.lock.unlockShared();
+            continue;
+        };
+        shared.lock.unlockShared();
+        defer snap.deinit();
+        answer(alloc, a, out, shared, &snap, req) catch {};
+    }
 }
 
 /// Every problem in a cell, in `basalt check --format json`'s shape, against the
@@ -307,6 +377,7 @@ fn checkScript(a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, req
     for (issues, 0..) |is, k| {
         var e = ErrorInfo{ .msg = is.msg };
         locate(&e, st.text, st.entry_at, is.file orelse "", is.pos, is.end);
+        if (req.utf16) inUnits(a, &e, script);
         if (k > 0) try w.writeByte(',');
         try w.print("{{\"level\":\"{s}\",\"msg\":", .{if (is.warning) "warning" else "error"});
         try jsontext.string(w, e.msg);
@@ -400,8 +471,9 @@ fn lookupScript(gpa: std.mem.Allocator, a: std.mem.Allocator, out: *Out, decls: 
 }
 
 /// `format`: the script laid out, checked to read as it did after the session's
-/// declarations (less those it declares anew); refused with why, where the script
-/// does not parse, or when the layout would read differently. Nothing runs.
+/// declarations (less those it declares anew), with `tables` as `check` takes them;
+/// refused with why, where the script does not parse, or when the layout would read
+/// differently. Nothing runs.
 fn formatScript(a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, req: Request) !void {
     const script = req.script orelse
         return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = "`format` needs a `script`" } });
@@ -416,7 +488,13 @@ fn formatScript(a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, re
         try prelude.appendSlice(e.text);
         try prelude.appendSlice(";\n");
     }
-    switch (try cli.formatScript(a, script, "<repl>", ".", prelude.items)) {
+    const known = knownTables(a, req.tables) catch |e| switch (e) {
+        error.OutOfMemory => return e,
+        error.BadTables, error.BadType => return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = "`tables` must be a list of names, or of {\"name\": …, \"columns\": [{\"name\": …, \"type\": …}]}" } }),
+    };
+    const names = try a.alloc([]const u8, known.len);
+    for (known, names) |k, *n| n.* = k.name;
+    switch (try cli.formatScript(a, script, "<repl>", ".", prelude.items, names)) {
         .ok => |text| {
             var aw = std.Io.Writer.Allocating.init(a);
             try jsontext.string(&aw.writer, text);
@@ -429,6 +507,7 @@ fn formatScript(a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, re
                 e.line = r.line;
                 e.col = r.col;
             }
+            if (req.utf16) inUnits(a, &e, script);
             try reply(a, out, req.id, .{ .ok = false, .@"error" = e });
         },
     }
@@ -464,8 +543,11 @@ fn withComments(script: []const u8, entry: cli.Prepared, stmt: []const u8) []con
     return std.mem.trim(u8, script[from .. off + own.len], " \t\r\n");
 }
 
-fn readRequests(alloc: std.mem.Allocator, q: *Queue) void {
+/// Reads requests: a cancel acts at once; while a script runs, one of `side_ops`
+/// goes to the side thread; anything else waits its turn on the main loop.
+fn readRequests(alloc: std.mem.Allocator, q: *Queue, side_q: *Queue) void {
     defer q.close();
+    defer side_q.close();
     var buf: [64 * 1024]u8 = undefined;
     var fr = std.fs.File.stdin().readerStreaming(&buf);
     const r = &fr.interface;
@@ -481,7 +563,8 @@ fn readRequests(alloc: std.mem.Allocator, q: *Queue) void {
                 if (id) |s| alloc.free(s);
             } else {
                 const line = alloc.dupe(u8, t) catch return;
-                q.push(line) catch {
+                const to = if (q.isActive() and sideRequest(alloc, t)) side_q else q;
+                to.push(line) catch {
                     alloc.free(line);
                     return;
                 };
@@ -489,6 +572,14 @@ fn readRequests(alloc: std.mem.Allocator, q: *Queue) void {
         }
         _ = r.takeByte() catch return;
     }
+}
+
+/// Whether the line asks for one of `side_ops`.
+fn sideRequest(alloc: std.mem.Allocator, line: []const u8) bool {
+    const R = struct { op: []const u8 };
+    const p = std.json.parseFromSlice(R, alloc, line, .{ .ignore_unknown_fields = true }) catch return false;
+    defer p.deinit();
+    return isSide(p.value.op);
 }
 
 /// Null when the line is not a cancel request, else the optional id it names
@@ -605,6 +696,36 @@ fn locate(e: *ErrorInfo, prepared_text: []const u8, entry_at: usize, label: []co
     };
 }
 
+/// Column `col` (bytes, from 1) of line `line` of `text` in UTF-16 units; a column
+/// past the line's end keeps its excess, and one past the text is left as it is.
+fn unitCol(text: []const u8, line: u32, col: u32) u32 {
+    if (line == 0 or col == 0) return col;
+    var start: usize = 0;
+    var n: u32 = 1;
+    while (n < line) : (n += 1) start = (std.mem.indexOfScalarPos(u8, text, start, '\n') orelse return col) + 1;
+    const end = std.mem.indexOfScalarPos(u8, text, start, '\n') orelse text.len;
+    const off = @min(col - 1, end - start);
+    return @intCast(utf16.byteToUnit(text[start..end], off) + 1 + (col - 1 - off));
+}
+
+/// An error's columns in UTF-16 units of the text it is placed in: the script as
+/// sent, or an included file, read again; a session's has none.
+fn inUnits(a: std.mem.Allocator, e: *ErrorInfo, script: []const u8) void {
+    const file = e.file orelse "script";
+    const text = if (std.mem.eql(u8, file, "script"))
+        script
+    else if (std.mem.eql(u8, file, "session"))
+        return
+    else
+        std.fs.cwd().readFileAlloc(a, file, 8 << 20) catch return;
+    if (e.line) |ln| if (e.col) |c| {
+        e.col = unitCol(text, ln, c);
+    };
+    if (e.end_line) |ln| if (e.end_col) |c| {
+        e.end_col = unitCol(text, ln, c);
+    };
+}
+
 fn paramArgs(a: std.mem.Allocator, v: ?std.json.Value) ![]runtime.ParamArg {
     const obj = switch (v orelse return &.{}) {
         .object => |o| o,
@@ -711,6 +832,8 @@ const Capture = struct {
     broken: bool = false,
     loads: std.array_list.Managed(runtime.LoadDone),
     loads_mu: std.Thread.Mutex = .{},
+    /// The script as sent, when columns count UTF-16 units of it (`utf16`).
+    units: ?[]const u8 = null,
 
     fn start(self: *Capture) !void {
         const pipe = try std.posix.pipe2(.{ .CLOEXEC = true });
@@ -745,7 +868,7 @@ const Capture = struct {
             .statement = done.info.statement,
             .kind = done.info.kind,
             .line = done.info.line,
-            .col = done.info.col,
+            .col = if (self.units) |t| unitCol(t, done.info.line, done.info.col) else done.info.col,
             .rows = done.rows,
             .elapsed_ms = @intCast(@max(0, std.time.milliTimestamp() - done.info.t0_ms)),
             .truncated = done.truncated,
@@ -777,6 +900,7 @@ const Capture = struct {
         defer self.loads_mu.unlock();
         const a = self.loads.allocator;
         var l = done;
+        if (self.units) |t| l.col = unitCol(t, done.line, done.col);
         l.target = a.dupe(u8, done.target) catch "";
         l.reason = a.dupe(u8, done.reason) catch "";
         self.loads.append(l) catch {};
@@ -810,10 +934,11 @@ fn runScript(
     a: std.mem.Allocator,
     out: *Out,
     q: *Queue,
-    decls: *cli.DeclStore,
+    shared: *Shared,
     req: Request,
     opts: Opts,
 ) !void {
+    const decls = shared.decls;
     const id = req.id orelse "";
     const script = req.script orelse
         return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = "`run` needs a `script`" } });
@@ -831,6 +956,7 @@ fn runScript(
             var ei = ErrorInfo{ .msg = pdiag.parse.msg };
             const pe = pdiag.parse;
             locate(&ei, text, text.len - script.len, pdiag.label, .{ .line = pe.line, .col = pe.col }, if (pe.end_line > 0) ast.Pos{ .line = pe.end_line, .col = pe.end_col } else null);
+            if (req.utf16) inUnits(a, &ei, script);
             return reply(a, out, req.id, .{ .ok = false, .@"error" = ei });
         },
         error.OutOfMemory => return error.OutOfMemory,
@@ -840,9 +966,13 @@ fn runScript(
 
     const stands = try cli.declarationsStand(a, decls, entry.pending);
     const kept: []const cli.Pending = if (stands) entry.pending else &.{};
-    for (kept) |p| {
-        const stmt = withComments(script, entry, p.text);
-        try decls.putAt(p.id, stmt, declaredAt(id, script, entry, stmt));
+    {
+        shared.lock.lock();
+        defer shared.lock.unlock();
+        for (kept) |p| {
+            const stmt = withComments(script, entry, p.text);
+            try decls.putAt(p.id, stmt, declaredAt(id, script, entry, stmt));
+        }
     }
     const declared = try a.alloc(Declared, kept.len);
     for (declared, kept) |*d, p| d.* = .{ .kind = @tagName(p.id.kind), .name = p.id.name };
@@ -864,14 +994,19 @@ fn runScript(
                     .transient = rdiag.retryable or runtime.isTransient(e),
                 };
                 locate(&ei, entry.text, entry.entry_at, entry.prog.fileOf(rdiag.pos) orelse "", rdiag.pos, rdiag.end);
+                if (req.utf16) inUnits(a, &ei, script);
                 return reply(a, out, req.id, .{ .ok = false, .elapsed_ms = @intCast(std.time.milliTimestamp() - t0), .declared = declared, .@"error" = ei });
             };
-            if (stands) try freezer.commit(decls);
+            if (stands) {
+                shared.lock.lock();
+                defer shared.lock.unlock();
+                try freezer.commit(decls);
+            }
         }
         return reply(a, out, req.id, .{ .ok = true, .elapsed_ms = @intCast(std.time.milliTimestamp() - t0), .declared = declared });
     }
 
-    var cap = Capture{ .out = out, .id = id, .results = std.array_list.Managed(ResultFrame).init(a), .loads = std.array_list.Managed(runtime.LoadDone).init(a) };
+    var cap = Capture{ .out = out, .id = id, .results = std.array_list.Managed(ResultFrame).init(a), .loads = std.array_list.Managed(runtime.LoadDone).init(a), .units = if (req.utf16) script else null };
     var summary: obs.Summary = .{ .run_id = 0, .loads = 0 };
     var ran = false;
     cap.start() catch |e| {
@@ -880,7 +1015,11 @@ fn runScript(
     };
 
     var freezer = cli.LetFreezer.init(a);
-    defer freezer.commit(decls) catch {};
+    defer {
+        shared.lock.lock();
+        freezer.commit(decls) catch {};
+        shared.lock.unlock();
+    }
 
     runtime.resetAbort();
     q.setRunning(id);
@@ -942,7 +1081,16 @@ fn runScript(
         .transient = rdiag.retryable or runtime.isTransient(e),
     };
     locate(&ei, entry.text, entry.entry_at, entry.prog.fileOf(rdiag.pos) orelse "", rdiag.pos, rdiag.end);
+    if (req.utf16) inUnits(a, &ei, script);
     return reply(a, out, req.id, .{ .ok = false, .elapsed_ms = elapsed, .declared = declared, .results = results, .loads = loads, .@"error" = ei });
+}
+
+test "unitCol: a byte column as UTF-16 units of its line, past text that is not ASCII" {
+    const text = "SELECT 1;\nSELECT 'é😀' AS a, nope;";
+    try std.testing.expectEqual(@as(u32, 20), unitCol(text, 2, 23));
+    try std.testing.expectEqual(@as(u32, 5), unitCol(text, 1, 5));
+    try std.testing.expectEqual(@as(u32, 9), unitCol("ab", 1, 9));
+    try std.testing.expectEqual(@as(u32, 7), unitCol(text, 3, 7));
 }
 
 test "locate: positions count in the script as sent, not the replayed prelude" {

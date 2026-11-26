@@ -39,6 +39,7 @@ const builtins = @import("../exec/builtins.zig");
 const loadSource = @import("args.zig").loadSource;
 const loadExit = @import("args.zig").loadExit;
 const unknownOption = @import("args.zig").unknownOption;
+const nextVal = @import("args.zig").nextVal;
 
 const Level = struct {
     /// The indent of the line the level opened on; a closer's line stands there.
@@ -257,12 +258,13 @@ pub const Formatted = union(enum) { ok: []const u8, refused: Refusal };
 
 /// `text` laid out and checked: each parsed as `label`, its includes resolved
 /// against `dir` (a remote one from the cache, never fetched), after `prelude`,
-/// which ends in a newline or is empty. The prelude goes after the include block,
-/// as the kernel places the session's declarations.
-pub fn format(arena: std.mem.Allocator, text: []const u8, label: []const u8, dir: []const u8, prelude: []const u8) !Formatted {
+/// which ends in a newline or is empty, reading the tables `known` names as `check`
+/// does (another cell's results). The prelude goes after the include block, as the
+/// kernel places the session's declarations.
+pub fn format(arena: std.mem.Allocator, text: []const u8, label: []const u8, dir: []const u8, prelude: []const u8, known: []const []const u8) !Formatted {
     const laid = try layout(arena, text);
     var d1: include.Diag = .{};
-    const before = parse(arena, text, label, dir, prelude, &d1) catch |e| switch (e) {
+    const before = parse(arena, text, label, dir, prelude, known, &d1) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.ParseFailed => {
             const msg = try std.fmt.allocPrint(arena, "the script does not parse, so it is not formatted: {s}", .{d1.parse.msg});
@@ -279,7 +281,7 @@ pub fn format(arena: std.mem.Allocator, text: []const u8, label: []const u8, dir
         },
     };
     var d2: include.Diag = .{};
-    const after = parse(arena, laid, label, dir, prelude, &d2) catch |e| switch (e) {
+    const after = parse(arena, laid, label, dir, prelude, known, &d2) catch |e| switch (e) {
         error.OutOfMemory => return e,
         error.ParseFailed => return .{ .refused = .{ .msg = "laid out, the script would no longer parse; it is left as it was" } },
     };
@@ -288,7 +290,7 @@ pub fn format(arena: std.mem.Allocator, text: []const u8, label: []const u8, dir
     return .{ .ok = laid };
 }
 
-fn parse(arena: std.mem.Allocator, text: []const u8, label: []const u8, dir: []const u8, prelude: []const u8, diag: *include.Diag) !ast.Program {
+fn parse(arena: std.mem.Allocator, text: []const u8, label: []const u8, dir: []const u8, prelude: []const u8, known: []const []const u8, diag: *include.Diag) !ast.Program {
     var src = text;
     if (prelude.len > 0) {
         const cut = include.directivesEnd(text);
@@ -297,14 +299,15 @@ fn parse(arena: std.mem.Allocator, text: []const u8, label: []const u8, dir: []c
     }
     var resolver = remote.Resolver.init(arena, dir, null, false) catch null;
     return include.loadProgramOpts(arena, src, label, dir, diag, .{
-        .parse = .{ .is_builtin = builtins.isBuiltin },
+        .parse = .{ .is_builtin = builtins.isBuiltin, .known_tables = known },
         .remote = if (resolver) |*r| r else null,
     });
 }
 
-/// `basalt fmt [--check] <script>|-|-c "<inline>"`: a file is rewritten in place when
-/// its layout changes, stdin and `-c` print theirs; `--check` writes nothing and
-/// exits 1 when the layout would change, naming the file.
+/// `basalt fmt [--check] [--known t1,t2] <script>|-|-c "<inline>"`: a file is
+/// rewritten in place when its layout changes, stdin and `-c` print theirs; `--check`
+/// writes nothing and exits 1 when the layout would change, naming the file.
+/// `--known` names tables the script reads but does not declare, as for `check`.
 pub fn cmdFmt(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -319,6 +322,7 @@ pub fn cmdFmt(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     defer stderr.flush() catch {};
 
     var check = false;
+    var known = std.array_list.Managed([]const u8).init(a);
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -326,6 +330,13 @@ pub fn cmdFmt(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             i += 1;
         } else if (std.mem.eql(u8, arg, "--check")) {
             check = true;
+        } else if (std.mem.eql(u8, arg, "--known")) {
+            const v = (try nextVal(args, &i, "--known", stderr)) orelse return 2;
+            var it = std.mem.splitScalar(u8, v, ',');
+            while (it.next()) |n| {
+                const name = std.mem.trim(u8, n, " ");
+                if (name.len > 0) try known.append(name);
+            }
         } else if (try unknownOption(arg, "fmt", stderr)) return 2;
     }
     const src = loadSource(a, "fmt", args, stderr) catch |e| switch (e) {
@@ -333,7 +344,7 @@ pub fn cmdFmt(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         else => return e,
     };
     const is_file = !std.mem.eql(u8, src.label, "<command>") and !std.mem.eql(u8, src.label, "<stdin>");
-    const got = switch (try format(a, src.text, src.label, src.dir, "")) {
+    const got = switch (try format(a, src.text, src.label, src.dir, "", known.items)) {
         .ok => |t| t,
         .refused => |r| {
             if (r.line > 0) {
@@ -428,10 +439,12 @@ test "format: the laid-out script reads as the original; one that does not parse
     var ar = std.heap.ArenaAllocator.init(testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
-    const ok = try format(a, "CREATE FUNCTION tax(x) AS x * 2;\nSELECT   tax(1) AS t,\n x'0A' AS b\n  FROM range(3);", "<test>", ".", "");
+    const ok = try format(a, "CREATE FUNCTION tax(x) AS x * 2;\nSELECT   tax(1) AS t,\n x'0A' AS b\n  FROM range(3);", "<test>", ".", "", &.{});
     try testing.expectEqualStrings("CREATE FUNCTION tax(x) AS x * 2;\nSELECT tax(1) AS t,\n  x'0A' AS b\nFROM range(3);\n", ok.ok);
-    const bad = try format(a, "SELECT 1 AS a;\nSELECT FROM WHERE;", "<test>", ".", "");
+    const bad = try format(a, "SELECT 1 AS a;\nSELECT FROM WHERE;", "<test>", ".", "", &.{});
     try testing.expectEqual(@as(u32, 2), bad.refused.line);
-    const sess = try format(a, "SELECT   twice(2) AS v;", "<repl>", ".", "CREATE FUNCTION twice(x) AS x * 2;\n");
+    const sess = try format(a, "SELECT   twice(2) AS v;", "<repl>", ".", "CREATE FUNCTION twice(x) AS x * 2;\n", &.{});
     try testing.expectEqualStrings("SELECT twice(2) AS v;\n", sess.ok);
+    try testing.expect((try format(a, "SELECT  id FROM enrich;", "<repl>", ".", "", &.{})) == .refused);
+    try testing.expectEqualStrings("SELECT id FROM enrich;\n", (try format(a, "SELECT  id FROM enrich;", "<repl>", ".", "", &.{"enrich"})).ok);
 }

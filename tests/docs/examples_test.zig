@@ -77,10 +77,10 @@ test "every SQL example in the book lays out to text that reads the same, and la
         if (blk.expect_error) continue;
         tried += 1;
         const pre = try preludeFor(a, blk.text);
-        switch (try basalt.cli.formatScript(a, blk.text, "<doc>", ".", pre)) {
+        switch (try basalt.cli.formatScript(a, blk.text, "<doc>", ".", pre, &known_names)) {
             .ok => |t| {
                 laid += 1;
-                const again = try basalt.cli.formatScript(a, t, "<doc>", ".", pre);
+                const again = try basalt.cli.formatScript(a, t, "<doc>", ".", pre, &known_names);
                 if (again != .ok or !std.mem.eql(u8, again.ok, t)) {
                     std.debug.print("{s}:{d}: laying out twice differs\n", .{ blk.file, blk.line });
                     failures += 1;

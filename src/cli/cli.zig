@@ -183,7 +183,7 @@ fn usage(w: anytype) !void {
         \\               their ranges; --known: tables the script reads, undeclared
         \\  basalt complete <script>|-|-c <script> --pos N [--connect] [--utf16]
         \\               what Tab offers at offset N (bytes, or UTF-16 units), as JSON
-        \\  basalt fmt   <script>|-|-c <script> [--check]
+        \\  basalt fmt   <script>|-|-c <script> [--check] [--known t1,t2]
         \\               lay a script out in the house style, changing only blanks;
         \\               a file is rewritten, --check only says whether it would be
         \\  basalt catalog [--format json]

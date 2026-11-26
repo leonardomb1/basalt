@@ -268,6 +268,16 @@ pub const DeclStore = struct {
         try self.items.append(.{ .kind = id.kind, .name = dup_name, .text = dup_text, .origin = own });
     }
 
+    /// A copy of the store of its own: each declaration, where it stands, and the
+    /// value each LET holds.
+    pub fn clone(self: *const DeclStore, gpa: std.mem.Allocator) !DeclStore {
+        var c = DeclStore.init(gpa);
+        errdefer c.deinit();
+        for (self.items.items) |e| try c.putAt(.{ .kind = e.kind, .name = e.name }, e.text, e.origin);
+        for (self.held.items) |h| try c.hold(h.name, h.value);
+        return c;
+    }
+
     /// The declaration of kind `kind` named `name`, in any case.
     pub fn find(self: *const DeclStore, kind: DeclKind, name: []const u8) ?*const Entry {
         for (self.items.items) |*e| if (e.kind == kind and std.ascii.eqlIgnoreCase(e.name, name)) return e;

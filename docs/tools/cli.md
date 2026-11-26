@@ -5,7 +5,7 @@ basalt run      <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--form
 basalt check    <script>|-|-c "<inline>" [-p key=value ...] [--format json] [--known t1,t2] [--pin]
 basalt complete <script>|-|-c "<inline>" [--pos N] [--connect] [--utf16]
 basalt catalog  [--format json]
-basalt fmt      <script>|-|-c "<inline>" [--check]
+basalt fmt      <script>|-|-c "<inline>" [--check] [--known t1,t2]
 basalt repl
 basalt kernel   [--format table|json|csv|tsv|arrow] [-j threads] [--max-rows N]
 basalt version
@@ -160,6 +160,7 @@ the two must read the same, positions aside; one that does not parse is
 refused where it fails, and nothing is written. A file is rewritten in place
 when its layout changes; stdin and `-c` print theirs. `--check` writes
 nothing and exits `1`, naming the file, when the layout would change.
+`--known` names tables the script reads but does not declare, as for `check`.
 
 `basalt catalog` lists every built-in function — its signature, kind, return
 type when the arguments do not decide it, aliases and the reference's one

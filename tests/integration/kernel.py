@@ -313,6 +313,39 @@ def main(binary):
     report("hover on a built-in shows its catalog entry",
            h.get("builtin") == "scalar" and h.get("signature") == "upper(s)" and h.get("type") == "string" and h.get("doc"), st)
 
+    # While a script runs, the requests that only read the session are answered at once.
+    k.send(op="run", id="long", script="WITH a AS (SELECT * FROM range(20000)), b AS (SELECT * FROM range(20000)) "
+           "SELECT count(DISTINCT a.range * 100000 + b.range) AS n FROM a CROSS JOIN b;")
+    time.sleep(0.3)
+    t0 = time.time()
+    k.send(op="hover", id="hv", script="SELECT twice(1) AS v", pos=8)
+    k.send(op="check", id="ck", script="SELECT nope FROM range(1);")
+    got = {}
+    while len(got) < 2:
+        h = json.loads(k.p.stdout.readline())
+        if h["type"] == "data":
+            k.p.stdout.read(h["len"])
+        elif h["type"] == "status":
+            got[h["id"]] = h
+    quick = time.time() - t0
+    k.send(op="cancel", id="long")
+    _, st = k.reply()
+    report("while a script runs, hover and check answer at once, and the script still cancels",
+           "long" not in got and (got.get("hv", {}).get("hover") or {}).get("name") == "twice"
+           and len(got.get("ck", {}).get("diagnostics") or []) == 1 and quick < 2
+           and st.get("id") == "long" and st.get("cancelled") is True, (got, st, quick))
+    _, st = k.run("SELECT 1 AS v;")
+    report("the session goes on after a cancelled run with side requests", st["ok"], st)
+
+    # Columns count UTF-16 units under utf16, in errors as in hover.
+    bad = "SELECT 'é😀' AS a, nope FROM range(1);"
+    _, st = k.run(bad, utf16=True)
+    k.send(op="check", id="ck16", script=bad, utf16=True)
+    _, st2 = k.reply()
+    d = (st2.get("diagnostics") or [{}])[0]
+    report("a run's error and check's diagnostics count UTF-16 columns under utf16",
+           (st.get("error") or {}).get("col") == 20 and d.get("col") == 20 and d.get("end_col") == 24, (st, st2))
+
     # Format: only blanks change, checked against the session's declarations.
     k.send(op="format", id="f1", script="SELECT   twice(2) AS v,\n x'0A' AS b\n   FROM range(3)  ;  ")
     _, st = k.reply()
@@ -321,6 +354,10 @@ def main(binary):
     k.send(op="format", id="f2", script="SELECT 1 AS a;\nSELECT FROM WHERE;")
     _, st = k.reply()
     e = st.get("error") or {}
+    k.send(op="format", id="f3", script="SELECT  id FROM enrich;", tables=["enrich"])
+    _, st2 = k.reply()
+    report("format reads another cell's table named in tables, as check does",
+           st2["ok"] and st2.get("formatted") == "SELECT id FROM enrich;\n", st2)
     report("format refuses a script that does not parse, saying where",
            not st["ok"] and "formatted" not in st and e.get("file") == "script" and e.get("line") == 2, st)
 

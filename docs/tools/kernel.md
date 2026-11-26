@@ -37,7 +37,10 @@ declarations as well as the script's own; its status carries
 columns once per session and remembered, as the REPL does (`"connect": false`
 keeps it offline); `reset` forgets that too. `pos` is a byte offset, or — with
 `"utf16": true` — a UTF-16 offset, the unit a JavaScript editor counts in, and
-the answer's `start`/`end` then count the same way.
+the answer's `start`/`end` then count the same way. `"utf16": true` holds for
+every column a request is answered with: an error's `col`/`end_col`,
+`check`'s diagnostics, the `result` and `load` frames of a `run`, and what
+`hover` and `definition` place.
 
 `catalog` lists what the engine answers to, so an editor completes, colours and
 documents it with no list of its own; its status carries `catalog: {version,
@@ -80,7 +83,8 @@ and the session is left as it was.
 
 `format` lays a script out as `basalt fmt` does ([Command line](cli.md)),
 changing nothing but blanks, and its status carries the text as
-`formatted`. The script is checked after the session's declarations: one that
+`formatted`. The script is checked after the session's declarations, reading
+the `tables` it names as `check` does: one that
 does not parse is refused with `ok: false` and an `error` placed in it as a
 `run`'s is, and the layout is refused too, the script left as it was, should
 it ever read differently. Nothing runs, and the session is left as it was.
@@ -106,6 +110,15 @@ acts at once, even mid-script; one naming a different `id` than the running
 script's is ignored, and one without an `id` stops whatever runs. SIGINT
 cancels the running script too — however many times it is sent, it never ends
 the process.
+
+Requests are answered in the order they come, but for this: while a script
+runs, a `check`, `complete`, `hover`, `definition`, `format` or `catalog` is
+answered at once, on a thread of its own, so an editor's features keep
+working through a long query. It reads the session as it stands — the
+running script's declarations among it once that script parsed — and asks
+no connection, as one may be busy with the script, so `complete` and `hover`
+offer only what the connections already said. Its status may come before the
+running script's; each status names its request's `id`.
 
 ## Replies
 
