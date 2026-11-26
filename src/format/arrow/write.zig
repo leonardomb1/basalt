@@ -89,8 +89,9 @@ pub const StreamWriter = struct {
         try self.out.flush();
     }
 
-    /// The trailer: a zero-row batch carrying `meta`. Every column gets as many
-    /// zero-length buffers as its layout has, which is what a reader checks.
+    /// The trailer: a zero-row batch carrying `meta`. Every column, and every child
+    /// of a list, map or struct, gets its node and as many zero-length buffers as its
+    /// layout has (`emptyLayout`), which is what a reader checks.
     pub fn writeTrailer(self: *StreamWriter, meta: []const KeyValue) !void {
         const fb = &self.fb;
         fb.reset();
@@ -98,14 +99,7 @@ pub const StreamWriter = struct {
         defer nodes.deinit();
         var bufs = std.array_list.Managed(i64).init(self.gpa);
         defer bufs.deinit();
-        for (self.schema.fields) |f| {
-            try nodes.appendSlice(&.{ 0, 0 });
-            const nbuf: usize = switch (f.ty.sinkType().kind) {
-                .string, .bytes => 3,
-                else => 2,
-            };
-            for (0..nbuf) |_| try bufs.appendSlice(&.{ 0, 0 });
-        }
+        for (self.schema.fields) |f| try emptyLayout(f.ty, &nodes, &bufs);
         const kv = try keyValues(fb, self.gpa, meta);
         const nodes_vec = try fb.createI64PairVector(nodes.items);
         const bufs_vec = try fb.createI64PairVector(bufs.items);
@@ -358,6 +352,32 @@ fn typeTable(fb: *flatbuf.Builder, ty: types.Type) !struct { tag: TypeTag, off: 
 /// (a list's or map's offsets, then the child; a struct's fields in order), as
 /// Arrow lays a record batch out depth first. A nested column comes compact
 /// (`column.copy`), so its offsets start at 0 and its children at their first row.
+/// A zero-row column of `ty` laid out as `pushColumn` lays out a column: its node and
+/// validity buffer, then its data buffers, or a list's or map's offsets and its child,
+/// or a struct's fields, every buffer of zero length.
+fn emptyLayout(ty: types.Type, nodes: *std.array_list.Managed(i64), bufs: *std.array_list.Managed(i64)) !void {
+    try nodes.appendSlice(&.{ 0, 0 });
+    try bufs.appendSlice(&.{ 0, 0 });
+    switch (ty.kind) {
+        .array => {
+            try bufs.appendSlice(&.{ 0, 0 });
+            try emptyLayout(column.childType(ty), nodes, bufs);
+        },
+        .map => {
+            try bufs.appendSlice(&.{ 0, 0 });
+            try emptyLayout(column.entryType(ty), nodes, bufs);
+        },
+        .@"struct" => for (ty.fields orelse &.{}) |f| try emptyLayout(f.ty, nodes, bufs),
+        else => {
+            const data: usize = switch (ty.sinkType().kind) {
+                .string, .bytes => 2,
+                else => 1,
+            };
+            for (0..data) |_| try bufs.appendSlice(&.{ 0, 0 });
+        },
+    }
+}
+
 fn pushColumn(arena: std.mem.Allocator, body: *Body, nodes: *std.array_list.Managed(i64), col: *const Column, n: usize) anyerror!void {
     const nb = (n + 7) / 8;
     if (col.validity.bits.len < nb) return error.ArrowValidityTooShort;
@@ -812,6 +832,55 @@ test "file sink: the IPC file and stream a sink writes read back through the rea
         }
         try std.testing.expectEqual(@as(usize, 6), rows);
     }
+}
+
+test "stream: a trailer lays out a list of structs and a map down to their children, and the stream reads back" {
+    const arrowread = @import("read.zig");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realpathAlloc(a, ".");
+    const ty = @import("../../lang/sql_parser.zig").parseTypeStr;
+    const fields = [_]types.Schema.Field{
+        .{ .name = "l", .ty = (ty(a, "list(struct(no int, text string))") orelse return error.TestUnexpectedResult).asNullable() },
+        .{ .name = "m", .ty = (ty(a, "map(string, int)") orelse return error.TestUnexpectedResult).asNullable() },
+        .{ .name = "s", .ty = (ty(a, "struct(a int, b list(string))") orelse return error.TestUnexpectedResult).asNullable() },
+    };
+    const schema = types.Schema{ .fields = &fields };
+    const V = @import("../../exec/value.zig").Value;
+    const nested = @import("../../exec/nested.zig");
+    const texts = [_][]const u8{ "[{\"no\":1,\"text\":\"hello\"},{\"no\":2,\"text\":\" worl\"}]", "{\"k\":1}", "{\"a\":3,\"b\":[\"x\",\"y\"]}" };
+    const cols = try a.alloc(Column, fields.len);
+    for (fields, cols, texts) |f, *c, t| {
+        var b = column.Builder.init(a, f.ty);
+        const v: V = try nested.parse(a, t, f.ty);
+        try b.append(v);
+        c.* = try b.finish();
+    }
+    const path = try std.fs.path.join(a, &.{ dir, "n.arrows" });
+    var file = try std.fs.cwd().createFile(path, .{});
+    var buf: [4096]u8 = undefined;
+    var fw = file.writer(&buf);
+    var sw = try StreamWriter.init(std.testing.allocator, &fw.interface, schema, &.{});
+    defer sw.deinit();
+    try sw.writeBatch(a, .{ .schema = &schema, .columns = cols, .len = 1 });
+    try sw.writeTrailer(&.{.{ .key = "basalt.rows", .value = "1" }});
+    try sw.finish();
+    file.close();
+
+    const r = try arrowread.Reader.open(a, path);
+    defer r.close();
+    var rows: usize = 0;
+    while (try r.next(a)) |b| {
+        for (0..b.len) |i| {
+            const got = try @import("../../exec/eval.zig").valueToString(a, b.columns[0].getValue(i));
+            try std.testing.expect(std.mem.indexOf(u8, got, "worl") != null);
+        }
+        rows += b.len;
+    }
+    try std.testing.expectEqual(@as(usize, 1), rows);
 }
 
 test "a batch and field length past 2^31-1 is refused by the reader, never multiplied into a wrapped buffer size" {
