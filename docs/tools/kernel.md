@@ -26,6 +26,7 @@ Requests are NDJSON on stdin, one object per line:
 {"op":"catalog","id":"c4"}
 {"op":"hover","id":"c5","script":"SELECT tax(1);","pos":8}
 {"op":"definition","id":"c6","script":"SELECT tax(1);","pos":8}
+{"op":"format","id":"c7","script":"SELECT  a,\n b FROM t ;"}
 {"op":"reset"}                forget every declaration
 {"op":"close"}                exit 0 (as does EOF)
 ```
@@ -76,6 +77,13 @@ or `null` for a built-in, a column or nothing: `file` is `script`, an
 `session`, whose `line` and `col` count in the script that declared it, named by
 its `id`. `col` counts bytes, or UTF-16 units with `"utf16": true`. Nothing runs,
 and the session is left as it was.
+
+`format` lays a script out as `basalt fmt` does ([Command line](cli.md)),
+changing nothing but blanks, and its status carries the text as
+`formatted`. The script is checked after the session's declarations: one that
+does not parse is refused with `ok: false` and an `error` placed in it as a
+`run`'s is, and the layout is refused too, the script left as it was, should
+it ever read differently. Nothing runs, and the session is left as it was.
 
 `check` lists every problem in a script without running it, against the
 session — its connections, params, LETs and functions — as `basalt check

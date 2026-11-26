@@ -1,6 +1,7 @@
 //! Every ```sql example in docs/ and README.md is parsed and checked as `basalt
 //! check` would, after tests/docs/prelude.sql, so the docs cannot describe syntax
-//! the engine refuses. A fence tagged `sql ignore` is a fragment or synopsis and is
+//! the engine refuses; and laid out by `basalt fmt`, which must read the same and
+//! lay out to itself again. A fence tagged `sql ignore` is a fragment or synopsis and is
 //! skipped; one tagged `sql error` must fail, and one tagged `sql cont` is checked
 //! after the block before it on the page, whose declarations it uses. The run step
 //! has side effects so an edit to the docs alone re-runs it; it reads docs/ and
@@ -54,6 +55,50 @@ test "every SQL example in the book checks out" {
     }
 }
 
+test "every SQL example in the book lays out to text that reads the same, and lays out to itself again" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    var blocks = std.array_list.Managed(Block).init(a);
+    var dir = try std.fs.cwd().openDir("docs", .{ .iterate = true });
+    defer dir.close();
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".md")) continue;
+        const text = try dir.readFileAlloc(a, entry.path, 1 << 20);
+        try collect(a, try std.fmt.allocPrint(a, "docs/{s}", .{entry.path}), text, &blocks);
+    }
+    try collect(a, "README.md", try std.fs.cwd().readFileAlloc(a, "README.md", 1 << 20), &blocks);
+    var failures: usize = 0;
+    var laid: usize = 0;
+    var tried: usize = 0;
+    for (blocks.items) |blk| {
+        if (blk.expect_error) continue;
+        tried += 1;
+        const pre = try preludeFor(a, blk.text);
+        switch (try basalt.cli.formatScript(a, blk.text, "<doc>", ".", pre)) {
+            .ok => |t| {
+                laid += 1;
+                const again = try basalt.cli.formatScript(a, t, "<doc>", ".", pre);
+                if (again != .ok or !std.mem.eql(u8, again.ok, t)) {
+                    std.debug.print("{s}:{d}: laying out twice differs\n", .{ blk.file, blk.line });
+                    failures += 1;
+                }
+            },
+            .refused => |r| if (r.line == 0) {
+                std.debug.print("{s}:{d}: {s}\n", .{ blk.file, blk.line, r.msg });
+                failures += 1;
+            },
+        }
+    }
+    std.testing.expect(laid * 10 >= tried * 9) catch |e| {
+        std.debug.print("{d} of {d} examples laid out\n", .{ laid, tried });
+        return e;
+    };
+    try std.testing.expectEqual(@as(usize, 0), failures);
+}
+
 /// The ```sql blocks of one page, an indented fence (in a list) de-indented.
 fn collect(a: std.mem.Allocator, file: []const u8, text: []const u8, out: *std.array_list.Managed(Block)) !void {
     var lines = std.mem.splitScalar(u8, text, '\n');
@@ -82,8 +127,8 @@ fn collect(a: std.mem.Allocator, file: []const u8, text: []const u8, out: *std.a
     }
 }
 
-/// Null when the example (after the prelude) checks out, else the first problem.
-fn checkBlock(a: std.mem.Allocator, example: []const u8) !?[]const u8 {
+/// The prelude an example is checked after, less the PARAMs it declares itself.
+fn preludeFor(a: std.mem.Allocator, example: []const u8) ![]const u8 {
     var src = std.array_list.Managed(u8).init(a);
     var it = std.mem.splitScalar(u8, prelude, '\n');
     while (it.next()) |line| {
@@ -97,6 +142,13 @@ fn checkBlock(a: std.mem.Allocator, example: []const u8) !?[]const u8 {
         try src.appendSlice(line);
         try src.append('\n');
     }
+    return src.items;
+}
+
+/// Null when the example (after the prelude) checks out, else the first problem.
+fn checkBlock(a: std.mem.Allocator, example: []const u8) !?[]const u8 {
+    var src = std.array_list.Managed(u8).init(a);
+    try src.appendSlice(try preludeFor(a, example));
     try src.appendSlice(example);
 
     var pdiag: parser.Diagnostic = .{ .msg = "", .line = 0, .col = 0 };

@@ -5,6 +5,7 @@ basalt run      <script>|-|-c "<inline>" [-p key=value ...] [-j threads] [--form
 basalt check    <script>|-|-c "<inline>" [-p key=value ...] [--format json] [--known t1,t2] [--pin]
 basalt complete <script>|-|-c "<inline>" [--pos N] [--connect] [--utf16]
 basalt catalog  [--format json]
+basalt fmt      <script>|-|-c "<inline>" [--check]
 basalt repl
 basalt kernel   [--format table|json|csv|tsv|arrow] [-j threads] [--max-rows N]
 basalt version
@@ -143,6 +144,22 @@ comes back once: a column named `name` is not offered again as the keyword
 script's own declarations, so a script half typed still has its names; local
 files named in it give their columns; connections are asked for their tables and
 columns only under `--connect`, since that is a round trip to each.
+
+`basalt fmt` lays a script out in one house style, with no options: each
+line indented two spaces a level — inside parentheses, a `BEGIN … END` or
+`FOR EACH … END FOR` body and a `CASE` — a line that carries a statement on
+from the line before two further in unless it opens a clause (`FROM`,
+`WHERE`, `JOIN`, `ORDER BY`, …), runs of blanks inside a line one space —
+none after `(` or before `)`, `,` or `;`, one after a `,` — at most one blank
+line in a row, no trailing blanks, and one newline at the end. It changes
+nothing but blanks: no line is broken or joined, keywords keep the case they
+were written in, strings, `$$` bodies, comments and the leading `@include`
+lines stay as written, and no other characters that touch are parted
+(`x'0D0A'`). The script is parsed before and after, with its includes, and
+the two must read the same, positions aside; one that does not parse is
+refused where it fails, and nothing is written. A file is rewritten in place
+when its layout changes; stdin and `-c` print theirs. `--check` writes
+nothing and exits `1`, naming the file, when the layout would change.
 
 `basalt catalog` lists every built-in function — its signature, kind, return
 type when the arguments do not decide it, aliases and the reference's one

@@ -37,7 +37,7 @@
 //!
 //! This file keeps the signal handling, the dispatch and the usage text. Each
 //! command is its own file (`cmd_run.zig`, `cmd_check.zig`, `cmd_complete.zig`,
-//! `cmd_catalog.zig`,
+//! `cmd_catalog.zig`, `fmt.zig`, `lookup.zig` (hover and definition),
 //! `repl/repl.zig`, `kernel.zig`), with what they share in
 //! `args.zig` (script and flags), `entry.zig` (statements and the session's
 //! declarations), `prepare.zig` (an entry made runnable), `repl/catalog.zig` (what Tab
@@ -91,6 +91,8 @@ pub fn run(alloc: std.mem.Allocator) !void {
         std.process.exit(try cmdComplete(alloc, args));
     } else if (std.mem.eql(u8, verb, "catalog")) {
         std.process.exit(try cmdCatalog(alloc, args));
+    } else if (std.mem.eql(u8, verb, "fmt")) {
+        std.process.exit(try cmdFmt(alloc, args));
     } else if (std.mem.eql(u8, verb, "kernel")) {
         std.process.exit(try kernel.cmdKernel(alloc, args));
     } else if (std.mem.eql(u8, verb, "repl")) {
@@ -134,7 +136,9 @@ pub const checkText = @import("cmd_check.zig").checkText;
 const cmdCheck = @import("cmd_check.zig").cmdCheck;
 const cmdComplete = @import("cmd_complete.zig").cmdComplete;
 const cmdCatalog = @import("cmd_catalog.zig").cmdCatalog;
+const cmdFmt = @import("fmt.zig").cmdFmt;
 pub const catalogJson = @import("cmd_catalog.zig").json;
+pub const formatScript = @import("fmt.zig").format;
 pub const scopeFor = @import("lookup.zig").scopeFor;
 pub const resolveName = @import("lookup.zig").resolve;
 pub const writeHover = @import("lookup.zig").writeHover;
@@ -144,6 +148,7 @@ pub const originIn = @import("entry.zig").originIn;
 pub const declOf = @import("entry.zig").declOf;
 pub const sliceAt = @import("entry.zig").sliceAt;
 pub const nextTopSemi = @import("entry.zig").nextTopSemi;
+pub const splitStatements = @import("entry.zig").splitStatements;
 pub const declareFrom = @import("cmd_complete.zig").declareFrom;
 pub const writeOfferIn = @import("cmd_complete.zig").writeOfferIn;
 pub const writeOffer = @import("cmd_complete.zig").writeOffer;
@@ -178,6 +183,9 @@ fn usage(w: anytype) !void {
         \\               their ranges; --known: tables the script reads, undeclared
         \\  basalt complete <script>|-|-c <script> --pos N [--connect] [--utf16]
         \\               what Tab offers at offset N (bytes, or UTF-16 units), as JSON
+        \\  basalt fmt   <script>|-|-c <script> [--check]
+        \\               lay a script out in the house style, changing only blanks;
+        \\               a file is rewritten, --check only says whether it would be
         \\  basalt catalog [--format json]
         \\               every built-in function, keyword and type, with signatures
         \\               and docs
@@ -377,6 +385,7 @@ test {
     _ = @import("cmd_run.zig");
     _ = @import("entry.zig");
     _ = @import("lookup.zig");
+    _ = @import("fmt.zig");
     _ = @import("prepare.zig");
     _ = @import("repl/repl.zig");
     _ = @import("repl/wizard.zig");

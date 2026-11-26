@@ -182,6 +182,48 @@ pub const MatchArm = struct {
 };
 
 /// `e` in a node of its own in `arena`, the one way an expression is allocated.
+/// Whether two values of an AST type say the same thing wherever their text stood:
+/// positions and spans are passed over, as are a token's line and column, so a
+/// script and its reformatted text compare equal.
+pub fn sameShape(comptime T: type, a: T, b: T) bool {
+    if (T == Pos or T == Span or T == ?Pos or T == ?Span) return true;
+    if (T == token.Token) return a.tag == b.tag and std.mem.eql(u8, a.text, b.text);
+    switch (@typeInfo(T)) {
+        .@"struct" => |s| {
+            inline for (s.fields) |f| if (!sameShape(f.type, @field(a, f.name), @field(b, f.name))) return false;
+            return true;
+        },
+        .@"union" => |u| {
+            const Tag = u.tag_type orelse @compileError("sameShape needs a tagged union: " ++ @typeName(T));
+            if (@as(Tag, a) != @as(Tag, b)) return false;
+            inline for (u.fields) |f| if (@as(Tag, a) == @field(Tag, f.name)) return sameShape(f.type, @field(a, f.name), @field(b, f.name));
+            unreachable;
+        },
+        .pointer => |p| switch (p.size) {
+            .one => return sameShape(p.child, a.*, b.*),
+            .slice => {
+                if (a.len != b.len) return false;
+                if (p.child == u8) return std.mem.eql(u8, a, b);
+                for (a, b) |x, y| if (!sameShape(p.child, x, y)) return false;
+                return true;
+            },
+            else => return a == b,
+        },
+        .optional => |o| {
+            if (a == null or b == null) return a == null and b == null;
+            return sameShape(o.child, a.?, b.?);
+        },
+        .array => |arr| {
+            for (a, b) |x, y| if (!sameShape(arr.child, x, y)) return false;
+            return true;
+        },
+        .float => return @as(std.meta.Int(.unsigned, @bitSizeOf(T)), @bitCast(a)) == @as(std.meta.Int(.unsigned, @bitSizeOf(T)), @bitCast(b)),
+        .void => return true,
+        .@"enum", .int, .bool => return a == b,
+        else => @compileError("sameShape cannot compare " ++ @typeName(T)),
+    }
+}
+
 pub fn mk(arena: std.mem.Allocator, e: Expr) error{OutOfMemory}!*Expr {
     const p = try arena.create(Expr);
     p.* = e;

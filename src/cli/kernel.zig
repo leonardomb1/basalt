@@ -23,6 +23,8 @@
 //!                               `hover: {start, end, kind, signature, type, doc}`
 //!   {"op":"definition",...}     where it is declared: `definition: {file, line,
 //!                               col, end_line, end_col}`, null for a built-in
+//!   {"op":"format","script":"…"} the script laid out, only its blanks changed and
+//!                               checked to read the same: `formatted: "…"`
 //!   {"op":"catalog","id":"c4"}  every built-in function, keyword and type: the
 //!                               status carries `catalog: {...}`, as `basalt
 //!                               catalog --format json`
@@ -260,6 +262,8 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             try checkScript(a, &out, &decls, req);
         } else if (std.mem.eql(u8, req.op, "hover") or std.mem.eql(u8, req.op, "definition")) {
             try lookupScript(alloc, a, &out, &decls, &catalog, req);
+        } else if (std.mem.eql(u8, req.op, "format")) {
+            try formatScript(a, &out, &decls, req);
         } else if (std.mem.eql(u8, req.op, "catalog")) {
             try reply(a, &out, req.id, .{ .ok = true, .catalog = try cli.catalogJson() });
         } else if (std.mem.eql(u8, req.op, "reset")) {
@@ -271,7 +275,7 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
             try reply(a, &out, req.id, .{ .ok = true });
             break;
         } else {
-            const m = try msgfmt.allocPrint(a, "unknown op `{s}` — run, check, complete, hover, definition, catalog, cancel, reset or close", .{req.op});
+            const m = try msgfmt.allocPrint(a, "unknown op `{s}` — run, check, complete, hover, definition, format, catalog, cancel, reset or close", .{req.op});
             try reply(a, &out, req.id, .{ .ok = false, .@"error" = .{ .msg = m } });
         }
     }
@@ -395,6 +399,41 @@ fn lookupScript(gpa: std.mem.Allocator, a: std.mem.Allocator, out: *Out, decls: 
     try reply(a, out, req.id, .{ .ok = true, .definition = aw.written() });
 }
 
+/// `format`: the script laid out, checked to read as it did after the session's
+/// declarations (less those it declares anew); refused with why, where the script
+/// does not parse, or when the layout would read differently. Nothing runs.
+fn formatScript(a: std.mem.Allocator, out: *Out, decls: *const cli.DeclStore, req: Request) !void {
+    const script = req.script orelse
+        return reply(a, out, req.id, .{ .ok = false, .@"error" = .{ .msg = "`format` needs a `script`" } });
+    var own = std.array_list.Managed(cli.DeclId).init(a);
+    for (try cli.splitStatements(a, script)) |st| if (cli.declOf(st)) |d| try own.append(d);
+    var prelude = std.array_list.Managed(u8).init(a);
+    for (decls.items.items) |e| {
+        const shadowed = for (own.items) |d| {
+            if (d.kind == e.kind and std.ascii.eqlIgnoreCase(d.name, e.name)) break true;
+        } else false;
+        if (shadowed) continue;
+        try prelude.appendSlice(e.text);
+        try prelude.appendSlice(";\n");
+    }
+    switch (try cli.formatScript(a, script, "<repl>", ".", prelude.items)) {
+        .ok => |text| {
+            var aw = std.Io.Writer.Allocating.init(a);
+            try jsontext.string(&aw.writer, text);
+            try reply(a, out, req.id, .{ .ok = true, .formatted = aw.written() });
+        },
+        .refused => |r| {
+            var e = ErrorInfo{ .msg = r.msg };
+            if (r.file.len > 0) e.file = if (std.mem.eql(u8, r.file, "<repl>")) "script" else r.file;
+            if (r.line > 0) {
+                e.line = r.line;
+                e.col = r.col;
+            }
+            try reply(a, out, req.id, .{ .ok = false, .@"error" = e });
+        },
+    }
+}
+
 /// `part` as a slice of the script as sent: a slice of it already, or of the
 /// prelude-and-script text, whose script part keeps the script's offsets.
 fn inScript(script: []const u8, entry: cli.Prepared, part: []const u8) ?[]const u8 {
@@ -489,6 +528,7 @@ const Status = struct {
     catalog: ?[]const u8 = null,
     hover: ?[]const u8 = null,
     definition: ?[]const u8 = null,
+    formatted: ?[]const u8 = null,
 };
 
 fn anyTruncated(results: ?[]const ResultFrame) bool {
@@ -529,7 +569,7 @@ fn reply(a: std.mem.Allocator, out: *Out, id: ?[]const u8, st: Status) !void {
         try w.writeAll(",\"diagnostics\":");
         try w.writeAll(d);
     }
-    inline for (.{ "catalog", "hover", "definition" }) |f| if (@field(st, f)) |raw| {
+    inline for (.{ "catalog", "hover", "definition", "formatted" }) |f| if (@field(st, f)) |raw| {
         try w.writeAll(",\"" ++ f ++ "\":");
         try w.writeAll(raw);
     };

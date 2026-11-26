@@ -313,6 +313,17 @@ def main(binary):
     report("hover on a built-in shows its catalog entry",
            h.get("builtin") == "scalar" and h.get("signature") == "upper(s)" and h.get("type") == "string" and h.get("doc"), st)
 
+    # Format: only blanks change, checked against the session's declarations.
+    k.send(op="format", id="f1", script="SELECT   twice(2) AS v,\n x'0A' AS b\n   FROM range(3)  ;  ")
+    _, st = k.reply()
+    report("format lays a script out, a session function and a touching literal kept",
+           st["ok"] and st.get("formatted") == "SELECT twice(2) AS v,\n  x'0A' AS b\nFROM range(3);\n", st)
+    k.send(op="format", id="f2", script="SELECT 1 AS a;\nSELECT FROM WHERE;")
+    _, st = k.reply()
+    e = st.get("error") or {}
+    report("format refuses a script that does not parse, saying where",
+           not st["ok"] and "formatted" not in st and e.get("file") == "script" and e.get("line") == 2, st)
+
     # A LET keeps the value the declaring cell decided: later cells never
     # recompute now() nor re-run the query, even after its source changes.
     lf = os.path.join(tempfile.mkdtemp(), "let.csv")

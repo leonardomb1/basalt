@@ -172,7 +172,7 @@ pub fn resolve(arena: std.mem.Allocator, cx: *const Completer, session: *const D
                 .kind = "table",
                 .name = qualified,
                 .signature = qualified,
-                .columns = if (w.parts.len == 3) repl_catalog.tableColumns(cx, qualified) else null,
+                .columns = if (w.parts.len == 3) nonEmpty(repl_catalog.tableColumns(cx, qualified)) else null,
             };
         }
         if (w.part == w.parts.len - 1) return try columnHover(arena, cx, text, at, w, w.parts[w.part]);
@@ -186,6 +186,11 @@ pub fn resolve(arena: std.mem.Allocator, cx: *const Completer, session: *const D
         return .{ .start = w.start, .end = w.end, .kind = "function", .name = f.name, .signature = f.signature, .type = f.returns, .doc = f.doc, .builtin = @tagName(f.kind) };
     }
     return try columnHover(arena, cx, text, at, w, n);
+}
+
+/// Null for no columns: a table not asked, as `connect` is off, is not an empty one.
+fn nonEmpty(cols: []const complete.Column) ?[]const complete.Column {
+    return if (cols.len == 0) null else cols;
 }
 
 fn columnHover(arena: std.mem.Allocator, cx: *const Completer, text: []const u8, at: usize, w: Word, name: []const u8) !?Hover {
