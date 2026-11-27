@@ -20,7 +20,7 @@ Requests are NDJSON on stdin, one object per line:
 
 ```text
 {"op":"run","id":"c1","script":"SELECT ...;","params":{"days":7},"format":"arrow"}
-{"op":"cancel","id":"c1"}     stop the running script; the session survives
+{"op":"cancel","id":"c1"}     stop that script, running or waiting; the session survives
 {"op":"complete","id":"c2","script":"SELECT erp.","pos":11}
 {"op":"check","id":"c3","script":"SELECT ...;","tables":["enrich"]}
 {"op":"catalog","id":"c4"}
@@ -107,10 +107,13 @@ run — those its `@include`s export to it too, a library's as `"st.name"`
 ([Scripts](../language/scripts.md)) — and a key that names no `PARAM` of the script or the session is refused
 (`check` lists it); `format` overrides `--format` (default `arrow`) and `max_rows` overrides
 `--max-rows` for that script. A `cancel`
-acts at once, even mid-script; one naming a different `id` than the running
-script's is ignored, and one without an `id` stops whatever runs. SIGINT
-cancels the running script too — however many times it is sent, it never ends
-the process.
+acts at once, even mid-script, on the `run` whose `id` it names, wherever that
+run is: a running one stops; one the kernel took but has not started yet stops
+before it starts; one still waiting its turn is dropped and answered `cancelled:
+true`, with no other frame. A `cancel` with no `id` stops the running script,
+else the one about to start, else the first one waiting. One naming a run the
+kernel has finished, or never had, does nothing. SIGINT cancels the running
+script too — however many times it is sent, it never ends the process.
 
 Requests are answered in the order they come, but for this: while the kernel
 is busy — a script running or about to start, or any request being answered

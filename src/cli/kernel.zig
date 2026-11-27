@@ -28,7 +28,10 @@
 //!   {"op":"catalog","id":"c4"}  every built-in function, keyword and type: the
 //!                               status carries `catalog: {...}`, as `basalt
 //!                               catalog --format json`
-//!   {"op":"cancel"}             stop the running script; the session survives
+//!   {"op":"cancel","id":"c1"}   stop that run, running, about to start or still
+//!                               queued (dropped and answered `cancelled`); with
+//!                               no id, the running one, else the next; the
+//!                               session survives
 //!   {"op":"reset"}              forget every declaration
 //!   {"op":"close"}              exit (as does EOF on stdin)
 //!
@@ -66,8 +69,12 @@
 //! Echoed ids are clipped to 256 bytes; a clipped echo still pairs in order.
 //!
 //! Threads and fds. A stdin thread reads requests: `cancel` acts there at once,
-//! since it must reach a busy script, and only stops the script whose id it
-//! names; while the main loop is busy (a script running or about to, anything
+//! since it must reach a busy script, on the run whose id it names, which may be
+//! running, popped and about to start (it then never starts), or still queued (it
+//! is taken out and answered `cancelled` there); a finished or unknown id is a
+//! no-op. Each queued run carries its id from the moment it is read, and `pop`
+//! hands it to the main loop under the queue's lock, so no cancel falls between
+//! queue and start; while the main loop is busy (a script running or about to, anything
 //! answered or queued), a request that only reads the session (`side_ops`) goes
 //! to a side thread, answered at once from a copy of the session and asking no
 //! connection; everything else queues for the main loop in order. The main loop alone writes the session, holding `Shared.lock`. ^C
@@ -117,20 +124,37 @@ const Request = struct {
     tables: ?std.json.Value = null,
 };
 
+/// A request waiting its turn: its line and, for a `run`, its `id`, by which a cancel
+/// finds it. Both are owned by the queue's allocator until the item is freed.
+const Item = struct {
+    line: []u8,
+    run: bool = false,
+    id: ?[]u8 = null,
+
+    fn free(self: Item, gpa: std.mem.Allocator) void {
+        gpa.free(self.line);
+        if (self.id) |x| gpa.free(x);
+    }
+};
+
 const Queue = struct {
     mu: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
-    items: std.array_list.Managed([]u8),
+    items: std.array_list.Managed(Item),
     eof: bool = false,
-    running: ?[]const u8 = null,
-    active: bool = false,
     /// The main loop is answering a request it popped: from `pop` until `idle`.
     busy: bool = false,
+    /// The run the main loop popped and has not finished: its `id`, whether it is
+    /// running (`active`), and whether a cancel reached it before it started.
+    cur_run: bool = false,
+    cur_id: ?[]const u8 = null,
+    active: bool = false,
+    cur_cancelled: bool = false,
 
-    fn push(self: *Queue, line: []u8) !void {
+    fn push(self: *Queue, item: Item) !void {
         self.mu.lock();
         defer self.mu.unlock();
-        try self.items.append(line);
+        try self.items.append(item);
         self.cond.signal();
     }
 
@@ -141,19 +165,31 @@ const Queue = struct {
         self.cond.signal();
     }
 
-    fn pop(self: *Queue) ?[]u8 {
+    /// The next request, now the main loop's: a run becomes the one a cancel finds
+    /// as current, under the same lock, so no cancel falls between queue and start.
+    fn pop(self: *Queue) ?Item {
         self.mu.lock();
         defer self.mu.unlock();
         while (self.items.items.len == 0 and !self.eof) self.cond.wait(&self.mu);
         if (self.items.items.len == 0) return null;
+        const it = self.items.orderedRemove(0);
         self.busy = true;
-        return self.items.orderedRemove(0);
+        self.cur_run = it.run;
+        self.cur_id = it.id;
+        self.active = false;
+        self.cur_cancelled = false;
+        return it;
     }
 
+    /// The popped request is answered: a cancel naming it from now on is a no-op.
     fn idle(self: *Queue) void {
         self.mu.lock();
         defer self.mu.unlock();
         self.busy = false;
+        self.cur_run = false;
+        self.cur_id = null;
+        self.active = false;
+        self.cur_cancelled = false;
     }
 
     /// Whether a request sent now would wait: one is being answered or queued.
@@ -163,22 +199,45 @@ const Queue = struct {
         return self.busy or self.items.items.len > 0;
     }
 
-    fn setRunning(self: *Queue, id: ?[]const u8) void {
+    /// Starts the popped run, after the abort flag was reset: false when a cancel
+    /// reached it first, so it never runs; from here a cancel aborts it.
+    fn start(self: *Queue) bool {
         self.mu.lock();
         defer self.mu.unlock();
-        self.running = id;
-        self.active = id != null;
+        if (self.cur_cancelled) return false;
+        self.active = true;
+        return true;
     }
 
-    /// Aborts the running script if `id` names it, or names nothing.
-    fn cancel(self: *Queue, id: ?[]const u8) void {
+    fn stop(self: *Queue) void {
         self.mu.lock();
         defer self.mu.unlock();
-        if (!self.active) return;
-        if (id) |want| if (self.running) |cur| if (!std.mem.eql(u8, want, cur)) return;
-        runtime.requestAbort();
+        self.active = false;
+    }
+
+    /// Cancels the run `id` names, or, with no `id`, the one running or about to,
+    /// else the first queued: a running one is aborted, one popped but not started is
+    /// marked to stop when it would start, and a queued one is taken out and returned,
+    /// for the caller to answer `cancelled` and free. A run the kernel finished or
+    /// never had is left alone.
+    fn cancel(self: *Queue, id: ?[]const u8) ?Item {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.cur_run and cancelNames(id, self.cur_id)) {
+            if (self.active) runtime.requestAbort() else self.cur_cancelled = true;
+            return null;
+        }
+        for (self.items.items, 0..) |it, i| if (it.run and cancelNames(id, it.id)) return self.items.orderedRemove(i);
+        return null;
     }
 };
+
+/// Whether a cancel's `want` names a run of id `have`: any run when it names none.
+fn cancelNames(want: ?[]const u8, have: ?[]const u8) bool {
+    const w = want orelse return true;
+    const h = have orelse return false;
+    return std.mem.eql(u8, w, h);
+}
 
 const Out = struct {
     fd: std.posix.fd_t,
@@ -250,14 +309,14 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
     defer std.posix.close(out.fd);
     try std.posix.dup2(std.posix.STDERR_FILENO, std.posix.STDOUT_FILENO);
 
-    var queue = Queue{ .items = std.array_list.Managed([]u8).init(alloc) };
+    var queue = Queue{ .items = std.array_list.Managed(Item).init(alloc) };
     defer {
-        for (queue.items.items) |l| alloc.free(l);
+        for (queue.items.items) |it| it.free(alloc);
         queue.items.deinit();
     }
-    var side_q = Queue{ .items = std.array_list.Managed([]u8).init(alloc) };
+    var side_q = Queue{ .items = std.array_list.Managed(Item).init(alloc) };
     defer {
-        for (side_q.items.items) |l| alloc.free(l);
+        for (side_q.items.items) |it| it.free(alloc);
         side_q.items.deinit();
     }
 
@@ -272,13 +331,14 @@ pub fn cmdKernel(alloc: std.mem.Allocator, args: [][:0]u8) !u8 {
         side_q.close();
         side.join();
     }
-    const reader = try std.Thread.spawn(.{}, readRequests, .{ alloc, &queue, &side_q });
+    const reader = try std.Thread.spawn(.{}, readRequests, .{ alloc, &out, &queue, &side_q });
     reader.detach();
 
-    while (queue.pop()) |raw| {
-        defer queue.idle();
+    while (queue.pop()) |item| {
+        defer item.free(alloc);
         defer pagecache.trim();
-        defer alloc.free(raw);
+        defer queue.idle();
+        const raw = item.line;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -346,8 +406,9 @@ fn answer(gpa: std.mem.Allocator, a: std.mem.Allocator, out: *Out, shared: *Shar
 /// asked, as one may be busy with a script: what connections said before is still
 /// offered.
 fn sideLoop(alloc: std.mem.Allocator, out: *Out, q: *Queue, shared: *Shared) void {
-    while (q.pop()) |raw| {
-        defer alloc.free(raw);
+    while (q.pop()) |item| {
+        defer item.free(alloc);
+        const raw = item.line;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -555,10 +616,12 @@ fn withComments(script: []const u8, entry: cli.Prepared, stmt: []const u8) []con
     return std.mem.trim(u8, script[from .. off + own.len], " \t\r\n");
 }
 
-/// Reads requests: a cancel acts at once; while the main loop is busy, with a script
+/// Reads requests: a cancel acts at once (`Queue.cancel`), and a queued run it takes
+/// out is answered here, `cancelled`; while the main loop is busy, with a script
 /// running or about to, or anything else answered or queued, one of `side_ops` goes
-/// to the side thread; anything else waits its turn on the main loop.
-fn readRequests(alloc: std.mem.Allocator, q: *Queue, side_q: *Queue) void {
+/// to the side thread; anything else waits its turn on the main loop, a run marked
+/// with its `id`.
+fn readRequests(alloc: std.mem.Allocator, out: *Out, q: *Queue, side_q: *Queue) void {
     defer q.close();
     defer side_q.close();
     var buf: [64 * 1024]u8 = undefined;
@@ -571,14 +634,18 @@ fn readRequests(alloc: std.mem.Allocator, q: *Queue, side_q: *Queue) void {
         _ = r.streamDelimiterEnding(&acc.writer, '\n') catch return;
         const t = std.mem.trim(u8, acc.written(), " \t\r\n");
         if (t.len > 0) {
-            if (isCancel(alloc, t)) |id| {
-                q.cancel(id);
-                if (id) |s| alloc.free(s);
+            const h = headOf(alloc, t);
+            defer h.free(alloc);
+            if (std.mem.eql(u8, h.op, "cancel")) {
+                if (q.cancel(h.id)) |dropped| answerDropped(alloc, out, dropped);
             } else {
                 const line = alloc.dupe(u8, t) catch return;
-                const to = if (q.isBusy() and sideRequest(alloc, t)) side_q else q;
-                to.push(line) catch {
-                    alloc.free(line);
+                const run = std.mem.eql(u8, h.op, "run");
+                const id: ?[]u8 = if (run) (if (h.id) |x| (alloc.dupe(u8, x) catch null) else null) else null;
+                const item = Item{ .line = line, .run = run, .id = id };
+                const to = if (q.isBusy() and isSide(h.op)) side_q else q;
+                to.push(item) catch {
+                    item.free(alloc);
                     return;
                 };
             }
@@ -587,24 +654,34 @@ fn readRequests(alloc: std.mem.Allocator, q: *Queue, side_q: *Queue) void {
     }
 }
 
-/// Whether the line asks for one of `side_ops`.
-fn sideRequest(alloc: std.mem.Allocator, line: []const u8) bool {
-    const R = struct { op: []const u8 };
-    const p = std.json.parseFromSlice(R, alloc, line, .{ .ignore_unknown_fields = true }) catch return false;
-    defer p.deinit();
-    return isSide(p.value.op);
+/// A queued run a cancel took out, answered `cancelled` without running, and freed.
+fn answerDropped(alloc: std.mem.Allocator, out: *Out, item: Item) void {
+    defer item.free(alloc);
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    reply(arena.allocator(), out, item.id, .{ .ok = false, .cancelled = true }) catch {};
 }
 
-/// Null when the line is not a cancel request, else the optional id it names
-/// (owned by `alloc`).
-fn isCancel(alloc: std.mem.Allocator, line: []const u8) ??[]u8 {
-    if (std.mem.indexOf(u8, line, "cancel") == null) return null;
+/// A request line's `op` and `id`, owned by `alloc`; an empty op for a line that is
+/// not a JSON object with one, which the main loop then refuses.
+const Head = struct {
+    op: []u8,
+    id: ?[]u8,
+
+    fn free(self: Head, gpa: std.mem.Allocator) void {
+        gpa.free(self.op);
+        if (self.id) |x| gpa.free(x);
+    }
+};
+
+fn headOf(alloc: std.mem.Allocator, line: []const u8) Head {
     const C = struct { op: []const u8, id: ?[]const u8 = null };
-    const p = std.json.parseFromSlice(C, alloc, line, .{ .ignore_unknown_fields = true }) catch return null;
+    const none = Head{ .op = &.{}, .id = null };
+    const p = std.json.parseFromSlice(C, alloc, line, .{ .ignore_unknown_fields = true }) catch return none;
     defer p.deinit();
-    if (!std.mem.eql(u8, p.value.op, "cancel")) return null;
-    const id = p.value.id orelse return @as(?[]u8, null);
-    return alloc.dupe(u8, id) catch @as(?[]u8, null);
+    const op = alloc.dupe(u8, p.value.op) catch return none;
+    const id: ?[]u8 = if (p.value.id) |x| (alloc.dupe(u8, x) catch null) else null;
+    return .{ .op = op, .id = id };
 }
 
 const ErrorInfo = struct {
@@ -992,6 +1069,9 @@ fn runScript(
 
     if (entry.executable == 0) {
         if (!stands or declaresLet(entry.pending)) {
+            runtime.resetAbort();
+            if (!q.start()) return reply(a, out, req.id, .{ .ok = false, .cancelled = true, .elapsed_ms = @intCast(std.time.milliTimestamp() - t0), .declared = declared });
+            defer q.stop();
             var freezer = cli.LetFreezer.init(a);
             var rdiag: runtime.Diag = .{};
             _ = runtime.run(gpa, entry.prog, .{
@@ -1002,6 +1082,10 @@ fn runScript(
                 .held = try decls.heldLets(a),
             }, &rdiag) catch |e| {
                 if (e == error.OutOfMemory) return error.OutOfMemory;
+                if (e == error.Aborted or runtime.aborting()) {
+                    runtime.resetAbort();
+                    return reply(a, out, req.id, .{ .ok = false, .cancelled = true, .elapsed_ms = @intCast(std.time.milliTimestamp() - t0), .declared = declared });
+                }
                 var ei = ErrorInfo{
                     .msg = if (rdiag.msg.len > 0) try a.dupe(u8, rdiag.msg) else runtime.failLabel(e),
                     .transient = rdiag.retryable or runtime.isTransient(e),
@@ -1019,6 +1103,9 @@ fn runScript(
         return reply(a, out, req.id, .{ .ok = true, .elapsed_ms = @intCast(std.time.milliTimestamp() - t0), .declared = declared });
     }
 
+    runtime.resetAbort();
+    if (!q.start()) return reply(a, out, req.id, .{ .ok = false, .cancelled = true, .elapsed_ms = @intCast(std.time.milliTimestamp() - t0), .declared = declared });
+    defer q.stop();
     var cap = Capture{ .out = out, .id = id, .results = std.array_list.Managed(ResultFrame).init(a), .loads = std.array_list.Managed(runtime.LoadDone).init(a), .units = if (req.utf16) script else null };
     var summary: obs.Summary = .{ .run_id = 0, .loads = 0 };
     var ran = false;
@@ -1034,8 +1121,6 @@ fn runScript(
         shared.lock.unlock();
     }
 
-    runtime.resetAbort();
-    q.setRunning(id);
     var rdiag: runtime.Diag = .{};
     var failed: ?anyerror = null;
     if (entry.prog.explain == .plan) {
@@ -1076,7 +1161,7 @@ fn runScript(
         };
         ran = true;
     }
-    q.setRunning(null);
+    q.stop();
 
     cap.stop();
     const results = cap.results.items;
@@ -1152,14 +1237,78 @@ test "paramArgs: JSON scalars bind as the text a -p would carry" {
     try std.testing.expectError(error.BadParams, paramArgs(a, nested));
 }
 
-test "isCancel: only a cancel op is one, with or without an id" {
+test "headOf: a line's op and id, an empty op for a line that is not a request" {
     const a = std.testing.allocator;
-    try std.testing.expect(isCancel(a, "{\"op\":\"run\",\"script\":\"SELECT 'cancel';\"}") == null);
-    const bare = isCancel(a, "{\"op\":\"cancel\"}").?;
-    try std.testing.expect(bare == null);
-    const named = isCancel(a, "{\"op\":\"cancel\",\"id\":\"c7\"}").?.?;
-    defer a.free(named);
-    try std.testing.expectEqualStrings("c7", named);
+    const run = headOf(a, "{\"op\":\"run\",\"id\":\"r1\",\"script\":\"SELECT 'cancel';\"}");
+    defer run.free(a);
+    try std.testing.expectEqualStrings("run", run.op);
+    try std.testing.expectEqualStrings("r1", run.id.?);
+    const bare = headOf(a, "{\"op\":\"cancel\"}");
+    defer bare.free(a);
+    try std.testing.expect(bare.id == null);
+    const junk = headOf(a, "not json");
+    defer junk.free(a);
+    try std.testing.expectEqual(@as(usize, 0), junk.op.len);
+}
+
+fn testRun(a: std.mem.Allocator, id: ?[]const u8) !Item {
+    return .{ .line = try a.dupe(u8, "{}"), .run = true, .id = if (id) |x| try a.dupe(u8, x) else null };
+}
+
+test "Queue.cancel: a queued run is taken out, one popped but not started never starts, a running one is aborted" {
+    const a = std.testing.allocator;
+    var q = Queue{ .items = std.array_list.Managed(Item).init(a) };
+    defer {
+        for (q.items.items) |it| it.free(a);
+        q.items.deinit();
+    }
+    try q.push(try testRun(a, "r1"));
+    try q.push(try testRun(a, "r2"));
+    const dropped = q.cancel("r2").?;
+    try std.testing.expectEqualStrings("r2", dropped.id.?);
+    dropped.free(a);
+    try std.testing.expect(q.cancel("nope") == null);
+
+    const it = q.pop().?;
+    defer it.free(a);
+    try std.testing.expect(q.cancel("r1") == null);
+    runtime.resetAbort();
+    try std.testing.expect(!q.start());
+    try std.testing.expect(!runtime.aborting());
+    q.idle();
+    try std.testing.expect(q.cancel("r1") == null);
+
+    try q.push(try testRun(a, "r3"));
+    const it3 = q.pop().?;
+    defer it3.free(a);
+    try std.testing.expect(q.start());
+    defer runtime.resetAbort();
+    try std.testing.expect(q.cancel(null) == null);
+    try std.testing.expect(runtime.aborting());
+}
+
+test "Queue.cancel: with no id, the run popped or else the first queued; a finished one is left alone" {
+    const a = std.testing.allocator;
+    var q = Queue{ .items = std.array_list.Managed(Item).init(a) };
+    defer {
+        for (q.items.items) |it| it.free(a);
+        q.items.deinit();
+    }
+    try q.push(.{ .line = try a.dupe(u8, "{}") });
+    try q.push(try testRun(a, null));
+    try q.push(try testRun(a, "r5"));
+    const side = q.pop().?;
+    defer side.free(a);
+    const first = q.cancel(null).?;
+    try std.testing.expect(first.id == null);
+    first.free(a);
+    q.idle();
+    const r5 = q.pop().?;
+    defer r5.free(a);
+    try std.testing.expect(q.cancel(null) == null);
+    try std.testing.expect(!q.start());
+    q.idle();
+    try std.testing.expect(q.cancel(null) == null);
 }
 
 test "clip: an echoed id cut at 256 bytes never splits a codepoint, so the frame stays JSON" {

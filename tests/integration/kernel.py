@@ -358,6 +358,60 @@ def main(binary):
     report("hover on a file's own LET shows the value the session holds once the file ran",
            hl.get("kind") == "let" and hl.get("value") == 42 and hl.get("type") == "int", st)
 
+    # A cancel sent with its run, before the main loop starts it, still stops it.
+    def run_and_cancel(kk, rid, cancel_id, extra=None):
+        lines = [json.dumps({"op": "run", "id": rid, "script": "SELECT sum(range % 7) AS n FROM range(100000000000);"})]
+        if extra:
+            lines += extra
+        lines.append(json.dumps({"op": "cancel", "id": cancel_id} if cancel_id is not None else {"op": "cancel"}))
+        kk.p.stdin.write(("\n".join(lines) + "\n").encode())
+        kk.p.stdin.flush()
+    kc = Kernel(binary, "--format", "json")
+    fast = 0
+    worst = 0.0
+    import threading
+    for i in range(20):
+        rid = f"rc{i}"
+        dog = threading.Timer(5, kc.p.kill)
+        dog.start()
+        t0 = time.time()
+        run_and_cancel(kc, rid, rid)
+        try:
+            _, st = kc.reply()
+        except EOFError:
+            st = {}
+        dog.cancel()
+        dt = time.time() - t0
+        worst = max(worst, dt)
+        if st.get("id") == rid and st.get("cancelled") is True and dt < 0.1:
+            fast += 1
+        if kc.p.poll() is not None:
+            break
+    report("a cancel written with its run stops it, 20 times out of 20, each within 100 ms", fast == 20, (fast, worst))
+    if kc.p.poll() is None:
+        dog = threading.Timer(10, kc.p.kill)
+        dog.start()
+        kc.p.stdin.write((json.dumps({"op": "run", "id": "qa", "script": "SELECT sum(range % 7) AS n FROM range(100000000000);"}) + "\n"
+                          + json.dumps({"op": "run", "id": "qb", "script": "SELECT 1 AS one;"}) + "\n").encode())
+        kc.p.stdin.flush()
+        time.sleep(0.3)
+        kc.send(op="cancel", id="qb")
+        _, st = kc.reply()
+        report("a cancel naming a queued run drops it and answers it cancelled, with no frames, while another runs",
+               st.get("id") == "qb" and st.get("cancelled") is True and not kc.results and "elapsed_ms" not in st, st)
+        kc.send(op="cancel", id="nope")
+        kc.send(op="cancel")
+        _, st = kc.reply()
+        report("a cancel naming no run does nothing, and one with no id stops the running script",
+               st.get("id") == "qa" and st.get("cancelled") is True, st)
+        run_and_cancel(kc, "qc", None)
+        _, st = kc.reply()
+        report("a cancel with no id written with its run stops it before it starts", st.get("id") == "qc" and st.get("cancelled") is True, st)
+        data, st = kc.run("SELECT 2 AS two;")
+        dog.cancel()
+        report("the kernel runs on after cancels of every kind", st["ok"] and rows(data) == [{"two": 2}], st)
+    kc.close()
+
     # Columns count UTF-16 units under utf16, in errors as in hover.
     bad = "SELECT 'é😀' AS a, nope FROM range(1);"
     _, st = k.run(bad, utf16=True)
